@@ -5,10 +5,22 @@
  * round-trip, which is acceptable) until it is done or archived. In-memory:
  * execution is transient by nature.
  */
+/**
+ * Executor lineage snapshot (TICKET-0066): read once from the session
+ * header at start() time (parentSession + origin === 'subagent'), so the
+ * UI can render 「父会话 ↳ subagent」 even after the executor ends.
+ */
+export interface RunningLineage {
+  readonly parentSessionId?: string
+  readonly isSubagent?: boolean
+}
+
 export interface RunningInfo {
   readonly sessionId: string
   readonly sessionLabel: string
   readonly since: string
+  readonly parentSessionId?: string
+  readonly isSubagent?: boolean
 }
 
 /**
@@ -20,11 +32,25 @@ export function endsExecution(status?: string, archived?: boolean): boolean {
   return status === 'done' || status === 'blocked' || status === 'skipped' || archived === true
 }
 
+/** Lineage snapshot from a session-header-shaped object (TICKET-0066). */
+export function lineageOfHeader(header: { parentSession?: string; origin?: string } | undefined): RunningLineage {
+  return {
+    ...(header?.parentSession !== undefined ? { parentSessionId: header.parentSession } : {}),
+    ...(header?.origin === 'subagent' ? { isSubagent: true } : {}),
+  }
+}
+
 export class RunningRegistry {
   private readonly running = new Map<string, RunningInfo>()
 
-  start(id: string, sessionId: string, sessionLabel: string): void {
-    this.running.set(id, { sessionId, sessionLabel, since: new Date().toISOString() })
+  start(id: string, sessionId: string, sessionLabel: string, lineage: RunningLineage = {}): void {
+    this.running.set(id, {
+      sessionId,
+      sessionLabel,
+      since: new Date().toISOString(),
+      ...(lineage.parentSessionId !== undefined ? { parentSessionId: lineage.parentSessionId } : {}),
+      ...(lineage.isSubagent === true ? { isSubagent: true } : {}),
+    })
   }
 
   stop(id: string): void {

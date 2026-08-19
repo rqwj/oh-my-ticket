@@ -66,6 +66,12 @@ export interface UpdateInput {
    * when passive observation dispatches a pending item to running.
    */
   readonly executorSessionId?: string
+  /**
+   * Explicit-report signal (TICKET-0064): set by reportRunItem's internal
+   * double-write so the awaiting_confirmation trust gate knows this status
+   * change rides an omt_run_report and must not be gated.
+   */
+  readonly reported?: boolean
 }
 
 export interface ShowResult {
@@ -124,7 +130,9 @@ const RUN_TRANSITIONS: Readonly<Record<RunStatus, readonly RunStatus[]>> = {
 const ITEM_TRANSITIONS: Readonly<Record<RunItemState, readonly RunItemState[]>> = {
   pending: ['running', 'done', 'blocked', 'skipped'],
   running: ['done', 'failed', 'blocked', 'skipped', 'awaiting_confirmation', 'interrupted'],
-  awaiting_confirmation: ['done', 'failed', 'blocked', 'skipped', 'running'],
+  // awaiting_confirmation → interrupted is the 打回 (rejection) path
+  // (TICKET-0064): the ticket is reopened over an unconfirmed completion.
+  awaiting_confirmation: ['done', 'failed', 'blocked', 'skipped', 'running', 'interrupted'],
   done: [],
   failed: [],
   blocked: [],
@@ -148,6 +156,14 @@ export interface ObservedNodeChange {
   readonly archived?: boolean
 }
 
+/** Options travelling with an observed node change. */
+export interface ObserveOptions {
+  /** Session that made the change (executor attribution / trust gate). */
+  readonly executorSessionId?: string
+  /** The change rides an explicit omt_run_report double-write (TICKET-0064). */
+  readonly reported?: boolean
+}
+
 const DB_FILE = 'omt.db'
 
 export interface OpenOptions {
@@ -166,12 +182,53 @@ export interface JanitorResult {
   readonly interruptedItems: OmtRunItem[]
 }
 
+/**
+ * Run/item transition broadcast (TICKET-0065): emitted AFTER the mutation
+ * lands, carrying post-change snapshots. Item events fire for
+ * transitionItem/retryItem/replayItem; run events for every status change
+ * (setRunStatus — including stop-on-failure pauses and terminal
+ * derivation). Listeners attach after open(), so the startup janitor's
+ * demotions never reach them; janitor item demotions use the store
+ * directly and never emit item events at all.
+ */
+export interface OmtRunEvent {
+  readonly kind: 'item' | 'run'
+  readonly run: OmtRun
+  readonly item?: OmtRunItem
+  readonly fromItemState?: RunItemState
+  readonly fromRunStatus?: RunStatus
+}
+
 export class OmtCore {
+  private readonly runEventListeners = new Set<(event: OmtRunEvent) => void>()
+
   private constructor(
     readonly home: string,
     private readonly store: OmtStore,
     private readonly files: OmtFiles,
   ) {}
+
+  /**
+   * Subscribe to run/item transitions (TICKET-0065 notification hooks).
+   * Returns the unsubscribe function. Listener exceptions are contained
+   * (warn) — a broken listener never breaks a mutation.
+   */
+  onRunEvent(listener: (event: OmtRunEvent) => void): () => void {
+    this.runEventListeners.add(listener)
+    return () => {
+      this.runEventListeners.delete(listener)
+    }
+  }
+
+  private emitRunEvent(event: OmtRunEvent): void {
+    for (const listener of [...this.runEventListeners]) {
+      try {
+        listener(event)
+      } catch (error: unknown) {
+        console.warn('[omt] run-event listener failed', error)
+      }
+    }
+  }
 
   /**
    * Open the OMT home: create directories, open the database, and reindex
@@ -297,7 +354,10 @@ export class OmtCore {
     // Passive observation (TICKET-0061) funnels through here: every ordinary
     // update path (tools, RPC, the report double-write) broadcasts the
     // change to active runs exactly once — callers must not re-observe.
-    await this.observeNodeStatus(input.id, { status: input.status, archived: input.archived }, input.executorSessionId)
+    await this.observeNodeStatus(input.id, { status: input.status, archived: input.archived }, {
+      executorSessionId: input.executorSessionId,
+      reported: input.reported,
+    })
     return updated
   }
 
@@ -628,7 +688,9 @@ export class OmtCore {
       this.setRunStatus(runId, 'paused')
     }
     if (RUN_ITEM_FINAL_STATES.includes(to)) this.deriveRunTerminal(runId)
-    return this.store.getRunItem(runId, nodeId) as OmtRunItem
+    const updated = this.store.getRunItem(runId, nodeId) as OmtRunItem
+    this.emitRunEvent({ kind: 'item', run: this.requireRun(runId), item: updated, fromItemState: item.state })
+    return updated
   }
 
   /**
@@ -659,7 +721,9 @@ export class OmtCore {
     })
     // The run has dispatchable work again: leave the terminal state.
     if (run.status === 'completed_with_failures') this.setRunStatus(runId, 'running')
-    return this.store.getRunItem(runId, nodeId) as OmtRunItem
+    const retried = this.store.getRunItem(runId, nodeId) as OmtRunItem
+    this.emitRunEvent({ kind: 'item', run: this.requireRun(runId), item: retried, fromItemState: item.state })
+    return retried
   }
 
   /**
@@ -686,7 +750,9 @@ export class OmtCore {
       started_at: null,
       finished_at: null,
     })
-    return this.store.getRunItem(runId, nodeId) as OmtRunItem
+    const replayed = this.store.getRunItem(runId, nodeId) as OmtRunItem
+    this.emitRunEvent({ kind: 'item', run: this.requireRun(runId), item: replayed, fromItemState: item.state })
+    return replayed
   }
 
   /**
@@ -712,6 +778,21 @@ export class OmtCore {
     // side); when that drained the queue the run may be derivable now.
     if (claimed === undefined) this.deriveRunTerminal(runId)
     return claimed
+  }
+
+  /**
+   * Every item owned by one executor session across active (running |
+   * paused) runs — the disposed hook's involvement probe (TICKET-0063).
+   * Ownership survives completion, so callers filter by item state.
+   */
+  executorItems(sessionId: string): { run: OmtRun; item: OmtRunItem }[] {
+    const owned: { run: OmtRun; item: OmtRunItem }[] = []
+    for (const run of this.store.listRunsByStatus(['running', 'paused'])) {
+      for (const item of this.store.listRunItems(run.id)) {
+        if (item.executor_session_id === sessionId) owned.push({ run, item })
+      }
+    }
+    return owned
   }
 
   /**
@@ -809,11 +890,14 @@ export class OmtCore {
     }
     const transitioned = await this.transitionItem(runId, nodeId, outcome)
     // done/blocked/skipped double-write the ticket: note append and status
-    // land in one update (one read/write of the node file).
+    // land in one update (one read/write of the node file). `reported`
+    // marks the explicit-report channel so the TICKET-0064 trust gate never
+    // reroutes this completion (nor its broadcast to other runs' items).
     const updated = await this.update({
       id: nodeId,
       ...(noteText !== undefined ? { append: noteText } : {}),
       status: outcome,
+      reported: true,
     })
     return { item: transitioned, node: updated }
   }
@@ -825,16 +909,21 @@ export class OmtCore {
    * decision 1. Mapping:
    *   in_progress → pending item dispatches to running (running runs only —
    *     pause stops dispatch, decision 9), recording the observing session
-   *   done/blocked/skipped → item to the same state (pending items included:
+   *   done → item to done — EXCEPT the trust gate (TICKET-0064): a RUNNING
+   *     item completed by its own executor session through a bare update
+   *     (not omt_run_report, which sets `reported`) lands in
+   *     awaiting_confirmation instead, unless the run auto-verifies
+   *   blocked/skipped → item to the same state (pending items included:
    *     direct sets must not wedge a run)
    *   archived → item skipped
    *   open over a done/blocked/skipped item → replay back to pending
-   *     (decision 11)
+   *     (decision 11); open over an awaiting_confirmation item → 打回:
+   *     the completion is rejected and the item is interrupted
    * Claim priority (decision 14): an already-claimed item keeps its
    * executor_session_id — observation advances state but never rebinds
    * ownership. Returns the items actually advanced (hook reuse).
    */
-  async observeNodeStatus(nodeId: string, change: ObservedNodeChange, executorSessionId?: string): Promise<OmtRunItem[]> {
+  async observeNodeStatus(nodeId: string, change: ObservedNodeChange, options: ObserveOptions = {}): Promise<OmtRunItem[]> {
     // Title/body/append-only updates cannot affect any run: skip the scan.
     if (change.archived !== true && change.status === undefined) return []
     const advanced: OmtRunItem[] = []
@@ -855,10 +944,24 @@ export class OmtCore {
           // Dispatch only — a claimed (already running) item is left alone,
           // so its executor attribution is never overwritten.
           if (item.state === 'pending' && runStatus === 'running') {
-            advanced.push(await this.transitionItem(item.run_id, nodeId, 'running', { executorSessionId }))
+            advanced.push(await this.transitionItem(item.run_id, nodeId, 'running', { executorSessionId: options.executorSessionId }))
           }
           break
-        case 'done':
+        case 'done': {
+          if (!advance) break
+          // Trust gate (TICKET-0064): only the executor session's OWN bare
+          // done on its RUNNING item is gated. Reports (reported=true),
+          // other sessions, agent-less updates, and pending items land done
+          // directly; autoVerify runs skip the gate entirely.
+          const run = this.store.getRun(item.run_id)
+          const gated = item.state === 'running'
+            && options.reported !== true
+            && options.executorSessionId !== undefined
+            && item.executor_session_id === options.executorSessionId
+            && run !== undefined && !run.config.autoVerify
+          advanced.push(await this.transitionItem(item.run_id, nodeId, gated ? 'awaiting_confirmation' : 'done'))
+          break
+        }
         case 'blocked':
         case 'skipped':
           if (advance) {
@@ -868,6 +971,10 @@ export class OmtCore {
         case 'open':
           if (item.state === 'done' || item.state === 'blocked' || item.state === 'skipped') {
             advanced.push(await this.replayItem(item.run_id, nodeId))
+          } else if (item.state === 'awaiting_confirmation') {
+            // 打回 (TICKET-0064): reopening the ticket rejects the
+            // unconfirmed completion — interrupted waits for a retry.
+            advanced.push(await this.transitionItem(item.run_id, nodeId, 'interrupted'))
           }
           break
         default:
@@ -933,6 +1040,7 @@ export class OmtCore {
       ...(to === 'running' ? { finished_at: null } : {}),
       ...(to === 'completed' || to === 'completed_with_failures' || to === 'canceled' || to === 'interrupted' ? { finished_at: now } : {}),
     })
+    this.emitRunEvent({ kind: 'run', run: this.requireRun(id), fromRunStatus: run.status })
   }
 
   /**

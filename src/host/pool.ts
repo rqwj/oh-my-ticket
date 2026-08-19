@@ -11,11 +11,31 @@ import { join } from 'node:path'
 import { OmtCore } from './core.ts'
 import { TYPE_PREFIX, type NodeType } from './types.ts'
 
+export interface OmtCorePoolOptions {
+  /**
+   * Live DSH session ids, consulted by the startup janitor every time a
+   * core (re)opens (review fix #4): without it the janitor assumes NO
+   * session is alive and demotes every running item to interrupted on
+   * plugin load/reload. Cores open lazily — well after the agents registry
+   * is injected — so evaluating the provider at open time is safe.
+   */
+  readonly activeSessionIds?: () => readonly string[]
+  /**
+   * Observer attached to each core right after it opens (run-event
+   * listeners, TICKET-0065). Attached post-open, so the startup janitor's
+   * demotions never reach it.
+   */
+  readonly onCoreOpened?: (core: OmtCore) => void
+}
+
 export class OmtCorePool {
   private readonly cores = new Map<string, Promise<OmtCore>>()
 
   /** @param globalHome - fallback home (already resolved from config/env). */
-  constructor(readonly globalHome: string) {}
+  constructor(
+    readonly globalHome: string,
+    private readonly options: OmtCorePoolOptions = {},
+  ) {}
 
   /** Resolve the home directory for one workspace cwd (or the global fallback). */
   homeFor(cwd: string | undefined): string {
@@ -69,7 +89,13 @@ export class OmtCorePool {
   coreForHome(home: string): Promise<OmtCore> {
     let core = this.cores.get(home)
     if (core === undefined) {
-      core = OmtCore.open(home)
+      core = OmtCore.open(home, { activeSessionIds: this.options.activeSessionIds?.() })
+      const onCoreOpened = this.options.onCoreOpened
+      if (onCoreOpened !== undefined) {
+        // Rejection is owned by the awaited promise above (callers see it);
+        // this branch only skips the observer on a failed open.
+        void core.then(opened => onCoreOpened(opened), () => {})
+      }
       this.cores.set(home, core)
     }
     return core

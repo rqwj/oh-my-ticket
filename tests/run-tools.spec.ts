@@ -433,14 +433,16 @@ describe('TICKET-0061 passive observation', () => {
     expect(detail.items[1].state).toBe('pending')
   })
 
-  it('ticket → done advances the running item to done', async () => {
+  it('ticket → done routes the running item to awaiting_confirmation (TICKET-0064 default)', async () => {
     const ids = await ticketFixture(2)
     const run = await startedRun(ids)
     await tool('omt_update').execute({ id: ids[0], status: 'in_progress' }, agentExec('sess-1'))
     await tool('omt_update').execute({ id: ids[0], status: 'done' }, agentExec('sess-1'))
 
+    // The ticket itself lands done; the ITEM waits for confirmation.
     const detail = await tool('omt_run_show').execute({ id: run.id }, NO_EXEC)
-    expect(detail.items[0].state).toBe('done')
+    expect(detail.items[0].state).toBe('awaiting_confirmation')
+    expect(detail.run.status).toBe('running')
   })
 
   it('direct blocked/skipped sets map onto items (pending included — no wedged runs)', async () => {
@@ -491,8 +493,10 @@ describe('TICKET-0061 passive observation', () => {
 
   it('broadcasts progress to every active run holding the ticket', async () => {
     const ids = await ticketFixture(1)
-    const runA = await startedRun(ids)
-    const runB = await startedRun(ids)
+    // autoVerify: the broadcast mechanics under test are independent of the
+    // TICKET-0064 confirmation gate (covered in its own describe below).
+    const runA = await startedRun(ids, { autoVerify: true })
+    const runB = await startedRun(ids, { autoVerify: true })
 
     await tool('omt_update').execute({ id: ids[0], status: 'in_progress' }, agentExec('sess-1'))
     let detailA = await tool('omt_run_show').execute({ id: runA.id }, NO_EXEC)
@@ -511,7 +515,7 @@ describe('TICKET-0061 passive observation', () => {
 
   it('paused runs keep observing in-flight items but dispatch nothing new', async () => {
     const ids = await ticketFixture(2)
-    const run = await startedRun(ids)
+    const run = await startedRun(ids, { autoVerify: true })
     await tool('omt_update').execute({ id: ids[0], status: 'in_progress' }, agentExec('sess-1'))
     await tool('omt_run_control').execute({ id: run.id, action: 'pause' }, NO_EXEC)
 
@@ -528,7 +532,9 @@ describe('TICKET-0061 passive observation', () => {
 
   it('reopening a finished ticket replays its item back to pending', async () => {
     const ids = await ticketFixture(2)
-    const run = await startedRun(ids)
+    // autoVerify: replay mechanics need the item to actually reach done
+    // (default runs route the bare done to awaiting_confirmation, TICKET-0064).
+    const run = await startedRun(ids, { autoVerify: true })
     await tool('omt_update').execute({ id: ids[0], status: 'in_progress' }, agentExec('sess-1'))
     await tool('omt_update').execute({ id: ids[0], status: 'done' }, agentExec('sess-1'))
     let detail = await tool('omt_run_show').execute({ id: run.id }, NO_EXEC)
@@ -601,5 +607,99 @@ describe('TICKET-0061 passive observation', () => {
     await tool('omt_update').execute({ id: ids[0], status: 'blocked' }, agentExec('sess-1'))
     // blocked ends active execution: the mark clears like done/archive do.
     expect(running.get(ids[0]!)).toBeUndefined()
+  })
+})
+
+// ── TICKET-0064: awaiting_confirmation 信任策略 ─────────────────────────
+
+describe('TICKET-0064 trust policy (awaiting_confirmation)', () => {
+  it('autoVerify=true: a bare done from the executor lands done directly', async () => {
+    const ids = await ticketFixture(1)
+    const run = await startedRun(ids, { autoVerify: true })
+    await tool('omt_update').execute({ id: ids[0], status: 'in_progress' }, agentExec('sess-1'))
+    await tool('omt_update').execute({ id: ids[0], status: 'done' }, agentExec('sess-1'))
+
+    const detail = await tool('omt_run_show').execute({ id: run.id }, NO_EXEC)
+    expect(detail.items[0].state).toBe('done')
+    expect(detail.run.status).toBe('completed')
+  })
+
+  it('an explicit omt_run_report done lands done directly (never gated)', async () => {
+    const ids = await ticketFixture(1)
+    const run = await startedRun(ids)
+    await tool('omt_run_claim').execute({ id: run.id }, agentExec('sess-1'))
+    await tool('omt_run_report').execute({ id: run.id, nodeId: ids[0], outcome: 'done' }, agentExec('sess-1'))
+
+    const detail = await tool('omt_run_show').execute({ id: run.id }, NO_EXEC)
+    expect(detail.items[0].state).toBe('done')
+    expect(detail.run.status).toBe('completed')
+  })
+
+  it('a bare done from a NON-executor session is not gated', async () => {
+    const ids = await ticketFixture(2)
+    const run = await startedRun(ids)
+    await tool('omt_update').execute({ id: ids[0], status: 'in_progress' }, agentExec('sess-1'))
+    // A different session flips the ticket done (e.g. a human via another session).
+    await tool('omt_update').execute({ id: ids[0], status: 'done' }, agentExec('sess-2'))
+
+    const detail = await tool('omt_run_show').execute({ id: run.id }, NO_EXEC)
+    expect(detail.items[0].state).toBe('done')
+  })
+
+  it('a bare done on a PENDING item (never dispatched) is not gated', async () => {
+    const ids = await ticketFixture(2)
+    const run = await startedRun(ids)
+    await tool('omt_update').execute({ id: ids[0], status: 'done' }, NO_EXEC)
+
+    const detail = await tool('omt_run_show').execute({ id: run.id }, NO_EXEC)
+    expect(detail.items[0].state).toBe('done')
+  })
+
+  it('confirmation: a report on an awaiting_confirmation item completes it', async () => {
+    const ids = await ticketFixture(1)
+    const run = await startedRun(ids)
+    await tool('omt_update').execute({ id: ids[0], status: 'in_progress' }, agentExec('sess-1'))
+    await tool('omt_update').execute({ id: ids[0], status: 'done' }, agentExec('sess-1'))
+    expect((await tool('omt_run_show').execute({ id: run.id }, NO_EXEC)).items[0].state).toBe('awaiting_confirmation')
+
+    // 确认通道：显式 report（awaiting_confirmation 是 in-flight，接受 report）。
+    await tool('omt_run_report').execute({ id: run.id, nodeId: ids[0], outcome: 'done', note: '确认无误' }, agentExec('sess-1'))
+    const detail = await tool('omt_run_show').execute({ id: run.id }, NO_EXEC)
+    expect(detail.items[0].state).toBe('done')
+    expect(detail.run.status).toBe('completed')
+  })
+
+  it('rejection: reopening the ticket interrupts the awaiting_confirmation item (打回)', async () => {
+    const ids = await ticketFixture(2)
+    const run = await startedRun(ids)
+    await tool('omt_update').execute({ id: ids[0], status: 'in_progress' }, agentExec('sess-1'))
+    await tool('omt_update').execute({ id: ids[0], status: 'done' }, agentExec('sess-1'))
+    expect((await tool('omt_run_show').execute({ id: run.id }, NO_EXEC)).items[0].state).toBe('awaiting_confirmation')
+
+    // 打回通道：ticket 打回 open → item interrupted（等 retry，不是 replay）。
+    await tool('omt_update').execute({ id: ids[0], status: 'open' }, NO_EXEC)
+    const detail = await tool('omt_run_show').execute({ id: run.id }, NO_EXEC)
+    expect(detail.items[0].state).toBe('interrupted')
+    expect(detail.run.status).toBe('running')
+  })
+
+  it('awaiting_confirmation never auto-completes: an unrelated update leaves it in place', async () => {
+    const ids = await ticketFixture(2)
+    const run = await startedRun(ids)
+    await tool('omt_update').execute({ id: ids[0], status: 'in_progress' }, agentExec('sess-1'))
+    await tool('omt_update').execute({ id: ids[0], status: 'done' }, agentExec('sess-1'))
+    // 无响应/含糊：对 ticket 做非状态修改不会改变待确认状态。
+    await tool('omt_update').execute({ id: ids[0], append: '补充说明' }, agentExec('sess-1'))
+
+    const detail = await tool('omt_run_show').execute({ id: run.id }, NO_EXEC)
+    expect(detail.items[0].state).toBe('awaiting_confirmation')
+    expect(detail.run.status).toBe('running')
+  })
+
+  it('non-run tickets are untouched by the trust policy', async () => {
+    const ids = await ticketFixture(1)
+    // No run holds this ticket: a bare done is an ordinary status change.
+    const updated = await tool('omt_update').execute({ id: ids[0], status: 'done' }, agentExec('sess-1'))
+    expect(updated.status).toBe('done')
   })
 })

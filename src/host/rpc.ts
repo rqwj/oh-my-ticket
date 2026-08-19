@@ -16,12 +16,12 @@ import type { RpcResult } from '@deepseek-ai/dsh-host-apiproxy/api'
 import type { OmtCorePool } from './pool.ts'
 import type { ChangeHub } from './changes.ts'
 import type { RecentRegistry } from './recent.ts'
-import { endsExecution, type RunningRegistry } from './running.ts'
+import { endsExecution, lineageOfHeader, type RunningRegistry } from './running.ts'
 import { OmtError, STATUSES, type OmtNode, type OmtTreeNode } from './types.ts'
 
-/** Structural ctx.agents face: sessionId → agent → session header cwd. */
+/** Structural ctx.agents face: sessionId → agent → session header. */
 interface AgentsLike {
-  get(id: string): { session: { header: { cwd: string } } } | undefined
+  get(id: string): { session: { header: { cwd: string; parentSession?: string; origin?: 'subagent' } } } | undefined
 }
 
 // Every payload may carry the calling session so the handler can resolve
@@ -150,7 +150,13 @@ export function registerOmtRpc(ctx: Context, pool: OmtCorePool, recent?: RecentR
           // execute button dispatches the pending item of every active run
           // holding this ticket, with this session as the executor.
           const node = await core.update({ id: parsed.data.id, status: 'in_progress', executorSessionId: parsed.data.sessionId })
-          running?.start(parsed.data.id, parsed.data.sessionId, sessionLabelOf(parsed.data.sessionId))
+          running?.start(
+            parsed.data.id,
+            parsed.data.sessionId,
+            sessionLabelOf(parsed.data.sessionId),
+            // Executor lineage snapshot (TICKET-0066) from the session header.
+            lineageOfHeader(agents?.get(parsed.data.sessionId)?.session.header),
+          )
           recent?.touch(parsed.data.sessionId, parsed.data.id)
           changes?.bump(core.home)
           return ok(summarize(node))

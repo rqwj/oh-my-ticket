@@ -9,7 +9,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { defineTool, type ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { RUN_REPORT_OUTCOMES, type OmtCore, type ReindexResult, type ReportResult, type ShowResult } from './core.ts'
 import type { OmtCorePool } from './pool.ts'
-import { endsExecution, type RunningRegistry } from './running.ts'
+import { endsExecution, lineageOfHeader, type RunningRegistry } from './running.ts'
 import { stripChildrenBlock } from './markdown.ts'
 import { isRunItemStalled, NODE_TYPES, RUN_ITEM_STATES, RUN_STATUSES, STATUSES, type OmtNode, type OmtRun, type OmtRunItem } from './types.ts'
 
@@ -274,7 +274,8 @@ export function registerOmtTools(
   /** Status transitions drive the running marker (model-flow executions). */
   const trackRunning = (exec: ToolRunContext, id: string, status?: string, archived?: boolean): void => {
     if (running === undefined) return
-    if (status === 'in_progress') running.start(id, sessionOf(exec) ?? '', labelOf(exec))
+    // Executor lineage snapshot (TICKET-0066) from the session header.
+    if (status === 'in_progress') running.start(id, sessionOf(exec) ?? '', labelOf(exec), lineageOfHeader(exec.agent?.session.header))
     // done/blocked/skipped/archive all end active execution: clear the mark.
     if (endsExecution(status, archived)) running.stop(id)
   }
@@ -498,7 +499,7 @@ export function registerOmtTools(
         properties: {
           stopOnFailure: { type: 'boolean', description: 'item failed 时 run 自动暂停（默认 false）' },
           autoContinue: { type: 'boolean', description: '允许 idle 续跑提醒（默认 true）' },
-          autoVerify: { type: 'boolean', description: '信任策略（预留，当前版本不生效：被动观察的完成直接落 done；默认 false）' },
+          autoVerify: { type: 'boolean', description: '信任策略（TICKET-0064）：false 时执行者会话未经 omt_run_report 直接落 done 的项进入 awaiting_confirmation 待确认；true 直接落 done（默认 false）' },
           concurrency: { type: 'integer', description: '并发执行上限（P3 预留，默认 1）' },
         },
       },

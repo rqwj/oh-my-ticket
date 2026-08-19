@@ -113,7 +113,10 @@ run 是 ticket 的批量执行机制：一次做完一批 ticket，有队列、�
   - \`failed\`：执行失败，仅 item 落 failed，ticket 保持 in_progress（可重试）。
   - \`blocked\`：外部条件做不下去；\`skipped\`：必须跳过。两者 ticket 与
     item 同步落对应状态。
-  - \`interrupted\`：执行中断（会话销毁/宿主重启），可经 retry 或 resume 恢复。
+  - \`interrupted\`：执行中断（会话销毁/宿主重启）。恢复分两步：先
+    \`omt_run_control resume\` 把 run 拉回 running（resume **不会**重置
+    interrupted 项），再逐项 \`omt_run_control retry\` 把 interrupted 项重置回
+    pending，之后才能被重新 claim。
 - **run 终态**：\`completed\`（全 done/skipped）/ \`completed_with_failures\`
   （含 failed 或 interrupted 项）/ \`canceled\` / \`interrupted\`。
   run 本身没有 failed；\`interrupted\` 不是绝对终态——可 resume 回 running 续跑。
@@ -149,12 +152,16 @@ run 是 ticket 的批量执行机制：一次做完一批 ticket，有队列、�
 
 ## 信任策略
 
-当前版本：run item 处于 running 时，即使**未经 omt_run_report** 直接用
-omt_update 把 ticket 落 done，被动观察也会让 item 同步落 done——直接生效，
-不设确认环节。但正确做法仍是完成时先 omt_run_report（显式报告，note 一并
-记入 ticket 进度），不要依赖被动观察兜底。item 状态机中的
-\`awaiting_confirmation\` 信任门（未经 report 的完成先等人确认）是预留状态，
-将随后续版本落地；当前没有任何路径会进入它。
+- 经 \`omt_run_report\` 的完成是**显式报告**：item 直接落 done，note 一并记入
+  ticket 进度——这是唯一不受信任门影响的完成路径。
+- 未经 report、由执行者会话本人直接用 \`omt_update\` 把 ticket 落 done（item 处于
+  running）：run 配置 \`autoVerify=false\`（默认）时 item 进入
+  \`awaiting_confirmation\`，等待人到 run 详情确认或打回（打回把 ticket 重开为
+  open，item 落 interrupted，需 retry 重置后重新认领）；\`autoVerify=true\`
+  时直接落 done。
+- \`awaiting_confirmation\` 绝不自动完成：无响应或含糊的更新不会改变它。
+- 非执行者会话的状态修改、pending 项的直接状态设置不受信任门影响；非 run
+  成员的 ticket 行为完全不变。
 
 ## 边界
 

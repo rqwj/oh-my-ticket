@@ -105,9 +105,11 @@ export interface RunConfig {
   /** Idle hook may nudge the executor to continue the next pending item. */
   autoContinue: boolean
   /**
-   * Trust policy (reserved — the awaiting_confirmation confirmation gate
-   * lands in a later version): hook-observed completions land directly in
-   * done.
+   * Trust policy (TICKET-0064): when false, a RUNNING item completed by its
+   * own executor session through a bare omt_update (no omt_run_report)
+   * lands in awaiting_confirmation for a human to confirm/reject; when
+   * true the completion lands done directly. Explicit reports are always
+   * trusted, regardless of this flag.
    */
   autoVerify: boolean
   /** Reserved for P3 concurrent execution. */
