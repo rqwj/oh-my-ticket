@@ -129,15 +129,14 @@ export function registerOmtRpc(ctx: Context, pool: OmtCorePool, recent?: RecentR
           }
           const cwd = parsed.data.sessionId === undefined ? undefined : agents?.get(parsed.data.sessionId)?.session.header.cwd
           const core = await pool.coreForNode(parsed.data.id, cwd)
-          const node = await core.update({ id: parsed.data.id, title, status, archived, priority, append })
+          // Passive observation (TICKET-0061) rides on core.update; the
+          // session becomes the executor of any item this change dispatches.
+          const node = await core.update({ id: parsed.data.id, title, status, archived, priority, append, executorSessionId: parsed.data.sessionId })
           recent?.touch(parsed.data.sessionId, parsed.data.id)
           // Manual status changes never START a running mark — execution is
           // claimed only by the execute endpoint and model tool calls
           // (TICKET-0028). Done/blocked/skipped/archive always clear it.
           if (endsExecution(status, archived)) running?.stop(parsed.data.id)
-          // Passive observation (TICKET-0061): advance the matching items of
-          // every active run holding this node.
-          await core.observeNodeStatus(parsed.data.id, { status, archived }, parsed.data.sessionId)
           changes?.bump(core.home)
           return ok(summarize(node))
         }
@@ -147,11 +146,11 @@ export function registerOmtRpc(ctx: Context, pool: OmtCorePool, recent?: RecentR
           const cwd = agents?.get(parsed.data.sessionId)?.session.header.cwd
           const core = await pool.coreForNode(parsed.data.id, cwd)
           // Executing un-archives nothing and starts work: in_progress + running mark.
-          const node = await core.update({ id: parsed.data.id, status: 'in_progress' })
+          // Passive observation (TICKET-0061) rides on core.update: the
+          // execute button dispatches the pending item of every active run
+          // holding this ticket, with this session as the executor.
+          const node = await core.update({ id: parsed.data.id, status: 'in_progress', executorSessionId: parsed.data.sessionId })
           running?.start(parsed.data.id, parsed.data.sessionId, sessionLabelOf(parsed.data.sessionId))
-          // Passive observation (TICKET-0061): the execute button dispatches
-          // the pending item of every active run holding this ticket.
-          await core.observeNodeStatus(parsed.data.id, { status: 'in_progress' }, parsed.data.sessionId)
           recent?.touch(parsed.data.sessionId, parsed.data.id)
           changes?.bump(core.home)
           return ok(summarize(node))

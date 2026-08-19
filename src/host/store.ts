@@ -159,9 +159,6 @@ CREATE TABLE IF NOT EXISTS run_items (
 CREATE INDEX IF NOT EXISTS idx_run_items_node ON run_items(node_id);
 `
 
-/** Passive observation queries run_items by node_id on every ticket update. */
-const INDEX_RUN_ITEMS_NODE = 'CREATE INDEX IF NOT EXISTS idx_run_items_node ON run_items(node_id)'
-
 export class OmtStore {
   private constructor(private readonly db: DatabaseSync) {}
 
@@ -184,8 +181,6 @@ export class OmtStore {
     if (!tables.some(table => table.name === 'runs')) {
       db.exec(MIGRATION_V3)
     }
-    // Databases already migrated to v3 before the index existed get it here.
-    db.exec(INDEX_RUN_ITEMS_NODE)
     const store = new OmtStore(db)
     // Bump the version marker of pre-v3 databases (v1 databases carry no
     // marker at all; the core's first-open reindex/mark path handles those).
@@ -458,13 +453,23 @@ export class OmtStore {
   /**
    * Atomic claim (TICKET-0058): select the next pending item and flip it to
    * running with the executor in ONE immediate transaction, so two
-   * concurrent claimers can never receive the same item.
+   * concurrent claimers can never receive the same item. Pending items of
+   * archived members can never execute (reports reject archived nodes):
+   * the same transaction marks them skipped so the queue drains past them
+   * instead of wedging on an unclaimable head.
    */
   claimNextRunItem(runId: string, executorSessionId: string, now: string): OmtRunItem | undefined {
     this.db.exec('BEGIN IMMEDIATE')
     try {
+      this.db.prepare(
+        `UPDATE run_items SET state = 'skipped', finished_at = ?
+         WHERE run_id = ? AND state = 'pending'
+           AND node_id IN (SELECT id FROM nodes WHERE archived = 1)`,
+      ).run(now, runId)
       const row = this.db.prepare(
-        "SELECT node_id FROM run_items WHERE run_id = ? AND state = 'pending' ORDER BY position, node_id LIMIT 1",
+        `SELECT i.node_id FROM run_items i JOIN nodes n ON n.id = i.node_id
+         WHERE i.run_id = ? AND i.state = 'pending' AND n.archived = 0
+         ORDER BY i.position, i.node_id LIMIT 1`,
       ).get(runId) as { node_id: string } | undefined
       if (row === undefined) {
         this.db.exec('COMMIT')

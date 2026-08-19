@@ -61,6 +61,11 @@ export interface UpdateInput {
   readonly body?: string
   /** Append a progress note to the user body (ignored when body is set). */
   readonly append?: string
+  /**
+   * Session behind this change (tool/RPC caller): recorded as the executor
+   * when passive observation dispatches a pending item to running.
+   */
+  readonly executorSessionId?: string
 }
 
 export interface ShowResult {
@@ -289,6 +294,10 @@ export class OmtCore {
 
     // A title change shows up in the parent's managed children list.
     if (patch.title !== undefined && parent !== undefined) await this.refreshChildrenBlock(parent.id)
+    // Passive observation (TICKET-0061) funnels through here: every ordinary
+    // update path (tools, RPC, the report double-write) broadcasts the
+    // change to active runs exactly once — callers must not re-observe.
+    await this.observeNodeStatus(input.id, { status: input.status, archived: input.archived }, input.executorSessionId)
     return updated
   }
 
@@ -496,7 +505,12 @@ export class OmtCore {
     for (const nodeId of input.nodeIds) {
       if (seen.has(nodeId)) throw new OmtError('INVALID_INPUT', `duplicate run member: ${nodeId}`)
       seen.add(nodeId)
-      this.requireNode(nodeId)
+      const node = this.requireNode(nodeId)
+      // Archived nodes are read-only (reports reject them): admitting one
+      // would wedge its item, so refuse the run up front.
+      if (node.archived) {
+        throw new OmtError('INVALID_INPUT', `run member ${nodeId} is archived (已归档成员不能加入 run；请先恢复)`)
+      }
     }
     const config: RunConfig = { ...DEFAULT_RUN_CONFIG, ...input.config }
     if (!Number.isInteger(config.concurrency) || config.concurrency < 1) {
@@ -651,7 +665,8 @@ export class OmtCore {
   /**
    * Replay (decision 11): a member ticket went done/blocked/skipped → open
    * while the run was in progress — its item falls back to pending, keeping
-   * position and attempt history. Only on in-progress runs.
+   * position and attempt history. Only on in-progress runs. The nudge
+   * budget resets like retry does: a replayed item must not read as stalled.
    */
   async replayItem(runId: string, nodeId: string): Promise<OmtRunItem> {
     const run = this.requireRun(runId)
@@ -666,6 +681,8 @@ export class OmtCore {
     this.store.updateRunItem(runId, nodeId, {
       state: 'pending',
       executor_session_id: null,
+      nudged_at: null,
+      nudge_count: 0,
       started_at: null,
       finished_at: null,
     })
@@ -690,7 +707,11 @@ export class OmtCore {
     if (run.status !== 'running') {
       throw new OmtError('CONFLICT', `run ${runId} is ${run.status}; only a running run dispatches claims`)
     }
-    return this.store.claimNextRunItem(runId, executorSessionId, new Date().toISOString())
+    const claimed = await this.store.claimNextRunItem(runId, executorSessionId, new Date().toISOString())
+    // The claim transaction skips pending items of archived members (store
+    // side); when that drained the queue the run may be derivable now.
+    if (claimed === undefined) this.deriveRunTerminal(runId)
+    return claimed
   }
 
   /**
@@ -730,15 +751,21 @@ export class OmtCore {
    * Item-level removal (omt_run_control remove): drops the membership row
    * only — the ticket node is never touched. In-flight items (running /
    * awaiting_confirmation) cannot be removed; let them settle or cancel the
-   * run. Afterwards the run may derive its terminal state (last pending
-   * item removed with the rest final).
+   * run. Exception (wedge recovery): an in-flight item whose node is
+   * archived can never report (reports reject archived nodes), so it may be
+   * force-removed instead of canceling the whole run. Afterwards the run
+   * may derive its terminal state (last pending item removed with the rest
+   * final).
    */
   async removeRunItem(runId: string, nodeId: string): Promise<void> {
     this.requireRun(runId)
     const item = this.store.getRunItem(runId, nodeId)
     if (item === undefined) throw new OmtError('NOT_FOUND', `run ${runId} has no item for node: ${nodeId}`)
     if (isRunItemInFlight(item.state)) {
-      throw new OmtError('CONFLICT', `item ${nodeId} is ${item.state} (in-flight); it cannot be removed`)
+      const node = this.store.getNode(nodeId)
+      if (node !== undefined && !node.archived) {
+        throw new OmtError('CONFLICT', `item ${nodeId} is ${item.state} (in-flight); it cannot be removed`)
+      }
     }
     this.store.deleteRunItem(runId, nodeId)
     this.deriveRunTerminal(runId)
@@ -770,12 +797,14 @@ export class OmtCore {
     const noteText = note !== undefined && note.trim() !== '' ? note : undefined
     if (outcome === 'failed') {
       // failed touches only the item (the node enum has no failed — the
-      // ticket stays in_progress); the note is appended and kept in
-      // last_error.
-      if (noteText !== undefined) await this.update({ id: nodeId, append: noteText })
+      // ticket stays in_progress); the note is kept in last_error and
+      // appended to the body. Like every other outcome the transition lands
+      // FIRST: a failing note-append must not strand an untransitioned item
+      // with an orphaned note (no partial-write window).
       const transitioned = await this.transitionItem(runId, nodeId, outcome, {
         ...(noteText !== undefined ? { error: noteText } : {}),
       })
+      if (noteText !== undefined) await this.update({ id: nodeId, append: noteText })
       return { item: transitioned, node: this.requireNode(nodeId) }
     }
     const transitioned = await this.transitionItem(runId, nodeId, outcome)
@@ -854,7 +883,9 @@ export class OmtCore {
    * session is not active → interrupted. Run level — a running run with no
    * actively-executed item left either derives its terminal state (when the
    * demotion finished the last item) or falls to interrupted, which stays
-   * resumable. Paused runs keep their status (human-controlled already).
+   * resumable. Paused runs derive their terminal state the same way (the
+   * demotion may have finished their last in-flight item), but with work
+   * left they keep their status — they are human-controlled already.
    */
   janitorSweep(isSessionActive: (sessionId: string) => boolean = () => false): JanitorResult {
     const interruptedItems: OmtRunItem[] = []
@@ -872,17 +903,18 @@ export class OmtCore {
     }
 
     for (const run of candidates) {
-      if (run.status !== 'running') continue
       const items = this.store.listRunItems(run.id)
       // After the demotion loop, any item still running has a live executor.
       if (items.some(item => item.state === 'running')) continue
       // The demotion may have finished the last in-flight item: derive the
       // terminal state instead of interrupting (deriveRunTerminal owns the
-      // all-final precondition).
-      if (!this.deriveRunTerminal(run.id)) {
-        this.setRunStatus(run.id, 'interrupted')
-        interruptedRuns.push(run.id)
-      }
+      // all-final precondition). This applies to paused runs too — skipping
+      // them here would silently stall a paused run whose last running item
+      // was just demoted.
+      if (this.deriveRunTerminal(run.id)) continue
+      if (run.status !== 'running') continue
+      this.setRunStatus(run.id, 'interrupted')
+      interruptedRuns.push(run.id)
     }
     return { interruptedRuns, interruptedItems }
   }

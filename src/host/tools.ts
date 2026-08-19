@@ -411,14 +411,14 @@ export function registerOmtTools(
         id: args.id,
         title: args.title,
         status: args.status,
+        archived: args.archived,
         priority: args.priority,
         body: args.body,
         append: args.append,
+        // Passive observation (TICKET-0061) rides on core.update; the session
+        // becomes the executor of any item this change dispatches.
+        executorSessionId: sessionOf(exec),
       })
-      // Passive observation (TICKET-0061): advance the matching items of
-      // every active run holding this node (cross-run broadcast; claim
-      // priority keeps claimed executors untouched).
-      await core.observeNodeStatus(args.id, { status: args.status, archived: args.archived }, sessionOf(exec))
       changed?.(core.home)
       return nodeValue(updated)
     },
@@ -498,7 +498,7 @@ export function registerOmtTools(
         properties: {
           stopOnFailure: { type: 'boolean', description: 'item failed 时 run 自动暂停（默认 false）' },
           autoContinue: { type: 'boolean', description: '允许 idle 续跑提醒（默认 true）' },
-          autoVerify: { type: 'boolean', description: '信任策略：被动观察的完成直接落 done（默认 false）' },
+          autoVerify: { type: 'boolean', description: '信任策略（预留，当前版本不生效：被动观察的完成直接落 done；默认 false）' },
           concurrency: { type: 'integer', description: '并发执行上限（P3 预留，默认 1）' },
         },
       },
