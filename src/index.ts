@@ -13,7 +13,7 @@ import { OmtCorePool } from './host/pool.ts'
 import { RecentRegistry } from './host/recent.ts'
 import { RunningRegistry } from './host/running.ts'
 import { registerOmtRpc } from './host/rpc.ts'
-import { registerOmtSkill } from './host/skill.ts'
+import { registerOmtRunsSkill, registerOmtSkill } from './host/skill.ts'
 import { registerOmtTools } from './host/tools.ts'
 
 export const name = 'oh-my-ticket'
@@ -55,6 +55,7 @@ export function apply(ctx: Context, config: Config): void {
   const changes = new ChangeHub()
   registerOmtTools(ctx, pool, (sessionId, id) => recent.touch(sessionId, id), home => changes.bump(home), running)
   registerOmtSkill(ctx)
+  registerOmtRunsSkill(ctx)
   registerOmtRpc(ctx, pool, recent, changes, running)
   registerOmtEvents(ctx, changes)
   registerOmtIdleHook(ctx, pool, running)

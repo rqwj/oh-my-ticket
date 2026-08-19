@@ -1,9 +1,12 @@
 /**
- * Embedded OMT skill: registered at runtime through ctx.skills.register()
+ * Embedded OMT skills: registered at runtime through ctx.skills.register()
  * (one of the three skill contribution paths; no SKILL.md file needed).
- * The body teaches the model the OMT hierarchy, the omt_* tool family, and
- * — critically — the boundary against process/workflow skills: OMT manages
- * WHERE progress is recorded, never HOW to develop.
+ * Split into two skills (STORY-0014) so the catalog gives progressive
+ * loading: `omt` stays lean (node CRUD / hierarchy / status), `omt-runs`
+ * carries the batch-execution discipline and only loads when its routing
+ * words match. The bodies teach — critically — the boundary against
+ * process/workflow skills: OMT manages WHERE progress is recorded, never
+ * HOW to develop.
  */
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-skill'
@@ -65,13 +68,16 @@ ticket 按工作区归属：当前工作区根目录下存在 \`.omt/\` 时使�
 - **接手任务先定位 ticket**：用户消息中出现节点 id（如 TICKET-0001）时，先
   omt_show 读取其正文与验收标准，再开始工作。
 - **状态流转**：开始处理时将状态置为 in_progress；完成时把关键结论通过
-  omt_update 的 append 追加到正文（进度记录），并将状态置为 done。
-- **归档是独立维度**（archived=true/false），与状态（open/in_progress/done）正交；
-  归档节点只读——除恢复外的修改都会被拒绝，先恢复再改。
+  omt_update 的 append 追加到正文（进度记录），并将状态置为 done；
+  做不下去置 blocked（外部条件阻塞）、必须跳过置 skipped，均附 append 说明。
+- **归档是独立维度**（archived=true/false），与状态（open/in_progress/done/
+  blocked/skipped）正交；归档节点只读——除恢复外的修改都会被拒绝，先恢复再改。
 - **任务拆解**：先建 Epic/Story 骨架，再逐层细化 Ticket；拆解结果落成
   真实的 OMT 节点，而不是只写在回复里。
 - **范围克制**：不为与当前任务无关的节点做变更；不确定归属哪个节点时，
   先 omt_list/omt_show 确认，仍不确定则询问用户。
+- **批量执行多个 ticket**（run 的创建/续跑/结果汇报）时，加载 \`omt-runs\`
+  skill 并遵循其中的执行纪律。
 `
 
 /** Register the embedded OMT skill (model- and user-invocable). */
@@ -80,6 +86,93 @@ export function registerOmtSkill(ctx: Context): void {
     name: OMT_SKILL_NAME,
     description: OMT_SKILL_DESCRIPTION,
     content: OMT_SKILL_CONTENT,
+    source: 'runtime',
+  })
+}
+
+export const OMT_RUNS_SKILL_NAME = 'omt-runs'
+
+export const OMT_RUNS_SKILL_DESCRIPTION =
+  'OMT run（ticket 批量执行批次）的执行纪律：run 的创建/控制/认领/结果汇报、'
+  + '续跑 nudge 的响应、failed/blocked/skipped 的如实报告。'
+  + '当需要批量执行多个 ticket、创建或续跑 run、跳过某项、或处理 blocked/失败项时使用。'
+  + '本 skill 只负责批次纪律，不规定开发流程；开发方法论由其它 skill 负责。'
+
+export const OMT_RUNS_SKILL_CONTENT = `# OMT Run 批量执行
+
+run 是 ticket 的批量执行机制：一次做完一批 ticket，有队列、有进度、
+有单项成败记录、可中断续跑。你通过 omt_run_* 工具驱动它。
+
+## 概念模型
+
+- **run = 任意 ticket 的有序快照**：创建时把成员 ticket（可跨 Story/Epic
+  挑选）按执行顺序快照进 run；此后 run 与 ticket 树不维持结构链接。
+  同一 ticket 可同时属于多个活跃 run；所有成员必须同属一个 OMT home。
+- **item 状态机**：\`pending → running → done / failed / blocked / skipped /
+  interrupted\`；另有 \`awaiting_confirmation\`（见「信任策略」）。
+  - \`failed\`：执行失败，仅 item 落 failed，ticket 保持 in_progress（可重试）。
+  - \`blocked\`：外部条件做不下去；\`skipped\`：必须跳过。两者 ticket 与
+    item 同步落对应状态。
+  - \`interrupted\`：执行中断（会话销毁/宿主重启），可经 retry 或 resume 恢复。
+- **run 终态**：\`completed\`（全 done/skipped）/ \`completed_with_failures\`
+  （含 failed 或 interrupted 项）/ \`canceled\` / \`interrupted\`。
+  run 本身没有 failed；\`interrupted\` 不是绝对终态——可 resume 回 running 续跑。
+
+## 工具
+
+| 工具 | 用途 |
+|------|------|
+| omt_run_create | 创建 run（nodeIds 按执行顺序；config 可覆盖 stopOnFailure/autoContinue/autoVerify） |
+| omt_run_list | 列出 run（可按状态过滤，附成员进度统计） |
+| omt_run_show | 查看 run 详情：配置与成员状态/执行者/attempts/last_error |
+| omt_run_control | start / pause / resume / cancel / retry(nodeId) / remove(nodeId) |
+| omt_run_claim | 原子认领下一个 pending 项：置 running 并绑定当前会话为执行者 |
+| omt_run_report | 报告执行结果：outcome ∈ done/failed/blocked/skipped，note 记入 ticket 进度 |
+
+## 执行纪律（核心）
+
+逐项循环：**做完一项 → omt_run_report → omt_run_claim 领下一项**。
+
+1. 完成一项后立刻 \`omt_run_report\` 报告结果，再用 \`omt_run_claim\` 认领下一项；
+   收到「run 有待执行项」的续跑提醒（nudge）时同样走 claim → 执行 → report。
+   claim 成功后先用 omt_update 把该 ticket 置 in_progress 再动手（claim 只翻转
+   item 并绑定执行者，不改 ticket 状态；置 in_progress 才有未收尾提醒兜底）。
+2. **如实报告，用对词汇**：
+   - 做完了 → \`done\`（ticket 与 item 同落 done）。
+   - 做了但没成 → \`failed\`，note 写清失败原因（记入 last_error，ticket 保持
+     in_progress 等重试）。**不许留下 in_progress 悬空就走人**。
+   - 外部条件不满足做不下去 → \`blocked\`，note 写明缺什么。
+   - 必须跳过 → \`skipped\`，note 写明跳过原因。
+3. 收到 idle 提醒（未收尾 ticket 或 run 续跑）时：收尾或继续，**不要无视**。
+4. **委派 subagent 执行时**：把 ticket id 和 run id 写进委派任务，由 subagent
+   自己 omt_run_report 报告结果——不要替它报告，也不要漏报。
+
+## 信任策略
+
+run item 处于 running 时，如果**未经 omt_run_report** 直接用 omt_update 把
+ticket 落 done，item 会进 \`awaiting_confirmation\` 等待人工确认——这是
+机械分流，不是错误。正确做法：完成时先 omt_run_report（显式报告直接落
+done）；看到 awaiting_confirmation 时**不要重复声明**，等人确认即可。
+
+## 边界
+
+- \`paused\` 的 run 不可 claim（pause 只停派发与续跑 nudge，进行中的项继续）；
+  恢复用 omt_run_control resume。
+- 跨 home 的成员组 run 会被拒绝；item failed 且 run 开了 stopOnFailure 时
+  run 自动 pause，由人决定 resume 还是 cancel。
+- 直接用 omt_update 把 ticket 置 blocked/skipped/done 会同步推进持有它的
+  活跃 run 的 item；把 done/blocked/skipped 的 ticket 改回 open 会让 item
+  回退 pending（回放）。这些被动推进不替代你的显式 report。
+- 你负责且仅负责批次纪律；如何实现每个 ticket（开发流程）由对应的流程类
+  skill 决定。
+`
+
+/** Register the embedded omt-runs skill (batch-execution discipline). */
+export function registerOmtRunsSkill(ctx: Context): void {
+  ctx.skills.register({
+    name: OMT_RUNS_SKILL_NAME,
+    description: OMT_RUNS_SKILL_DESCRIPTION,
+    content: OMT_RUNS_SKILL_CONTENT,
     source: 'runtime',
   })
 }
