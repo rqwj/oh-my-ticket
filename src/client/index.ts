@@ -22,7 +22,7 @@ import { TurnTickets } from './components/TurnTickets.tsx'
 import { PromptSettings } from './components/PromptSettings.tsx'
 import { createSnapshotStore } from '@deepseek-ai/dsh-client-runtime/client'
 import { PromptSettingsModel, INITIAL_PROMPT_SETTINGS_VIEW } from './prompt-settings-model.ts'
-import type { BoundSkillRow } from '../host/prompt-settings.ts'
+import { OMT_PROMPT_SETTINGS_NS, type BoundSkillRow } from '../host/prompt-settings.ts'
 import { en, NS, zh, type Translate } from './locales.ts'
 // Shared tokens + badge/dot/type/status classes (single injected sheet).
 import './omt-shared.css'
@@ -47,7 +47,7 @@ interface ClientContextLike {
   locale: LocaleLike
 }
 
-export const inject = ['slots', 'connection', 'inputTriggers', 'layout', 'locale', 'settingsScope']
+export const inject = ['slots', 'connection', 'inputTriggers', 'layout', 'locale', 'settingsScope', 'remote']
 
 export function apply(ctx: ClientContextLike): void {
   const controller = new OmtController(ctx.connection.rpc, ctx.layout)
@@ -246,8 +246,9 @@ export function apply(ctx: ClientContextLike): void {
 
   const promptView = createSnapshotStore(INITIAL_PROMPT_SETTINGS_VIEW)
   const settingsScope = (ctx as unknown as {
-    settingsScope?: { bind: (ns: string) => { set: (key: string, value: unknown) => Promise<void> } }
+    settingsScope?: { bind: (spec: { namespace: string }) => { set: (key: string, value: unknown) => Promise<void> } }
   }).settingsScope
+  const promptSettings = settingsScope === undefined ? undefined : settingsScope.bind({ namespace: OMT_PROMPT_SETTINGS_NS })
   const promptModel = new PromptSettingsModel(
     async () => {
       const sessionId = controller.currentSessionId
@@ -257,10 +258,9 @@ export function apply(ctx: ClientContextLike): void {
       return { extraPrompt: value.extraPrompt, skills: value.skills }
     },
     async next => {
-      if (settingsScope === undefined) throw new Error('settings unavailable')
-      const bound = settingsScope.bind('oh-my-ticket-prompt')
-      await bound.set('extraPrompt', next.extraPrompt)
-      await bound.set('boundSkillNames', next.boundSkillNames)
+      if (promptSettings === undefined) throw new Error('settings unavailable')
+      await promptSettings.set('extraPrompt', next.extraPrompt)
+      await promptSettings.set('boundSkillNames', next.boundSkillNames)
     },
     view => { promptView.set(view) },
   )

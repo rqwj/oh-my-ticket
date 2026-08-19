@@ -13,4 +13,10 @@ describe('client service injection', () => {
     const source = readFileSync(new URL('../src/client/index.ts', import.meta.url), 'utf8')
     expect(source).toContain("label: () => ctx.locale.bind(NS)('settings.nav')")
   })
+
+  it('binds the prompt settings namespace as a spec object', () => {
+    const source = readFileSync(new URL('../src/client/index.ts', import.meta.url), 'utf8')
+    expect(source).toContain('bind({ namespace: OMT_PROMPT_SETTINGS_NS })')
+    expect(source).not.toContain("bind('oh-my-ticket-prompt')")
+  })
 })
