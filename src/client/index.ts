@@ -19,6 +19,10 @@ import { ReferencedBar } from './components/ReferencedBar.tsx'
 import { ToggleButton } from './components/ToggleButton.tsx'
 import { OmtShowRow } from './components/OmtShowRow.tsx'
 import { TurnTickets } from './components/TurnTickets.tsx'
+import { PromptSettings } from './components/PromptSettings.tsx'
+import { createSnapshotStore } from '@deepseek-ai/dsh-client-runtime/client'
+import { PromptSettingsModel, INITIAL_PROMPT_SETTINGS_VIEW } from './prompt-settings-model.ts'
+import type { BoundSkillRow } from '../host/prompt-settings.ts'
 import { en, NS, zh, type Translate } from './locales.ts'
 // Shared tokens + badge/dot/type/status classes (single injected sheet).
 import './omt-shared.css'
@@ -233,4 +237,39 @@ export function apply(ctx: ClientContextLike): void {
         refreshRelated: controller.refreshRelated,
       }),
     }, TurnTickets))
+
+  const promptView = createSnapshotStore(INITIAL_PROMPT_SETTINGS_VIEW)
+  const settingsScope = (ctx as unknown as {
+    settingsScope?: { bind: (ns: string) => { set: (key: string, value: unknown) => Promise<void> } }
+  }).settingsScope
+  const promptModel = new PromptSettingsModel(
+    async () => {
+      const result = await ctx.connection.rpc.call('/omt', 'skills', {})
+      if (!result.ok) throw new Error(result.error.message)
+      const value = result.value as { extraPrompt: string; skills: BoundSkillRow[] }
+      return { extraPrompt: value.extraPrompt, skills: value.skills }
+    },
+    async next => {
+      if (settingsScope === undefined) throw new Error('settings unavailable')
+      const bound = settingsScope.bind('oh-my-ticket-prompt')
+      await bound.set('extraPrompt', next.extraPrompt)
+      await bound.set('boundSkillNames', next.boundSkillNames)
+    },
+    view => { promptView.set(view) },
+  )
+  void promptModel.load()
+  ctx.slots.inject('settings.section', () =>
+    ctx.slots.register({
+      name: 'settings.section',
+      id: 'omt-prompt',
+      order: 80,
+      locale: NS,
+      inject: () => ({
+        hooks: { view: promptView },
+        setDraftExtra: promptModel.setDraftExtra.bind(promptModel),
+        setExtraPrompt: (value: string) => { void promptModel.setExtraPrompt(value) },
+        toggle: (name: string) => { void promptModel.toggle(name) },
+        retry: () => { void promptModel.load() },
+      }),
+    }, PromptSettings))
 }

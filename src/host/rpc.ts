@@ -17,7 +17,13 @@ import type { OmtCorePool } from './pool.ts'
 import type { ChangeHub } from './changes.ts'
 import type { RecentRegistry } from './recent.ts'
 import type { RunningRegistry } from './running.ts'
+import { describeBoundCatalog, type SkillCatalogEntry } from './prompt-settings.ts'
 import { OmtError, type OmtNode, type OmtTreeNode } from './types.ts'
+
+export interface PromptRpcHost {
+  getSettings(): { extraPrompt: string; boundSkillNames: string[] }
+  listCatalog(): Promise<readonly SkillCatalogEntry[]>
+}
 
 /** Structural ctx.agents face: sessionId → agent → session header cwd. */
 interface AgentsLike {
@@ -44,6 +50,7 @@ const updatePayloadSchema = z.object({
   ...sessionField,
 }).strict()
 const reindexPayloadSchema = z.object({ ...sessionField }).strict()
+const skillsPayloadSchema = z.object({}).strict()
 const recentPayloadSchema = z.object({ sessionId: z.string().min(1) }).strict()
 const executePayloadSchema = z.object({ id: z.string().min(1), sessionId: z.string().min(1) }).strict()
 
@@ -75,7 +82,7 @@ function badRequest(message: string, issues: z.core.$ZodIssue[]): RpcResult<unkn
 }
 
 /** Register the `/omt` RPC channel (loopback authority: local GUI only). */
-export function registerOmtRpc(ctx: Context, pool: OmtCorePool, recent?: RecentRegistry, changes?: ChangeHub, running?: RunningRegistry): void {
+export function registerOmtRpc(ctx: Context, pool: OmtCorePool, recent?: RecentRegistry, changes?: ChangeHub, running?: RunningRegistry, prompt?: PromptRpcHost): void {
   const agents = (ctx as unknown as { agents?: AgentsLike }).agents
   const sessionLabelOf = (sessionId: string): string => {
     const cwd = agents?.get(sessionId)?.session.header.cwd
@@ -162,6 +169,16 @@ export function registerOmtRpc(ctx: Context, pool: OmtCorePool, recent?: RecentR
             if (node !== undefined) summaries.push(summarize(node))
           }
           return ok(summaries)
+        }
+        case 'skills': {
+          const parsed = skillsPayloadSchema.safeParse(payload ?? {})
+          if (!parsed.success) return badRequest('invalid skills payload', parsed.error.issues)
+          const settings = prompt?.getSettings() ?? { extraPrompt: '', boundSkillNames: [] }
+          const catalog = prompt === undefined ? [] : await prompt.listCatalog()
+          return ok({
+            extraPrompt: settings.extraPrompt,
+            skills: describeBoundCatalog(catalog, settings.boundSkillNames),
+          })
         }
         case 'reindex': {
           const parsed = reindexPayloadSchema.safeParse(payload ?? {})

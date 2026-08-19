@@ -94,3 +94,28 @@ it('rejects invalid payloads and unknown endpoints', async () => {
   expect(unknown.ok).toBe(false)
   expect(unknown.error.code).toBe('bad-request')
 })
+
+it('skills returns catalog rows plus missing binds', async () => {
+  let skillsHandler: Handler | undefined
+  const stubCtx = {
+    connection: {
+      rpc: {
+        handle(_channel: string, h: Handler) {
+          skillsHandler = h
+        },
+      },
+    },
+  }
+  registerOmtRpc(stubCtx as never, new OmtCorePool(home), undefined, undefined, undefined, {
+    getSettings: () => ({ extraPrompt: '拆票标题用中文', boundSkillNames: ['ce-plan', 'gone'] }),
+    listCatalog: async () => [{ name: 'ce-plan', description: 'plan' }, { name: 'omt', description: 'omt' }],
+  })
+  const result = await skillsHandler!('skills', {}, new AbortController().signal)
+  expect(result.ok).toBe(true)
+  expect(result.value.extraPrompt).toBe('拆票标题用中文')
+  expect(result.value.skills).toEqual([
+    { name: 'ce-plan', description: 'plan', bound: true, missing: false },
+    { name: 'omt', description: 'omt', bound: false, missing: false },
+    { name: 'gone', description: '', bound: true, missing: true },
+  ])
+})

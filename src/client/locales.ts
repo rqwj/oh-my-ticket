@@ -112,6 +112,19 @@ export const zh = {
   'serialize.childrenLine': '子节点: {list}',
   'serialize.childrenNone': '子节点: （无）',
   'serialize.childSep': '、',
+
+  'settings.helper': '在这里写追加约定并勾选拆票 skill。默认 OMT 规范始终生效。',
+  'settings.extraLabel': '追加约定',
+  'settings.extraHelper': '这段文字会叠在内置 OMT 规范后面。留空则只用默认规范。',
+  'settings.extraPlaceholder': '例如：拆票标题用中文',
+  'settings.bindLabel': '拆票 skill',
+  'settings.loading': '加载 skill 列表…',
+  'settings.empty': '没有可绑定的 skill。',
+  'settings.loadFailed': '加载失败：{message}',
+  'settings.retry': '重试',
+  'settings.missing': '已卸载',
+  'settings.omtHint': 'OMT 规范已默认在场，勾选可选',
+  'settings.writeFailed': '保存失败：{message}',
 } satisfies Record<string, string>
 
 /** Translation keys owned by the OMT UI namespace. */
@@ -235,6 +248,19 @@ export const en: Record<OmtKey, string> = {
   'serialize.childrenLine': 'Children: {list}',
   'serialize.childrenNone': 'Children: (none)',
   'serialize.childSep': ', ',
+
+  'settings.helper': 'Add extra rules and bind split-ticket skills here. Default OMT rules are always on.',
+  'settings.extraLabel': 'Extra rules',
+  'settings.extraHelper': 'This text is appended after the built-in OMT spec. Leave empty to keep the defaults.',
+  'settings.extraPlaceholder': 'Example: use Chinese ticket titles',
+  'settings.bindLabel': 'Split-ticket skills',
+  'settings.loading': 'Loading skills…',
+  'settings.empty': 'No bindable skills.',
+  'settings.loadFailed': 'Failed to load: {message}',
+  'settings.retry': 'Retry',
+  'settings.missing': 'Uninstalled',
+  'settings.omtHint': 'OMT rules are already always on; binding is optional',
+  'settings.writeFailed': 'Save failed: {message}',
 }
 
 /** Status value → dictionary key (shared by every status label site). */
