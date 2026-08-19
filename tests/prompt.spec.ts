@@ -40,7 +40,7 @@ describe('composeOmtPrompt', () => {
     expect(extraIndex).toBeGreaterThan(specIndex)
   })
 
-  it('lists still-installed bound skills with OMT-phase triggers', () => {
+  it('lists still-installed bound skills and enters OMT on substantial work', () => {
     const text = composeOmtPrompt({
       extraPrompt: '',
       boundSkillNames: ['ce-plan', 'missing'],
@@ -48,6 +48,8 @@ describe('composeOmtPrompt', () => {
     })
     expect(text).toContain('ce-plan')
     expect(text).not.toContain('missing')
+    expect(text).toContain('实质性开发')
+    expect(text).toContain('重新对接')
     expect(text).toContain('拆任务')
     expect(text).toContain('TICKET-')
     expect(text).toContain('skill')

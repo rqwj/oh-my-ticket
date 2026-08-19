@@ -16,9 +16,13 @@ const PHASE_CLAUSE = [
   '## OMT 阶段与绑定 skill',
   '',
   '本段始终在场，不必再 load `omt` skill。',
-  '绑定的拆票 skill 只在 **OMT 阶段** 加载：用户提到 ticket、拆任务，或 `TICKET-` / `EPIC-` / `STORY-` / `SUBSTORY-` / `SUBTICKET-` 节点 id。',
-  '未到 OMT 阶段不要为了拆票去 load 绑定名单。其它目录 skill 仍可按任务自行发现。',
-  'OMT 阶段若用户在拆任务或新建工单，把结果落成真实 OMT 节点，不要只写在回复里。',
+  '**OMT 阶段**在下列情况进入，不必等用户说 ticket / 拆任务：',
+  '- 实质性开发：新功能、重新对接、改造、非琐碎实现、跨越多文件的改动',
+  '- 用户明确提到 ticket、拆任务，或 `TICKET-` / `EPIC-` / `STORY-` / `SUBSTORY-` / `SUBTICKET-` 节点 id',
+  '进入后、动手写代码或只在回复里拆步骤之前，先用 omt_* 建好 Epic/Story 骨架（已有匹配节点则 omt_show 接手）。',
+  '绑定的拆票 skill 只在 OMT 阶段 load。其它目录 skill 仍可按任务自行发现，但不得跳过建单。',
+  '拆解结果必须落成真实 OMT 节点，不要只写在回复里。',
+  '琐碎单步（改一个字、查一个状态、回答一个事实）不必建单。',
 ].join('\n')
 
 /** Strip complete `{{…}}` groups so user extra text cannot fail renderPrompt. */

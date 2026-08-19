@@ -8,7 +8,7 @@
 SQLite 存元数据与层级关系，Markdown 存正文。ticket 随项目走（`.omt/` 目录可直接进 git），
 模型通过工具创建/推进，人通过三种可切换的 UI 展现方式浏览与管理。
 插件启用后，完整 OMT 操作规范默认写入系统提示，不必先 load `omt` skill。
-设置页可追加约定，并从已装 skill 勾选拆票 skill；提到 ticket / 拆任务 / 节点 id 时再 load。
+设置页可追加约定，并从已装 skill 勾选拆票 skill；实质性开发（新功能 / 重新对接 / 改造）以及提到 ticket / 拆任务 / 节点 id 时进入 OMT 阶段并 load 绑定 skill。
 
 ![image-20260819114848240](attachments/README/image-20260819114848240.png)
 
