@@ -173,6 +173,7 @@ export function TicketPanel(props: TicketPanelProps) {
   const t = props.t
   const tree = props.useTree(snapshot => snapshot)
   const active = props.useActive(snapshot => snapshot)
+  const collapsed = props.useCollapsed(snapshot => snapshot)
   // Viewing-only filter state (search keyword + archived + type/status chips).
   const [query, setQuery] = useState('')
   const [showArchived, setShowArchived] = useState(false)
@@ -336,7 +337,6 @@ export function TicketPanel(props: TicketPanelProps) {
         ) : (
           (() => {
             const visible = sortForest(filterForest(tree.forest, filter), sortOrder)
-            const collapsed = props.useCollapsed(snapshot => snapshot)
             const rows = flattenVisible(visible, collapsed)
             const onKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>): void => {
               const result = navigateVisible(rows, focusedId ?? active?.id, event.key)
