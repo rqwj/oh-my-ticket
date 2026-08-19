@@ -1,3 +1,4 @@
+import { useEffect } from 'react'
 import type { PromptSettingsView } from '../prompt-settings-model.ts'
 import type { Translate } from '../locales.ts'
 import css from './PromptSettings.module.css'
@@ -16,6 +17,7 @@ export interface PromptSettingsProps {
 export function PromptSettings(props: PromptSettingsProps) {
   const view = props.useView(snapshot => snapshot)
   const { t } = props
+  useEffect(() => { props.retry() }, [])
   return (
     <section className={css.root}>
       <h2 className={css.title}>{t('settings.title')}</h2>

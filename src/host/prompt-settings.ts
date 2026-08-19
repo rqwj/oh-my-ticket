@@ -41,6 +41,18 @@ export interface AgentCwdFace {
   readonly session?: { readonly header?: { readonly cwd?: string } }
 }
 
+export function resolveLiveAgent<T>(
+  sessionId: string | undefined,
+  get: (id: string) => T | undefined,
+  list: () => readonly T[],
+): T | undefined {
+  if (sessionId !== undefined) {
+    const hit = get(sessionId)
+    if (hit !== undefined) return hit
+  }
+  return list()[0]
+}
+
 /** Session cwds first, then a no-cwd pass for runtime / user-global skills. */
 export function catalogLookupsFromAgents(
   agents: readonly AgentCwdFace[],

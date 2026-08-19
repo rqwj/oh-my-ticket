@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { catalogLookupsFromAgents, collectBindableCatalog, DEFAULT_PROMPT_SETTINGS, describeBoundCatalog, InstalledSkillCache, selectBindableSkills } from '../src/host/prompt-settings.ts'
+import { catalogLookupsFromAgents, collectBindableCatalog, DEFAULT_PROMPT_SETTINGS, describeBoundCatalog, InstalledSkillCache, resolveLiveAgent, selectBindableSkills } from '../src/host/prompt-settings.ts'
 
 describe('describeBoundCatalog', () => {
   it('flags bound and missing names', () => {
@@ -35,6 +35,16 @@ describe('catalogLookupsFromAgents', () => {
       { session: { header: { cwd: '/ws/b' } } },
       { session: { header: { cwd: '' } } },
     ])).toEqual([{ cwd: '/ws/a' }, { cwd: '/ws/b' }, {}])
+  })
+})
+
+describe('resolveLiveAgent', () => {
+  it('prefers the named session then falls back to the first live agent', () => {
+    const a = { id: 'a' }
+    const b = { id: 'b' }
+    expect(resolveLiveAgent('b', id => id === 'b' ? b : undefined, () => [a, b])).toBe(b)
+    expect(resolveLiveAgent('missing', () => undefined, () => [a, b])).toBe(a)
+    expect(resolveLiveAgent(undefined, () => undefined, () => [a])).toBe(a)
   })
 })
 

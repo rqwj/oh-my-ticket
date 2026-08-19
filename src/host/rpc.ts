@@ -22,7 +22,7 @@ import { OmtError, type OmtNode, type OmtTreeNode } from './types.ts'
 
 export interface PromptRpcHost {
   getSettings(): { extraPrompt: string; boundSkillNames: string[] }
-  listCatalog(cwd?: string): Promise<readonly SkillCatalogEntry[]>
+  listCatalog(sessionId?: string): Promise<readonly SkillCatalogEntry[]>
 }
 
 /** Structural ctx.agents face: sessionId → agent → session header cwd. */
@@ -205,8 +205,7 @@ export function registerOmtRpc(ctx: Context, pool: OmtCorePool, recent?: RecentR
           const parsed = skillsPayloadSchema.safeParse(payload ?? {})
           if (!parsed.success) return badRequest('invalid skills payload', parsed.error.issues)
           const settings = prompt?.getSettings() ?? { extraPrompt: '', boundSkillNames: [] }
-          const cwd = parsed.data.sessionId === undefined ? undefined : agents?.get(parsed.data.sessionId)?.session.header.cwd
-          const catalog = prompt === undefined ? [] : await prompt.listCatalog(cwd)
+          const catalog = prompt === undefined ? [] : await prompt.listCatalog(parsed.data.sessionId)
           return ok({
             extraPrompt: settings.extraPrompt,
             skills: describeBoundCatalog(catalog, settings.boundSkillNames),

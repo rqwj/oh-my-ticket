@@ -9,7 +9,7 @@ import Schema from '@deepseek-ai/schemastery'
 import { ChangeHub } from './host/changes.ts'
 import { registerOmtEvents } from './host/events.ts'
 import { OmtCorePool } from './host/pool.ts'
-import { catalogLookupsFromAgents, collectBindableCatalog, DEFAULT_PROMPT_SETTINGS, InstalledSkillCache, type PromptSettings } from './host/prompt-settings.ts'
+import { DEFAULT_PROMPT_SETTINGS, InstalledSkillCache, resolveLiveAgent, selectBindableSkills, type PromptSettings } from './host/prompt-settings.ts'
 import { registerOmtPrompt } from './host/prompt.ts'
 import { RecentRegistry } from './host/recent.ts'
 import { registerOmtRpc } from './host/rpc.ts'
@@ -85,11 +85,20 @@ export function apply(ctx: Context, config: Config): void {
   registerOmtTools(ctx, pool, (sessionId, id) => recent.touch(sessionId, id), home => changes.bump(home), running)
   registerOmtSkill(ctx)
   registerOmtPrompt(ctx, promptInputs)
-  const agents = (ctx as unknown as { agents?: { list?: () => { session?: { header?: { cwd?: string } } }[] } }).agents
-  const listCatalog = (cwd?: string) => collectBindableCatalog(
-    lookup => ctx.skills.list(lookup),
-    catalogLookupsFromAgents(agents?.list?.() ?? [], cwd),
-  )
+  const agents = ctx.agents as {
+    get: (id: string) => { session?: { header?: { cwd?: string } } } | undefined
+    list: () => { session?: { header?: { cwd?: string } } }[]
+  }
+  const listCatalog = async (sessionId?: string) => {
+    const live = resolveLiveAgent(sessionId, id => agents.get(id), () => agents.list())
+    const presets = ctx.get('agentPresets') as { serviceFor?: (agent: unknown, name: string) => { list: (opts: { cwd?: string; scope?: unknown }) => Promise<{ name: string; description: string; invocation?: { modelInvocable?: boolean } }[]> } | undefined } | undefined
+    const registry = (live === undefined ? undefined : presets?.serviceFor?.(live, 'skills')) ?? ctx.skills
+    const cwd = live?.session?.header?.cwd
+    const skills = await registry.list(live === undefined ? {} : { cwd, scope: live })
+    const catalog = selectBindableSkills(skills)
+    console.log(`[omt] skill catalog ${catalog.length}: ${catalog.map(row => row.name).join(', ')}`)
+    return catalog
+  }
   registerOmtRpc(ctx, pool, recent, changes, running, {
     getSettings: () => promptSettings,
     listCatalog,
