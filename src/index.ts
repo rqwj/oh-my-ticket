@@ -9,7 +9,7 @@ import Schema from '@deepseek-ai/schemastery'
 import { ChangeHub } from './host/changes.ts'
 import { registerOmtEvents } from './host/events.ts'
 import { OmtCorePool } from './host/pool.ts'
-import { DEFAULT_PROMPT_SETTINGS, InstalledSkillCache, type PromptSettings } from './host/prompt-settings.ts'
+import { catalogLookupsFromAgents, collectBindableCatalog, DEFAULT_PROMPT_SETTINGS, InstalledSkillCache, type PromptSettings } from './host/prompt-settings.ts'
 import { registerOmtPrompt } from './host/prompt.ts'
 import { RecentRegistry } from './host/recent.ts'
 import { registerOmtRpc } from './host/rpc.ts'
@@ -85,17 +85,17 @@ export function apply(ctx: Context, config: Config): void {
   registerOmtTools(ctx, pool, (sessionId, id) => recent.touch(sessionId, id), home => changes.bump(home), running)
   registerOmtSkill(ctx)
   registerOmtPrompt(ctx, promptInputs)
+  const agents = (ctx as unknown as { agents?: { list?: () => { session?: { header?: { cwd?: string } } }[] } }).agents
+  const listCatalog = (cwd?: string) => collectBindableCatalog(
+    lookup => ctx.skills.list(lookup),
+    catalogLookupsFromAgents(agents?.list?.() ?? [], cwd),
+  )
   registerOmtRpc(ctx, pool, recent, changes, running, {
     getSettings: () => promptSettings,
-    listCatalog: async () => {
-      const skills = await ctx.skills.list()
-      return skills
-        .filter(skill => skill.invocation.modelInvocable)
-        .map(skill => ({ name: skill.name, description: skill.description }))
-    },
+    listCatalog,
   })
   registerOmtEvents(ctx, changes)
-  const refreshInstalled = () => installed.refresh(() => ctx.skills.list())
+  const refreshInstalled = () => installed.refresh(async () => listCatalog())
   void refreshInstalled()
   ctx.on('skills/change', () => { void refreshInstalled() })
   attachPromptSettings(ctx, value => { promptSettings = value })

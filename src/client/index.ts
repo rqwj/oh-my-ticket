@@ -250,7 +250,8 @@ export function apply(ctx: ClientContextLike): void {
   }).settingsScope
   const promptModel = new PromptSettingsModel(
     async () => {
-      const result = await ctx.connection.rpc.call('/omt', 'skills', {})
+      const sessionId = controller.currentSessionId
+      const result = await ctx.connection.rpc.call('/omt', 'skills', sessionId === undefined ? {} : { sessionId })
       if (!result.ok) throw new Error(result.error.message)
       const value = result.value as { extraPrompt: string; skills: BoundSkillRow[] }
       return { extraPrompt: value.extraPrompt, skills: value.skills }

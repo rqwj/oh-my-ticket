@@ -22,7 +22,7 @@ import { OmtError, type OmtNode, type OmtTreeNode } from './types.ts'
 
 export interface PromptRpcHost {
   getSettings(): { extraPrompt: string; boundSkillNames: string[] }
-  listCatalog(): Promise<readonly SkillCatalogEntry[]>
+  listCatalog(cwd?: string): Promise<readonly SkillCatalogEntry[]>
 }
 
 /** Structural ctx.agents face: sessionId → agent → session header cwd. */
@@ -51,7 +51,7 @@ const updatePayloadSchema = z.object({
   ...sessionField,
 }).strict()
 const reindexPayloadSchema = z.object({ ...sessionField }).strict()
-const skillsPayloadSchema = z.object({}).strict()
+const skillsPayloadSchema = z.object({ ...sessionField }).strict()
 const recentPayloadSchema = z.object({ sessionId: z.string().min(1) }).strict()
 const executePayloadSchema = z.object({ id: z.string().min(1), sessionId: z.string().min(1) }).strict()
 const createPayloadSchema = z.object({
@@ -205,7 +205,8 @@ export function registerOmtRpc(ctx: Context, pool: OmtCorePool, recent?: RecentR
           const parsed = skillsPayloadSchema.safeParse(payload ?? {})
           if (!parsed.success) return badRequest('invalid skills payload', parsed.error.issues)
           const settings = prompt?.getSettings() ?? { extraPrompt: '', boundSkillNames: [] }
-          const catalog = prompt === undefined ? [] : await prompt.listCatalog()
+          const cwd = parsed.data.sessionId === undefined ? undefined : agents?.get(parsed.data.sessionId)?.session.header.cwd
+          const catalog = prompt === undefined ? [] : await prompt.listCatalog(cwd)
           return ok({
             extraPrompt: settings.extraPrompt,
             skills: describeBoundCatalog(catalog, settings.boundSkillNames),

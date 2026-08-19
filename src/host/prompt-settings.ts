@@ -24,6 +24,52 @@ export interface BoundSkillRow {
   missing: boolean
 }
 
+export interface SkillListRow {
+  readonly name: string
+  readonly description: string
+  readonly invocation?: { readonly modelInvocable?: boolean }
+}
+
+/** Keep every installed skill unless it explicitly opts out of model use. */
+export function selectBindableSkills(skills: readonly SkillListRow[]): SkillCatalogEntry[] {
+  return skills
+    .filter(skill => skill.invocation?.modelInvocable !== false)
+    .map(skill => ({ name: skill.name, description: skill.description }))
+}
+
+export interface AgentCwdFace {
+  readonly session?: { readonly header?: { readonly cwd?: string } }
+}
+
+/** Session cwds first, then a no-cwd pass for runtime / user-global skills. */
+export function catalogLookupsFromAgents(
+  agents: readonly AgentCwdFace[],
+  preferredCwd?: string,
+): Array<{ cwd?: string }> {
+  const cwds: string[] = []
+  const add = (cwd: string | undefined): void => {
+    if (cwd === undefined || cwd === '') return
+    if (!cwds.includes(cwd)) cwds.push(cwd)
+  }
+  add(preferredCwd)
+  for (const agent of agents) add(agent.session?.header?.cwd)
+  return [...cwds.map(cwd => ({ cwd })), {}]
+}
+
+export async function collectBindableCatalog(
+  list: (lookup: { cwd?: string }) => Promise<readonly SkillListRow[]>,
+  lookups: readonly { cwd?: string }[],
+): Promise<SkillCatalogEntry[]> {
+  const byName = new Map<string, SkillCatalogEntry>()
+  for (const lookup of lookups) {
+    const skills = await list(lookup.cwd === undefined ? {} : { cwd: lookup.cwd })
+    for (const skill of selectBindableSkills(skills)) {
+      if (!byName.has(skill.name)) byName.set(skill.name, skill)
+    }
+  }
+  return [...byName.values()]
+}
+
 /** Merge the live catalog with bound names so stale binds stay visible. */
 export function describeBoundCatalog(catalog: readonly SkillCatalogEntry[], bound: readonly string[]): BoundSkillRow[] {
   const boundSet = new Set(bound)
@@ -50,8 +96,6 @@ export class InstalledSkillCache {
 
   async refresh(list: () => Promise<readonly { name: string; invocation?: { modelInvocable?: boolean } }[]>): Promise<void> {
     const skills = await list()
-    this.namesInternal = skills
-      .filter(skill => skill.invocation?.modelInvocable !== false)
-      .map(skill => skill.name)
+    this.namesInternal = selectBindableSkills(skills).map(skill => skill.name)
   }
 }

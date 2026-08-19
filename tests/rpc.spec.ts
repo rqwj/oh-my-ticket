@@ -134,6 +134,8 @@ it('skills returns catalog rows plus missing binds', async () => {
     getSettings: () => ({ extraPrompt: '拆票标题用中文', boundSkillNames: ['ce-plan', 'gone'] }),
     listCatalog: async () => [{ name: 'ce-plan', description: 'plan' }, { name: 'omt', description: 'omt' }],
   })
+  const withSession = await skillsHandler!('skills', { sessionId: 's1' }, new AbortController().signal)
+  expect(withSession.ok).toBe(true)
   const result = await skillsHandler!('skills', {}, new AbortController().signal)
   expect(result.ok).toBe(true)
   expect(result.value.extraPrompt).toBe('拆票标题用中文')

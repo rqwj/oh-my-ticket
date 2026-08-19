@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { DEFAULT_PROMPT_SETTINGS, describeBoundCatalog, InstalledSkillCache } from '../src/host/prompt-settings.ts'
+import { catalogLookupsFromAgents, collectBindableCatalog, DEFAULT_PROMPT_SETTINGS, describeBoundCatalog, InstalledSkillCache, selectBindableSkills } from '../src/host/prompt-settings.ts'
 
 describe('describeBoundCatalog', () => {
   it('flags bound and missing names', () => {
@@ -12,6 +12,41 @@ describe('describeBoundCatalog', () => {
       { name: 'omt', description: 'omt', bound: false, missing: false },
       { name: 'gone', description: '', bound: true, missing: true },
     ])
+  })
+})
+
+describe('selectBindableSkills', () => {
+  it('keeps installed skills unless they opt out of model invocation', () => {
+    const rows = selectBindableSkills([
+      { name: 'ce-plan', description: 'plan', invocation: { modelInvocable: true } },
+      { name: 'hidden', description: 'x', invocation: { modelInvocable: false } },
+      { name: 'plain', description: 'p' },
+      { name: 'omt', description: 'omt', invocation: { modelInvocable: true } },
+    ])
+    expect(rows.map(row => row.name)).toEqual(['ce-plan', 'plain', 'omt'])
+  })
+})
+
+describe('catalogLookupsFromAgents', () => {
+  it('collects unique session cwds so settings can see filesystem skills', () => {
+    expect(catalogLookupsFromAgents([
+      { session: { header: { cwd: '/ws/a' } } },
+      { session: { header: { cwd: '/ws/a' } } },
+      { session: { header: { cwd: '/ws/b' } } },
+      { session: { header: { cwd: '' } } },
+    ])).toEqual([{ cwd: '/ws/a' }, { cwd: '/ws/b' }, {}])
+  })
+})
+
+describe('collectBindableCatalog', () => {
+  it('merges session and global lookups without dropping filesystem skills', async () => {
+    const rows = await collectBindableCatalog(
+      async lookup => lookup.cwd === '/ws/a'
+        ? [{ name: 'ce-plan', description: 'plan', invocation: { modelInvocable: true } }]
+        : [{ name: 'omt', description: 'omt', invocation: { modelInvocable: true } }],
+      [{ cwd: '/ws/a' }, {}],
+    )
+    expect(rows.map(row => row.name)).toEqual(['ce-plan', 'omt'])
   })
 })
 
