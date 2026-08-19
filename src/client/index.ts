@@ -47,7 +47,7 @@ interface ClientContextLike {
   locale: LocaleLike
 }
 
-export const inject = ['slots', 'connection', 'inputTriggers', 'layout', 'locale']
+export const inject = ['slots', 'connection', 'inputTriggers', 'layout', 'locale', 'settingsScope']
 
 export function apply(ctx: ClientContextLike): void {
   const controller = new OmtController(ctx.connection.rpc, ctx.layout)
@@ -269,6 +269,7 @@ export function apply(ctx: ClientContextLike): void {
       name: 'settings.section',
       id: 'omt-prompt',
       order: 80,
+      label: () => ctx.locale.bind(NS)('settings.nav'),
       locale: NS,
       inject: () => ({
         hooks: { view: promptView },

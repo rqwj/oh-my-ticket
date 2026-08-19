@@ -1,5 +1,6 @@
 import type { PromptSettingsView } from '../prompt-settings-model.ts'
 import type { Translate } from '../locales.ts'
+import css from './PromptSettings.module.css'
 
 export type Selector<T> = <S>(selector: (snapshot: T) => S) => S
 
@@ -16,46 +17,62 @@ export function PromptSettings(props: PromptSettingsProps) {
   const view = props.useView(snapshot => snapshot)
   const { t } = props
   return (
-    <section>
-      <p>{t('settings.helper')}</p>
-      <label>
-        {t('settings.extraLabel')}
+    <section className={css.root}>
+      <h2 className={css.title}>{t('settings.title')}</h2>
+      <p className={css.intro}>{t('settings.helper')}</p>
+      <label className={css.field}>
+        <span className={css.label}>{t('settings.extraLabel')}</span>
         <textarea
+          className={css.textarea}
           value={view.extraPrompt}
           placeholder={t('settings.extraPlaceholder')}
+          rows={6}
           onChange={event => props.setDraftExtra(event.target.value)}
           onBlur={event => props.setExtraPrompt(event.target.value)}
         />
       </label>
-      <p>{t('settings.extraHelper')}</p>
-      <fieldset>
-        <legend>{t('settings.bindLabel')}</legend>
-        {view.catalogStatus === 'loading' && <p>{t('settings.loading')}</p>}
-        {view.catalogStatus === 'empty' && <p>{t('settings.empty')}</p>}
+      <p className={css.intro}>{t('settings.extraHelper')}</p>
+      <div className={css.group}>
+        <h3 className={css.groupTitle}>{t('settings.bindLabel')}</h3>
+        {view.catalogStatus === 'loading' && <p className={css.status}>{t('settings.loading')}</p>}
+        {view.catalogStatus === 'empty' && <p className={css.status}>{t('settings.empty')}</p>}
         {view.catalogStatus === 'error' && (
-          <p>
+          <p className={css.error}>
             {t('settings.loadFailed', { message: view.catalogError })}
-            <button type="button" onClick={props.retry}>{t('settings.retry')}</button>
+            <button type="button" className={css.retry} onClick={props.retry}>{t('settings.retry')}</button>
           </p>
         )}
-        {(view.catalogStatus === 'ready' || view.skills.some(row => row.missing)) && view.skills.map(row => {
-          const label = row.missing
-            ? `${row.name} ${t('settings.missing')}`
-            : row.name === 'omt'
-              ? `${row.name} (${t('settings.omtHint')})`
-              : row.name
-          return (
-            <label key={row.name}>
-              <input type="checkbox" checked={row.bound} onChange={() => props.toggle(row.name)} />
-              {label}
-            </label>
-          )
-        })}
-      </fieldset>
+        {(view.catalogStatus === 'ready' || view.skills.some(row => row.missing)) && (
+          <div className={css.list}>
+            {view.skills.map(row => {
+              const hint = row.missing
+                ? t('settings.missing')
+                : row.name === 'omt'
+                  ? t('settings.omtHint')
+                  : undefined
+              return (
+                <label
+                  key={row.name}
+                  className={css.skill}
+                  title={hint === undefined ? row.name : `${row.name} ${hint}`}
+                >
+                  <input type="checkbox" checked={row.bound} onChange={() => props.toggle(row.name)} />
+                  <span className={css.skillBody}>
+                    <span className={css.skillName}>{row.name}</span>
+                    {hint !== undefined && (
+                      <span className={`${css.skillHint} ${row.missing ? css.missing : ''}`}>{hint}</span>
+                    )}
+                  </span>
+                </label>
+              )
+            })}
+          </div>
+        )}
+      </div>
       {view.writeError !== '' && (
-        <p>
+        <p className={css.error}>
           {t('settings.writeFailed', { message: view.writeError })}
-          <button type="button" onClick={props.retry}>{t('settings.retry')}</button>
+          <button type="button" className={css.retry} onClick={props.retry}>{t('settings.retry')}</button>
         </p>
       )}
     </section>
