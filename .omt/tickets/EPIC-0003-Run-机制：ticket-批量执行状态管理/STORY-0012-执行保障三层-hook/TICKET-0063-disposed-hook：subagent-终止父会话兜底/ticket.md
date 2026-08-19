@@ -25,3 +25,9 @@ Tier 2 hook：监听 `agent/disposed`：
 - 父会话 inject 内容含 subagent 最终报告摘要
 - **父会话 idle 时 followup 通知必达**（唤醒驱动）
 - 单测
+
+<!-- omt:children -->
+## 子节点
+
+（暂无子节点）
+<!-- /omt:children -->

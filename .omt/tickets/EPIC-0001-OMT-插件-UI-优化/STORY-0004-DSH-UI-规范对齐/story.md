@@ -25,8 +25,8 @@ updated_at: '2026-08-18T06:37:55.051Z'
 <!-- omt:children -->
 ## 子节点
 
-- [TICKET-0031 接入 locale 中英字典](TICKET-0031-接入-locale-中英字典/ticket.md) — open
-- [TICKET-0032 颜色 token 化与样式去重](TICKET-0032-颜色-token-化与样式去重/ticket.md) — open
-- [TICKET-0033 窄视口适配](TICKET-0033-窄视口适配/ticket.md) — open
-- [TICKET-0034 字体/焦点/动效细节规范](TICKET-0034-字体焦点动效细节规范/ticket.md) — open
+- [TICKET-0031 接入 locale 中英字典](TICKET-0031-接入-locale-中英字典/ticket.md) — done
+- [TICKET-0032 颜色 token 化与样式去重](TICKET-0032-颜色-token-化与样式去重/ticket.md) — done
+- [TICKET-0033 窄视口适配](TICKET-0033-窄视口适配/ticket.md) — done
+- [TICKET-0034 字体/焦点/动效细节规范](TICKET-0034-字体焦点动效细节规范/ticket.md) — done
 <!-- /omt:children -->

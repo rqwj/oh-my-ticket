@@ -2,11 +2,11 @@
 id: TICKET-0061
 type: ticket
 title: 被动观察推进 item 状态
-status: open
+status: done
 priority: 1
 parent: STORY-0011
 created_at: '2026-08-19T09:10:44.281Z'
-updated_at: '2026-08-19T13:41:57.761Z'
+updated_at: '2026-08-19T14:46:38.485Z'
 ---
 
 ## 任务
@@ -31,3 +31,9 @@ updated_at: '2026-08-19T13:41:57.761Z'
 - paused 期间 running item 照常推进、无新派发的行为有单测
 - claim 后手动操作不覆盖 executor 归属的单测
 - 跨 run 广播推进的单测
+
+<!-- omt:children -->
+## 子节点
+
+（暂无子节点）
+<!-- /omt:children -->

@@ -2,11 +2,11 @@
 id: TICKET-0054
 type: ticket
 title: run/item 状态机与终态推导
-status: open
+status: done
 priority: 1
 parent: STORY-0010
 created_at: '2026-08-19T09:10:08.248Z'
-updated_at: '2026-08-19T10:20:29.937Z'
+updated_at: '2026-08-19T14:19:31.218Z'
 ---
 
 ## 任务
@@ -27,3 +27,9 @@ updated_at: '2026-08-19T10:20:29.937Z'
 - 终态推导三种结果各有用例（含 interrupted 计失败）
 - interrupted → resume → running 出口有单测
 - 状态机单测覆盖全流转
+
+<!-- omt:children -->
+## 子节点
+
+（暂无子节点）
+<!-- /omt:children -->

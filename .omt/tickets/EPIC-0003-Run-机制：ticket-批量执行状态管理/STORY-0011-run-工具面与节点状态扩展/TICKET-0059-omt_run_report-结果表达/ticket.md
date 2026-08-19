@@ -2,11 +2,11 @@
 id: TICKET-0059
 type: ticket
 title: omt_run_report 结果表达
-status: open
+status: done
 priority: 1
 parent: STORY-0011
 created_at: '2026-08-19T09:10:44.264Z'
-updated_at: '2026-08-19T10:20:29.958Z'
+updated_at: '2026-08-19T14:46:38.464Z'
 ---
 
 ## 任务
@@ -27,3 +27,9 @@ outcome ∈ done / failed / blocked / skipped。
 - 双写一致：blocked/skipped 校验节点侧 + item 侧，failed 校验 item 侧
 - note 追加到 ticket 进度记录
 - 工具层单测
+
+<!-- omt:children -->
+## 子节点
+
+（暂无子节点）
+<!-- /omt:children -->

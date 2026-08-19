@@ -2,11 +2,11 @@
 id: TICKET-0062
 type: ticket
 title: idle hook：未收尾提醒与 run 续跑 nudge
-status: open
+status: done
 priority: 1
 parent: STORY-0012
 created_at: '2026-08-19T09:11:19.261Z'
-updated_at: '2026-08-19T13:26:14.851Z'
+updated_at: '2026-08-19T15:10:00.476Z'
 ---
 
 ## 任务
@@ -31,3 +31,17 @@ Tier 1 hook：监听 cordis `agent/status` 事件，agent 转 idle 时：
 - 预算内退避重试、耗尽转 UI 停滞标记的行为有单测
 - autoContinue=false 时只提醒不续跑
 - 单测（mock agent 事件与 followup）
+
+
+## 进度（实现完成，待编排方验收）
+
+- 新增 `src/host/idle-hook.ts`：订阅 cordis `agent/status` idle；未收尾提醒（内存防抖，每 session 每 ticket 一次）+ run 续跑 nudge（仅 running 且 autoContinue 的 run；paused 不发）。
+- nudge 预算走 `run_items.nudged_at/nudge_count`（core 新增 `recordItemNudge` / `continuationCandidates`），指数退避 base×2^(k-1)，上限 `NUDGE_BUDGET=3`；耗尽即停滞约定 `isRunItemStalled`（pending + 预算耗尽，不加新状态），`omt_run_show` 透出 `stalled: true` 与「停滞」渲染。
+- 退避计时器 unref + cordis `ctx.effect` dispose 清理；触发时复核 agent idle / run running / item pending。
+- 测试：tests/idle-hook.spec.ts 13 例、tests/run-tools.spec.ts 新增停滞标记 1 例；`pnpm typecheck` 干净。
+
+<!-- omt:children -->
+## 子节点
+
+（暂无子节点）
+<!-- /omt:children -->

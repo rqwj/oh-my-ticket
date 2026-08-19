@@ -24,8 +24,8 @@ updated_at: '2026-08-17T13:59:15.996Z'
 
 - [STORY-0001 抽屉树交互优化](STORY-0001-抽屉树交互优化/story.md) — open
 - [STORY-0002 文档详情面板体验](STORY-0002-文档详情面板体验/story.md) — open
-- [STORY-0003 @ 引用与 chip 体验](STORY-0003-@-引用与-chip-体验/story.md) — open
-- [STORY-0004 DSH UI 规范对齐](STORY-0004-DSH-UI-规范对齐/story.md) — open
-- [STORY-0005 会话联动展示](STORY-0005-会话联动展示/story.md) — open
-- [STORY-0006 ticket list 三种展现方式（抽屉/浮窗/tab）](STORY-0006-ticket-list-三种展现方式（抽屉浮窗tab）/story.md) — open
+- [STORY-0003 @ 引用与 chip 体验](STORY-0003-@-引用与-chip-体验/story.md) — done
+- [STORY-0004 DSH UI 规范对齐](STORY-0004-DSH-UI-规范对齐/story.md) — done
+- [STORY-0005 会话联动展示](STORY-0005-会话联动展示/story.md) — done
+- [STORY-0006 ticket list 三种展现方式（抽屉/浮窗/tab）](STORY-0006-ticket-list-三种展现方式（抽屉浮窗tab）/story.md) — done
 <!-- /omt:children -->

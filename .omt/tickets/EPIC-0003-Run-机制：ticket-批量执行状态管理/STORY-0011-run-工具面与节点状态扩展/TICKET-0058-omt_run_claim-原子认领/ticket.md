@@ -2,11 +2,11 @@
 id: TICKET-0058
 type: ticket
 title: omt_run_claim 原子认领
-status: open
+status: done
 priority: 1
 parent: STORY-0011
 created_at: '2026-08-19T09:10:44.253Z'
-updated_at: '2026-08-19T13:41:57.726Z'
+updated_at: '2026-08-19T14:46:38.453Z'
 ---
 
 ## 任务
@@ -22,3 +22,9 @@ run paused 时拒绝 claim。**executor 归属遵循 claim 优先**：claim 写�
 
 - 并发 claim 单测（同一 run 两个调用拿到不同 item）
 - 空队列返回明确信号
+
+<!-- omt:children -->
+## 子节点
+
+（暂无子节点）
+<!-- /omt:children -->

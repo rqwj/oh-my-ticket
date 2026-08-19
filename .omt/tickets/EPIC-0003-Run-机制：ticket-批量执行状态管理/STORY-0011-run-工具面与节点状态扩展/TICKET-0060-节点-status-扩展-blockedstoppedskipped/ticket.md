@@ -2,11 +2,11 @@
 id: TICKET-0060
 type: ticket
 title: 节点 status 扩展 blocked/stopped/skipped
-status: open
+status: done
 priority: 1
 parent: STORY-0011
 created_at: '2026-08-19T09:10:44.272Z'
-updated_at: '2026-08-19T13:41:57.741Z'
+updated_at: '2026-08-19T14:46:38.475Z'
 ---
 
 ## 任务
@@ -26,3 +26,9 @@ updated_at: '2026-08-19T13:41:57.741Z'
 - omt_update 接受新状态；非法状态仍被拒绝
 - omt_list 按新状态过滤正常
 - 单测更新
+
+<!-- omt:children -->
+## 子节点
+
+（暂无子节点）
+<!-- /omt:children -->

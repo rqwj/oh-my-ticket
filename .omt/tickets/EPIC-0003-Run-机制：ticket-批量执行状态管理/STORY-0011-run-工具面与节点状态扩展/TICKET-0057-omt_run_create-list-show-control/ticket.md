@@ -2,11 +2,11 @@
 id: TICKET-0057
 type: ticket
 title: omt_run_create / list / show / control
-status: open
+status: done
 priority: 1
 parent: STORY-0011
 created_at: '2026-08-19T09:10:44.241Z'
-updated_at: '2026-08-19T13:42:29.809Z'
+updated_at: '2026-08-19T14:46:38.441Z'
 ---
 
 ## 任务
@@ -26,3 +26,9 @@ updated_at: '2026-08-19T13:42:29.809Z'
 - 同 home 校验、重复成员校验
 - control 各动作状态流转合法（含 start：pending → running；remove 不碰 ticket）
 - 工具层单测
+
+<!-- omt:children -->
+## 子节点
+
+（暂无子节点）
+<!-- /omt:children -->

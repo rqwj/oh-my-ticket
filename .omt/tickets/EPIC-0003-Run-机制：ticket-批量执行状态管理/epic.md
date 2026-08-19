@@ -109,3 +109,13 @@ run_items: run_id, node_id, position, state(pending/running/done/failed/blocked/
   整个 pause 时，只能 cancel 重建（丢失 run 内进度记录）。真实取舍：中途可改
   config（control 加 set-config / UI 编辑）vs 明确声明为一次性决策，
   建议与 P3 并发配置一起考虑。
+
+<!-- omt:children -->
+## 子节点
+
+- [STORY-0010 run 数据核心与状态机](STORY-0010-run-数据核心与状态机/story.md) — done
+- [STORY-0011 run 工具面与节点状态扩展](STORY-0011-run-工具面与节点状态扩展/story.md) — done
+- [STORY-0012 执行保障三层 hook](STORY-0012-执行保障三层-hook/story.md) — open
+- [STORY-0013 run UI](STORY-0013-run-UI/story.md) — open
+- [STORY-0014 skill 拆分渐进加载（omt / omt-runs）](STORY-0014-skill-拆分渐进加载（omt-omt-runs）/story.md) — open
+<!-- /omt:children -->

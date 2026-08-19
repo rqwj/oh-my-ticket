@@ -41,7 +41,7 @@ OMT ticket list 支持三种展现方式并可互相切换：
 - [TICKET-0037 FloatWindow 浮窗壳（拖拽 + 缩放）](TICKET-0037-FloatWindow-浮窗壳（拖拽-+-缩放）/ticket.md) — done
 - [TICKET-0038 OMT tab 注册 conversation.view](TICKET-0038-OMT-tab-注册-conversation.view/ticket.md) — done
 - [TICKET-0039 模式切换接线、文案与测试](TICKET-0039-模式切换接线、文案与测试/ticket.md) — done
-- [TICKET-0040 浮窗激活时隐藏 OMT tab 并回退 Chat](TICKET-0040-浮窗激活时隐藏-OMT-tab-并回退-Chat/ticket.md) — open
+- [TICKET-0040 浮窗激活时隐藏 OMT tab 并回退 Chat](TICKET-0040-浮窗激活时隐藏-OMT-tab-并回退-Chat/ticket.md) — done
 <!-- /omt:children -->
 
 五个 ticket 全部完成。三种展现方式（抽屉/浮窗/tab）共享 TicketPanel，mode 与浮窗几何持久化；0.2.22 已安装到 web profile，DSH 重启 + 页面刷新后生效。

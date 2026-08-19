@@ -2,11 +2,11 @@
 id: TICKET-0053
 type: ticket
 title: schema v3：runs/run_items 建表与迁移
-status: open
+status: done
 priority: 1
 parent: STORY-0010
 created_at: '2026-08-19T09:10:08.239Z'
-updated_at: '2026-08-19T13:27:14.662Z'
+updated_at: '2026-08-19T14:19:31.204Z'
 ---
 
 ## 任务
@@ -27,3 +27,9 @@ run id 用 RUN-0001 序号（复用 meta 计数器）。title 供多 run 选择�
 
 - 旧库打开自动迁移，数据无损；新库直接建 v3
 - 单测覆盖迁移与建表
+
+<!-- omt:children -->
+## 子节点
+
+（暂无子节点）
+<!-- /omt:children -->

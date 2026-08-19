@@ -2,11 +2,11 @@
 id: TICKET-0056
 type: ticket
 title: 启动 janitor 与 reindex 保护
-status: open
+status: done
 priority: 1
 parent: STORY-0010
 created_at: '2026-08-19T09:10:08.266Z'
-updated_at: '2026-08-19T09:49:53.695Z'
+updated_at: '2026-08-19T14:19:31.237Z'
 ---
 
 ## 任务

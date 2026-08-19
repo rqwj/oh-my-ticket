@@ -24,3 +24,13 @@ updated_at: '2026-08-19T09:38:06.768Z'
 - SSE run 事件接入前端 store
 
 详见 Epic 正文决策 4/6/15/16。
+
+<!-- omt:children -->
+## 子节点
+
+- [TICKET-0067 树与详情的「加入 run」按钮](TICKET-0067-树与详情的「加入-run」按钮/ticket.md) — open
+- [TICKET-0068 run 列表与详情视图](TICKET-0068-run-列表与详情视图/ticket.md) — open
+- [TICKET-0069 blocked/stopped/skipped 黄色呈现](TICKET-0069-blockedstoppedskipped-黄色呈现/ticket.md) — open
+- [TICKET-0070 awaiting_confirmation 确认入口](TICKET-0070-awaiting_confirmation-确认入口/ticket.md) — open
+- [TICKET-0071 SSE run 事件前端接入](TICKET-0071-SSE-run-事件前端接入/ticket.md) — open
+<!-- /omt:children -->

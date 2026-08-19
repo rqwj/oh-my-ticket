@@ -2,11 +2,11 @@
 id: TICKET-0055
 type: ticket
 title: 边界语义：stop-on-failure / pause / 重试 / 回放
-status: open
+status: done
 priority: 1
 parent: STORY-0010
 created_at: '2026-08-19T09:10:08.257Z'
-updated_at: '2026-08-19T13:41:57.774Z'
+updated_at: '2026-08-19T14:19:31.227Z'
 ---
 
 ## 任务
@@ -31,3 +31,9 @@ updated_at: '2026-08-19T13:41:57.774Z'
 - 六条语义各有单测
 - resume 跳过失败项继续、interrupted 项不自动重置的逻辑正确
 - stop-on-failure 触发集合（仅 failed）有单测
+
+<!-- omt:children -->
+## 子节点
+
+（暂无子节点）
+<!-- /omt:children -->

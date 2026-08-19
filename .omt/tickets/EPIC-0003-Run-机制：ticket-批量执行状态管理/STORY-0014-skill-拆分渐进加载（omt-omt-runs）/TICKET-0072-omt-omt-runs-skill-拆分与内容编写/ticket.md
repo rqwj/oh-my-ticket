@@ -2,11 +2,11 @@
 id: TICKET-0072
 type: ticket
 title: omt / omt-runs skill 拆分与内容编写
-status: open
+status: done
 priority: 1
 parent: STORY-0014
 created_at: '2026-08-19T09:12:00.415Z'
-updated_at: '2026-08-19T10:21:15.412Z'
+updated_at: '2026-08-19T15:19:21.666Z'
 ---
 
 ## 任务

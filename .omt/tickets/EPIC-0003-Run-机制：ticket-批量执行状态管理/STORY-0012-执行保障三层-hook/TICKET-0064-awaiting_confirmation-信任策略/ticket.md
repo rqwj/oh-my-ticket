@@ -27,3 +27,9 @@ updated_at: '2026-08-19T13:41:57.785Z'
 
 - 三种信任路径 + 分流标准单测
 - awaiting_confirmation 可被人/UI 确认与打回
+
+<!-- omt:children -->
+## 子节点
+
+（暂无子节点）
+<!-- /omt:children -->

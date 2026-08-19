@@ -35,3 +35,9 @@ updated_at: '2026-08-19T13:27:14.642Z'
 - interrupted 不注入的例外路径
 - 与 nudge 合并/去重策略
 - 单测
+
+<!-- omt:children -->
+## 子节点
+
+（暂无子节点）
+<!-- /omt:children -->

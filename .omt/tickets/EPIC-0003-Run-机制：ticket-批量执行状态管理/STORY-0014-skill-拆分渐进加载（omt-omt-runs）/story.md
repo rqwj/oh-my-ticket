@@ -2,11 +2,11 @@
 id: STORY-0014
 type: story
 title: skill 拆分渐进加载（omt / omt-runs）
-status: open
+status: done
 priority: 1
 parent: EPIC-0003
 created_at: '2026-08-19T09:09:31.823Z'
-updated_at: '2026-08-19T10:47:58.198Z'
+updated_at: '2026-08-19T15:19:21.681Z'
 ---
 
 # skill 拆分渐进加载

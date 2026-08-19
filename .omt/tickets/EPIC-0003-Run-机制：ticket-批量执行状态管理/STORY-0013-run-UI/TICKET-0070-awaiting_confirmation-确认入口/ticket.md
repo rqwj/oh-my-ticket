@@ -25,3 +25,9 @@ awaiting_confirmation 的人工确认入口：
 - 确认/打回两条路径状态正确联动
 - 打回后 ticket 保持 in_progress、标识清除、retry 重跑路径可走通
 - 浏览器测试
+
+<!-- omt:children -->
+## 子节点
+
+（暂无子节点）
+<!-- /omt:children -->
