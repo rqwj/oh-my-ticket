@@ -285,6 +285,22 @@ describe('TICKET-0058 omt_run_claim', () => {
     await tool('omt_run_control').execute({ id: created.run.id, action: 'start' }, NO_EXEC)
     await tool('omt_run_control').execute({ id: created.run.id, action: 'pause' }, NO_EXEC)
     await expect(tool('omt_run_claim').execute({ id: created.run.id }, agentExec('sess-1'))).rejects.toThrow(/paused/)
+
+    // canceled is absolute terminal: no dispatch ever again.
+    await tool('omt_run_control').execute({ id: created.run.id, action: 'resume' }, NO_EXEC)
+    await tool('omt_run_control').execute({ id: created.run.id, action: 'cancel' }, NO_EXEC)
+    await expect(tool('omt_run_claim').execute({ id: created.run.id }, agentExec('sess-1'))).rejects.toThrow(/canceled/)
+
+    // A run that derived completed (last item claimed + reported done)
+    // rejects claims too.
+    const doneRun = await startedRun(await ticketFixture(1))
+    const claimed = await tool('omt_run_claim').execute({ id: doneRun.id }, agentExec('sess-1'))
+    await tool('omt_run_report').execute(
+      { id: doneRun.id, nodeId: claimed.item.node_id, outcome: 'done' },
+      agentExec('sess-1'),
+    )
+    expect((await tool('omt_run_show').execute({ id: doneRun.id }, NO_EXEC)).run.status).toBe('completed')
+    await expect(tool('omt_run_claim').execute({ id: doneRun.id }, agentExec('sess-1'))).rejects.toThrow(/completed/)
   })
 
   it('rejects agent-less claims with a clear error', async () => {
@@ -380,6 +396,28 @@ describe('TICKET-0059 omt_run_report', () => {
     )
     expect(afterFailed.run.status).toBe('paused')
   })
+
+  it('rejects a report whose ticket was archived after the claim, leaving the body untouched', async () => {
+    const ids = await ticketFixture(1)
+    const run = await startedRun(ids)
+    const claimed = await tool('omt_run_claim').execute({ id: run.id }, agentExec('sess-1'))
+    const before = (await tool('omt_show').execute({ id: ids[0]! }, NO_EXEC)).body
+
+    // Archiving after the claim seals the node (observation skips the item);
+    // a late report is refused by the archived guard instead of rewriting
+    // the ticket — the guard fires before the item-state check.
+    await tool('omt_update').execute({ id: ids[0]!, archived: true }, agentExec('sess-1'))
+    await expect(
+      tool('omt_run_report').execute(
+        { id: run.id, nodeId: claimed.item.node_id, outcome: 'done', note: '不应落盘' },
+        agentExec('sess-1'),
+      ),
+    ).rejects.toThrow(/归档|archived/)
+
+    const after = await tool('omt_show').execute({ id: ids[0]! }, NO_EXEC)
+    expect(after.body).toBe(before)
+    expect(after.node.status).not.toBe('done')
+  })
 })
 
 // ── TICKET-0061: passive observation ─────────────────────────────────────
@@ -426,8 +464,11 @@ describe('TICKET-0061 passive observation', () => {
     const ids = await ticketFixture(2)
     const run = await startedRun(ids)
     await tool('omt_update').execute({ id: ids[0], status: 'in_progress' }, agentExec('sess-1'))
-    await tool('omt_update').execute({ id: ids[0], archived: true }, agentExec('sess-1'))
+    const archived = await tool('omt_update').execute({ id: ids[0], archived: true }, agentExec('sess-1'))
 
+    // The observed change must match what actually landed: the node side is
+    // archived too (not just the item advanced).
+    expect(archived.archived).toBe(true)
     const detail = await tool('omt_run_show').execute({ id: run.id }, NO_EXEC)
     expect(detail.items[0].state).toBe('skipped')
   })
@@ -529,6 +570,27 @@ describe('TICKET-0061 passive observation', () => {
     expect(executed.ok).toBe(true)
     const after = await tool('omt_run_show').execute({ id: run.id }, NO_EXEC)
     expect(after.items[1]).toMatchObject({ state: 'running', executor_session_id: 'sess-rpc' })
+  })
+
+  it('an explicit report completion broadcasts to other active runs holding the ticket', async () => {
+    const ids = await ticketFixture(1)
+    const runA = await startedRun(ids)
+    const runB = await startedRun(ids)
+
+    const claimed = await tool('omt_run_claim').execute({ id: runA.id }, agentExec('sess-1'))
+    await tool('omt_run_report').execute(
+      { id: runA.id, nodeId: claimed.item.node_id, outcome: 'done', note: '完成' },
+      agentExec('sess-1'),
+    )
+
+    // The report's ticket double-write goes through core.update, so the
+    // second run's item advances with no separate observation wiring.
+    const detailA = await tool('omt_run_show').execute({ id: runA.id }, NO_EXEC)
+    const detailB = await tool('omt_run_show').execute({ id: runB.id }, NO_EXEC)
+    expect(detailA.items[0].state).toBe('done')
+    expect(detailA.run.status).toBe('completed')
+    expect(detailB.items[0].state).toBe('done')
+    expect(detailB.run.status).toBe('completed')
   })
 
   it('manual status changes still never START a running mark (TICKET-0028)', async () => {

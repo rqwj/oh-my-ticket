@@ -9,7 +9,7 @@
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { OmtCore } from '../src/host/core.ts'
 import { registerOmtIdleHook } from '../src/host/idle-hook.ts'
 import { OmtCorePool } from '../src/host/pool.ts'
@@ -43,6 +43,8 @@ let nowMs: number
 let scheduled: Scheduled[]
 let messages: unknown[]
 let statusListeners: ((payload: { agent: FakeAgent; status: 'idle' | 'running' }) => void)[]
+/** Disposers captured from the hook's ctx.effect generator (dispose path). */
+let disposers: (() => void)[]
 
 function fakeAgent(id: string): FakeAgent {
   return {
@@ -99,9 +101,14 @@ beforeEach(async () => {
   scheduled = []
   messages = []
   statusListeners = []
+  disposers = []
   const stubCtx = {
     on: (event: string, listener: any) => {
       if (event === 'agent/status') statusListeners.push(listener)
+    },
+    // cordis effect lifecycle: run the generator, keep the yielded disposers.
+    effect: (body: () => Generator<() => void, void, unknown>) => {
+      for (const disposer of body()) disposers.push(disposer)
     },
   }
   registerOmtIdleHook(stubCtx as never, pool, running, {
@@ -352,5 +359,59 @@ describe('nudge 预算与退避', () => {
     expect(texts()).toHaveLength(4)
     expect(texts()[3]).toContain('继续下一项')
     expect(itemOf(run.id, ticketIds[1]).nudge_count).toBe(1)
+  })
+})
+
+describe('ctx.effect 清理路径', () => {
+  it('the yielded disposer clears every armed backoff timer', async () => {
+    // Registration ran the effect generator exactly once.
+    expect(disposers).toHaveLength(1)
+
+    await runFixture('s1')
+    const agent = fakeAgent('s1')
+
+    // Nudge 1 on idle, then a second idle inside the backoff window arms a
+    // timer for the remainder.
+    emitIdle(agent)
+    await flush()
+    expect(texts()).toHaveLength(1)
+    nowMs = T0 + 400
+    emitIdle(agent)
+    await flush()
+    expect(scheduled.filter(entry => !entry.cleared)).toHaveLength(1)
+
+    // Plugin dispose: the armed timer is dropped, nothing left behind.
+    disposers[0]!()
+    expect(scheduled.filter(entry => !entry.cleared)).toHaveLength(0)
+  })
+})
+
+describe('错误路径', () => {
+  it('a throwing followup is contained: no unhandled rejection, other reminders still land', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const broken = fakeAgent('s1')
+      broken.followup = () => {
+        throw new Error('channel gone')
+      }
+      running.start('TICKET-0042', 's1', 'demo 的会话')
+
+      // The throw is caught inside the hook (logged as a warning) — the idle
+      // handling promise still settles, so vitest sees no rejection.
+      emitIdle(broken)
+      await flush()
+      expect(warn).toHaveBeenCalled()
+      expect(texts()).toHaveLength(0)
+
+      // …and the failure never poisons delivery to other sessions.
+      running.start('TICKET-0043', 's2', 'demo 的会话')
+      emitIdle(fakeAgent('s2'))
+      await flush()
+      expect(texts()).toHaveLength(1)
+      expect(texts()[0]).toContain('TICKET-0043')
+      expect(texts()[0]).toContain('收尾')
+    } finally {
+      warn.mockRestore()
+    }
   })
 })

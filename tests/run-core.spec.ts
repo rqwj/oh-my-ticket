@@ -10,8 +10,8 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { OmtCore } from '../src/host/core.ts'
 import { OmtStore } from '../src/host/store.ts'
-import { OmtError } from '../src/host/types.ts'
-import { ticketFixture } from './mocks/fixtures.ts'
+import { isRunItemStalled, NUDGE_BUDGET, OmtError } from '../src/host/types.ts'
+import { requireItem, ticketFixture } from './mocks/fixtures.ts'
 
 let home: string
 let core: OmtCore
@@ -53,6 +53,16 @@ describe('createRun', () => {
     await expect(core.createRun({ nodeIds: [ticket.id, ticket.id] })).rejects.toThrow(/duplicate/i)
     await expect(core.createRun({ nodeIds: [], config: { concurrency: 0 } })).rejects.toThrow(/concurrency/)
     expect(() => core.runItems('RUN-9999')).toThrow(OmtError)
+  })
+
+  it('rejects archived members up front (they could never accept a report)', async () => {
+    const [a, b] = await fixture(2)
+    await core.update({ id: a!.id, archived: true })
+    await expect(core.createRun({ nodeIds: [a!.id, b!.id] })).rejects.toThrow(/archived|已归档/)
+    // Restoring the node unblocks the run creation.
+    await core.update({ id: a!.id, archived: false })
+    const run = await core.createRun({ nodeIds: [a!.id, b!.id] })
+    expect(run.status).toBe('pending')
   })
 })
 
@@ -192,6 +202,23 @@ describe('terminal derivation', () => {
     await core.transitionItem(run.id, b!.id, 'done')
     expect(core.getRun(run.id)?.status).toBe('completed_with_failures')
   })
+
+  it('removing the last pending item after the rest finished derives completed', async () => {
+    const [a, b] = await fixture(2)
+    const run = await core.createRun({ nodeIds: [a!.id, b!.id] })
+    await core.startRun(run.id)
+    await core.claimRunItem(run.id, 'sess-1')
+    await core.reportRunItem(run.id, a!.id, 'done')
+    // One final item, one still pending: the run is not derivable yet.
+    expect(core.getRun(run.id)?.status).toBe('running')
+
+    // Dropping the remaining pending item leaves only final states behind.
+    await core.removeRunItem(run.id, b!.id)
+    const finished = core.getRun(run.id)
+    expect(finished?.status).toBe('completed')
+    expect(finished?.finished_at).toBeDefined()
+    expect(core.getRunItem(run.id, b!.id)).toBeUndefined()
+  })
 })
 
 describe('boundary semantics (TICKET-0055)', () => {
@@ -264,6 +291,18 @@ describe('boundary semantics (TICKET-0055)', () => {
     await expect(core.retryItem(run.id, a!.id)).rejects.toThrow(/done/)
   })
 
+  it('retry rejects a completed run (full success has no reopen path)', async () => {
+    const [a] = await fixture(1)
+    const run = await core.createRun({ nodeIds: [a!.id] })
+    await core.startRun(run.id)
+    await core.transitionItem(run.id, a!.id, 'running')
+    await core.transitionItem(run.id, a!.id, 'done')
+    expect(core.getRun(run.id)?.status).toBe('completed')
+
+    // Unlike completed_with_failures, completed accepts no row-level retry.
+    await expect(core.retryItem(run.id, a!.id)).rejects.toThrow(/completed/)
+  })
+
   it('replay returns done/blocked/skipped items to pending, keeping position', async () => {
     const [a, b, c, d] = await fixture(4)
     const run = await core.createRun({ nodeIds: [a!.id, b!.id, c!.id, d!.id] })
@@ -290,6 +329,24 @@ describe('boundary semantics (TICKET-0055)', () => {
     await expect(core.replayItem(run.id, a!.id)).rejects.toThrow(/running/)
   })
 
+  it('replay clears the nudge budget: a replayed item is no longer stalled', async () => {
+    const [a, b] = await fixture(2)
+    const run = await core.createRun({ nodeIds: [a!.id, b!.id] })
+    await core.startRun(run.id)
+    // Exhaust the continuation-nudge budget on the pending item (TICKET-0062).
+    for (let count = 0; count < NUDGE_BUDGET; count += 1) core.recordItemNudge(run.id, a!.id)
+    expect(isRunItemStalled(requireItem(core, run.id, a!.id))).toBe(true)
+
+    // done → open replays the item; like retry, it gets a fresh budget.
+    await core.update({ id: a!.id, status: 'done' })
+    await core.update({ id: a!.id, status: 'open' })
+    const replayed = requireItem(core, run.id, a!.id)
+    expect(replayed.state).toBe('pending')
+    expect(replayed.nudge_count).toBe(0)
+    expect(replayed.nudged_at).toBeUndefined()
+    expect(isRunItemStalled(replayed)).toBe(false)
+  })
+
   it('resume after stop-on-failure skips the failed item and continues dispatch', async () => {
     const [a, b] = await fixture(2)
     const run = await core.createRun({ config: { stopOnFailure: true }, nodeIds: [a!.id, b!.id] })
@@ -311,8 +368,10 @@ describe('boundary semantics (TICKET-0055)', () => {
     const [a, b] = await fixture(2)
     const run = await core.createRun({ nodeIds: [a!.id, b!.id] })
     await core.startRun(run.id)
+    // The status flip itself dispatches the item (passive observation rides
+    // on core.update now — no separate transitionItem needed).
     await core.update({ id: a!.id, status: 'in_progress' })
-    await core.transitionItem(run.id, a!.id, 'running', { executorSessionId: 'sess-1' })
+    expect(core.getRunItem(run.id, a!.id)?.state).toBe('running')
 
     await core.cancelRun(run.id)
     expect(core.getRun(run.id)?.status).toBe('canceled')
@@ -327,6 +386,68 @@ describe('boundary semantics (TICKET-0055)', () => {
     await expect(core.retryItem(run.id, a!.id)).rejects.toThrow(/canceled/)
     await expect(core.resumeRun(run.id)).rejects.toThrow(/canceled/)
     await expect(core.transitionItem(run.id, a!.id, 'done')).rejects.toThrow(/canceled/)
+  })
+})
+
+describe('archived members (wedge fixes)', () => {
+  it('claim skips archived members and derives the terminal state when the queue drains', async () => {
+    const [a, b, c] = await fixture(3)
+    const run = await core.createRun({ nodeIds: [a!.id, b!.id] })
+    // Archive b while the run is still pending: no observation fires, so the
+    // archived member sits in the queue until claim time.
+    await core.update({ id: b!.id, archived: true })
+    await core.startRun(run.id)
+
+    const claimed = await core.claimRunItem(run.id, 'sess-1')
+    expect(claimed?.node_id).toBe(a!.id)
+    // The archived member was marked skipped inside the claim transaction.
+    expect(core.getRunItem(run.id, b!.id)?.state).toBe('skipped')
+
+    // A run whose only member is archived drains to a terminal state.
+    const solo = await core.createRun({ nodeIds: [c!.id] })
+    await core.update({ id: c!.id, archived: true })
+    await core.startRun(solo.id)
+    expect(await core.claimRunItem(solo.id, 'sess-1')).toBeUndefined()
+    expect(core.getRunItem(solo.id, c!.id)?.state).toBe('skipped')
+    expect(core.getRun(solo.id)?.status).toBe('completed')
+  })
+
+  it('removeRunItem force-removes an in-flight item whose node is archived (wedge recovery)', async () => {
+    const [a] = await fixture(1)
+    const run = await core.createRun({ nodeIds: [a!.id] })
+    await core.startRun(run.id)
+    await core.claimRunItem(run.id, 'sess-1')
+
+    // In-flight items are not removable while the node is live…
+    await expect(core.removeRunItem(run.id, a!.id)).rejects.toThrow(/in-flight/)
+
+    // …but a node archived out of band (here: cancel freezes observation,
+    // like a reindex of hand-edited files would) wedges the item — reports
+    // reject archived nodes. Forced removal recovers without touching the
+    // ticket or canceling anything further.
+    await core.cancelRun(run.id)
+    await core.update({ id: a!.id, archived: true })
+    await core.removeRunItem(run.id, a!.id)
+    expect(core.getRunItem(run.id, a!.id)).toBeUndefined()
+    expect(core.getNode(a!.id)?.status).toBe('open')
+  })
+})
+
+describe('reportRunItem write order', () => {
+  it('failed transitions the item before appending the note (no orphaned note on a stranded item)', async () => {
+    const [a] = await fixture(1)
+    const run = await core.createRun({ nodeIds: [a!.id] })
+    await core.startRun(run.id)
+    await core.transitionItem(run.id, a!.id, 'running', { executorSessionId: 'sess-1' })
+
+    // Make the note-append fail (node file gone): the transition must
+    // already have landed, matching the other outcomes' order.
+    await rm(join(home, a!.path))
+    await expect(core.reportRunItem(run.id, a!.id, 'failed', '炸了')).rejects.toThrow(/node file missing/)
+    const item = requireItem(core, run.id, a!.id)
+    expect(item.state).toBe('failed')
+    expect(item.last_error).toBe('炸了')
+    expect(core.getRun(run.id)?.status).toBe('completed_with_failures')
   })
 })
 
@@ -396,6 +517,30 @@ describe('startup janitor (TICKET-0056)', () => {
     expect(core.getRun(run.id)?.status).toBe('paused')
     expect(core.getRunItem(run.id, a!.id)?.state).toBe('interrupted')
     expect(core.getRunItem(run.id, b!.id)?.state).toBe('pending')
+
+    // Resume flips back to running and the pending item dispatches again.
+    await core.resumeRun(run.id)
+    expect(core.getRun(run.id)?.status).toBe('running')
+    await core.transitionItem(run.id, b!.id, 'running', { executorSessionId: 'sess-2' })
+    await core.transitionItem(run.id, b!.id, 'done')
+    expect(core.getRun(run.id)?.status).toBe('completed_with_failures')
+  })
+
+  it('derives the terminal state of a paused run when the demotion finishes its last in-flight item', async () => {
+    const [a, b] = await fixture(2)
+    const run = await core.createRun({ nodeIds: [a!.id, b!.id] })
+    await core.startRun(run.id)
+    await core.transitionItem(run.id, a!.id, 'running')
+    await core.transitionItem(run.id, a!.id, 'done')
+    await core.transitionItem(run.id, b!.id, 'running', { executorSessionId: 'sess-dead' })
+    await core.pauseRun(run.id)
+
+    core.close()
+    core = await OmtCore.open(home)
+
+    expect(core.getRunItem(run.id, b!.id)?.state).toBe('interrupted')
+    // Paused no longer skips terminal derivation: no silent stall after resume.
+    expect(core.getRun(run.id)?.status).toBe('completed_with_failures')
   })
 
   it('derives the terminal state when the demotion finishes the last item', async () => {
