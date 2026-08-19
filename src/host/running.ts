@@ -11,6 +11,15 @@ export interface RunningInfo {
   readonly since: string
 }
 
+/**
+ * Execution-ending changes (shared by the tool and RPC update paths):
+ * done/blocked/skipped/archive all end active execution, so the running
+ * mark clears.
+ */
+export function endsExecution(status?: string, archived?: boolean): boolean {
+  return status === 'done' || status === 'blocked' || status === 'skipped' || archived === true
+}
+
 export class RunningRegistry {
   private readonly running = new Map<string, RunningInfo>()
 

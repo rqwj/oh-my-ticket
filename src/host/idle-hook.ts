@@ -31,7 +31,7 @@ import type { RunningRegistry } from './running.ts'
 import { NUDGE_BUDGET, type OmtRun, type OmtRunItem } from './types.ts'
 
 /** Default backoff base interval between continuation nudges. */
-export const DEFAULT_BACKOFF_BASE_MS = 30_000
+const DEFAULT_BACKOFF_BASE_MS = 30_000
 
 export interface IdleHookOptions {
   /** Base backoff interval in ms (doubled per nudge). Default 30s. */
@@ -66,7 +66,7 @@ export type NudgeDecision =
  * requires base × 2^(k-1) ms since the last one; at NUDGE_BUDGET the item
  * is stalled (no more nudges until retry resets the budget).
  */
-export function nudgeDecision(
+function nudgeDecision(
   item: Pick<OmtRunItem, 'nudge_count' | 'nudged_at'>,
   nowMs: number,
   baseMs: number,
@@ -133,6 +133,22 @@ export function registerOmtIdleHook(ctx: Context, pool: OmtCorePool, running: Ru
     timers.set(key, handle)
   }
 
+  /**
+   * Shared nudge-decision dispatch (idle event and backoff timer): arms the
+   * backoff timer or records the nudge, returning the nudge line when one
+   * is due. Delivery is the caller's choice (merged vs direct followup).
+   */
+  const applyNudgeDecision = (agent: AgentLike, core: OmtCore, run: OmtRun, item: OmtRunItem): string | undefined => {
+    const decision = nudgeDecision(item, now(), baseMs)
+    if (decision.kind === 'stalled') return undefined
+    if (decision.kind === 'backoff') {
+      armBackoff(agent, run.id, item.node_id, decision.waitMs)
+      return undefined
+    }
+    recordNudge(core, run.id, item.node_id)
+    return nudgeLine(run, item)
+  }
+
   /** Timer path: revalidate everything before spending budget. */
   const onBackoffTimer = async (agent: AgentLike, runId: string, nodeId: string): Promise<void> => {
     // Not idle anymore → drop; the next idle event re-evaluates from scratch.
@@ -142,23 +158,23 @@ export function registerOmtIdleHook(ctx: Context, pool: OmtCorePool, running: Ru
     if (run === undefined || run.status !== 'running' || !run.config.autoContinue) return
     const item = core.getRunItem(runId, nodeId)
     if (item === undefined || item.state !== 'pending') return
-    const decision = nudgeDecision(item, now(), baseMs)
-    if (decision.kind === 'stalled') return
-    if (decision.kind === 'backoff') {
-      armBackoff(agent, runId, nodeId, decision.waitMs)
-      return
-    }
-    recordNudge(core, runId, nodeId)
-    followup(agent, nudgeLine(run, item))
+    const text = applyNudgeDecision(agent, core, run, item)
+    if (text !== undefined) followup(agent, text)
   }
 
   const onIdle = async (agent: AgentLike): Promise<void> => {
     const sessionId = agent.id
     const lines: string[] = []
 
-    // 1. 未收尾提醒 — once per (session, ticket).
-    for (const { id } of running.forSession(sessionId)) {
-      const key = `${sessionId}${id}`
+    // 1. 未收尾提醒 — once per (session, ticket); keys are pruned once the
+    // ticket leaves the running registry so the set stays bounded.
+    const runningEntries = running.forSession(sessionId)
+    const activeKeys = new Set(runningEntries.map(({ id }) => `${sessionId}:${id}`))
+    for (const key of reminded) {
+      if (key.startsWith(`${sessionId}:`) && !activeKeys.has(key)) reminded.delete(key)
+    }
+    for (const { id } of runningEntries) {
+      const key = `${sessionId}:${id}`
       if (reminded.has(key)) continue
       reminded.add(key)
       lines.push(reminderLine(id))
@@ -168,14 +184,8 @@ export function registerOmtIdleHook(ctx: Context, pool: OmtCorePool, running: Ru
     // continuationCandidates), autoContinue honored, budget enforced.
     const core = await pool.coreFor(agent.session.header.cwd)
     for (const { run, item } of core.continuationCandidates(sessionId)) {
-      const decision = nudgeDecision(item, now(), baseMs)
-      if (decision.kind === 'stalled') continue
-      if (decision.kind === 'backoff') {
-        armBackoff(agent, run.id, item.node_id, decision.waitMs)
-        continue
-      }
-      recordNudge(core, run.id, item.node_id)
-      lines.push(nudgeLine(run, item))
+      const text = applyNudgeDecision(agent, core, run, item)
+      if (text !== undefined) lines.push(text)
     }
 
     // One merged followup per idle event (TICKET-0065 owns further merging).

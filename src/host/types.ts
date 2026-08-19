@@ -104,7 +104,11 @@ export interface RunConfig {
   stopOnFailure: boolean
   /** Idle hook may nudge the executor to continue the next pending item. */
   autoContinue: boolean
-  /** Trust policy: hook-observed completions land directly in done. */
+  /**
+   * Trust policy (reserved — the awaiting_confirmation confirmation gate
+   * lands in a later version): hook-observed completions land directly in
+   * done.
+   */
   autoVerify: boolean
   /** Reserved for P3 concurrent execution. */
   concurrency: number
@@ -145,12 +149,17 @@ export interface OmtRunItem {
   readonly finished_at?: string
 }
 
-export function isRunStatus(value: unknown): value is RunStatus {
-  return typeof value === 'string' && (RUN_STATUSES as readonly string[]).includes(value)
-}
-
 export function isRunItemState(value: unknown): value is RunItemState {
   return typeof value === 'string' && (RUN_ITEM_STATES as readonly string[]).includes(value)
+}
+
+/**
+ * In-flight item states: actively executed (running) or awaiting human
+ * confirmation (awaiting_confirmation). Paused runs let only in-flight
+ * items advance; in-flight items cannot be removed and accept reports.
+ */
+export function isRunItemInFlight(state: RunItemState): boolean {
+  return state === 'running' || state === 'awaiting_confirmation'
 }
 
 /**

@@ -13,14 +13,10 @@ import { registerOmtRpc } from '../src/host/rpc.ts'
 import { RunningRegistry } from '../src/host/running.ts'
 import { registerOmtTools } from '../src/host/tools.ts'
 import { NUDGE_BUDGET } from '../src/host/types.ts'
+import { ticketFixtureViaTools } from './mocks/fixtures.ts'
+import { renderToolText, stubToolCtx, toolOf, type RegisteredTool } from './mocks/registered-tool.ts'
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
-
-interface RegisteredTool {
-  name: string
-  execute: (args: any, exec?: any) => Promise<any>
-  output: { render: (args: any, value: any) => { type: string; text?: string }[] }
-}
 
 let home: string
 let pool: OmtCorePool
@@ -32,14 +28,7 @@ beforeEach(async () => {
   pool = new OmtCorePool(home)
   running = new RunningRegistry()
   tools = new Map()
-  const stubCtx = {
-    tools: {
-      register(def: RegisteredTool) {
-        tools.set(def.name, def)
-      },
-    },
-  }
-  registerOmtTools(stubCtx as never, pool, undefined, undefined, running)
+  registerOmtTools(stubToolCtx(tools) as never, pool, undefined, undefined, running)
 })
 
 afterEach(async () => {
@@ -48,9 +37,7 @@ afterEach(async () => {
 })
 
 function tool(name: string): RegisteredTool {
-  const found = tools.get(name)
-  expect(found).toBeDefined()
-  return found!
+  return toolOf(tools, name)
 }
 
 /** Agent-less exec (no session) — like the existing tool tests. */
@@ -62,19 +49,12 @@ function agentExec(sessionId: string, cwd?: string): any {
 }
 
 function renderText(toolName: string, args: unknown, value: unknown): string {
-  return tool(toolName).output.render(args, value).map(block => block.text ?? '').join('\n')
+  return renderToolText(tools, toolName, args, value)
 }
 
 /** epic → story → n tickets, created through the tool surface (global home). */
-async function ticketFixture(count: number): Promise<string[]> {
-  const epic = await tool('omt_create').execute({ type: 'epic', title: '批量' }, NO_EXEC)
-  const story = await tool('omt_create').execute({ type: 'story', title: '批次', parentId: epic.id }, NO_EXEC)
-  const ids: string[] = []
-  for (let index = 0; index < count; index += 1) {
-    const ticket = await tool('omt_create').execute({ type: 'ticket', title: `任务${index + 1}`, parentId: story.id }, NO_EXEC)
-    ids.push(ticket.id)
-  }
-  return ids
+function ticketFixture(count: number): Promise<string[]> {
+  return ticketFixtureViaTools(tools, count)
 }
 
 /** A started run over the given tickets. */
@@ -140,10 +120,7 @@ describe('TICKET-0057 omt_run_create', () => {
     await mkdir(join(workspace, '.omt'), { recursive: true })
     const crossPool = new OmtCorePool(globalHome)
     const crossTools = new Map<string, RegisteredTool>()
-    registerOmtTools(
-      { tools: { register(def: RegisteredTool) { crossTools.set(def.name, def) } } } as never,
-      crossPool,
-    )
+    registerOmtTools(stubToolCtx(crossTools) as never, crossPool)
     try {
       const create = crossTools.get('omt_create')!
       const globalEpic = await create.execute({ type: 'epic', title: '全局' }, NO_EXEC)

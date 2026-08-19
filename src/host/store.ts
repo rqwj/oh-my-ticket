@@ -22,8 +22,6 @@ import {
   type RunItemState,
   type RunStatus,
   type Status,
-  isRunItemState,
-  isRunStatus,
 } from './types.ts'
 
 const SCHEMA_VERSION = '3'
@@ -158,7 +156,11 @@ CREATE TABLE IF NOT EXISTS run_items (
   finished_at         TEXT,
   PRIMARY KEY (run_id, node_id)
 );
+CREATE INDEX IF NOT EXISTS idx_run_items_node ON run_items(node_id);
 `
+
+/** Passive observation queries run_items by node_id on every ticket update. */
+const INDEX_RUN_ITEMS_NODE = 'CREATE INDEX IF NOT EXISTS idx_run_items_node ON run_items(node_id)'
 
 export class OmtStore {
   private constructor(private readonly db: DatabaseSync) {}
@@ -182,6 +184,8 @@ export class OmtStore {
     if (!tables.some(table => table.name === 'runs')) {
       db.exec(MIGRATION_V3)
     }
+    // Databases already migrated to v3 before the index existed get it here.
+    db.exec(INDEX_RUN_ITEMS_NODE)
     const store = new OmtStore(db)
     // Bump the version marker of pre-v3 databases (v1 databases carry no
     // marker at all; the core's first-open reindex/mark path handles those).
@@ -226,13 +230,17 @@ export class OmtStore {
     this.setMeta(`counter_${TYPE_PREFIX[type]}`, String(value))
   }
 
-  /** Allocate the next id for a type (`EPIC-0001`, counters independent). */
-  nextId(type: NodeType): string {
-    const prefix = TYPE_PREFIX[type]
+  /** Allocate the next `PREFIX-NNNN` id from the shared meta counter. */
+  private allocateCounterId(prefix: string): string {
     const key = `counter_${prefix}`
     const next = Number(this.getMeta(key) ?? '0') + 1
     this.setMeta(key, String(next))
     return `${prefix}-${String(next).padStart(4, '0')}`
+  }
+
+  /** Allocate the next id for a type (`EPIC-0001`, counters independent). */
+  nextId(type: NodeType): string {
+    return this.allocateCounterId(TYPE_PREFIX[type])
   }
 
   /** After a reindex, move counters past every id seen on disk. */
@@ -255,14 +263,28 @@ export class OmtStore {
     ).run(node.id, node.type, node.title, node.status, node.archived ? 1 : 0, node.priority, node.path, node.created_at, node.updated_at)
   }
 
-  updateNode(id: string, patch: { title?: string; status?: Status; archived?: boolean; priority?: number; path?: string; updated_at?: string }): void {
-    const entries = Object.entries(patch)
-      .filter(([, value]) => value !== undefined)
-      .map(([key, value]) => [key, key === 'archived' ? (value === true ? 1 : 0) : value] as [string, string | number])
+  /**
+   * Shared dynamic-patch UPDATE: undefined values are skipped, every defined
+   * key becomes a `key = ?` assignment. No-op on an empty patch.
+   */
+  private applyPatch(
+    table: 'nodes' | 'runs' | 'run_items',
+    patch: Record<string, string | number | null | undefined>,
+    where: string,
+    ...keys: (string | number)[]
+  ): void {
+    const entries = Object.entries(patch).filter(([, value]) => value !== undefined)
     if (entries.length === 0) return
     const assignments = entries.map(([key]) => `${key} = ?`).join(', ')
-    this.db.prepare(`UPDATE nodes SET ${assignments} WHERE id = ?`)
-      .run(...entries.map(([, value]) => value), id)
+    this.db.prepare(`UPDATE ${table} SET ${assignments} WHERE ${where}`)
+      .run(...entries.map(([, value]) => value as string | number | null), ...keys)
+  }
+
+  updateNode(id: string, patch: { title?: string; status?: Status; archived?: boolean; priority?: number; path?: string; updated_at?: string }): void {
+    // archived is the only boolean column: convert to the stored integer.
+    this.applyPatch('nodes', Object.fromEntries(Object.entries(patch).map(
+      ([key, value]): [string, string | number] => [key, key === 'archived' ? (value === true ? 1 : 0) : (value as string | number)],
+    )), 'id = ?', id)
   }
 
   getNode(id: string): OmtNode | undefined {
@@ -355,10 +377,7 @@ export class OmtStore {
 
   /** Allocate the next run id (`RUN-0001`, counter shared via meta). */
   nextRunId(): string {
-    const key = 'counter_RUN'
-    const next = Number(this.getMeta(key) ?? '0') + 1
-    this.setMeta(key, String(next))
-    return `RUN-${String(next).padStart(4, '0')}`
+    return this.allocateCounterId('RUN')
   }
 
   insertRun(run: OmtRun): void {
@@ -368,11 +387,7 @@ export class OmtStore {
   }
 
   updateRun(id: string, patch: { title?: string | null; status?: RunStatus; finished_at?: string | null }): void {
-    const entries = Object.entries(patch).filter(([, value]) => value !== undefined)
-    if (entries.length === 0) return
-    const assignments = entries.map(([key]) => `${key} = ?`).join(', ')
-    this.db.prepare(`UPDATE runs SET ${assignments} WHERE id = ?`)
-      .run(...entries.map(([, value]) => value as string | null), id)
+    this.applyPatch('runs', patch, 'id = ?', id)
   }
 
   getRun(id: string): OmtRun | undefined {
@@ -411,11 +426,7 @@ export class OmtStore {
     started_at: string | null
     finished_at: string | null
   }>): void {
-    const entries = Object.entries(patch).filter(([, value]) => value !== undefined)
-    if (entries.length === 0) return
-    const assignments = entries.map(([key]) => `${key} = ?`).join(', ')
-    this.db.prepare(`UPDATE run_items SET ${assignments} WHERE run_id = ? AND node_id = ?`)
-      .run(...entries.map(([, value]) => value as string | number | null), runId, nodeId)
+    this.applyPatch('run_items', patch, 'run_id = ? AND node_id = ?', runId, nodeId)
   }
 
   getRunItem(runId: string, nodeId: string): OmtRunItem | undefined {
@@ -431,16 +442,17 @@ export class OmtStore {
   /**
    * Every item for one node across runs in the given statuses (passive
    * observation scans the active runs holding a ticket — EPIC-0003
-   * decision 1 cross-run broadcast).
+   * decision 1 cross-run broadcast). The JOIN also carries the run status
+   * so observers don't re-fetch one run row per item.
    */
-  runItemsForNode(nodeId: string, runStatuses: readonly RunStatus[]): OmtRunItem[] {
+  runItemsForNode(nodeId: string, runStatuses: readonly RunStatus[]): { item: OmtRunItem; runStatus: RunStatus }[] {
     if (runStatuses.length === 0) return []
     const placeholders = runStatuses.map(() => '?').join(', ')
     const rows = this.db.prepare(
-      `SELECT i.* FROM run_items i JOIN runs r ON r.id = i.run_id
+      `SELECT i.*, r.status AS run_status FROM run_items i JOIN runs r ON r.id = i.run_id
        WHERE i.node_id = ? AND r.status IN (${placeholders}) ORDER BY i.run_id`,
-    ).all(nodeId, ...runStatuses) as unknown as RunItemRow[]
-    return rows.map(rowToRunItem)
+    ).all(nodeId, ...runStatuses) as unknown as (RunItemRow & { run_status: string })[]
+    return rows.map(row => ({ item: rowToRunItem(row), runStatus: row.run_status as RunStatus }))
   }
 
   /**
@@ -472,6 +484,14 @@ export class OmtStore {
   listRunItems(runId: string): OmtRunItem[] {
     const rows = this.db.prepare('SELECT * FROM run_items WHERE run_id = ? ORDER BY position, node_id').all(runId) as unknown as RunItemRow[]
     return rows.map(rowToRunItem)
+  }
+
+  /** Per-state member counts for one run (omt_run_list progress; single GROUP BY). */
+  runItemStateCounts(runId: string): { state: RunItemState; count: number }[] {
+    const rows = this.db.prepare(
+      'SELECT state, COUNT(*) AS count FROM run_items WHERE run_id = ? GROUP BY state',
+    ).all(runId) as unknown as { state: string; count: number }[]
+    return rows.map(row => ({ state: row.state as RunItemState, count: row.count }))
   }
 
   /** All runs whose status is one of `statuses` (janitor sweep). */

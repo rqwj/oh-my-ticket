@@ -24,6 +24,7 @@ import {
   RUN_ITEM_FINAL_STATES,
   RUN_ITEM_FAILURE_STATES,
   isNodeType,
+  isRunItemInFlight,
   isRunItemState,
   isStatus,
   type NodeFrontmatter,
@@ -110,7 +111,7 @@ const RUN_TRANSITIONS: Readonly<Record<RunStatus, readonly RunStatus[]>> = {
 /**
  * Legal direct item transitions. Terminal-ish states (done/failed/blocked/
  * skipped/interrupted) have no direct exits — they move only through the
- * dedicated retry (failed/interrupted/stalled pending) and replay
+ * dedicated retry (failed/interrupted/pending) and replay
  * (done/blocked/skipped) paths. Pending additionally allows done/blocked:
  * passive observation (TICKET-0061) must map a ticket directly set to those
  * statuses onto a not-yet-dispatched item, or the run would wedge.
@@ -519,6 +520,13 @@ export class OmtCore {
     return this.store.getRun(id)
   }
 
+  /** Run lookup with the shared NOT_FOUND error (public for tool wrappers). */
+  requireRun(id: string): OmtRun {
+    const run = this.store.getRun(id)
+    if (run === undefined) throw new OmtError('NOT_FOUND', `unknown run: ${id}`)
+    return run
+  }
+
   listRuns(filter: { status?: RunStatus } = {}): OmtRun[] {
     return this.store.listRuns(filter)
   }
@@ -530,6 +538,11 @@ export class OmtCore {
   runItems(runId: string): OmtRunItem[] {
     this.requireRun(runId)
     return this.store.listRunItems(runId)
+  }
+
+  /** Per-state member counts for one run (omt_run_list progress; no existence check). */
+  runItemStateCounts(runId: string): { state: RunItemState; count: number }[] {
+    return this.store.runItemStateCounts(runId)
   }
 
   /** start: pending → running; an empty run derives completed immediately. */
@@ -578,7 +591,7 @@ export class OmtCore {
     if (item === undefined) throw new OmtError('NOT_FOUND', `run ${runId} has no item for node: ${nodeId}`)
 
     if (run.status === 'paused') {
-      if (item.state !== 'running' && item.state !== 'awaiting_confirmation') {
+      if (!isRunItemInFlight(item.state)) {
         throw new OmtError('CONFLICT', `run ${runId} is paused; dispatch is stopped (item ${nodeId} is ${item.state})`)
       }
     } else if (run.status !== 'running') {
@@ -605,8 +618,8 @@ export class OmtCore {
   }
 
   /**
-   * Retry (decision 10): reset a failed / interrupted / stalled-pending item
-   * back to pending in place — attempts+1, last_error kept, nudge budget
+   * Retry (decision 10): reset a failed / interrupted / pending (stalled)
+   * item back to pending in place — attempts+1, last_error kept, nudge budget
    * cleared (the new attempt gets a fresh one), executor/timestamps cleared.
    * Retrying inside a completed_with_failures run reopens it to running;
    * canceled (and fully completed) runs accept no retry (TICKET-0055 #6).
@@ -619,7 +632,7 @@ export class OmtCore {
     const item = this.store.getRunItem(runId, nodeId)
     if (item === undefined) throw new OmtError('NOT_FOUND', `run ${runId} has no item for node: ${nodeId}`)
     if (item.state !== 'failed' && item.state !== 'interrupted' && item.state !== 'pending') {
-      throw new OmtError('CONFLICT', `only failed/interrupted/stalled-pending items can retry (${nodeId} is ${item.state})`)
+      throw new OmtError('CONFLICT', `only failed/interrupted/pending items can retry (${nodeId} is ${item.state})`)
     }
     this.store.updateRunItem(runId, nodeId, {
       state: 'pending',
@@ -724,7 +737,7 @@ export class OmtCore {
     this.requireRun(runId)
     const item = this.store.getRunItem(runId, nodeId)
     if (item === undefined) throw new OmtError('NOT_FOUND', `run ${runId} has no item for node: ${nodeId}`)
-    if (item.state === 'running' || item.state === 'awaiting_confirmation') {
+    if (isRunItemInFlight(item.state)) {
       throw new OmtError('CONFLICT', `item ${nodeId} is ${item.state} (in-flight); it cannot be removed`)
     }
     this.store.deleteRunItem(runId, nodeId)
@@ -750,20 +763,30 @@ export class OmtCore {
     }
     const item = this.store.getRunItem(runId, nodeId)
     if (item === undefined) throw new OmtError('NOT_FOUND', `run ${runId} has no item for node: ${nodeId}`)
-    if (item.state !== 'running' && item.state !== 'awaiting_confirmation') {
+    if (!isRunItemInFlight(item.state)) {
       throw new OmtError('CONFLICT', `only in-flight items can report (${nodeId} is ${item.state})`)
     }
 
-    if (note !== undefined && note.trim() !== '') {
-      await this.update({ id: nodeId, append: note })
+    const noteText = note !== undefined && note.trim() !== '' ? note : undefined
+    if (outcome === 'failed') {
+      // failed touches only the item (the node enum has no failed — the
+      // ticket stays in_progress); the note is appended and kept in
+      // last_error.
+      if (noteText !== undefined) await this.update({ id: nodeId, append: noteText })
+      const transitioned = await this.transitionItem(runId, nodeId, outcome, {
+        ...(noteText !== undefined ? { error: noteText } : {}),
+      })
+      return { item: transitioned, node: this.requireNode(nodeId) }
     }
-    const transitioned = await this.transitionItem(runId, nodeId, outcome, {
-      ...(outcome === 'failed' && note !== undefined && note.trim() !== '' ? { error: note } : {}),
+    const transitioned = await this.transitionItem(runId, nodeId, outcome)
+    // done/blocked/skipped double-write the ticket: note append and status
+    // land in one update (one read/write of the node file).
+    const updated = await this.update({
+      id: nodeId,
+      ...(noteText !== undefined ? { append: noteText } : {}),
+      status: outcome,
     })
-    if (outcome !== 'failed') {
-      await this.update({ id: nodeId, status: outcome })
-    }
-    return { item: transitioned, node: this.requireNode(nodeId) }
+    return { item: transitioned, node: updated }
   }
 
   /**
@@ -783,13 +806,17 @@ export class OmtCore {
    * ownership. Returns the items actually advanced (hook reuse).
    */
   async observeNodeStatus(nodeId: string, change: ObservedNodeChange, executorSessionId?: string): Promise<OmtRunItem[]> {
+    // Title/body/append-only updates cannot affect any run: skip the scan.
+    if (change.archived !== true && change.status === undefined) return []
     const advanced: OmtRunItem[] = []
-    for (const item of this.store.runItemsForNode(nodeId, ['running', 'paused'])) {
-      const run = this.requireRun(item.run_id)
-      const inFlight = item.state === 'running' || item.state === 'awaiting_confirmation'
+    for (const { item, runStatus } of this.store.runItemsForNode(nodeId, ['running', 'paused'])) {
+      const inFlight = isRunItemInFlight(item.state)
+      // In-flight items always advance; pending items only while the run
+      // dispatches (pause stops dispatch, decision 9).
+      const advance = inFlight || (item.state === 'pending' && runStatus === 'running')
 
       if (change.archived === true) {
-        if (inFlight || (item.state === 'pending' && run.status === 'running')) {
+        if (advance) {
           advanced.push(await this.transitionItem(item.run_id, nodeId, 'skipped'))
         }
         continue
@@ -798,14 +825,14 @@ export class OmtCore {
         case 'in_progress':
           // Dispatch only — a claimed (already running) item is left alone,
           // so its executor attribution is never overwritten.
-          if (item.state === 'pending' && run.status === 'running') {
+          if (item.state === 'pending' && runStatus === 'running') {
             advanced.push(await this.transitionItem(item.run_id, nodeId, 'running', { executorSessionId }))
           }
           break
         case 'done':
         case 'blocked':
         case 'skipped':
-          if (inFlight || (item.state === 'pending' && run.status === 'running')) {
+          if (advance) {
             advanced.push(await this.transitionItem(item.run_id, nodeId, change.status))
           }
           break
@@ -820,7 +847,6 @@ export class OmtCore {
     }
     return advanced
   }
-
 
   /**
    * Startup janitor (decision 12): demote orphaned in-flight work. Item
@@ -848,14 +874,12 @@ export class OmtCore {
     for (const run of candidates) {
       if (run.status !== 'running') continue
       const items = this.store.listRunItems(run.id)
-      const hasLiveExecution = items.some(
-        item => item.state === 'running' && item.executor_session_id !== undefined && isSessionActive(item.executor_session_id),
-      )
-      if (hasLiveExecution) continue
-      if (items.length > 0 && items.every(item => RUN_ITEM_FINAL_STATES.includes(item.state))) {
-        // The demotion finished the last in-flight item: derive instead.
-        this.deriveRunTerminal(run.id)
-      } else {
+      // After the demotion loop, any item still running has a live executor.
+      if (items.some(item => item.state === 'running')) continue
+      // The demotion may have finished the last in-flight item: derive the
+      // terminal state instead of interrupting (deriveRunTerminal owns the
+      // all-final precondition).
+      if (!this.deriveRunTerminal(run.id)) {
         this.setRunStatus(run.id, 'interrupted')
         interruptedRuns.push(run.id)
       }
@@ -864,12 +888,6 @@ export class OmtCore {
   }
 
   // ── internals ────────────────────────────────────────────────────────
-
-  private requireRun(id: string): OmtRun {
-    const run = this.store.getRun(id)
-    if (run === undefined) throw new OmtError('NOT_FOUND', `unknown run: ${id}`)
-    return run
-  }
 
   /** Validated run status change; finished_at tracks absolute terminal states. */
   private setRunStatus(id: string, to: RunStatus): void {
@@ -889,14 +907,16 @@ export class OmtCore {
    * Terminal derivation (decision 7): once every item is final — all
    * done/skipped → completed; any failed/interrupted (or blocked, which is
    * likewise not a success) → completed_with_failures. Runs have no failed.
+   * Returns true when a terminal status was derived.
    */
-  private deriveRunTerminal(id: string): void {
+  private deriveRunTerminal(id: string): boolean {
     const run = this.requireRun(id)
-    if (run.status !== 'running' && run.status !== 'paused') return
+    if (run.status !== 'running' && run.status !== 'paused') return false
     const items = this.store.listRunItems(id)
-    if (items.some(item => !RUN_ITEM_FINAL_STATES.includes(item.state))) return
+    if (items.some(item => !RUN_ITEM_FINAL_STATES.includes(item.state))) return false
     const failed = items.some(item => RUN_ITEM_FAILURE_STATES.includes(item.state))
     this.setRunStatus(id, failed ? 'completed_with_failures' : 'completed')
+    return true
   }
 
   private requireNode(id: string): OmtNode {

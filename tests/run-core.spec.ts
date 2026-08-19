@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { OmtCore } from '../src/host/core.ts'
 import { OmtStore } from '../src/host/store.ts'
 import { OmtError } from '../src/host/types.ts'
+import { ticketFixture } from './mocks/fixtures.ts'
 
 let home: string
 let core: OmtCore
@@ -25,20 +26,14 @@ afterEach(async () => {
   await rm(home, { recursive: true, force: true })
 })
 
-/** Standard fixture: epic → story → three tickets. */
-async function ticketFixture(count = 3) {
-  const epic = await core.create({ type: 'epic', title: '批量' })
-  const story = await core.create({ type: 'story', title: '批次', parentId: epic.id })
-  const tickets = []
-  for (let index = 0; index < count; index += 1) {
-    tickets.push(await core.create({ type: 'ticket', title: `任务${index + 1}`, parentId: story.id }))
-  }
-  return tickets
+/** Standard fixture: epic → story → `count` tickets (shared helper). */
+function fixture(count = 3) {
+  return ticketFixture(core, count)
 }
 
 describe('createRun', () => {
   it('creates a run with pending items ordered by position', async () => {
-    const tickets = await ticketFixture()
+    const tickets = await fixture()
     const run = await core.createRun({ title: '第一批次', nodeIds: tickets.map(t => t.id) })
 
     expect(run.id).toBe('RUN-0001')
@@ -53,7 +48,7 @@ describe('createRun', () => {
   })
 
   it('rejects unknown members, duplicates, and unknown run ids', async () => {
-    const [ticket] = await ticketFixture(1)
+    const [ticket] = await fixture(1)
     await expect(core.createRun({ nodeIds: ['TICKET-9999'] })).rejects.toThrow(OmtError)
     await expect(core.createRun({ nodeIds: [ticket.id, ticket.id] })).rejects.toThrow(/duplicate/i)
     await expect(core.createRun({ nodeIds: [], config: { concurrency: 0 } })).rejects.toThrow(/concurrency/)
@@ -63,7 +58,7 @@ describe('createRun', () => {
 
 describe('run state machine', () => {
   it('walks pending → running → paused → running and rejects illegal moves', async () => {
-    const tickets = await ticketFixture()
+    const tickets = await fixture()
     const run = await core.createRun({ nodeIds: tickets.map(t => t.id) })
 
     // pending: only start/cancel are legal.
@@ -83,7 +78,7 @@ describe('run state machine', () => {
   })
 
   it('rejects every transition out of absolute terminal states', async () => {
-    const tickets = await ticketFixture(1)
+    const tickets = await fixture(1)
     const run = await core.createRun({ nodeIds: tickets.map(t => t.id) })
     await core.startRun(run.id)
     await core.transitionItem(run.id, tickets[0]!.id, 'running')
@@ -105,7 +100,7 @@ describe('run state machine', () => {
 
 describe('item state machine', () => {
   it('walks pending → running → done with executor and timestamps', async () => {
-    const [ticket] = await ticketFixture(1)
+    const [ticket] = await fixture(1)
     const run = await core.createRun({ nodeIds: [ticket.id] })
     await core.startRun(run.id)
 
@@ -120,7 +115,7 @@ describe('item state machine', () => {
   })
 
   it('rejects illegal item transitions and unknown states', async () => {
-    const [a, b] = await ticketFixture(2)
+    const [a, b] = await fixture(2)
     const run = await core.createRun({ nodeIds: [a!.id, b!.id] })
     await core.startRun(run.id)
 
@@ -145,7 +140,7 @@ describe('item state machine', () => {
   })
 
   it('supports running → awaiting_confirmation → done', async () => {
-    const [ticket] = await ticketFixture(1)
+    const [ticket] = await fixture(1)
     const run = await core.createRun({ nodeIds: [ticket.id] })
     await core.startRun(run.id)
     await core.transitionItem(run.id, ticket.id, 'running', { executorSessionId: 'sess-1' })
@@ -160,7 +155,7 @@ describe('item state machine', () => {
 
 describe('terminal derivation', () => {
   it('all done/skipped → completed', async () => {
-    const [a, b, c] = await ticketFixture()
+    const [a, b, c] = await fixture()
     const run = await core.createRun({ nodeIds: [a!.id, b!.id, c!.id] })
     await core.startRun(run.id)
     await core.transitionItem(run.id, a!.id, 'running')
@@ -176,7 +171,7 @@ describe('terminal derivation', () => {
   })
 
   it('a failed item → completed_with_failures', async () => {
-    const [a, b] = await ticketFixture(2)
+    const [a, b] = await fixture(2)
     const run = await core.createRun({ nodeIds: [a!.id, b!.id] })
     await core.startRun(run.id)
     await core.transitionItem(run.id, a!.id, 'running')
@@ -188,7 +183,7 @@ describe('terminal derivation', () => {
   })
 
   it('an interrupted item counts as failure → completed_with_failures', async () => {
-    const [a, b] = await ticketFixture(2)
+    const [a, b] = await fixture(2)
     const run = await core.createRun({ nodeIds: [a!.id, b!.id] })
     await core.startRun(run.id)
     await core.transitionItem(run.id, a!.id, 'running', { executorSessionId: 'sess-dead' })
@@ -201,7 +196,7 @@ describe('terminal derivation', () => {
 
 describe('boundary semantics (TICKET-0055)', () => {
   it('stop-on-failure: only failed pauses the run; blocked/skipped do not', async () => {
-    const [a, b, c, d] = await ticketFixture(4)
+    const [a, b, c, d] = await fixture(4)
     const run = await core.createRun({ config: { stopOnFailure: true }, nodeIds: [a!.id, b!.id, c!.id, d!.id] })
     await core.startRun(run.id)
 
@@ -222,7 +217,7 @@ describe('boundary semantics (TICKET-0055)', () => {
   })
 
   it('pause stops dispatch but in-flight items keep advancing', async () => {
-    const [a, b] = await ticketFixture(2)
+    const [a, b] = await fixture(2)
     const run = await core.createRun({ nodeIds: [a!.id, b!.id] })
     await core.startRun(run.id)
     await core.transitionItem(run.id, a!.id, 'running', { executorSessionId: 'sess-1' })
@@ -237,7 +232,7 @@ describe('boundary semantics (TICKET-0055)', () => {
   })
 
   it('retry resets failed/interrupted/stalled items in place and clears the nudge budget', async () => {
-    const [a, b] = await ticketFixture(2)
+    const [a, b] = await fixture(2)
     const run = await core.createRun({ nodeIds: [a!.id, b!.id] })
     await core.startRun(run.id)
     await core.transitionItem(run.id, a!.id, 'running', { executorSessionId: 'sess-1' })
@@ -270,7 +265,7 @@ describe('boundary semantics (TICKET-0055)', () => {
   })
 
   it('replay returns done/blocked/skipped items to pending, keeping position', async () => {
-    const [a, b, c, d] = await ticketFixture(4)
+    const [a, b, c, d] = await fixture(4)
     const run = await core.createRun({ nodeIds: [a!.id, b!.id, c!.id, d!.id] })
     await core.startRun(run.id)
     await core.transitionItem(run.id, a!.id, 'running')
@@ -296,7 +291,7 @@ describe('boundary semantics (TICKET-0055)', () => {
   })
 
   it('resume after stop-on-failure skips the failed item and continues dispatch', async () => {
-    const [a, b] = await ticketFixture(2)
+    const [a, b] = await fixture(2)
     const run = await core.createRun({ config: { stopOnFailure: true }, nodeIds: [a!.id, b!.id] })
     await core.startRun(run.id)
     await core.transitionItem(run.id, a!.id, 'running')
@@ -313,7 +308,7 @@ describe('boundary semantics (TICKET-0055)', () => {
   })
 
   it('cancel freezes items in place and never touches the ticket nodes', async () => {
-    const [a, b] = await ticketFixture(2)
+    const [a, b] = await fixture(2)
     const run = await core.createRun({ nodeIds: [a!.id, b!.id] })
     await core.startRun(run.id)
     await core.update({ id: a!.id, status: 'in_progress' })
@@ -337,7 +332,7 @@ describe('boundary semantics (TICKET-0055)', () => {
 
 describe('startup janitor (TICKET-0056)', () => {
   it('demotes crash residue (running run/items) to interrupted on reopen', async () => {
-    const [a, b] = await ticketFixture(2)
+    const [a, b] = await fixture(2)
     const run = await core.createRun({ nodeIds: [a!.id, b!.id] })
     await core.startRun(run.id)
     await core.transitionItem(run.id, a!.id, 'running', { executorSessionId: 'sess-dead' })
@@ -372,7 +367,7 @@ describe('startup janitor (TICKET-0056)', () => {
   })
 
   it('keeps items whose executor session is still active', async () => {
-    const [a, b, c] = await ticketFixture()
+    const [a, b, c] = await fixture()
     const run = await core.createRun({ nodeIds: [a!.id, b!.id, c!.id] })
     await core.startRun(run.id)
     await core.transitionItem(run.id, a!.id, 'running', { executorSessionId: 'sess-alive' })
@@ -389,7 +384,7 @@ describe('startup janitor (TICKET-0056)', () => {
   })
 
   it('paused runs stay paused; only their orphaned running items are demoted', async () => {
-    const [a, b] = await ticketFixture(2)
+    const [a, b] = await fixture(2)
     const run = await core.createRun({ nodeIds: [a!.id, b!.id] })
     await core.startRun(run.id)
     await core.transitionItem(run.id, a!.id, 'running', { executorSessionId: 'sess-dead' })
@@ -404,7 +399,7 @@ describe('startup janitor (TICKET-0056)', () => {
   })
 
   it('derives the terminal state when the demotion finishes the last item', async () => {
-    const [a, b] = await ticketFixture(2)
+    const [a, b] = await fixture(2)
     const run = await core.createRun({ nodeIds: [a!.id, b!.id] })
     await core.startRun(run.id)
     await core.transitionItem(run.id, a!.id, 'running')
@@ -420,7 +415,7 @@ describe('startup janitor (TICKET-0056)', () => {
   })
 
   it('reindex never touches run data', async () => {
-    const [a, b] = await ticketFixture(2)
+    const [a, b] = await fixture(2)
     const run = await core.createRun({ nodeIds: [a!.id, b!.id] })
     await core.startRun(run.id)
     await core.transitionItem(run.id, a!.id, 'running', { executorSessionId: 'sess-1' })

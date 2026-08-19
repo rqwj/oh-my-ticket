@@ -9,9 +9,9 @@ import type { Context } from '@deepseek-ai/cordis'
 import { defineTool, type ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { RUN_REPORT_OUTCOMES, type OmtCore, type ReindexResult, type ReportResult, type ShowResult } from './core.ts'
 import type { OmtCorePool } from './pool.ts'
-import type { RunningRegistry } from './running.ts'
+import { endsExecution, type RunningRegistry } from './running.ts'
 import { stripChildrenBlock } from './markdown.ts'
-import { isRunItemStalled, NODE_TYPES, RUN_ITEM_STATES, RUN_STATUSES, STATUSES, type OmtNode, type OmtRun, type OmtRunItem, type RunItemState } from './types.ts'
+import { isRunItemStalled, NODE_TYPES, RUN_ITEM_STATES, RUN_STATUSES, STATUSES, type OmtNode, type OmtRun, type OmtRunItem } from './types.ts'
 
 const NODE_SCHEMA = {
   type: 'object',
@@ -195,6 +195,11 @@ function coreOf(pool: OmtCorePool, exec: ToolRunContext) {
   return pool.coreFor(exec.agent?.session.header.cwd)
 }
 
+/** Resolve the core owning a run id (caller's workspace disambiguates). */
+function runCoreOf(pool: OmtCorePool, exec: ToolRunContext, id: string) {
+  return pool.coreForRun(id, exec.agent?.session.header.cwd)
+}
+
 /** Structural ctx.userQuestions face (UI-backed ask service). */
 interface UserQuestionsLike {
   ask(request: {
@@ -271,7 +276,7 @@ export function registerOmtTools(
     if (running === undefined) return
     if (status === 'in_progress') running.start(id, sessionOf(exec) ?? '', labelOf(exec))
     // done/blocked/skipped/archive all end active execution: clear the mark.
-    if (status === 'done' || status === 'blocked' || status === 'skipped' || archived === true) running.stop(id)
+    if (endsExecution(status, archived)) running.stop(id)
   }
   ctx.tools.register(defineTool({
     name: 'omt_create',
@@ -516,10 +521,10 @@ export function registerOmtTools(
       const cwd = exec.agent?.session.header.cwd
       // Single-home rule (decision 2): every member must resolve to the
       // same owning home — resolve by ownership, not by caller cwd.
+      // Membership itself is validated by core.createRun (requireNode).
       let core: OmtCore | undefined
       for (const nodeId of args.nodeIds) {
         const owner = await pool.coreForNode(nodeId, cwd)
-        if (owner.getNode(nodeId) === undefined) throw new Error(`omt_run_create: 未知节点 ${nodeId}`)
         core ??= owner
         if (owner.home !== core.home) {
           throw new Error(`omt_run_create 的成员必须同属一个 OMT home（${nodeId} 属于 ${owner.home}，与 ${core.home} 不同）`)
@@ -568,9 +573,10 @@ export function registerOmtTools(
       const core = await coreOf(pool, exec)
       return core.listRuns({ status: args.status }).map(run => {
         const progress: Record<string, number> = { total: 0, ...Object.fromEntries(RUN_ITEM_STATES.map(state => [state, 0])) }
-        for (const item of core.runItems(run.id)) {
-          progress.total += 1
-          progress[item.state] = (progress[item.state] ?? 0) + 1
+        // One GROUP BY per run (runs come from listRuns, so no re-validation).
+        for (const { state, count } of core.runItemStateCounts(run.id)) {
+          progress.total += count
+          progress[state] = count
         }
         return { run: runValue(run), progress }
       })
@@ -598,10 +604,10 @@ export function registerOmtTools(
       }],
     },
     async execute(args, exec) {
-      const core = await pool.coreForRun(args.id, exec.agent?.session.header.cwd)
+      const core = await runCoreOf(pool, exec, args.id)
       // runItems throws NOT_FOUND for unknown runs (consistent error path).
       const items = core.runItems(args.id).map(item => runItemValue(item, core.getNode(item.node_id)?.title))
-      return { run: runValue(core.getRun(args.id) as OmtRun), items }
+      return { run: runValue(core.requireRun(args.id)), items }
     },
   }))
 
@@ -632,20 +638,21 @@ export function registerOmtTools(
       }],
     },
     async execute(args, exec) {
-      const core = await pool.coreForRun(args.id, exec.agent?.session.header.cwd)
+      const core = await runCoreOf(pool, exec, args.id)
+      let run: OmtRun | undefined
       let item: OmtRunItem | undefined
       switch (args.action as string) {
         case 'start':
-          await core.startRun(args.id)
+          run = await core.startRun(args.id)
           break
         case 'pause':
-          await core.pauseRun(args.id)
+          run = await core.pauseRun(args.id)
           break
         case 'resume':
-          await core.resumeRun(args.id)
+          run = await core.resumeRun(args.id)
           break
         case 'cancel':
-          await core.cancelRun(args.id)
+          run = await core.cancelRun(args.id)
           break
         case 'retry':
           if (args.nodeId === undefined) throw new Error('omt_run_control retry 需要 nodeId（指定要重试的成员）')
@@ -660,7 +667,7 @@ export function registerOmtTools(
       }
       changed?.(core.home)
       return {
-        run: runValue(core.getRun(args.id) as OmtRun),
+        run: runValue(run ?? core.requireRun(args.id)),
         ...(item !== undefined ? { item: runItemValue(item, core.getNode(item.node_id)?.title) } : {}),
       }
     },
@@ -698,7 +705,7 @@ export function registerOmtTools(
       if (sessionId === undefined) {
         throw new Error('omt_run_claim 需要执行者会话：agent-less 调用不可认领（无从绑定 executor）')
       }
-      const core = await pool.coreForRun(args.id, exec.agent?.session.header.cwd)
+      const core = await runCoreOf(pool, exec, args.id)
       const item = await core.claimRunItem(args.id, sessionId)
       changed?.(core.home)
       if (item === undefined) return { run_id: args.id, claimed: false }
@@ -740,14 +747,14 @@ export function registerOmtTools(
       }],
     },
     async execute(args, exec) {
-      const core = await pool.coreForRun(args.id, exec.agent?.session.header.cwd)
+      const core = await runCoreOf(pool, exec, args.id)
       const result: ReportResult = await core.reportRunItem(args.id, args.nodeId, args.outcome, args.note)
       // A report concludes the current execution: clear the running mark
       // (failed keeps the ticket in_progress; a retry re-marks it).
       running?.stop(args.nodeId)
       changed?.(core.home)
       return {
-        run: runValue(core.getRun(args.id) as OmtRun),
+        run: runValue(core.requireRun(args.id)),
         item: runItemValue(result.item, result.node.title),
         node: nodeValue(result.node),
       }

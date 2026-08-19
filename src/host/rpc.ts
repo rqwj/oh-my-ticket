@@ -16,7 +16,7 @@ import type { RpcResult } from '@deepseek-ai/dsh-host-apiproxy/api'
 import type { OmtCorePool } from './pool.ts'
 import type { ChangeHub } from './changes.ts'
 import type { RecentRegistry } from './recent.ts'
-import type { RunningRegistry } from './running.ts'
+import { endsExecution, type RunningRegistry } from './running.ts'
 import { OmtError, STATUSES, type OmtNode, type OmtTreeNode } from './types.ts'
 
 /** Structural ctx.agents face: sessionId → agent → session header cwd. */
@@ -134,7 +134,7 @@ export function registerOmtRpc(ctx: Context, pool: OmtCorePool, recent?: RecentR
           // Manual status changes never START a running mark — execution is
           // claimed only by the execute endpoint and model tool calls
           // (TICKET-0028). Done/blocked/skipped/archive always clear it.
-          if (status === 'done' || status === 'blocked' || status === 'skipped' || archived === true) running?.stop(parsed.data.id)
+          if (endsExecution(status, archived)) running?.stop(parsed.data.id)
           // Passive observation (TICKET-0061): advance the matching items of
           // every active run holding this node.
           await core.observeNodeStatus(parsed.data.id, { status, archived }, parsed.data.sessionId)

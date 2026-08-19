@@ -149,10 +149,12 @@ run 是 ticket 的批量执行机制：一次做完一批 ticket，有队列、�
 
 ## 信任策略
 
-run item 处于 running 时，如果**未经 omt_run_report** 直接用 omt_update 把
-ticket 落 done，item 会进 \`awaiting_confirmation\` 等待人工确认——这是
-机械分流，不是错误。正确做法：完成时先 omt_run_report（显式报告直接落
-done）；看到 awaiting_confirmation 时**不要重复声明**，等人确认即可。
+当前版本：run item 处于 running 时，即使**未经 omt_run_report** 直接用
+omt_update 把 ticket 落 done，被动观察也会让 item 同步落 done——直接生效，
+不设确认环节。但正确做法仍是完成时先 omt_run_report（显式报告，note 一并
+记入 ticket 进度），不要依赖被动观察兜底。item 状态机中的
+\`awaiting_confirmation\` 信任门（未经 report 的完成先等人确认）是预留状态，
+将随后续版本落地；当前没有任何路径会进入它。
 
 ## 边界
 

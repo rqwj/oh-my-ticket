@@ -15,6 +15,7 @@ import { registerOmtIdleHook } from '../src/host/idle-hook.ts'
 import { OmtCorePool } from '../src/host/pool.ts'
 import { RunningRegistry } from '../src/host/running.ts'
 import { isRunItemStalled, NUDGE_BUDGET, type OmtRun, type OmtRunItem, type RunConfig } from '../src/host/types.ts'
+import { requireItem, ticketFixture } from './mocks/fixtures.ts'
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -77,23 +78,16 @@ function texts(): string[] {
 
 /** Two-ticket run, started, first item claimed+reported done by `sessionId`. */
 async function runFixture(sessionId: string, config?: Partial<RunConfig>): Promise<{ run: OmtRun; ticketIds: string[] }> {
-  const epic = await core.create({ type: 'epic', title: '批量' })
-  const story = await core.create({ type: 'story', title: '批次', parentId: epic.id })
-  const tickets = [
-    await core.create({ type: 'ticket', title: '任务一', parentId: story.id }),
-    await core.create({ type: 'ticket', title: '任务二', parentId: story.id }),
-  ]
+  const tickets = await ticketFixture(core, 2)
   const run = await core.createRun({ nodeIds: tickets.map(ticket => ticket.id), ...(config !== undefined ? { config } : {}) })
   await core.startRun(run.id)
   await core.claimRunItem(run.id, sessionId)
-  await core.reportRunItem(run.id, tickets[0].id, 'done')
+  await core.reportRunItem(run.id, tickets[0]!.id, 'done')
   return { run, ticketIds: tickets.map(ticket => ticket.id) }
 }
 
 function itemOf(runId: string, nodeId: string): OmtRunItem {
-  const item = core.getRunItem(runId, nodeId)
-  expect(item).toBeDefined()
-  return item as OmtRunItem
+  return requireItem(core, runId, nodeId)
 }
 
 beforeEach(async () => {

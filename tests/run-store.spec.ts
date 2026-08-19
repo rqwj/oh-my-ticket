@@ -157,5 +157,6 @@ describe('reindex protection', () => {
     expect(store.getRun('RUN-0001')).toMatchObject({ status: 'running' })
     expect(store.getRunItem('RUN-0001', 'TICKET-0001')).toMatchObject({ state: 'running', executor_session_id: 'sess-1' })
     // The RUN counter is not a node counter: reindex must not reset it.
-    expect(store.nextRunId()).toBe('RUN-0002')  })
+    expect(store.nextRunId()).toBe('RUN-0002')
+  })
 })

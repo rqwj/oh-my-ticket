@@ -86,22 +86,32 @@ export class OmtCorePool {
   }
 
   /**
+   * Shared ownership resolution: workspace home (when present) first, then
+   * global; the first core where `contains` holds wins. When no home
+   * contains the id, the fallback core is returned so the caller's
+   * NOT_FOUND error path stays consistent (homes is never empty — the
+   * global home is always included).
+   */
+  private async coreForId(id: string, cwd: string | undefined, contains: (core: OmtCore, id: string) => boolean): Promise<OmtCore> {
+    const homes = this.candidateHomes(cwd)
+    let fallback: OmtCore | undefined
+    for (const home of homes) {
+      const core = await this.coreForHome(home)
+      fallback ??= core
+      if (contains(core, id)) return core
+    }
+    return fallback as OmtCore
+  }
+
+  /**
    * Resolve the core CONTAINING a node id: workspace home (when present)
    * first, then global. Child nodes must live in their parent's home, so
    * id-addressed operations route by ownership rather than by cwd. When no
    * home contains the id, the default-resolution core is returned so the
    * caller's NOT_FOUND error path stays consistent.
    */
-  async coreForNode(id: string, cwd: string | undefined): Promise<OmtCore> {
-    const homes = this.candidateHomes(cwd)
-    let fallback: OmtCore | undefined
-    for (const home of homes) {
-      const core = await this.coreForHome(home)
-      fallback ??= core
-      if (core.getNode(id) !== undefined) return core
-    }
-    // homes is never empty (globalHome always included).
-    return fallback as OmtCore
+  coreForNode(id: string, cwd: string | undefined): Promise<OmtCore> {
+    return this.coreForId(id, cwd, (core, nodeId) => core.getNode(nodeId) !== undefined)
   }
 
   /**
@@ -111,16 +121,8 @@ export class OmtCorePool {
    * disambiguates). When no home contains the id, the fallback core is
    * returned so the caller's NOT_FOUND path stays consistent.
    */
-  async coreForRun(id: string, cwd: string | undefined): Promise<OmtCore> {
-    const homes = this.candidateHomes(cwd)
-    let fallback: OmtCore | undefined
-    for (const home of homes) {
-      const core = await this.coreForHome(home)
-      fallback ??= core
-      if (core.getRun(id) !== undefined) return core
-    }
-    // homes is never empty (globalHome always included).
-    return fallback as OmtCore
+  coreForRun(id: string, cwd: string | undefined): Promise<OmtCore> {
+    return this.coreForId(id, cwd, (core, runId) => core.getRun(runId) !== undefined)
   }
 
   /** Close every open core (tests and plugin teardown). */

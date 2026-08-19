@@ -10,14 +10,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { OmtCore } from '../src/host/core.ts'
 import { OmtCorePool } from '../src/host/pool.ts'
 import { registerOmtTools } from '../src/host/tools.ts'
-
-/* eslint-disable @typescript-eslint/no-explicit-any */
-
-interface RegisteredTool {
-  name: string
-  execute: (args: any, exec?: any) => Promise<any>
-  output: { render: (args: any, value: any) => { type: string; text?: string }[] }
-}
+import { renderToolText, stubToolCtx, type RegisteredTool } from './mocks/registered-tool.ts'
 
 let home: string
 let core: OmtCore
@@ -27,14 +20,7 @@ beforeEach(async () => {
   home = await mkdtemp(join(tmpdir(), 'omt-tools-test-'))
   core = await OmtCore.open(home)
   tools = new Map()
-  const stubCtx = {
-    tools: {
-      register(def: RegisteredTool) {
-        tools.set(def.name, def)
-      },
-    },
-  }
-  registerOmtTools(stubCtx as never, new OmtCorePool(home))
+  registerOmtTools(stubToolCtx(tools) as never, new OmtCorePool(home))
 })
 
 afterEach(async () => {
@@ -43,9 +29,7 @@ afterEach(async () => {
 })
 
 function renderText(toolName: string, args: unknown, value: unknown): string {
-  const tool = tools.get(toolName)
-  expect(tool).toBeDefined()
-  return tool!.output.render(args, value).map(block => block.text ?? '').join('\n')
+  return renderToolText(tools, toolName, args, value)
 }
 
 it('registers the omt_* node tools and the omt_run_* family', () => {
