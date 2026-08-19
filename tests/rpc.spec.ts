@@ -78,6 +78,30 @@ it('get folds unknown ids into an error result', async () => {
   expect(result.error.message).toContain('NOT_FOUND')
 })
 
+it('update accepts a full body replace', async () => {
+  const result = await handler('update', { id: 'TICKET-0001', body: '全新正文' }, new AbortController().signal)
+  expect(result.ok).toBe(true)
+  const shown = await handler('get', { id: 'TICKET-0001' }, new AbortController().signal)
+  expect(shown.value.body).toContain('全新正文')
+  expect(shown.value.body).not.toContain('OAuth')
+})
+
+it('get returns ancestors from root to parent', async () => {
+  const result = await handler('get', { id: 'TICKET-0001' }, new AbortController().signal)
+  expect(result.value.ancestors.map((n: { id: string }) => n.id)).toEqual(['EPIC-0001', 'STORY-0001'])
+  const root = await handler('get', { id: 'EPIC-0001' }, new AbortController().signal)
+  expect(root.value.ancestors).toEqual([])
+})
+
+it('create adds a legal child and a root epic', async () => {
+  const child = await handler('create', { type: 'ticket', title: '新票', parentId: 'STORY-0001' }, new AbortController().signal)
+  expect(child.ok).toBe(true)
+  expect(child.value.type).toBe('ticket')
+  const epic = await handler('create', { type: 'epic', title: '新史诗' }, new AbortController().signal)
+  expect(epic.ok).toBe(true)
+  expect(epic.value.type).toBe('epic')
+})
+
 it('update accepts title and priority', async () => {
   const result = await handler('update', { id: 'TICKET-0001', title: '登录接口 v2', priority: 2 }, new AbortController().signal)
   expect(result.ok).toBe(true)

@@ -22,6 +22,8 @@ export interface TicketTabProps {
   readonly reindex: (sessionId?: string) => void
   readonly select: (id: string, sessionId?: string) => void
   readonly archive: (id: string, sessionId?: string) => void
+  readonly createNode: import('./TicketPanel.tsx').TicketPanelProps['createNode']
+  readonly expandIds: (ids: readonly string[]) => void
   /** Pop-out seats: switch the overlay to float mode and open it. */
   readonly setPanelMode: (mode: PanelMode) => void
   readonly openPanel: (sessionId?: string) => void
@@ -43,6 +45,8 @@ export function TicketTab(props: TicketTabProps) {
         reindex={props.reindex}
         select={props.select}
         archive={props.archive}
+        createNode={props.createNode}
+        expandIds={props.expandIds}
         sessionId={sessionId}
         headerActions={
           <button

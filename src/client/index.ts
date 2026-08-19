@@ -92,6 +92,8 @@ export function apply(ctx: ClientContextLike): void {
     reindex: controller.reindex,
     select: controller.select,
     archive: (id: string, sessionId?: string) => controller.setArchived(id, true, sessionId),
+    createNode: controller.createNode,
+    expandIds: controller.expandIds,
   })
 
   // Left side drawer (frame-wide overlay).
@@ -138,6 +140,8 @@ export function apply(ctx: ClientContextLike): void {
           reindex: controller.reindex,
           select: controller.select,
           archive: (id: string, sessionId?: string) => controller.setArchived(id, true, sessionId),
+          createNode: controller.createNode,
+          expandIds: controller.expandIds,
           setPanelMode: controller.setPanelMode,
           openPanel: controller.openPanel,
         }),
@@ -205,6 +209,8 @@ export function apply(ctx: ClientContextLike): void {
           rename: controller.rename,
           setPriority: controller.setPriority,
           appendNote: controller.appendNote,
+          saveBody: controller.saveBody,
+          setBodyEditing: controller.setBodyEditing,
           select: controller.select,
           forget: controller.forget,
         }),

@@ -113,7 +113,7 @@ export class OmtController {
       void this.refreshTree(sessionId).catch(() => {})
       if (sessionId !== undefined) void this.refreshRelated(sessionId).catch(() => {})
       const active = this.active.getSnapshot()
-      if (active !== undefined) void this.select(active.id, sessionId).catch(() => {})
+      if (active !== undefined && !this.bodyEditing) void this.select(active.id, sessionId).catch(() => {})
     }, 300)
   }
 
@@ -200,6 +200,12 @@ export class OmtController {
     if (this.drawerOpen.getSnapshot()) return
     this.drawerOpen.set(true)
     void this.refreshTree(sessionId)
+  }
+
+  expandIds = (ids: readonly string[]): void => {
+    this.collapsed.update(draft => {
+      for (const id of ids) delete draft[id]
+    })
   }
 
   toggleCollapsed = (id: string): void => {
@@ -324,6 +330,30 @@ export class OmtController {
   setStatus = async (id: string, status: ActiveInfo['status'], sessionId?: string): Promise<void> => {
     await this.rpc.call('/omt', 'update', { sessionId, id, status })
     await this.afterMutation(id, sessionId)
+  }
+
+  private bodyEditing = false
+
+  setBodyEditing = (editing: boolean): void => {
+    this.bodyEditing = editing
+  }
+
+  saveBody = async (id: string, body: string, sessionId?: string): Promise<void> => {
+    await this.rpc.call('/omt', 'update', { sessionId, id, body })
+    this.bodyEditing = false
+    await this.afterMutation(id, sessionId)
+  }
+
+  createNode = async (
+    input: { type: OmtTreeNode['type']; title: string; parentId?: string; body?: string },
+    sessionId?: string,
+  ): Promise<string | undefined> => {
+    const result = await this.rpc.call('/omt', 'create', { sessionId, ...input })
+    if (!result.ok) return undefined
+    const created = result.value as { id: string }
+    await this.refreshTree(sessionId)
+    await this.select(created.id, sessionId)
+    return created.id
   }
 
   appendNote = async (id: string, text: string, sessionId?: string): Promise<void> => {

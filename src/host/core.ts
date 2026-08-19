@@ -277,6 +277,18 @@ export class OmtCore {
     return this.store.listNodes({ type: filter.type, status: filter.status })
   }
 
+  /** Ancestors from root to the direct parent (empty for a root). */
+  ancestors(id: string): OmtNode[] {
+    this.requireNode(id)
+    const chain: OmtNode[] = []
+    let current = this.store.parentOf(id)
+    while (current !== undefined) {
+      chain.unshift(current)
+      current = this.store.parentOf(current.id)
+    }
+    return chain
+  }
+
   async show(id: string): Promise<ShowResult> {
     const node = this.requireNode(id)
     const file = await this.files.readNode(node.path)

@@ -33,6 +33,8 @@ export interface FloatWindowProps {
   readonly reindex: (sessionId?: string) => void
   readonly select: (id: string, sessionId?: string) => void
   readonly archive: (id: string, sessionId?: string) => void
+  readonly createNode: import('./TicketPanel.tsx').TicketPanelProps['createNode']
+  readonly expandIds: (ids: readonly string[]) => void
   /** Mode switch: re-present the open panel as the left drawer. */
   readonly setPanelMode: (mode: PanelMode) => void
   /** Framework-injected translate seat (registration declares locale: NS). */
@@ -160,6 +162,8 @@ export function FloatWindow(props: FloatWindowProps) {
         reindex={props.reindex}
         select={props.select}
         archive={props.archive}
+        createNode={props.createNode}
+        expandIds={props.expandIds}
         sessionId={current}
         headerDrag={headerDrag}
         headerActions={

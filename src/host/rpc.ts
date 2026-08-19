@@ -47,12 +47,21 @@ const updatePayloadSchema = z.object({
   archived: z.boolean().optional(),
   priority: z.number().int().optional(),
   append: z.string().min(1).optional(),
+  body: z.string().optional(),
   ...sessionField,
 }).strict()
 const reindexPayloadSchema = z.object({ ...sessionField }).strict()
 const skillsPayloadSchema = z.object({}).strict()
 const recentPayloadSchema = z.object({ sessionId: z.string().min(1) }).strict()
 const executePayloadSchema = z.object({ id: z.string().min(1), sessionId: z.string().min(1) }).strict()
+const createPayloadSchema = z.object({
+  type: z.enum(['epic', 'story', 'substory', 'ticket', 'subticket']),
+  title: z.string().min(1),
+  parentId: z.string().min(1).optional(),
+  body: z.string().optional(),
+  scope: z.enum(['workspace', 'global']).optional(),
+  ...sessionField,
+}).strict()
 
 export interface NodeSummary {
   readonly id: string
@@ -125,23 +134,45 @@ export function registerOmtRpc(ctx: Context, pool: OmtCorePool, recent?: RecentR
             ...(result.parent !== undefined ? { parent: summarize(result.parent) } : {}),
             children: result.children.map(summarize),
             body: result.body,
+            ancestors: core.ancestors(parsed.data.id).map(summarize),
           })
         }
         case 'update': {
           const parsed = updatePayloadSchema.safeParse(payload)
           if (!parsed.success) return badRequest('invalid update payload', parsed.error.issues)
-          const { title, status, archived, priority, append } = parsed.data
-          if ([title, status, archived, priority, append].every(v => v === undefined)) {
-            return badRequest('update requires at least one change (title/status/archived/priority/append)', [])
+          const { title, status, archived, priority, append, body } = parsed.data
+          if ([title, status, archived, priority, append, body].every(v => v === undefined)) {
+            return badRequest('update requires at least one change (title/status/archived/priority/append/body)', [])
           }
           const cwd = parsed.data.sessionId === undefined ? undefined : agents?.get(parsed.data.sessionId)?.session.header.cwd
           const core = await pool.coreForNode(parsed.data.id, cwd)
-          const node = await core.update({ id: parsed.data.id, title, status, archived, priority, append })
+          const node = await core.update({ id: parsed.data.id, title, status, archived, priority, append, body })
           recent?.touch(parsed.data.sessionId, parsed.data.id)
           // Manual status changes never START a running mark — execution is
           // claimed only by the execute endpoint and model tool calls
           // (TICKET-0028). Done/archive always clear it.
           if (status === 'done' || archived === true) running?.stop(parsed.data.id)
+          changes?.bump(core.home)
+          return ok(summarize(node))
+        }
+        case 'create': {
+          const parsed = createPayloadSchema.safeParse(payload)
+          if (!parsed.success) return badRequest('invalid create payload', parsed.error.issues)
+          const cwd = parsed.data.sessionId === undefined ? undefined : agents?.get(parsed.data.sessionId)?.session.header.cwd
+          const core = parsed.data.parentId !== undefined
+            ? await pool.coreForNode(parsed.data.parentId, cwd)
+            : parsed.data.scope !== undefined
+              ? await pool.coreForScope(cwd, parsed.data.scope)
+              : await pool.coreFor(cwd)
+          const id = await pool.allocateId(parsed.data.type, cwd, parsed.data.scope === 'workspace')
+          const node = await core.create({
+            type: parsed.data.type,
+            title: parsed.data.title,
+            parentId: parsed.data.parentId,
+            body: parsed.data.body,
+            id,
+          })
+          recent?.touch(parsed.data.sessionId, node.id)
           changes?.bump(core.home)
           return ok(summarize(node))
         }

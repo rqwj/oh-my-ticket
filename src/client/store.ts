@@ -35,6 +35,7 @@ export interface DocData {
   readonly running?: { readonly sessionId: string; readonly sessionLabel: string; readonly since: string }
   readonly node: OmtTreeNode
   readonly parent?: NodeSummary
+  readonly ancestors?: readonly NodeSummary[]
   readonly children: readonly NodeSummary[]
   readonly body: string
 }

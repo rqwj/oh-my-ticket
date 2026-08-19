@@ -9,7 +9,7 @@ import { useEffect, useRef, useState } from 'react'
 import type { PanelMode } from '../controller.ts'
 import type { ActiveInfo, TreeState } from '../store.ts'
 import type { Translate } from '../locales.ts'
-import { TicketPanel, type Selector } from './TicketPanel.tsx'
+import { TicketPanel, type Selector, type TicketPanelProps } from './TicketPanel.tsx'
 import css from './Drawer.module.css'
 
 // Selector moved to TicketPanel with the shared content; re-exported here so
@@ -30,6 +30,8 @@ export interface DrawerProps {
   readonly reindex: (sessionId?: string) => void
   readonly select: (id: string, sessionId?: string) => void
   readonly archive: (id: string, sessionId?: string) => void
+  readonly createNode: TicketPanelProps['createNode']
+  readonly expandIds: (ids: readonly string[]) => void
   readonly useDrawerWidth: Selector<number>
   readonly setDrawerWidth: (px: number) => void
   readonly useCollapsed: Selector<Record<string, boolean>>
@@ -154,6 +156,8 @@ export function Drawer(props: DrawerProps) {
         reindex={props.reindex}
         select={props.select}
         archive={props.archive}
+        createNode={props.createNode}
+        expandIds={props.expandIds}
         sessionId={current}
         headerActions={
           <button

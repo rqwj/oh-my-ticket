@@ -7,9 +7,10 @@
  * The owning shell supplies positioning, sizing, and drag furniture; the
  * panel fills whatever box it is given (flex column, min-height 0).
  */
-import { useEffect, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react'
 import type { ActiveInfo, OmtTreeNode, TreeState } from '../store.ts'
 import { filterForest, sortForest, type TreeFilter, type TreeSortOrder } from '../tree-filter.ts'
+import { ancestorIdsOf, CHILD_TYPES, flattenVisible, navigateVisible } from '../tree-nav.ts'
 import { priorityMeta } from '../priority.ts'
 import { STATUS_KEY, type Translate } from '../locales.ts'
 import { PriorityIcon } from './PriorityIcon.tsx'
@@ -34,6 +35,8 @@ export interface TicketPanelProps {
   readonly reindex: (sessionId?: string) => void
   readonly select: (id: string, sessionId?: string) => void
   readonly archive: (id: string, sessionId?: string) => void
+  readonly createNode: (input: { type: OmtTreeNode['type']; title: string; parentId?: string; body?: string }, sessionId?: string) => Promise<string | undefined>
+  readonly expandIds: (ids: readonly string[]) => void
   /** Session whose workspace home the tree follows. */
   readonly sessionId: string | undefined
   /** Extra header buttons ahead of the close seat (mode switches). */
@@ -70,22 +73,25 @@ interface TreeRowProps {
   readonly node: OmtTreeNode
   readonly depth: number
   readonly activeId: string | undefined
+  readonly focusedId: string | undefined
   readonly onSelect: (id: string) => void
   readonly onArchive: (id: string) => void
+  readonly onCreateChild: (parent: OmtTreeNode) => void
   readonly useCollapsed: Selector<Record<string, boolean>>
   readonly onToggleCollapsed: (id: string) => void
   readonly showId: boolean
   readonly t: Translate
 }
 
-function TreeRow({ node, depth, activeId, onSelect, onArchive, useCollapsed, onToggleCollapsed, showId, t }: TreeRowProps) {
+function TreeRow({ node, depth, activeId, focusedId, onSelect, onArchive, onCreateChild, useCollapsed, onToggleCollapsed, showId, t }: TreeRowProps) {
   // Collapse state persists across sessions (shared store, TICKET-0011).
   const collapsed = useCollapsed(snapshot => snapshot[node.id] === true)
   const hasChildren = node.children.length > 0
   return (
     <div>
       <div
-        className={`${css.row} ${node.id === activeId ? css.rowActive : ''}`}
+        className={`${css.row} ${node.id === activeId ? css.rowActive : ''} ${node.id === focusedId ? css.rowFocus : ''}`}
+        data-omt-id={node.id}
         style={{ paddingLeft: 8 + depth * 14 }}
         onClick={() => onSelect(node.id)}
         title={t('node.titleWithStatus', { id: node.id, title: node.title, status: statusText(t, node) })}
@@ -116,10 +122,21 @@ function TreeRow({ node, depth, activeId, onSelect, onArchive, useCollapsed, onT
             ⛁
           </button>
         )}
+        {CHILD_TYPES[node.type].length > 0 && !node.archived && (
+          <button
+            type="button"
+            className={css.addChild}
+            title={t('drawer.addChild')}
+            onClick={event => {
+              event.stopPropagation()
+              onCreateChild(node)
+            }}
+          >+</button>
+        )}
         <span className={`omt-dot omt-dot--lg ${dotClass(node)}`} />
       </div>
       {!collapsed && node.children.map(child => (
-        <TreeRow key={child.id} node={child} depth={depth + 1} activeId={activeId} onSelect={onSelect} onArchive={onArchive} useCollapsed={useCollapsed} onToggleCollapsed={onToggleCollapsed} showId={showId} t={t} />
+        <TreeRow key={child.id} node={child} depth={depth + 1} activeId={activeId} focusedId={focusedId} onSelect={onSelect} onArchive={onArchive} onCreateChild={onCreateChild} useCollapsed={useCollapsed} onToggleCollapsed={onToggleCollapsed} showId={showId} t={t} />
       ))}
     </div>
   )
@@ -164,6 +181,12 @@ export function TicketPanel(props: TicketPanelProps) {
   const [priorityFilter, setPriorityFilter] = useState<readonly number[]>([])
   const [showId, setShowId] = useState(false)
   const [sortOrder, setSortOrder] = useState<TreeSortOrder>('none')
+  const [focusedId, setFocusedId] = useState<string | undefined>(undefined)
+  const [flashId, setFlashId] = useState<string | undefined>(undefined)
+  const [creating, setCreating] = useState<{ type: OmtTreeNode['type']; parentId?: string } | undefined>(undefined)
+  const [createTitle, setCreateTitle] = useState('')
+  const [createBody, setCreateBody] = useState('')
+  const treeRef = useRef<HTMLDivElement>(null)
   const toggleNum = (list: readonly number[], value: number): readonly number[] =>
     list.includes(value) ? list.filter(item => item !== value) : [...list, value]
   const toggleIn = (list: readonly string[], value: string): readonly string[] =>
@@ -186,6 +209,31 @@ export function TicketPanel(props: TicketPanelProps) {
         {...(props.headerDrag ?? {})}
       >
         <span className={css.headerTitle}>OMT Tickets</span>
+        <button type="button" className={css.headerButton} onClick={() => setCreating({ type: 'epic' })} title={t('drawer.newEpic')}>+</button>
+        <button
+          type="button"
+          className={css.headerButton}
+          disabled={active === undefined}
+          title={t('drawer.locate')}
+          onClick={() => {
+            if (active === undefined || tree.status !== 'ready') return
+            const forest = filterForest(sortForest(tree.forest, sortOrder), filter)
+            const hidden = query !== '' || typeFilter.length > 0 || statusFilter.length > 0 || priorityFilter.length > 0
+            if (hidden) {
+              setQuery('')
+              setTypeFilter([])
+              setStatusFilter([])
+              setPriorityFilter([])
+            }
+            props.expandIds(ancestorIdsOf(tree.forest, active.id))
+            setFocusedId(active.id)
+            setFlashId(active.id)
+            window.setTimeout(() => setFlashId(undefined), 800)
+            window.requestAnimationFrame(() => {
+              treeRef.current?.querySelector(`[data-omt-id="${active.id}"]`)?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+            })
+          }}
+        >◎</button>
         <button type="button" className={css.headerButton} onClick={() => props.refreshTree(sessionId)} title={t('drawer.refresh')}>
           ↻
         </button>
@@ -281,31 +329,82 @@ export function TicketPanel(props: TicketPanelProps) {
         ) : tree.status === 'error' ? (
           <div className={css.placeholder}>{t('drawer.loadFailed', { message: tree.message })}</div>
         ) : tree.forest.length === 0 ? (
-          <div className={css.placeholder}>{t('drawer.empty')}</div>
+          <div className={css.placeholder}>
+            {t('drawer.empty')}
+            <button type="button" className={css.action} onClick={() => setCreating({ type: 'epic' })}>{t('drawer.newEpic')}</button>
+          </div>
         ) : (
           (() => {
             const visible = sortForest(filterForest(tree.forest, filter), sortOrder)
+            const collapsed = props.useCollapsed(snapshot => snapshot)
+            const rows = flattenVisible(visible, collapsed)
+            const onKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>): void => {
+              const result = navigateVisible(rows, focusedId ?? active?.id, event.key)
+              if (result.focusId === focusedId && result.expandId === undefined && result.collapseId === undefined && result.openId === undefined) return
+              event.preventDefault()
+              setFocusedId(result.focusId)
+              if (result.expandId !== undefined && collapsed[result.expandId] === true) props.toggleCollapsed(result.expandId)
+              if (result.collapseId !== undefined && collapsed[result.collapseId] !== true) props.toggleCollapsed(result.collapseId)
+              if (result.openId !== undefined) props.select(result.openId, sessionId)
+            }
             return visible.length === 0 ? (
               <div className={css.placeholder}>{t('drawer.noMatch')}</div>
             ) : (
-              visible.map(node => (
-                <TreeRow
-                  key={node.id}
-                  node={node}
-                  depth={0}
-                  activeId={active?.id}
-                  onSelect={id => props.select(id, sessionId)}
-                  onArchive={id => props.archive(id, sessionId)}
-                  useCollapsed={props.useCollapsed}
-                  onToggleCollapsed={props.toggleCollapsed}
-                  showId={showId}
-                  t={t}
-                />
-              ))
+              <div ref={treeRef} className={css.treeNav} tabIndex={0} onKeyDown={onKeyDown}>
+                {visible.map(node => (
+                  <TreeRow
+                    key={node.id}
+                    node={node}
+                    depth={0}
+                    activeId={active?.id}
+                    focusedId={flashId ?? focusedId}
+                    onSelect={id => props.select(id, sessionId)}
+                    onArchive={id => props.archive(id, sessionId)}
+                    onCreateChild={parent => setCreating({ type: CHILD_TYPES[parent.type][0]!, parentId: parent.id })}
+                    useCollapsed={props.useCollapsed}
+                    onToggleCollapsed={props.toggleCollapsed}
+                    showId={showId}
+                    t={t}
+                  />
+                ))}
+              </div>
             )
           })()
         )}
       </div>
+      {creating !== undefined && (
+        <form
+          className={css.createForm}
+          onSubmit={event => {
+            event.preventDefault()
+            const title = createTitle.trim()
+            if (title === '') return
+            void props.createNode({ type: creating.type, title, parentId: creating.parentId, body: createBody.trim() || undefined }, sessionId).then(id => {
+              setCreating(undefined)
+              setCreateTitle('')
+              setCreateBody('')
+              if (id !== undefined) setFocusedId(id)
+            })
+          }}
+        >
+          <select value={creating.type} onChange={event => setCreating({ ...creating, type: event.target.value as OmtTreeNode['type'] })}>
+            {(creating.parentId === undefined ? (['epic'] as const) : CHILD_TYPES[tree.status === 'ready' ? (function find(nodes: readonly OmtTreeNode[]): OmtTreeNode['type'][] {
+              for (const node of nodes) {
+                if (node.id === creating.parentId) return [...CHILD_TYPES[node.type]]
+                const nested = find(node.children)
+                if (nested.length > 0) return nested
+              }
+              return ['ticket']
+            })(tree.forest) : ['ticket']]).map(type => <option key={type} value={type}>{type}</option>)}
+          </select>
+          <input value={createTitle} placeholder={t('drawer.createTitle')} onChange={event => setCreateTitle(event.target.value)} autoFocus />
+          <textarea value={createBody} placeholder={t('drawer.createBody')} onChange={event => setCreateBody(event.target.value)} rows={3} />
+          <div>
+            <button type="submit">{t('drawer.createSubmit')}</button>
+            <button type="button" onClick={() => setCreating(undefined)}>{t('drawer.createCancel')}</button>
+          </div>
+        </form>
+      )}
     </div>
   )
 }

@@ -32,6 +32,8 @@ export interface DocPanelProps {
   readonly rename: (id: string, title: string, sessionId?: string) => void
   readonly setPriority: (id: string, priority: number, sessionId?: string) => void
   readonly appendNote: (id: string, text: string, sessionId?: string) => void
+  readonly saveBody: (id: string, body: string, sessionId?: string) => void
+  readonly setBodyEditing: (editing: boolean) => void
   readonly select: (id: string, sessionId?: string) => void
   /** NOT_FOUND cleanup: unpin + drop from related + close. */
   readonly forget: (id: string, sessionId?: string) => void
@@ -78,6 +80,8 @@ export function DocPanel(props: DocPanelProps) {
   const [draft, setDraft] = useState('')
   const [copied, setCopied] = useState<string | undefined>(undefined)
   const [editingTitle, setEditingTitle] = useState(false)
+  const [editingBody, setEditingBody] = useState(false)
+  const [bodyDraft, setBodyDraft] = useState('')
 
   const copy = (key: string, text: string): void => {
     void navigator.clipboard?.writeText(text)
@@ -127,6 +131,7 @@ export function DocPanel(props: DocPanelProps) {
   }
 
   const { node, parent, children, body } = doc.data
+  const ancestors = doc.data.ancestors ?? (parent === undefined ? [] : [parent])
   // While a session executes this ticket, mutating actions lock (TICKET-0026);
   // archived nodes stay sealed as before.
   const locked = node.archived || doc.data.running !== undefined
@@ -201,10 +206,17 @@ export function DocPanel(props: DocPanelProps) {
         </div>
       )}
 
-      {parent !== undefined && (
+      {ancestors.length > 0 && (
         <div className={css.relation}>
-          <span className={css.relationLabel}>{t('doc.parent')}</span>
-          <RelationChip node={parent} onSelect={id => props.select(id, props.sessionId)} t={t} />
+          <span className={css.relationLabel}>{t('doc.breadcrumb')}</span>
+          <div className={css.chipRow}>
+            {ancestors.map((item, index) => (
+              <span key={item.id}>
+                {index > 0 ? <span aria-hidden> › </span> : null}
+                <RelationChip node={item} onSelect={id => props.select(id, props.sessionId)} t={t} />
+              </span>
+            ))}
+          </div>
         </div>
       )}
       {children.length > 0 && (
@@ -256,7 +268,34 @@ export function DocPanel(props: DocPanelProps) {
       </div>
 
       <div className={css.bodyScroll}>
-        <MarkdownText text={stripChildrenBlock(body)} />
+        {editingBody && !locked ? (
+          <>
+            <textarea className={css.appendInput} value={bodyDraft} rows={12} onChange={event => setBodyDraft(event.target.value)} />
+            <div className={css.actions}>
+              <button type="button" className={css.actionPrimary} onClick={() => {
+                props.saveBody(node.id, bodyDraft, props.sessionId)
+                setEditingBody(false)
+                props.setBodyEditing(false)
+              }}>{t('doc.saveBody')}</button>
+              <button type="button" className={css.action} onClick={() => {
+                setEditingBody(false)
+                setBodyDraft('')
+                props.setBodyEditing(false)
+              }}>{t('doc.cancelEdit')}</button>
+            </div>
+          </>
+        ) : (
+          <>
+            {!locked && (
+              <button type="button" className={css.action} onClick={() => {
+                setBodyDraft(stripChildrenBlock(body))
+                setEditingBody(true)
+                props.setBodyEditing(true)
+              }}>{t('doc.editBody')}</button>
+            )}
+            <MarkdownText text={stripChildrenBlock(body)} />
+          </>
+        )}
       </div>
 
       <div className={css.appendArea}>
