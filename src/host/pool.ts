@@ -104,6 +104,25 @@ export class OmtCorePool {
     return fallback as OmtCore
   }
 
+  /**
+   * Resolve the core CONTAINING a run id. Run ids count per home, so the
+   * same id can exist in several homes — resolution follows the node rule
+   * (workspace home first, then global; the caller's workspace context
+   * disambiguates). When no home contains the id, the fallback core is
+   * returned so the caller's NOT_FOUND path stays consistent.
+   */
+  async coreForRun(id: string, cwd: string | undefined): Promise<OmtCore> {
+    const homes = this.candidateHomes(cwd)
+    let fallback: OmtCore | undefined
+    for (const home of homes) {
+      const core = await this.coreForHome(home)
+      fallback ??= core
+      if (core.getRun(id) !== undefined) return core
+    }
+    // homes is never empty (globalHome always included).
+    return fallback as OmtCore
+  }
+
   /** Close every open core (tests and plugin teardown). */
   async closeAll(): Promise<void> {
     for (const core of this.cores.values()) {

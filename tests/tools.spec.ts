@@ -48,9 +48,11 @@ function renderText(toolName: string, args: unknown, value: unknown): string {
   return tool!.output.render(args, value).map(block => block.text ?? '').join('\n')
 }
 
-it('registers the six omt_* tools', () => {
+it('registers the omt_* node tools and the omt_run_* family', () => {
   expect([...tools.keys()].sort()).toEqual([
-    'omt_create', 'omt_list', 'omt_move', 'omt_reindex', 'omt_show', 'omt_update',
+    'omt_create', 'omt_list', 'omt_move', 'omt_reindex',
+    'omt_run_claim', 'omt_run_control', 'omt_run_create', 'omt_run_list', 'omt_run_report', 'omt_run_show',
+    'omt_show', 'omt_update',
   ])
 })
 

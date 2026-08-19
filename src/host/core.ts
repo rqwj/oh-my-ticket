@@ -111,10 +111,12 @@ const RUN_TRANSITIONS: Readonly<Record<RunStatus, readonly RunStatus[]>> = {
  * Legal direct item transitions. Terminal-ish states (done/failed/blocked/
  * skipped/interrupted) have no direct exits — they move only through the
  * dedicated retry (failed/interrupted/stalled pending) and replay
- * (done/blocked/skipped) paths.
+ * (done/blocked/skipped) paths. Pending additionally allows done/blocked:
+ * passive observation (TICKET-0061) must map a ticket directly set to those
+ * statuses onto a not-yet-dispatched item, or the run would wedge.
  */
 const ITEM_TRANSITIONS: Readonly<Record<RunItemState, readonly RunItemState[]>> = {
-  pending: ['running', 'skipped'],
+  pending: ['running', 'done', 'blocked', 'skipped'],
   running: ['done', 'failed', 'blocked', 'skipped', 'awaiting_confirmation', 'interrupted'],
   awaiting_confirmation: ['done', 'failed', 'blocked', 'skipped', 'running'],
   done: [],
@@ -122,6 +124,22 @@ const ITEM_TRANSITIONS: Readonly<Record<RunItemState, readonly RunItemState[]>> 
   blocked: [],
   skipped: [],
   interrupted: [],
+}
+
+/** Explicit report vocabulary (TICKET-0059): the only legal outcomes. */
+export const RUN_REPORT_OUTCOMES = ['done', 'failed', 'blocked', 'skipped'] as const
+export type RunReportOutcome = (typeof RUN_REPORT_OUTCOMES)[number]
+
+/** Result of an explicit report: the transitioned item plus the node as-is. */
+export interface ReportResult {
+  readonly item: OmtRunItem
+  readonly node: OmtNode
+}
+
+/** A node change observed through the normal update paths (TICKET-0061). */
+export interface ObservedNodeChange {
+  readonly status?: Status
+  readonly archived?: boolean
 }
 
 const DB_FILE = 'omt.db'
@@ -640,6 +658,136 @@ export class OmtCore {
     })
     return this.store.getRunItem(runId, nodeId) as OmtRunItem
   }
+
+  /**
+   * Claim (TICKET-0058): atomically take the next pending item of a running
+   * run — one immediate transaction flips it to running and binds the
+   * executor session, so concurrent claimers never share an item. Returns
+   * undefined when the queue is empty (an explicit signal, not an error).
+   * Claimed ownership wins over passive observation (decision 14).
+   */
+  async claimRunItem(runId: string, executorSessionId: string): Promise<OmtRunItem | undefined> {
+    const run = this.requireRun(runId)
+    if (executorSessionId.trim() === '') {
+      throw new OmtError('INVALID_INPUT', 'claim requires an executor session id')
+    }
+    if (run.status === 'pending') {
+      throw new OmtError('CONFLICT', `run ${runId} has not started; start it before claiming`)
+    }
+    if (run.status !== 'running') {
+      throw new OmtError('CONFLICT', `run ${runId} is ${run.status}; only a running run dispatches claims`)
+    }
+    return this.store.claimNextRunItem(runId, executorSessionId, new Date().toISOString())
+  }
+
+  /**
+   * Item-level removal (omt_run_control remove): drops the membership row
+   * only — the ticket node is never touched. In-flight items (running /
+   * awaiting_confirmation) cannot be removed; let them settle or cancel the
+   * run. Afterwards the run may derive its terminal state (last pending
+   * item removed with the rest final).
+   */
+  async removeRunItem(runId: string, nodeId: string): Promise<void> {
+    this.requireRun(runId)
+    const item = this.store.getRunItem(runId, nodeId)
+    if (item === undefined) throw new OmtError('NOT_FOUND', `run ${runId} has no item for node: ${nodeId}`)
+    if (item.state === 'running' || item.state === 'awaiting_confirmation') {
+      throw new OmtError('CONFLICT', `item ${nodeId} is ${item.state} (in-flight); it cannot be removed`)
+    }
+    this.store.deleteRunItem(runId, nodeId)
+    this.deriveRunTerminal(runId)
+  }
+
+  /**
+   * Explicit report (TICKET-0059): the model's legal vocabulary for how an
+   * execution ended. done/blocked/skipped double-write the ticket status and
+   * the item; failed touches only the item (the node enum has no failed —
+   * the ticket stays in_progress) and keeps the note in last_error. Any
+   * note is appended to the ticket's progress record. stop-on-failure and
+   * terminal derivation ride on transitionItem.
+   */
+  async reportRunItem(runId: string, nodeId: string, outcome: RunReportOutcome, note?: string): Promise<ReportResult> {
+    if (!RUN_REPORT_OUTCOMES.includes(outcome)) {
+      throw new OmtError('INVALID_INPUT', `unknown report outcome: ${String(outcome)} (done/failed/blocked/skipped)`)
+    }
+    this.requireRun(runId)
+    const node = this.requireNode(nodeId)
+    if (node.archived) {
+      throw new OmtError('CONFLICT', `${nodeId} 已归档，无法接受 report`)
+    }
+    const item = this.store.getRunItem(runId, nodeId)
+    if (item === undefined) throw new OmtError('NOT_FOUND', `run ${runId} has no item for node: ${nodeId}`)
+    if (item.state !== 'running' && item.state !== 'awaiting_confirmation') {
+      throw new OmtError('CONFLICT', `only in-flight items can report (${nodeId} is ${item.state})`)
+    }
+
+    if (note !== undefined && note.trim() !== '') {
+      await this.update({ id: nodeId, append: note })
+    }
+    const transitioned = await this.transitionItem(runId, nodeId, outcome, {
+      ...(outcome === 'failed' && note !== undefined && note.trim() !== '' ? { error: note } : {}),
+    })
+    if (outcome !== 'failed') {
+      await this.update({ id: nodeId, status: outcome })
+    }
+    return { item: transitioned, node: this.requireNode(nodeId) }
+  }
+
+  /**
+   * Passive observation (TICKET-0061): a node status/archive change seen on
+   * the ordinary update paths advances the matching items of every ACTIVE
+   * run (running | paused) in this home — the cross-run broadcast of
+   * decision 1. Mapping:
+   *   in_progress → pending item dispatches to running (running runs only —
+   *     pause stops dispatch, decision 9), recording the observing session
+   *   done/blocked/skipped → item to the same state (pending items included:
+   *     direct sets must not wedge a run)
+   *   archived → item skipped
+   *   open over a done/blocked/skipped item → replay back to pending
+   *     (decision 11)
+   * Claim priority (decision 14): an already-claimed item keeps its
+   * executor_session_id — observation advances state but never rebinds
+   * ownership. Returns the items actually advanced (hook reuse).
+   */
+  async observeNodeStatus(nodeId: string, change: ObservedNodeChange, executorSessionId?: string): Promise<OmtRunItem[]> {
+    const advanced: OmtRunItem[] = []
+    for (const item of this.store.runItemsForNode(nodeId, ['running', 'paused'])) {
+      const run = this.requireRun(item.run_id)
+      const inFlight = item.state === 'running' || item.state === 'awaiting_confirmation'
+
+      if (change.archived === true) {
+        if (inFlight || (item.state === 'pending' && run.status === 'running')) {
+          advanced.push(await this.transitionItem(item.run_id, nodeId, 'skipped'))
+        }
+        continue
+      }
+      switch (change.status) {
+        case 'in_progress':
+          // Dispatch only — a claimed (already running) item is left alone,
+          // so its executor attribution is never overwritten.
+          if (item.state === 'pending' && run.status === 'running') {
+            advanced.push(await this.transitionItem(item.run_id, nodeId, 'running', { executorSessionId }))
+          }
+          break
+        case 'done':
+        case 'blocked':
+        case 'skipped':
+          if (inFlight || (item.state === 'pending' && run.status === 'running')) {
+            advanced.push(await this.transitionItem(item.run_id, nodeId, change.status))
+          }
+          break
+        case 'open':
+          if (item.state === 'done' || item.state === 'blocked' || item.state === 'skipped') {
+            advanced.push(await this.replayItem(item.run_id, nodeId))
+          }
+          break
+        default:
+          break
+      }
+    }
+    return advanced
+  }
+
 
   /**
    * Startup janitor (decision 12): demote orphaned in-flight work. Item

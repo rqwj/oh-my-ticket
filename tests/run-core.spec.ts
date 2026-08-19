@@ -124,9 +124,11 @@ describe('item state machine', () => {
     const run = await core.createRun({ nodeIds: [a!.id, b!.id] })
     await core.startRun(run.id)
 
-    // pending can only go to running/skipped.
-    await expect(core.transitionItem(run.id, a!.id, 'done')).rejects.toThrow(/pending/)
+    // pending can go to running (dispatch) or done/blocked/skipped (passive
+    // observation direct sets, TICKET-0061) — but not to executor-side states.
     await expect(core.transitionItem(run.id, a!.id, 'failed')).rejects.toThrow(/pending/)
+    await expect(core.transitionItem(run.id, a!.id, 'awaiting_confirmation')).rejects.toThrow(/pending/)
+    await expect(core.transitionItem(run.id, a!.id, 'interrupted')).rejects.toThrow(/pending/)
     await expect(core.transitionItem(run.id, a!.id, 'bogus' as never)).rejects.toThrow(/unknown/i)
     await expect(core.transitionItem(run.id, 'TICKET-9999', 'running')).rejects.toThrow(OmtError)
 

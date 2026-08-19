@@ -7,7 +7,13 @@
 export const NODE_TYPES = ['epic', 'story', 'substory', 'ticket', 'subticket'] as const
 export type NodeType = (typeof NODE_TYPES)[number]
 
-export const STATUSES = ['open', 'in_progress', 'done'] as const
+/**
+ * Node lifecycle statuses. `blocked`/`skipped` (EPIC-0003 decision 4):
+ * blocked = cannot continue due to an external condition (resumable once it
+ * clears); skipped = deliberately or necessarily skipped. `stopped` was
+ * ruled out in round-2 review (no production path, no item mapping).
+ */
+export const STATUSES = ['open', 'in_progress', 'done', 'blocked', 'skipped'] as const
 export type Status = (typeof STATUSES)[number]
 
 /** Legal child types per parent type. Root creation is allowed for epic only. */

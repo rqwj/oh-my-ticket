@@ -9,7 +9,7 @@ export interface OmtTreeNode {
   readonly id: string
   readonly type: 'epic' | 'story' | 'substory' | 'ticket' | 'subticket'
   readonly title: string
-  readonly status: 'open' | 'in_progress' | 'done'
+  readonly status: 'open' | 'in_progress' | 'done' | 'blocked' | 'skipped'
   /** Archive is a separate dimension from the lifecycle status. */
   readonly archived: boolean
   readonly priority: number

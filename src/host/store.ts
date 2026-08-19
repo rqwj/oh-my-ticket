@@ -423,6 +423,52 @@ export class OmtStore {
     return row === undefined ? undefined : rowToRunItem(row)
   }
 
+  /** Item-level removal (omt_run_control remove): membership only, nodes untouched. */
+  deleteRunItem(runId: string, nodeId: string): void {
+    this.db.prepare('DELETE FROM run_items WHERE run_id = ? AND node_id = ?').run(runId, nodeId)
+  }
+
+  /**
+   * Every item for one node across runs in the given statuses (passive
+   * observation scans the active runs holding a ticket — EPIC-0003
+   * decision 1 cross-run broadcast).
+   */
+  runItemsForNode(nodeId: string, runStatuses: readonly RunStatus[]): OmtRunItem[] {
+    if (runStatuses.length === 0) return []
+    const placeholders = runStatuses.map(() => '?').join(', ')
+    const rows = this.db.prepare(
+      `SELECT i.* FROM run_items i JOIN runs r ON r.id = i.run_id
+       WHERE i.node_id = ? AND r.status IN (${placeholders}) ORDER BY i.run_id`,
+    ).all(nodeId, ...runStatuses) as unknown as RunItemRow[]
+    return rows.map(rowToRunItem)
+  }
+
+  /**
+   * Atomic claim (TICKET-0058): select the next pending item and flip it to
+   * running with the executor in ONE immediate transaction, so two
+   * concurrent claimers can never receive the same item.
+   */
+  claimNextRunItem(runId: string, executorSessionId: string, now: string): OmtRunItem | undefined {
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const row = this.db.prepare(
+        "SELECT node_id FROM run_items WHERE run_id = ? AND state = 'pending' ORDER BY position, node_id LIMIT 1",
+      ).get(runId) as { node_id: string } | undefined
+      if (row === undefined) {
+        this.db.exec('COMMIT')
+        return undefined
+      }
+      this.db.prepare(
+        "UPDATE run_items SET state = 'running', executor_session_id = ?, started_at = COALESCE(started_at, ?) WHERE run_id = ? AND node_id = ? AND state = 'pending'",
+      ).run(executorSessionId, now, runId, row.node_id)
+      this.db.exec('COMMIT')
+      return this.getRunItem(runId, row.node_id)
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
   listRunItems(runId: string): OmtRunItem[] {
     const rows = this.db.prepare('SELECT * FROM run_items WHERE run_id = ? ORDER BY position, node_id').all(runId) as unknown as RunItemRow[]
     return rows.map(rowToRunItem)

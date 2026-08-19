@@ -12,6 +12,8 @@ export const zh = {
   'status.open': '未开始',
   'status.inProgress': '进行中',
   'status.done': '已完成',
+  'status.blocked': '受阻',
+  'status.skipped': '已跳过',
   'status.archived': '已归档',
   'status.archivedWith': '已归档（{status}）',
 
@@ -135,6 +137,8 @@ export const en: Record<OmtKey, string> = {
   'status.open': 'Open',
   'status.inProgress': 'In progress',
   'status.done': 'Done',
+  'status.blocked': 'Blocked',
+  'status.skipped': 'Skipped',
   'status.archived': 'Archived',
   'status.archivedWith': 'Archived ({status})',
 
@@ -242,4 +246,6 @@ export const STATUS_KEY = {
   open: 'status.open',
   in_progress: 'status.inProgress',
   done: 'status.done',
+  blocked: 'status.blocked',
+  skipped: 'status.skipped',
 } as const satisfies Record<string, OmtKey>

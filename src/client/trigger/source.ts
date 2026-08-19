@@ -139,6 +139,10 @@ const STATUS_ICON: Record<NodeSummary['status'], string> = {
   open: '⚪',
   in_progress: '🔵',
   done: '🟢',
+  // blocked/skipped render yellow (EPIC-0003 decision 4); final visual
+  // treatment lands with STORY-0013.
+  blocked: '🟡',
+  skipped: '🟡',
 }
 
 /** Create the ticket trigger source bound to one RPC caller. */
