@@ -4,24 +4,51 @@
  * plugins cannot rely on Typert's monorepo-built strict descriptors, so
  * payloads are validated here with zod on both ends.
  *
- * Endpoints (all read-only; mutations stay with the omt_* tools):
- *   tree   { rootId? }              → OmtTreeNode[] (full forest or subtree)
- *   search { query?, limit? }       → NodeSummary[] (@-trigger candidates)
- *   get    { id }                   → { node, parent?, children, body }
+ * Endpoints (mutations bump the ChangeHub so SSE clients refetch):
+ *   tree        { rootId? }                        → OmtTreeNode[] (full forest or subtree)
+ *   search      { query?, limit? }                 → NodeSummary[] (@-trigger candidates)
+ *   get         { id }                             → { node, parent?, children, body, runs }
+ *   update      { id, ...changes }                 → NodeSummary
+ *   execute     { id, sessionId }                  → NodeSummary (claim + running mark)
+ *   recent      { sessionId }                      → NodeSummary[]
+ *   reindex     {}                                 → { nodes, edges, skipped }
+ *   run-list    {}                                 → { runs: RunSummary[] } (progress/stalled/grouping flags)
+ *   run-show    { id }                             → { run: RunSummary & config, items: RunItemView[] }
+ *   run-control { id, action, nodeId? }            → start/pause/resume/cancel/retry/remove
+ *   run-create  { nodeIds, title? }                → 一键直建（默认配置，子树收集）
+ *   run-add     { id, nodeIds }                    → 加入既有 run（去重/跳过/home 校验）
+ *   run-confirm { id, nodeId, decision }           → awaiting_confirmation 确认/打回
  */
+import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-client-connection'
 import type { RpcResult } from '@deepseek-ai/dsh-host-apiproxy/api'
+import type { OmtCore } from './core.ts'
 import type { OmtCorePool } from './pool.ts'
 import type { ChangeHub } from './changes.ts'
 import type { RecentRegistry } from './recent.ts'
 import { endsExecution, lineageOfHeader, type RunningRegistry } from './running.ts'
-import { OmtError, STATUSES, type OmtNode, type OmtTreeNode } from './types.ts'
+import {
+  isRunActive,
+  isRunHistory,
+  isRunItemStalled,
+  OmtError,
+  RUN_ITEM_STATES,
+  STATUSES,
+  type OmtNode,
+  type OmtRun,
+  type OmtRunItem,
+  type OmtTreeNode,
+  type RunItemState,
+} from './types.ts'
 
-/** Structural ctx.agents face: sessionId → agent → session header. */
+/** Structural ctx.agents face: sessionId → agent → session header (+ wake for run start). */
 interface AgentsLike {
-  get(id: string): { session: { header: { cwd: string; parentSession?: string; origin?: 'subagent' } } } | undefined
+  get(id: string): {
+    session: { header: { cwd: string; parentSession?: string; origin?: 'subagent' } }
+    followup?(message: unknown): void
+  } | undefined
 }
 
 // Every payload may carry the calling session so the handler can resolve
@@ -47,6 +74,34 @@ const reindexPayloadSchema = z.object({ ...sessionField }).strict()
 const recentPayloadSchema = z.object({ sessionId: z.string().min(1) }).strict()
 const executePayloadSchema = z.object({ id: z.string().min(1), sessionId: z.string().min(1) }).strict()
 
+// ── run endpoints (STORY-0013 UI channel) ────────────────────────────────
+const runListPayloadSchema = z.object({ ...sessionField }).strict()
+const runShowPayloadSchema = z.object({ id: z.string().min(1), ...sessionField }).strict()
+const runControlPayloadSchema = z.object({
+  id: z.string().min(1),
+  action: z.enum(['start', 'pause', 'resume', 'cancel', 'retry', 'remove']),
+  nodeId: z.string().min(1).optional(),
+  ...sessionField,
+}).strict()
+const runCreatePayloadSchema = z.object({
+  /** Root nodes; each root + its whole subtree is collected (TICKET-0067). */
+  nodeIds: z.array(z.string().min(1)).min(1),
+  title: z.string().min(1).optional(),
+  ...sessionField,
+}).strict()
+const runAddPayloadSchema = z.object({
+  id: z.string().min(1),
+  /** Root nodes; each root + its whole subtree is collected (TICKET-0067). */
+  nodeIds: z.array(z.string().min(1)).min(1),
+  ...sessionField,
+}).strict()
+const runConfirmPayloadSchema = z.object({
+  id: z.string().min(1),
+  nodeId: z.string().min(1),
+  decision: z.enum(['confirm', 'reject']),
+  ...sessionField,
+}).strict()
+
 export interface NodeSummary {
   readonly id: string
   readonly type: OmtNode['type']
@@ -58,6 +113,104 @@ export interface NodeSummary {
 
 function summarize(node: OmtNode): NodeSummary {
   return { id: node.id, type: node.type, title: node.title, status: node.status, archived: node.archived, priority: node.priority }
+}
+
+// ── run view values (STORY-0013 UI channel) ──────────────────────────────
+
+type RunProgress = Record<RunItemState, number> & { total: number }
+
+export interface RunSummaryValue {
+  readonly id: string
+  readonly title?: string
+  readonly status: OmtRun['status']
+  /** 加入-run picker eligibility (TICKET-0067): pending/running/paused. */
+  readonly active: boolean
+  /** Folds into the 历史 group (TICKET-0068); interrupted stays in the main list. */
+  readonly history: boolean
+  readonly created_at: string
+  readonly finished_at?: string
+  readonly progress: RunProgress
+  /** Pending items whose 续跑 nudge budget is exhausted (TICKET-0062). */
+  readonly stalled: number
+}
+
+function runProgress(core: OmtCore, runId: string): RunProgress {
+  const progress = { total: 0, ...Object.fromEntries(RUN_ITEM_STATES.map(state => [state, 0])) } as RunProgress
+  for (const { state, count } of core.runItemStateCounts(runId)) {
+    progress.total += count
+    progress[state] = count
+  }
+  return progress
+}
+
+function runSummary(core: OmtCore, run: OmtRun): RunSummaryValue {
+  return {
+    id: run.id,
+    ...(run.title !== undefined ? { title: run.title } : {}),
+    status: run.status,
+    active: isRunActive(run.status),
+    history: isRunHistory(run.status),
+    created_at: run.created_at,
+    ...(run.finished_at !== undefined ? { finished_at: run.finished_at } : {}),
+    progress: runProgress(core, run.id),
+    stalled: core.runItems(run.id).filter(isRunItemStalled).length,
+  }
+}
+
+/** One collectable run member: pending by default, running for in_progress tickets. */
+interface CollectedMember {
+  readonly nodeId: string
+  readonly state: 'pending' | 'running'
+  readonly executorSessionId?: string
+}
+
+interface MemberCollection {
+  readonly members: CollectedMember[]
+  readonly skippedDone: number
+  readonly skippedArchived: number
+}
+
+/**
+ * 加入-run collection (TICKET-0067): each root + its whole subtree in tree
+ * (DFS pre-order) order. done/archived nodes are skipped and counted (their
+ * children are still collected); in_progress nodes join as running with the
+ * RunningRegistry executor snapshot. Overlapping roots dedupe via `seen`.
+ */
+function collectRunMembers(core: OmtCore, running: RunningRegistry | undefined, rootIds: readonly string[]): MemberCollection {
+  const members: CollectedMember[] = []
+  const seen = new Set<string>()
+  let skippedDone = 0
+  let skippedArchived = 0
+  const visit = (node: OmtTreeNode): void => {
+    if (!seen.has(node.id)) {
+      seen.add(node.id)
+      if (node.archived) {
+        skippedArchived += 1
+      } else if (node.status === 'done') {
+        skippedDone += 1
+      } else if (node.status === 'in_progress') {
+        const info = running?.get(node.id)
+        members.push({ nodeId: node.id, state: 'running', ...(info !== undefined ? { executorSessionId: info.sessionId } : {}) })
+      } else {
+        members.push({ nodeId: node.id, state: 'pending' })
+      }
+    }
+    for (const child of node.children) visit(child)
+  }
+  for (const rootId of rootIds) {
+    for (const root of core.tree(rootId)) visit(root)
+  }
+  return { members, skippedDone, skippedArchived }
+}
+
+/** Plugin-sourced user message (same wire shape as the notify-hook). */
+function pluginMessage(text: string): unknown {
+  return {
+    id: randomUUID(),
+    role: 'user',
+    content: [{ type: 'text', text }],
+    source: { kind: 'plugin', plugin: 'oh-my-ticket' },
+  }
 }
 
 type RpcSuccess = { ok: true; value: unknown }
@@ -84,6 +237,73 @@ export function registerOmtRpc(ctx: Context, pool: OmtCorePool, recent?: RecentR
   }
   const coreFor = (sessionId: string | undefined) =>
     pool.coreFor(sessionId === undefined ? undefined : agents?.get(sessionId)?.session.header.cwd)
+  const cwdOf = (sessionId: string | undefined) =>
+    sessionId === undefined ? undefined : agents?.get(sessionId)?.session.header.cwd
+
+  /**
+   * Executor lineage view (TICKET-0066/0068): the RunningRegistry snapshot
+   * wins while the ticket is still marked running; otherwise fall back to
+   * the live session header (gone once the executor session is disposed).
+   */
+  const executorOf = (item: OmtRunItem) => {
+    const sessionId = item.executor_session_id
+    if (sessionId === undefined) return undefined
+    const live = running?.get(item.node_id)
+    if (live !== undefined && live.sessionId === sessionId) {
+      return {
+        sessionId,
+        label: live.sessionLabel,
+        ...(live.parentSessionId !== undefined ? { parentSessionId: live.parentSessionId } : {}),
+        ...(live.isSubagent === true ? { isSubagent: true } : {}),
+      }
+    }
+    const header = agents?.get(sessionId)?.session.header
+    return {
+      sessionId,
+      label: sessionLabelOf(sessionId),
+      ...(header?.parentSession !== undefined ? { parentSessionId: header.parentSession } : {}),
+      ...(header?.origin === 'subagent' ? { isSubagent: true } : {}),
+    }
+  }
+
+  /** Run-detail item row: state/谱系/attempts/last_error/stalled + ticket join. */
+  const runItemView = (core: OmtCore, item: OmtRunItem) => {
+    const node = core.getNode(item.node_id)
+    const executor = executorOf(item)
+    return {
+      node_id: item.node_id,
+      position: item.position,
+      state: item.state,
+      attempts: item.attempts,
+      ...(item.last_error !== undefined ? { last_error: item.last_error } : {}),
+      ...(isRunItemStalled(item) ? { stalled: true } : {}),
+      ...(item.started_at !== undefined ? { started_at: item.started_at } : {}),
+      ...(item.finished_at !== undefined ? { finished_at: item.finished_at } : {}),
+      ...(item.executor_session_id !== undefined ? { executor_session_id: item.executor_session_id } : {}),
+      ...(executor !== undefined ? { executor } : {}),
+      ...(node !== undefined ? { node: { id: node.id, title: node.title, status: node.status, archived: node.archived } } : {}),
+    }
+  }
+
+  /**
+   * 加入-run home rule (TICKET-0067, same as omt_run_create): every root
+   * must exist and resolve to `baselineHome`. For run-create the baseline
+   * is the first root's home; for run-add it is the run's home.
+   */
+  const assertSameHome = async (baselineHome: string | undefined, rootIds: readonly string[], cwd: string | undefined, runId?: string): Promise<string> => {
+    let home = baselineHome
+    for (const rootId of rootIds) {
+      const owner = await pool.coreForNode(rootId, cwd)
+      if (owner.getNode(rootId) === undefined) throw new OmtError('NOT_FOUND', `unknown node: ${rootId}`)
+      home ??= owner.home
+      if (owner.home !== home) {
+        throw new OmtError('INVALID_INPUT', runId === undefined
+          ? `run 成员必须同属一个 OMT home（${rootId} 属于 ${owner.home}，与 ${home} 不同）`
+          : `跨 home 加入被拒绝：${rootId} 属于 ${owner.home}，而 run ${runId} 属于 ${home}；请另建 run`)
+      }
+    }
+    return home as string
+  }
   ctx.connection.rpc.handle('/omt', async (endpoint, payload) => {
     try {
       switch (endpoint) {
@@ -118,6 +338,16 @@ export function registerOmtRpc(ctx: Context, pool: OmtCorePool, recent?: RecentR
             ...(result.parent !== undefined ? { parent: summarize(result.parent) } : {}),
             children: result.children.map(summarize),
             body: result.body,
+            // 所属 run 链接 (TICKET-0068): every non-terminal run holding
+            // this ticket, with the item state (awaiting_confirmation 标识)
+            // and a small progress summary.
+            runs: core.runsOfNode(parsed.data.id).map(({ run, item }) => ({
+              id: run.id,
+              ...(run.title !== undefined ? { title: run.title } : {}),
+              status: run.status,
+              itemState: item.state,
+              progress: runProgress(core, run.id),
+            })),
           })
         }
         case 'update': {
@@ -181,6 +411,142 @@ export function registerOmtRpc(ctx: Context, pool: OmtCorePool, recent?: RecentR
           const result = await core.reindex()
           changes?.bump(core.home)
           return ok(result)
+        }
+        case 'run-list': {
+          const parsed = runListPayloadSchema.safeParse(payload ?? {})
+          if (!parsed.success) return badRequest('invalid run-list payload', parsed.error.issues)
+          const core = await coreFor(parsed.data.sessionId)
+          // Active + interrupted + history in one list; the client groups by
+          // the active/history flags (TICKET-0068 layout).
+          return ok({ runs: core.listRuns({}).map(run => runSummary(core, run)) })
+        }
+        case 'run-show': {
+          const parsed = runShowPayloadSchema.safeParse(payload)
+          if (!parsed.success) return badRequest('invalid run-show payload', parsed.error.issues)
+          const core = await pool.coreForRun(parsed.data.id, cwdOf(parsed.data.sessionId))
+          const run = core.requireRun(parsed.data.id)
+          return ok({
+            run: { ...runSummary(core, run), config: run.config },
+            items: core.runItems(run.id).map(item => runItemView(core, item)),
+          })
+        }
+        case 'run-control': {
+          const parsed = runControlPayloadSchema.safeParse(payload)
+          if (!parsed.success) return badRequest('invalid run-control payload', parsed.error.issues)
+          const { id, action, nodeId } = parsed.data
+          const core = await pool.coreForRun(id, cwdOf(parsed.data.sessionId))
+          let item: OmtRunItem | undefined
+          switch (action) {
+            case 'start': {
+              await core.startRun(id)
+              // 开始执行 (TICKET-0068): wake the operating session with a
+              // followup pointing at the claim loop. Best-effort — a dead
+              // session never fails the start.
+              const agent = parsed.data.sessionId === undefined ? undefined : agents?.get(parsed.data.sessionId)
+              if (agent?.followup !== undefined) {
+                const count = core.runItems(id).length
+                try {
+                  agent.followup(pluginMessage(
+                    `用户从 UI 触发了 run ${id} 的开始执行（共 ${count} 个成员）。`
+                    + `请调用 omt_run_claim（id="${id}"）认领下一个待执行项并执行；`
+                    + '每项完成后用 omt_run_report 报告结果（done/failed/blocked/skipped）。',
+                  ))
+                } catch (error) {
+                  console.warn('[omt] run-control start: followup injection failed', error)
+                }
+              }
+              break
+            }
+            case 'pause':
+              await core.pauseRun(id)
+              break
+            case 'resume':
+              await core.resumeRun(id)
+              break
+            case 'cancel':
+              await core.cancelRun(id)
+              break
+            case 'retry':
+              if (nodeId === undefined) return badRequest('run-control retry requires nodeId', [])
+              item = await core.retryItem(id, nodeId)
+              break
+            case 'remove':
+              if (nodeId === undefined) return badRequest('run-control remove requires nodeId', [])
+              await core.removeRunItem(id, nodeId)
+              break
+          }
+          changes?.bump(core.home, { id, kind: item !== undefined ? 'item' : 'run', ...(item !== undefined ? { nodeId: item.node_id } : {}) })
+          return ok({
+            run: runSummary(core, core.requireRun(id)),
+            ...(item !== undefined ? { item: runItemView(core, item) } : {}),
+          })
+        }
+        case 'run-create': {
+          const parsed = runCreatePayloadSchema.safeParse(payload)
+          if (!parsed.success) return badRequest('invalid run-create payload', parsed.error.issues)
+          const cwd = cwdOf(parsed.data.sessionId)
+          // 一键直建 (TICKET-0067): default config; advanced config stays
+          // with the model-side omt_run_create.
+          const home = await assertSameHome(undefined, parsed.data.nodeIds, cwd)
+          const core = await pool.coreForHome(home)
+          const collected = collectRunMembers(core, running, parsed.data.nodeIds)
+          const run = await core.createRun({
+            ...(parsed.data.title !== undefined ? { title: parsed.data.title } : {}),
+            nodeIds: [],
+          })
+          const { added } = await core.addRunMembers(run.id, collected.members)
+          changes?.bump(core.home, { id: run.id, kind: 'run' })
+          return ok({
+            run: runSummary(core, core.requireRun(run.id)),
+            added: added.map(entry => entry.node_id),
+            addedRunning: added.filter(entry => entry.state === 'running').map(entry => entry.node_id),
+            skippedDone: collected.skippedDone,
+            skippedArchived: collected.skippedArchived,
+          })
+        }
+        case 'run-add': {
+          const parsed = runAddPayloadSchema.safeParse(payload)
+          if (!parsed.success) return badRequest('invalid run-add payload', parsed.error.issues)
+          const cwd = cwdOf(parsed.data.sessionId)
+          const core = await pool.coreForRun(parsed.data.id, cwd)
+          const run = core.requireRun(parsed.data.id)
+          await assertSameHome(core.home, parsed.data.nodeIds, cwd, run.id)
+          const collected = collectRunMembers(core, running, parsed.data.nodeIds)
+          const { added, duplicates } = await core.addRunMembers(run.id, collected.members)
+          changes?.bump(core.home, { id: run.id, kind: 'run' })
+          return ok({
+            run: runSummary(core, core.requireRun(run.id)),
+            added: added.map(entry => entry.node_id),
+            addedRunning: added.filter(entry => entry.state === 'running').map(entry => entry.node_id),
+            duplicates,
+            skippedDone: collected.skippedDone,
+            skippedArchived: collected.skippedArchived,
+          })
+        }
+        case 'run-confirm': {
+          const parsed = runConfirmPayloadSchema.safeParse(payload)
+          if (!parsed.success) return badRequest('invalid run-confirm payload', parsed.error.issues)
+          const { id, nodeId, decision } = parsed.data
+          const core = await pool.coreForRun(id, cwdOf(parsed.data.sessionId))
+          core.requireRun(id)
+          const current = core.getRunItem(id, nodeId)
+          if (current === undefined) throw new OmtError('NOT_FOUND', `run ${id} has no item for node: ${nodeId}`)
+          if (current.state !== 'awaiting_confirmation') {
+            throw new OmtError('CONFLICT', `item ${nodeId} is ${current.state}; only awaiting_confirmation items can be confirmed/rejected`)
+          }
+          let item: OmtRunItem
+          if (decision === 'confirm') {
+            // 确认完成 (TICKET-0070): an explicit done report — item done +
+            // ticket done (reported bypasses the trust gate by design).
+            item = (await core.reportRunItem(id, nodeId, 'done')).item
+            running?.stop(nodeId)
+          } else {
+            // 打回: item interrupted; the ticket keeps its in_progress
+            // status (aligned with the failed semantics of TICKET-0059).
+            item = await core.transitionItem(id, nodeId, 'interrupted')
+          }
+          changes?.bump(core.home, { id, kind: 'item', nodeId })
+          return ok({ run: runSummary(core, core.requireRun(id)), item: runItemView(core, item) })
         }
         default:
           return badRequest(`unknown endpoint: ${endpoint}`, [])

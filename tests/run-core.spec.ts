@@ -579,3 +579,74 @@ describe('startup janitor (TICKET-0056)', () => {
     expect(next.id).toBe('RUN-0002')
   })
 })
+
+describe('addRunMembers (TICKET-0067 host side)', () => {
+  it('appends members after existing positions and reports duplicates', async () => {
+    const [a, b, c] = await fixture(3)
+    const run = await core.createRun({ nodeIds: [a!.id] })
+    const result = await core.addRunMembers(run.id, [
+      { nodeId: b!.id },
+      { nodeId: a!.id }, // already a member
+      { nodeId: b!.id }, // duplicate within the same call
+      { nodeId: c!.id },
+    ])
+    expect(result.duplicates).toEqual([a!.id, b!.id])
+    expect(result.added.map(item => [item.node_id, item.position, item.state])).toEqual([
+      [b!.id, 1, 'pending'],
+      [c!.id, 2, 'pending'],
+    ])
+    expect(core.runItems(run.id)).toHaveLength(3)
+  })
+
+  it('inserts in_progress members directly as running with an executor snapshot (no transition)', async () => {
+    const [a, b] = await fixture(2)
+    const run = await core.createRun({ nodeIds: [a!.id] })
+    const { added } = await core.addRunMembers(run.id, [
+      { nodeId: b!.id, state: 'running', executorSessionId: 'sess-ui' },
+    ])
+    const item = added[0]!
+    expect(item.state).toBe('running')
+    expect(item.executor_session_id).toBe('sess-ui')
+    expect(item.started_at).toBeDefined()
+    expect(item.attempts).toBe(0)
+  })
+
+  it('rejects terminal runs and interrupted runs (human review first)', async () => {
+    const [a, b, c] = await fixture(3)
+    const canceled = await core.createRun({ nodeIds: [a!.id] })
+    await core.cancelRun(canceled.id)
+    await expect(core.addRunMembers(canceled.id, [{ nodeId: b!.id }])).rejects.toThrow(/终态|另建/)
+
+    const interrupted = await core.createRun({ nodeIds: [a!.id, b!.id] })
+    await core.startRun(interrupted.id)
+    await core.transitionItem(interrupted.id, a!.id, 'running', { executorSessionId: 'sess-dead' })
+    // Demote the only running item with pending work left: run → interrupted.
+    core.janitorSweep(() => false)
+    expect(core.getRun(interrupted.id)?.status).toBe('interrupted')
+    await expect(core.addRunMembers(interrupted.id, [{ nodeId: c!.id }])).rejects.toThrow(/resume/)
+  })
+
+  it('rejects archived and unknown members (unknown = foreign home)', async () => {
+    const [a, b] = await fixture(2)
+    const run = await core.createRun({ nodeIds: [a!.id] })
+    await core.update({ id: b!.id, archived: true })
+    await expect(core.addRunMembers(run.id, [{ nodeId: b!.id }])).rejects.toThrow(/归档|archived/)
+    await expect(core.addRunMembers(run.id, [{ nodeId: 'TICKET-9999' }])).rejects.toThrow(OmtError)
+    // A rejected batch member must not wedge the run: prior adds still stand.
+    expect(core.runItems(run.id).map(item => item.node_id)).toEqual([a!.id])
+  })
+})
+
+describe('runsOfNode (TICKET-0068 ticket detail run links)', () => {
+  it('returns non-terminal runs holding the node, with the item state', async () => {
+    const [a] = await fixture(1)
+    const active = await core.createRun({ nodeIds: [a!.id] })
+    const history = await core.createRun({ nodeIds: [a!.id] })
+    await core.cancelRun(history.id)
+
+    const memberships = core.runsOfNode(a!.id)
+    expect(memberships.map(m => m.run.id)).toEqual([active.id])
+    expect(memberships[0]!.item.state).toBe('pending')
+    expect(core.runsOfNode('TICKET-9999')).toEqual([])
+  })
+})

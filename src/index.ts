@@ -6,7 +6,7 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import Schema from '@deepseek-ai/schemastery'
-import { ChangeHub } from './host/changes.ts'
+import { bridgeRunEvents, ChangeHub } from './host/changes.ts'
 import { registerOmtDisposedHook } from './host/disposed-hook.ts'
 import { registerOmtEvents } from './host/events.ts'
 import { registerOmtIdleHook } from './host/idle-hook.ts'
@@ -51,14 +51,19 @@ export function apply(ctx: Context, config: Config): void {
   // Run-notification closure (TICKET-0065): attaches to every core as it
   // opens, so lazily-opened workspace homes notify too.
   const notifier = createOmtRunNotifier(ctx)
+  const changes = new ChangeHub()
   // Workspace-aware pool: a workspace root with its own `.omt/` wins, the
   // global home is the fallback. Cores open lazily per home (lazy
   // node:sqlite import, possible first-run reindex). The startup janitor
   // receives the live-session list so a plugin reload never demotes items
-  // whose executor session is still alive (review fix #4).
+  // whose executor session is still alive (review fix #4). Each opened core
+  // also bridges its run events into the SSE hub (TICKET-0071).
   const pool = new OmtCorePool(globalHome, {
     activeSessionIds: () => agents?.list().map(agent => agent.id) ?? [],
-    onCoreOpened: core => notifier.attach(core),
+    onCoreOpened: core => {
+      notifier.attach(core)
+      bridgeRunEvents(core, changes)
+    },
   })
   console.log(`[omt] host plugin loaded (global home: ${globalHome}; workspace .omt/ wins when present)`)
   const recent = new RecentRegistry()
@@ -69,7 +74,6 @@ export function apply(ctx: Context, config: Config): void {
       ;(await pool.coreFor(undefined)).setSessionRecent(sessionId, ids)
     },
   })
-  const changes = new ChangeHub()
   registerOmtTools(ctx, pool, (sessionId, id) => recent.touch(sessionId, id), home => changes.bump(home), running)
   registerOmtSkill(ctx)
   registerOmtRunsSkill(ctx)

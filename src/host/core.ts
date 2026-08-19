@@ -24,6 +24,7 @@ import {
   RUN_ITEM_FINAL_STATES,
   RUN_ITEM_FAILURE_STATES,
   isNodeType,
+  isRunActive,
   isRunItemInFlight,
   isRunItemState,
   isStatus,
@@ -101,6 +102,24 @@ export interface TransitionItemOptions {
   readonly executorSessionId?: string
   /** Failure detail kept in last_error (also across retries). */
   readonly error?: string
+}
+
+/**
+ * One member to append to an existing run (TICKET-0067 加入 run).
+ * `state: 'running'` is the explicit in_progress join: the ticket is already
+ * being executed, so the item is SET running with the executor snapshot —
+ * deliberately no transition (a pending run would gate one out).
+ */
+export interface AddRunMemberInput {
+  readonly nodeId: string
+  readonly state?: 'pending' | 'running'
+  readonly executorSessionId?: string
+}
+
+export interface AddRunMembersResult {
+  readonly added: OmtRunItem[]
+  /** Node ids skipped because they were already members (run 内去重). */
+  readonly duplicates: string[]
 }
 
 /**
@@ -617,6 +636,72 @@ export class OmtCore {
   /** Per-state member counts for one run (omt_run_list progress; no existence check). */
   runItemStateCounts(runId: string): { state: RunItemState; count: number }[] {
     return this.store.runItemStateCounts(runId)
+  }
+
+  /**
+   * Append members to an existing run (TICKET-0067 「加入 run」 host path).
+   * Only ACTIVE runs (pending/running/paused) accept members: history runs
+   * are sealed, and an interrupted run needs human review (resume) before
+   * its membership changes. Duplicates (existing membership or repeated
+   * input) are skipped and reported, never an error. Membership validates
+   * against this home's nodes (unknown id = foreign home = NOT_FOUND);
+   * archived members are refused up front like in createRun. Positions
+   * continue after the current maximum. No transition semantics: a member
+   * with `state: 'running'` is inserted running directly (in_progress join
+   * with an executor snapshot), which a pending/paused run would otherwise
+   * gate out.
+   */
+  async addRunMembers(runId: string, members: readonly AddRunMemberInput[]): Promise<AddRunMembersResult> {
+    const run = this.requireRun(runId)
+    if (!isRunActive(run.status)) {
+      throw new OmtError('CONFLICT', run.status === 'interrupted'
+        ? `run ${runId} 处于 interrupted（需人工核对）；请先 resume 再加入成员`
+        : `run ${runId} 已终态（${run.status}），不可加入成员；请另建 run`)
+    }
+    let position = this.store.listRunItems(runId).reduce((max, item) => Math.max(max, item.position), -1) + 1
+    const added: OmtRunItem[] = []
+    const duplicates: string[] = []
+    const seen = new Set<string>()
+    for (const member of members) {
+      if (seen.has(member.nodeId) || this.store.getRunItem(runId, member.nodeId) !== undefined) {
+        duplicates.push(member.nodeId)
+        continue
+      }
+      seen.add(member.nodeId)
+      const node = this.requireNode(member.nodeId)
+      if (node.archived) {
+        throw new OmtError('INVALID_INPUT', `run member ${member.nodeId} is archived (已归档成员不能加入 run；请先恢复)`)
+      }
+      const state = member.state ?? 'pending'
+      this.store.insertRunItem({
+        run_id: runId,
+        node_id: member.nodeId,
+        position,
+        state,
+        attempts: 0,
+        nudge_count: 0,
+        ...(state === 'running'
+          ? {
+            started_at: new Date().toISOString(),
+            ...(member.executorSessionId !== undefined ? { executor_session_id: member.executorSessionId } : {}),
+          }
+          : {}),
+      })
+      added.push(this.store.getRunItem(runId, member.nodeId) as OmtRunItem)
+      position += 1
+    }
+    return { added, duplicates }
+  }
+
+  /**
+   * Non-terminal runs holding one node, with the node's item in each
+   * (ticket detail 所属 run 链接, TICKET-0068). Unknown nodes yield [] —
+   * callers surface NOT_FOUND through their own node resolution first.
+   */
+  runsOfNode(nodeId: string): { run: OmtRun; item: OmtRunItem }[] {
+    return this.store
+      .runItemsForNode(nodeId, ['pending', 'running', 'paused', 'interrupted'])
+      .map(({ item }) => ({ run: this.requireRun(item.run_id), item }))
   }
 
   /** start: pending → running; an empty run derives completed immediately. */

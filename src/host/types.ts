@@ -86,6 +86,23 @@ export type RunStatus = (typeof RUN_STATUSES)[number]
 export const RUN_ITEM_STATES = ['pending', 'running', 'done', 'failed', 'blocked', 'skipped', 'interrupted', 'awaiting_confirmation'] as const
 export type RunItemState = (typeof RUN_ITEM_STATES)[number]
 
+/**
+ * Run grouping for UI surfaces (TICKET-0067/0068): history runs fold into
+ * the collapsed 历史 group; active runs are the 加入-run picker targets.
+ * `interrupted` is neither — resumable but needing human review, it stays
+ * ungrouped in the main list and accepts no new members.
+ */
+export const RUN_HISTORY_STATUSES: readonly RunStatus[] = ['completed', 'completed_with_failures', 'canceled']
+export const RUN_ACTIVE_STATUSES: readonly RunStatus[] = ['pending', 'running', 'paused']
+
+export function isRunHistory(status: RunStatus): boolean {
+  return (RUN_HISTORY_STATUSES as readonly string[]).includes(status)
+}
+
+export function isRunActive(status: RunStatus): boolean {
+  return (RUN_ACTIVE_STATUSES as readonly string[]).includes(status)
+}
+
 /** Item states that count as "finished" for run terminal derivation. */
 export const RUN_ITEM_FINAL_STATES: readonly RunItemState[] = ['done', 'failed', 'blocked', 'skipped', 'interrupted']
 
