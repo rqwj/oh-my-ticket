@@ -12,6 +12,7 @@ import { OmtCorePool } from '../src/host/pool.ts'
 import { registerOmtRpc } from '../src/host/rpc.ts'
 import { RunningRegistry } from '../src/host/running.ts'
 import { registerOmtTools } from '../src/host/tools.ts'
+import { NUDGE_BUDGET } from '../src/host/types.ts'
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -191,6 +192,23 @@ describe('TICKET-0057 omt_run_list / show', () => {
     expect(detail.items[0]).toMatchObject({ node_id: ids[0], state: 'running', executor_session_id: 'sess-1', attempts: 0 })
     expect(detail.items[0].title).toBe('任务1')
     expect(renderText('omt_run_show', { id: run.id }, detail)).toContain(ids[0]!)
+  })
+
+  it('marks a nudge-budget-exhausted pending item as stalled (TICKET-0062)', async () => {
+    const ids = await ticketFixture(2)
+    const run = await startedRun(ids)
+    const core = await pool.coreFor(undefined)
+    for (let count = 0; count < NUDGE_BUDGET; count += 1) core.recordItemNudge(run.id, ids[1]!)
+
+    const detail = await tool('omt_run_show').execute({ id: run.id }, NO_EXEC)
+    expect(detail.items[1]).toMatchObject({ node_id: ids[1], state: 'pending', stalled: true })
+    expect(detail.items[0].stalled).toBeUndefined()
+    expect(renderText('omt_run_show', { id: run.id }, detail)).toContain('停滞')
+
+    // Retry clears the budget → the marker disappears.
+    await tool('omt_run_control').execute({ id: run.id, action: 'retry', nodeId: ids[1] }, NO_EXEC)
+    const after = await tool('omt_run_show').execute({ id: run.id }, NO_EXEC)
+    expect(after.items[1].stalled).toBeUndefined()
   })
 })
 

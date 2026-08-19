@@ -92,6 +92,13 @@ export const RUN_ITEM_FINAL_STATES: readonly RunItemState[] = ['done', 'failed',
 /** Item states that mark the run outcome as not fully successful. */
 export const RUN_ITEM_FAILURE_STATES: readonly RunItemState[] = ['failed', 'blocked', 'interrupted']
 
+/**
+ * Continuation-nudge budget (TICKET-0062 / EPIC-0003 decision 5): the idle
+ * hook nudges one pending item at most this many times (exponential
+ * backoff); afterwards the item reads as stalled until a human retries it.
+ */
+export const NUDGE_BUDGET = 3
+
 export interface RunConfig {
   /** Item failed → run pauses for a human decision (blocked/skipped do not trigger). */
   stopOnFailure: boolean
@@ -144,6 +151,15 @@ export function isRunStatus(value: unknown): value is RunStatus {
 
 export function isRunItemState(value: unknown): value is RunItemState {
   return typeof value === 'string' && (RUN_ITEM_STATES as readonly string[]).includes(value)
+}
+
+/**
+ * Stalled convention (TICKET-0062): no dedicated item state — a pending item
+ * whose nudge budget is exhausted IS the stalled marker. UI/query surfaces
+ * derive it here; `retryItem` (budget reset) is the way back.
+ */
+export function isRunItemStalled(item: Pick<OmtRunItem, 'state' | 'nudge_count'>): boolean {
+  return item.state === 'pending' && item.nudge_count >= NUDGE_BUDGET
 }
 
 /** Error with a stable machine-readable code for tool/API surfaces. */

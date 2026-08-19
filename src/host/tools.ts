@@ -11,7 +11,7 @@ import { RUN_REPORT_OUTCOMES, type OmtCore, type ReindexResult, type ReportResul
 import type { OmtCorePool } from './pool.ts'
 import type { RunningRegistry } from './running.ts'
 import { stripChildrenBlock } from './markdown.ts'
-import { NODE_TYPES, RUN_ITEM_STATES, RUN_STATUSES, STATUSES, type OmtNode, type OmtRun, type OmtRunItem, type RunItemState } from './types.ts'
+import { isRunItemStalled, NODE_TYPES, RUN_ITEM_STATES, RUN_STATUSES, STATUSES, type OmtNode, type OmtRun, type OmtRunItem, type RunItemState } from './types.ts'
 
 const NODE_SCHEMA = {
   type: 'object',
@@ -96,6 +96,8 @@ const RUN_ITEM_SCHEMA = {
     executor_session_id: { type: 'string' },
     attempts: { type: 'integer', required: true },
     last_error: { type: 'string' },
+    /** Derived (TICKET-0062): pending item whose 续跑 nudge budget is exhausted — needs human attention. */
+    stalled: { type: 'boolean' },
     started_at: { type: 'string' },
     finished_at: { type: 'string' },
     /** Joined node title (show/claim only). */
@@ -120,6 +122,8 @@ interface RunItemValue {
   executor_session_id?: string
   attempts: number
   last_error?: string
+  /** Derived stalled marker (pending + nudge budget exhausted, TICKET-0062). */
+  stalled?: boolean
   started_at?: string
   finished_at?: string
   title?: string
@@ -145,6 +149,7 @@ function runItemValue(item: OmtRunItem, title?: string): RunItemValue {
     ...(item.executor_session_id !== undefined ? { executor_session_id: item.executor_session_id } : {}),
     attempts: item.attempts,
     ...(item.last_error !== undefined ? { last_error: item.last_error } : {}),
+    ...(isRunItemStalled(item) ? { stalled: true } : {}),
     ...(item.started_at !== undefined ? { started_at: item.started_at } : {}),
     ...(item.finished_at !== undefined ? { finished_at: item.finished_at } : {}),
     ...(title !== undefined ? { title } : {}),
@@ -161,6 +166,7 @@ function renderItemLine(item: RunItemValue): string {
   if (item.executor_session_id !== undefined) parts.push(`（执行者 ${item.executor_session_id}）`)
   if (item.attempts > 0) parts.push(`（第 ${item.attempts + 1} 次尝试）`)
   if (item.last_error !== undefined) parts.push(`（上次失败：${item.last_error}）`)
+  if (item.stalled === true) parts.push('（停滞：续跑 nudge 预算已耗尽，请人工介入或 omt_run_control retry 重置）')
   return parts.join('')
 }
 

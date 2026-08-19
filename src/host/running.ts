@@ -25,4 +25,13 @@ export class RunningRegistry {
   get(id: string): RunningInfo | undefined {
     return this.running.get(id)
   }
+
+  /** Reverse lookup (idle hook): every ticket currently running under one session. */
+  forSession(sessionId: string): { id: string; info: RunningInfo }[] {
+    const matches: { id: string; info: RunningInfo }[] = []
+    for (const [id, info] of this.running) {
+      if (info.sessionId === sessionId) matches.push({ id, info })
+    }
+    return matches
+  }
 }

@@ -8,6 +8,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import Schema from '@deepseek-ai/schemastery'
 import { ChangeHub } from './host/changes.ts'
 import { registerOmtEvents } from './host/events.ts'
+import { registerOmtIdleHook } from './host/idle-hook.ts'
 import { OmtCorePool } from './host/pool.ts'
 import { RecentRegistry } from './host/recent.ts'
 import { RunningRegistry } from './host/running.ts'
@@ -56,4 +57,5 @@ export function apply(ctx: Context, config: Config): void {
   registerOmtSkill(ctx)
   registerOmtRpc(ctx, pool, recent, changes, running)
   registerOmtEvents(ctx, changes)
+  registerOmtIdleHook(ctx, pool, running)
 }

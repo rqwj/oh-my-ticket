@@ -681,6 +681,39 @@ export class OmtCore {
   }
 
   /**
+   * Continuation candidates (TICKET-0062): for every RUNNING run with
+   * autoContinue on where `sessionId` is the executor — it owns at least one
+   * item (any state; ownership survives completion) — the next pending item
+   * in position order. Paused runs stop dispatch AND nudges (decision 9);
+   * stalled pending items (nudge budget exhausted) stay in the result so the
+   * hook can recognize them instead of silently skipping ahead.
+   */
+  continuationCandidates(sessionId: string): { run: OmtRun; item: OmtRunItem }[] {
+    const candidates: { run: OmtRun; item: OmtRunItem }[] = []
+    for (const run of this.store.listRunsByStatus(['running'])) {
+      if (!run.config.autoContinue) continue
+      const items = this.store.listRunItems(run.id)
+      if (!items.some(item => item.executor_session_id === sessionId)) continue
+      const next = items.find(item => item.state === 'pending')
+      if (next !== undefined) candidates.push({ run, item: next })
+    }
+    return candidates
+  }
+
+  /**
+   * Record one continuation nudge on an item (TICKET-0062): nudge_count+1
+   * with nudged_at stamped. Pure bookkeeping — budget/backoff policy lives
+   * in the idle hook; retryItem clears both fields for a fresh budget.
+   */
+  recordItemNudge(runId: string, nodeId: string, at: string = new Date().toISOString()): OmtRunItem {
+    this.requireRun(runId)
+    const item = this.store.getRunItem(runId, nodeId)
+    if (item === undefined) throw new OmtError('NOT_FOUND', `run ${runId} has no item for node: ${nodeId}`)
+    this.store.updateRunItem(runId, nodeId, { nudged_at: at, nudge_count: item.nudge_count + 1 })
+    return this.store.getRunItem(runId, nodeId) as OmtRunItem
+  }
+
+  /**
    * Item-level removal (omt_run_control remove): drops the membership row
    * only — the ticket node is never touched. In-flight items (running /
    * awaiting_confirmation) cannot be removed; let them settle or cancel the
