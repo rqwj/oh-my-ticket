@@ -1,0 +1,5 @@
+# OMT 组合层：profile 列出本 bundle 时插入 OMT 插件行。
+# 行按包名引用，Node 从 profile 目录解析已安装的代码。
+- insert:
+    - id: omt
+      name: 'oh-my-ticket'

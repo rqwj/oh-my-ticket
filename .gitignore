@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+
+# Build output (tsdown → lib/)
+lib/
+
+# Pack artifacts (release tarballs)
+*.tgz
+
+# OMT SQLite index — derived from .omt/tickets/*.md, rebuilt by omt_reindex
+.omt/omt.db
+.omt/omt.db-shm
+.omt/omt.db-wal
+
+# OS noise
+.DS_Store
+
+# Local symlink to a deepseek-harness checkout (created by pnpm run setup)
+.dsh-checkout
+
+# Local pnpm store cache (created when installing with CI=true)
+.pnpm-store/
+
+# Logs
+*.log

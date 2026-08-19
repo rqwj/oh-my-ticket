@@ -1,0 +1,57 @@
+{
+  "name": "oh-my-ticket",
+  "version": "0.2.24",
+  "description": "DSH ticket management plugin: Epic/Story/Ticket hierarchy backed by SQLite + Markdown",
+  "license": "MIT",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    }
+  },
+  "scripts": {
+    "setup": "bash scripts/setup-links.sh",
+    "prebuild": "rm -rf lib",
+    "build": "tsdown",
+    "watch": "tsdown --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "link:./.dsh-checkout/vendor/cordis",
+    "@deepseek-ai/dsh-client-connection": "link:./.dsh-checkout/packages/client/connection",
+    "@deepseek-ai/dsh-client-ui-input-trigger": "link:./.dsh-checkout/packages/client/ui-input-trigger",
+    "@deepseek-ai/dsh-host-apiproxy": "link:./.dsh-checkout/packages/host/apiproxy",
+    "@deepseek-ai/dsh-skill": "link:./.dsh-checkout/packages/skill/skill",
+    "@deepseek-ai/dsh-tools": "link:./.dsh-checkout/packages/core/tools",
+    "@deepseek-ai/schemastery": "link:./.dsh-checkout/vendor/schemastery",
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^22.0.0",
+    "@types/react": "^18.3.0",
+    "js-yaml": "^4.1.0",
+    "jsdom": "^24.0.0",
+    "lightningcss": "^1.27.0",
+    "react": "^18.2.0",
+    "tsdown": "^0.16.0",
+    "typescript": "^5.9.0",
+    "vitest": "^3.0.0",
+    "zod": "^4.4.3"
+  }
+}

@@ -1,0 +1,362 @@
+/* Three-region layout: fixed header, scrolling body, fixed append area. */
+.panel {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+  padding: 12px 14px 0;
+  color: var(--dsw-alias-label-primary);
+  font-size: var(--dsw-font-xs-13-font-size);
+  line-height: 1.6;
+}
+
+.headerTop {
+  flex: none;
+}
+
+.bodyScroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  margin-top: 10px;
+  padding-top: 10px;
+  padding-bottom: 12px;
+  border-top: 1px solid var(--dsw-alias-border-l1);
+}
+
+.appendArea {
+  flex: none;
+  padding-bottom: 12px;
+}
+
+.placeholder {
+  padding: 24px 8px;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+/* Single-line header sized for the 360px details default width. */
+.header {
+  display: flex;
+  align-items: center;
+  flex-wrap: nowrap;
+  gap: 6px;
+}
+
+.id {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 700;
+  font-size: var(--dsw-font-xxs-12-font-size);
+  color: var(--dsw-alias-brand-text);
+}
+
+.statusSelect {
+  flex: none;
+  font: inherit;
+  font-size: var(--dsw-font-xxxs-11-font-size);
+  color: var(--dsw-alias-label-primary);
+  background: var(--dsw-specific-input-major);
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 4px;
+  padding: 1px 4px;
+}
+
+.closeButton {
+  flex: none;
+  margin-left: auto;
+  font: inherit;
+  font-size: var(--dsw-font-s-14-font-size);
+  color: var(--dsw-alias-label-secondary);
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  padding: 0 6px;
+  cursor: pointer;
+}
+
+.closeButton:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.title {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 6px 0 10px;
+  font-size: var(--dsw-font-base-16-font-size);
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.titleText {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.relation {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.relationLabel {
+  flex: none;
+  font-size: var(--dsw-font-xxxs-11-font-size);
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.chipRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font: inherit;
+  font-size: var(--dsw-font-xxxs-11-font-size);
+  padding: 1px 8px;
+  border-radius: 10px;
+  border: 1px solid var(--dsw-alias-border-l3);
+  background: transparent;
+  color: var(--dsw-alias-label-secondary);
+  cursor: pointer;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chip:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary);
+}
+
+
+
+.append {
+  display: flex;
+  gap: 6px;
+  padding-top: 10px;
+  border-top: 1px solid var(--dsw-alias-border-l1);
+}
+
+.appendInput {
+  flex: 1;
+  font: inherit;
+  font-size: var(--dsw-font-xxs-12-font-size);
+  color: var(--dsw-alias-label-primary);
+  background: var(--dsw-specific-input-major);
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 6px;
+  padding: 6px 8px;
+  resize: vertical;
+}
+
+.appendInput::placeholder {
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.appendButton {
+  font: inherit;
+  font-size: var(--dsw-font-xxs-12-font-size);
+  align-self: flex-end;
+  padding: 4px 12px;
+  border: none;
+  border-radius: 6px;
+  /* Same pair as the composer send button: blue fill, static white text. */
+  background: var(--dsw-alias-button-info-fill);
+  color: var(--omt-on-accent);
+  cursor: pointer;
+}
+
+.appendButton:hover {
+  background: var(--dsw-alias-button-info-hover);
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 4px 0 2px;
+}
+
+.action {
+  font: inherit;
+  font-size: var(--dsw-font-xxs-12-font-size);
+  padding: 2px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--dsw-alias-border-l3);
+  background: transparent;
+  color: var(--dsw-alias-label-secondary);
+  cursor: pointer;
+}
+
+.action:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary);
+}
+
+.actionPrimary {
+  font: inherit;
+  font-size: var(--dsw-font-xxs-12-font-size);
+  padding: 2px 12px;
+  border-radius: 6px;
+  border: none;
+  background: var(--dsw-alias-button-info-fill);
+  color: var(--omt-on-accent);
+  cursor: pointer;
+}
+
+.actionPrimary:hover:not(:disabled) {
+  background: var(--dsw-alias-button-info-hover);
+}
+
+.actionPrimary:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.archivedBadge {
+  flex: none;
+  white-space: nowrap;
+  font-size: var(--dsw-font-xxxs-11-font-size);
+  font-weight: 400;
+  padding: 1px 8px;
+  border-radius: 8px;
+  border: 1px dashed var(--omt-status-archived-border);
+  color: var(--dsw-alias-label-tertiary);
+}
+
+/* "Executing" badge: pale-band sweep across the text (same technique as the
+   host turn-status shimmer — gradient clipped to glyphs, position animated). */
+.running {
+  margin: 2px 0 8px;
+  font-size: var(--dsw-font-xxs-12-font-size);
+  background: linear-gradient(
+    90deg,
+    var(--dsw-static-deepseek-500) 0%,
+    var(--dsw-static-deepseek-500) 40%,
+    var(--dsw-static-deepseek-200) 50%,
+    var(--dsw-static-deepseek-500) 60%,
+    var(--dsw-static-deepseek-500) 100%
+  );
+  background-size: 250% 100%;
+  background-position: 100% 0;
+  background-clip: text;
+  -webkit-background-clip: text;
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+  animation: omt-running-shimmer 1.8s linear infinite;
+}
+
+@keyframes omt-running-shimmer {
+  to {
+    background-position: 0 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .running {
+    background-position: 0 0;
+    background-size: 100% 100%;
+    animation: none;
+  }
+}
+
+.titleInput {
+  font: inherit;
+  font-size: var(--dsw-font-base-16-font-size);
+  font-weight: 600;
+  width: 100%;
+  margin: 6px 0 10px;
+  color: var(--dsw-alias-label-primary);
+  background: var(--dsw-specific-input-major);
+  border: 1px solid var(--dsw-alias-brand-text);
+  border-radius: 6px;
+  padding: 2px 6px;
+}
+
+.times {
+  margin: -4px 0 8px;
+  font-size: var(--dsw-font-xxxs-11-font-size);
+  color: var(--dsw-alias-label-tertiary);
+  cursor: default;
+}
+
+.skeletonTitle {
+  height: 20px;
+  width: 60%;
+  border-radius: 6px;
+  background: var(--dsw-alias-bg-skeleton);
+  margin: 8px 0 14px;
+  animation: omt-skeleton-pulse 1.4s ease-in-out infinite;
+}
+
+.skeletonLine {
+  height: 12px;
+  border-radius: 4px;
+  background: var(--dsw-alias-bg-skeleton);
+  margin-bottom: 10px;
+  animation: omt-skeleton-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes omt-skeleton-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skeletonTitle, .skeletonLine { animation: none; }
+}
+
+.errorBox {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 20px 4px;
+}
+
+.errorIcon {
+  font-size: var(--dsw-font-l-20-font-size);
+  color: var(--omt-warn);
+}
+
+.errorTitle {
+  font-size: var(--dsw-font-xs-13-font-size);
+  font-weight: 600;
+}
+
+.errorDetail {
+  font-size: var(--dsw-font-xxs-12-font-size);
+  color: var(--dsw-alias-label-tertiary);
+  word-break: break-all;
+}
+
+.errorActions {
+  display: flex;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+/* Keyboard focus rings (TICKET-0034). */
+.statusSelect:focus-visible,
+.closeButton:focus-visible,
+.chip:focus-visible,
+.action:focus-visible,
+.actionPrimary:focus-visible,
+.appendInput:focus-visible,
+.appendButton:focus-visible,
+.titleInput:focus-visible {
+  outline: 2px solid var(--omt-focus-ring);
+  outline-offset: 1px;
+}

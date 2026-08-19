@@ -1,0 +1,66 @@
+/* Drawer shell: the overlay aside plus its width drag handle. All tree
+   content styles live in TicketPanel.module.css. */
+.drawer {
+  position: fixed;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 320px;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  background: var(--dsw-alias-bg-base);
+  border-right: 1px solid var(--dsw-alias-border-l1);
+  box-shadow: 4px 0 16px rgba(0, 0, 0, 0.3);
+  font: inherit;
+  color: var(--dsw-alias-label-primary);
+}
+
+.headerButton {
+  font: inherit;
+  color: var(--dsw-alias-label-secondary);
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+
+.headerButton:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary);
+}
+
+.headerButton:focus-visible {
+  outline: 2px solid var(--omt-focus-ring);
+  outline-offset: 1px;
+}
+
+/* 6px hit area; the visible cue is a centered 2px line (hover/drag only).
+   touch-action: none keeps touch drags flowing to the pointer handler
+   instead of the scroll gesture. */
+.dragHandle {
+  position: absolute;
+  top: 0;
+  right: -3px;
+  bottom: 0;
+  width: 6px;
+  cursor: col-resize;
+  z-index: 61;
+  touch-action: none;
+}
+
+.dragHandle::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 2px;
+  width: 2px;
+  background: transparent;
+}
+
+.dragHandle:hover::after,
+.dragHandle[data-dragging]::after {
+  background: var(--omt-drag-cue);
+}

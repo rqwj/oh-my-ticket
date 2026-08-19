@@ -1,0 +1,64 @@
+/* FloatWindow shell: a fixed rounded card above the frame (same z-band as
+   the drawer — the two are mode-gated and never co-render). */
+.float {
+  position: fixed;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  background: var(--dsw-alias-bg-base);
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 10px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+  overflow: hidden;
+  font: inherit;
+  color: var(--dsw-alias-label-primary);
+}
+
+.headerButton {
+  font: inherit;
+  color: var(--dsw-alias-label-secondary);
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+
+.headerButton:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary);
+}
+
+.headerButton:focus-visible {
+  outline: 2px solid var(--omt-focus-ring);
+  outline-offset: 1px;
+}
+
+/* Corner resize grip: a 14px hit area with an L-shaped cue. */
+.resizeHandle {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 14px;
+  height: 14px;
+  cursor: nwse-resize;
+  touch-action: none;
+  z-index: 61;
+}
+
+.resizeHandle::after {
+  content: '';
+  position: absolute;
+  right: 3px;
+  bottom: 3px;
+  width: 8px;
+  height: 8px;
+  border-right: 2px solid var(--dsw-alias-label-tertiary);
+  border-bottom: 2px solid var(--dsw-alias-label-tertiary);
+  border-bottom-right-radius: 6px;
+  opacity: 0.5;
+}
+
+.resizeHandle:hover::after {
+  opacity: 1;
+}

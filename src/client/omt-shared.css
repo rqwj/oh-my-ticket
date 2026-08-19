@@ -1,0 +1,101 @@
+/**
+ * OMT shared styles: the single home of every plugin color and of the
+ * badge/dot/type/status classes shared by the drawer, doc panel, reference
+ * bar, turn tail, and active dock. Injected once as a plain stylesheet
+ * (tsdown CSS plugin, non-module arm); classes are global by design —
+ * components reference them as plain strings alongside their module classes.
+ *
+ * Color rule: component CSS never holds a literal — it reads var(--omt-*)
+ * or a host --dsw-* token directly. Host-mappable semantics delegate to the
+ * host token (fallback = the pre-tokenization literal, honored only when the
+ * shell's theme is absent); plugin-owned hues keep their literal here.
+ */
+:root {
+  /* Text on saturated fills (type badges, primary buttons). */
+  --omt-on-accent: var(--dsw-alias-label-primary-inverted, #fff);
+
+  /* Type palette — plugin-owned, no host counterpart. */
+  --omt-type-epic: #7c5cbf;
+  --omt-type-story: #2f6fd0;
+  --omt-type-substory: #4a80b4;
+  --omt-type-ticket: #2e9e6b;
+  --omt-type-subticket: #5a8a6e;
+
+  /* Status dots. */
+  --omt-status-open: #9aa3b2;
+  --omt-status-in_progress: var(--dsw-static-deepseek-500, #4d9fff);
+  --omt-status-done: var(--dsw-alias-state-success-primary, #3fbf6f);
+  --omt-status-archived-border: #75787e;
+
+  /* Priority signal bars (PriorityIcon + doc-panel select). */
+  --omt-priority-p1: var(--dsw-static-deepseek-500, #4d9fff);
+  --omt-priority-p2: var(--dsw-alias-state-warn-primary, #e09543);
+  --omt-priority-p3: var(--dsw-alias-state-error-primary, #d4554d);
+
+  /* Armed destructive confirm (drawer reindex two-stage button). */
+  --omt-danger: var(--dsw-alias-state-error-primary, #b0483e);
+  --omt-danger-hover: var(--dsw-alias-state-error-secondary, #c2574c);
+
+  /* Warning glyph (doc-panel error box). */
+  --omt-warn: var(--dsw-alias-state-warn-primary, #d4883e);
+
+  /* ToggleButton active background (bluish tint, plugin-owned). */
+  --omt-toggle-active-bg: rgba(97, 135, 216, 0.25);
+
+  /* Drawer width drag cue. */
+  --omt-drag-cue: rgba(125, 162, 255, 0.45);
+
+  /* Keyboard focus ring (host brand text color). */
+  --omt-focus-ring: var(--dsw-alias-brand-text, #7da2ff);
+}
+
+/* Type badge (E/S/SS/T/ST). --lg matches the drawer row's larger metrics.
+   The 9/9.5px captions deliberately stay px: the host font token floor is
+   --dsw-font-xxxs-11 (11px), and badge glyphs must sit below it to fit the
+   13/14px badge height. */
+.omt-badge {
+  flex: none;
+  min-width: 16px;
+  padding: 0 3px;
+  border-radius: 3px;
+  font-size: 9px;
+  font-weight: 700;
+  text-align: center;
+  line-height: 13px;
+  color: var(--omt-on-accent);
+}
+
+.omt-badge--lg {
+  min-width: 18px;
+  font-size: 9.5px;
+  line-height: 14px;
+}
+
+.omt-type-epic { background: var(--omt-type-epic); }
+.omt-type-story { background: var(--omt-type-story); }
+.omt-type-substory { background: var(--omt-type-substory); }
+.omt-type-ticket { background: var(--omt-type-ticket); }
+.omt-type-subticket { background: var(--omt-type-subticket); }
+
+/* Status dot. --lg matches the drawer row's 7px dot. */
+.omt-dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+}
+
+.omt-dot--lg {
+  width: 7px;
+  height: 7px;
+}
+
+.omt-status-open { background: var(--omt-status-open); }
+.omt-status-in_progress { background: var(--omt-status-in_progress); }
+.omt-status-done { background: var(--omt-status-done); }
+/* Archived = hollow dot: "boxed away" reads distinctly at 6px and for color-blind users. */
+.omt-status-archived {
+  box-sizing: border-box;
+  background: transparent;
+  border: 1.5px solid var(--omt-status-archived-border);
+}

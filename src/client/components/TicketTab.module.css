@@ -1,0 +1,32 @@
+/* TicketTab shell: fill the conversation view body (the owner renders the
+   active view in a full-size flex slot). */
+.tab {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+  height: 100%;
+  background: var(--dsw-alias-bg-base);
+  font: inherit;
+  color: var(--dsw-alias-label-primary);
+}
+
+.headerButton {
+  font: inherit;
+  color: var(--dsw-alias-label-secondary);
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+
+.headerButton:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary);
+}
+
+.headerButton:focus-visible {
+  outline: 2px solid var(--omt-focus-ring);
+  outline-offset: 1px;
+}

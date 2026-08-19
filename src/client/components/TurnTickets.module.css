@@ -1,0 +1,49 @@
+.wrap {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 6px 0 2px;
+  font-size: var(--dsw-font-xxs-12-font-size);
+}
+
+.label {
+  color: var(--dsw-alias-label-tertiary);
+  font-size: var(--dsw-font-xxxs-11-font-size);
+  flex: none;
+}
+
+.item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font: inherit;
+  font-size: var(--dsw-font-xxs-12-font-size);
+  padding: 1px 8px;
+  border-radius: 10px;
+  border: 1px solid var(--dsw-alias-border-l3);
+  background: transparent;
+  color: var(--dsw-alias-label-secondary);
+  cursor: pointer;
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.item:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary);
+}
+
+.title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Keyboard focus rings (TICKET-0034). */
+.item:focus-visible {
+  outline: 2px solid var(--omt-focus-ring);
+  outline-offset: 1px;
+}
