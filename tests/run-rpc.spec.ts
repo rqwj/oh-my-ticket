@@ -274,6 +274,27 @@ describe('run-create', () => {
     expect(events.some(event => event.run?.id === result.value.run.id)).toBe(true)
   })
 
+  it('an in_progress ticket WITHOUT a running mark joins as pending (re-dispatch)', async () => {
+    const { story, tickets } = await storyFixture(2)
+    const [open, inProgress] = tickets
+    await core.update({ id: inProgress!.id, status: 'in_progress' })
+    // 没有 running.start：RunningRegistry 无活跃标记的 in_progress 不是
+    // 真实执行中，加入后应置 pending 让 run 重新派发。
+    const pc = await pcore()
+
+    const result = await handler('run-create', { nodeIds: [story.id], sessionId: SESSION }, new AbortController().signal)
+    expect(result.ok).toBe(true)
+    expect(result.value.added).toEqual([story.id, open!.id, inProgress!.id])
+    expect(result.value.addedRunning).toEqual([])
+
+    const items = pc.runItems(result.value.run.id)
+    expect(items.map(item => [item.node_id, item.state])).toEqual([
+      [story.id, 'pending'],
+      [open!.id, 'pending'],
+      [inProgress!.id, 'pending'],
+    ])
+  })
+
   it('rejects members from different homes', async () => {
     const { tickets } = await storyFixture(2)
     const wsDir = await mkdtemp(join(tmpdir(), 'omt-run-rpc-ws-'))
@@ -402,16 +423,46 @@ describe('run-confirm', () => {
     expect(events.some(event => event.run?.id === run.id)).toBe(true)
   })
 
-  it('reject interrupts the item and keeps the ticket in_progress', async () => {
+  it('reject interrupts the item and reopens the ticket to open', async () => {
     const { pc, run, ticket } = await awaitingFixture()
-    await pc.update({ id: ticket.id, status: 'in_progress', executorSessionId: SESSION })
+    // 真实门控状态：ticket 已 done、item awaiting_confirmation（不重置）。
+    expect(pc.getNode(ticket.id)?.status).toBe('done')
 
     const result = await handler('run-confirm', { id: run.id, nodeId: ticket.id, decision: 'reject' }, new AbortController().signal)
     expect(result.ok).toBe(true)
     expect(result.value.item.state).toBe('interrupted')
-    expect(pc.getNode(ticket.id)?.status).toBe('in_progress')
+    // 打回重开 ticket（而不是保持 in_progress）。
+    expect(pc.getNode(ticket.id)?.status).toBe('open')
     const bump = events.find(event => event.run?.id === run.id && event.run.kind === 'item')
     expect(bump?.run).toMatchObject({ id: run.id, kind: 'item', nodeId: ticket.id })
+  })
+
+  it('reject replays the same ticket’s item in another active run (cross-run broadcast)', async () => {
+    const { tickets } = await storyFixture(2)
+    const [ticket, other] = tickets
+    const pc = await pcore()
+    const runA = await pc.createRun({ nodeIds: [ticket!.id] })
+    // runB needs a second pending member: a single-member run would derive
+    // completed on the bare done below and leave the replay path.
+    const runB = await pc.createRun({ nodeIds: [ticket!.id, other!.id] })
+    await pc.startRun(runA.id)
+    await pc.startRun(runB.id)
+    await pc.transitionItem(runA.id, ticket!.id, 'running', { executorSessionId: SESSION })
+    // Bare done by the executor: runA's item is gated to
+    // awaiting_confirmation; runB's pending item lands done directly.
+    await pc.update({ id: ticket!.id, status: 'done', executorSessionId: SESSION })
+    expect(pc.getRunItem(runA.id, ticket!.id)?.state).toBe('awaiting_confirmation')
+    expect(pc.getRunItem(runB.id, ticket!.id)?.state).toBe('done')
+    expect(pc.getRun(runB.id)?.status).toBe('running')
+
+    const result = await handler('run-confirm', { id: runA.id, nodeId: ticket!.id, decision: 'reject' }, new AbortController().signal)
+    expect(result.ok).toBe(true)
+    expect(result.value.item.state).toBe('interrupted')
+    expect(pc.getNode(ticket!.id)?.status).toBe('open')
+    // 回放：另一活跃 run 中已落 done 的同票 item 回退 pending（重跑）。
+    expect(pc.getRunItem(runB.id, ticket!.id)?.state).toBe('pending')
+    expect(pc.getRunItem(runB.id, other!.id)?.state).toBe('pending')
+    expect(pc.getRun(runB.id)?.status).toBe('running')
   })
 
   it('rejects items that are not awaiting_confirmation', async () => {

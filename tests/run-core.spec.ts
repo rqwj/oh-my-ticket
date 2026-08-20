@@ -8,7 +8,8 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { OmtCore } from '../src/host/core.ts'
+import { bridgeRunEvents, ChangeHub, type OmtChangeEvent } from '../src/host/changes.ts'
+import { OmtCore, type OmtRunEvent } from '../src/host/core.ts'
 import { OmtStore } from '../src/host/store.ts'
 import { isRunItemStalled, NUDGE_BUDGET, OmtError } from '../src/host/types.ts'
 import { requireItem, ticketFixture } from './mocks/fixtures.ts'
@@ -430,6 +431,50 @@ describe('archived members (wedge fixes)', () => {
     await core.removeRunItem(run.id, a!.id)
     expect(core.getRunItem(run.id, a!.id)).toBeUndefined()
     expect(core.getNode(a!.id)?.status).toBe('open')
+  })
+})
+
+describe('claim events (run-event broadcast)', () => {
+  it('claimRunItem emits a pending → running item event that bridges into an SSE bump', async () => {
+    const [a] = await fixture(1)
+    const run = await core.createRun({ nodeIds: [a!.id] })
+    await core.startRun(run.id)
+    const hub = new ChangeHub()
+    const detach = bridgeRunEvents(core, hub)
+    const bumps: OmtChangeEvent[] = []
+    hub.subscribe(event => bumps.push(event))
+
+    const claimed = await core.claimRunItem(run.id, 'sess-1')
+    detach()
+
+    expect(claimed?.state).toBe('running')
+    expect(claimed?.executor_session_id).toBe('sess-1')
+    const bump = bumps.find(event => event.run?.kind === 'item' && event.run.nodeId === a!.id)
+    expect(bump?.run).toMatchObject({ id: run.id, kind: 'item', nodeId: a!.id })
+  })
+
+  it('claimRunItem surfaces archived-member skips as item events (pending → skipped)', async () => {
+    const [a, b] = await fixture(2)
+    const run = await core.createRun({ nodeIds: [a!.id, b!.id] })
+    // Archive b while the run is still pending: no observation fires, so the
+    // archived member sits in the queue until claim time.
+    await core.update({ id: b!.id, archived: true })
+    await core.startRun(run.id)
+    const seen: OmtRunEvent[] = []
+    const detach = core.onRunEvent(event => seen.push(event))
+
+    const claimed = await core.claimRunItem(run.id, 'sess-1')
+    detach()
+
+    expect(claimed?.node_id).toBe(a!.id)
+    expect(
+      seen
+        .filter(event => event.kind === 'item')
+        .map(event => [event.item?.node_id, event.fromItemState, event.item?.state]),
+    ).toEqual([
+      [b!.id, 'pending', 'skipped'],
+      [a!.id, 'pending', 'running'],
+    ])
   })
 })
 

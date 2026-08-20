@@ -84,6 +84,8 @@ export class OmtController {
   private yieldListener: (() => void) | undefined
   private events: EventSource | undefined
   private refreshTimer: ReturnType<typeof setTimeout> | undefined
+  /** Run-hint ids accumulated across one debounce window (latest-wins #4). */
+  private refreshRunHints = new Set<string>()
 
   constructor(
     private readonly rpc: RpcCaller,
@@ -147,23 +149,28 @@ export class OmtController {
   }
 
   private scheduleRefresh(runHint?: OmtRunChangeHint): void {
+    // Accumulate hints across the whole debounce window: a later hint-less
+    // message must not drop an earlier run hint (#4 latest-wins 丢 hint).
+    if (runHint !== undefined) this.refreshRunHints.add(runHint.id)
     if (this.refreshTimer !== undefined) clearTimeout(this.refreshTimer)
     this.refreshTimer = setTimeout(() => {
       this.refreshTimer = undefined
+      const runHints = this.refreshRunHints
+      this.refreshRunHints = new Set()
       const sessionId = this.currentSessionId
       void this.refreshTree(sessionId).catch(() => {})
       if (sessionId !== undefined) void this.refreshRelated(sessionId).catch(() => {})
       const active = this.active.getSnapshot()
       if (active !== undefined) void this.select(active.id, sessionId).catch(() => {})
-      // Run views (TICKET-0071): the list refreshes when the hint names a
-      // run or the Runs 区块 is on screen (showRuns fetches on entry, so a
+      // Run views (TICKET-0071): the list refreshes when the window saw a
+      // hint or the Runs 区块 is on screen (showRuns fetches on entry, so a
       // tree-only bump with the tickets section staged skips the round
-      // trip); the open detail reloads only when the hint names it.
-      if (runHint !== undefined || this.panelSection.getSnapshot() === 'runs') {
+      // trip); the open detail reloads only when a hint names it.
+      if (runHints.size > 0 || this.panelSection.getSnapshot() === 'runs') {
         void this.refreshRuns(sessionId).catch(() => {})
       }
       const detail = this.runDetail.getSnapshot()
-      if (runHint !== undefined && detail.status === 'ready' && detail.id === runHint.id) {
+      if (detail.status === 'ready' && runHints.has(detail.id)) {
         void this.openRun(detail.id, sessionId).catch(() => {})
       }
     }, 300)
@@ -524,14 +531,31 @@ export class OmtController {
     if (this.active.getSnapshot()?.id === nodeId) await this.select(nodeId, sessionId)
   }
 
+  /** 加入 run reentry guard (#7): set before the first await, cleared in finally. */
+  private joining = false
+
   /**
    * 加入 run (TICKET-0067): collect the node + its subtree host-side.
    * Zero active runs → 一键默认配置直建; exactly one → direct join;
    * several → the picker opens (non-terminal runs only — interrupted is
    * neither active nor history and accepts no new members). Host errors
    * (跨 home 拒绝) surface as an error notice.
+   *
+   * A fast double click must not create two duplicate runs: the first
+   * joinRun sets `joining` before its first await and a concurrent call
+   * returns immediately (guard-first, like pickRun).
    */
   joinRun = async (nodeId: string, sessionId?: string): Promise<void> => {
+    if (this.joining) return
+    this.joining = true
+    try {
+      await this.joinRunInner(nodeId, sessionId)
+    } finally {
+      this.joining = false
+    }
+  }
+
+  private async joinRunInner(nodeId: string, sessionId?: string): Promise<void> {
     const result = await this.rpc.call('/omt', 'run-list', sessionId === undefined ? {} : { sessionId })
     if (!result.ok) {
       this.setNotice({ kind: 'error', text: errorMessage(result) })

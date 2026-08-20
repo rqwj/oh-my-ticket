@@ -142,6 +142,41 @@ describe('subagent executor', () => {
     expect(core.getRun(run.id)?.status).toBe('running')
   })
 
+  it('sends NO followup and NO sweep when the subagent owns only terminal items (parent alive)', async () => {
+    const { run, ticketIds } = await runningItemFixture('child-1')
+    await core.reportRunItem(run.id, ticketIds[0]!, 'done', '收工')
+    const parent = makeAgent('parent-1')
+    liveAgents.set('parent-1', parent)
+    const child = makeAgent('child-1', { origin: 'subagent', parentSession: 'parent-1' }, ASSISTANT_EVENTS)
+    liveAgents.set('child-1', child)
+
+    emitDisposed(child)
+    await flush()
+
+    // 仅含终态项：无需父会话接管，也不触发 janitor sweep。
+    expect(texts()).toHaveLength(0)
+    expect(requireItem(core, run.id, ticketIds[0]!).state).toBe('done')
+    expect(requireItem(core, run.id, ticketIds[1]!).state).toBe('pending')
+    expect(core.getRun(run.id)?.status).toBe('running')
+  })
+
+  it('falls back to （不可得） when the disposed subagent has no usable event stream', async () => {
+    const { run, ticketIds } = await runningItemFixture('child-1')
+    const parent = makeAgent('parent-1')
+    liveAgents.set('parent-1', parent)
+    // 空事件流：最终报告摘要不存在的兜底分支。
+    const child = makeAgent('child-1', { origin: 'subagent', parentSession: 'parent-1' })
+    liveAgents.set('child-1', child)
+
+    emitDisposed(child)
+    await flush()
+
+    expect(texts()).toHaveLength(1)
+    expect(texts()[0]).toContain(ticketIds[0])
+    expect(texts()[0]).toContain('（不可得）')
+    expect(requireItem(core, run.id, ticketIds[0]!).state).toBe('running')
+  })
+
   it('contains a throwing parent followup (warn, item left running)', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
     try {
@@ -163,6 +198,27 @@ describe('subagent executor', () => {
       warn.mockRestore()
     }
   })
+
+  it('demotes the handed-off child items when the parent disposes afterwards', async () => {
+    const { run, ticketIds } = await runningItemFixture('child-1')
+    const parent = makeAgent('parent-1')
+    liveAgents.set('parent-1', parent)
+    const child = makeAgent('child-1', { origin: 'subagent', parentSession: 'parent-1' }, ASSISTANT_EVENTS)
+    liveAgents.set('child-1', child)
+
+    // 子先销毁：交接给存活的父会话，item 保持 running。
+    emitDisposed(child)
+    await flush()
+    expect(texts()).toHaveLength(1)
+    expect(requireItem(core, run.id, ticketIds[0]!).state).toBe('running')
+
+    // 父后销毁：父名下无项（owned 为空），但交接登记让它落入 janitor
+    // sweep —— 死掉的 child 的 running item 被降级。
+    emitDisposed(parent)
+    await flush()
+    expect(requireItem(core, run.id, ticketIds[0]!).state).toBe('interrupted')
+    expect(core.getRun(run.id)?.status).toBe('interrupted')
+  })
 })
 
 describe('main-session executor', () => {
@@ -180,6 +236,33 @@ describe('main-session executor', () => {
     expect(core.getRun(run.id)?.status).toBe('interrupted')
     // The dead session's running mark is cleaned up.
     expect(running.get(ticketIds[0]!)).toBeUndefined()
+  })
+
+  it('demotes running items of a PAUSED run owned by the disposed session', async () => {
+    const { run, ticketIds } = await runningItemFixture('s1')
+    await core.pauseRun(run.id)
+    const main = makeAgent('s1')
+    liveAgents.set('s1', main)
+
+    emitDisposed(main)
+    await flush()
+
+    // paused run 同样是 janitor 候选：孤儿 running item 降级；run 本身
+    // 保持 paused（人工控制中），续跑走 resume + retry。
+    expect(requireItem(core, run.id, ticketIds[0]!).state).toBe('interrupted')
+    expect(core.getRun(run.id)?.status).toBe('paused')
+  })
+
+  it('clears the running marks of a disposed session with NO run involvement', async () => {
+    // 无 run 项的会话：执行中标记也必须清理（不能因早退而泄漏）。
+    running.start('TICKET-0001', 's1', 'demo 的会话')
+    const main = makeAgent('s1')
+    liveAgents.set('s1', main)
+
+    emitDisposed(main)
+    await flush()
+
+    expect(running.get('TICKET-0001')).toBeUndefined()
   })
 
   it('leaves runs alone when the disposed session has no involvement', async () => {

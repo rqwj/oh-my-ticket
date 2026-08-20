@@ -696,6 +696,27 @@ describe('TICKET-0064 trust policy (awaiting_confirmation)', () => {
     expect(detail.run.status).toBe('running')
   })
 
+  it('a repeated bare done does NOT complete an awaiting_confirmation item (gate holds)', async () => {
+    const ids = await ticketFixture(1)
+    const run = await startedRun(ids)
+    await tool('omt_update').execute({ id: ids[0], status: 'in_progress' }, agentExec('sess-1'))
+    await tool('omt_update').execute({ id: ids[0], status: 'done' }, agentExec('sess-1'))
+    expect((await tool('omt_run_show').execute({ id: run.id }, NO_EXEC)).items[0].state).toBe('awaiting_confirmation')
+
+    // 第二次裸 done（不带 report）必须被信任门拦下：只有 omt_run_report /
+    // UI confirm 能完成 gated 项。
+    await tool('omt_update').execute({ id: ids[0], status: 'done' }, agentExec('sess-1'))
+    let detail = await tool('omt_run_show').execute({ id: run.id }, NO_EXEC)
+    expect(detail.items[0].state).toBe('awaiting_confirmation')
+    expect(detail.run.status).toBe('running')
+
+    // report 路径照常完成（reported=true 绕过此拦截）。
+    await tool('omt_run_report').execute({ id: run.id, nodeId: ids[0], outcome: 'done' }, agentExec('sess-1'))
+    detail = await tool('omt_run_show').execute({ id: run.id }, NO_EXEC)
+    expect(detail.items[0].state).toBe('done')
+    expect(detail.run.status).toBe('completed')
+  })
+
   it('non-run tickets are untouched by the trust policy', async () => {
     const ids = await ticketFixture(1)
     // No run holds this ticket: a bare done is an ordinary status change.

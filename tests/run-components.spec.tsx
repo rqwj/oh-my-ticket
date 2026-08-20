@@ -199,6 +199,22 @@ describe('RunsView list (TICKET-0068)', () => {
     const container = render(createElement(RunsView, { bindings, select: () => {}, sessionId: 's1', t }))
     expect(container.textContent).toContain('还没有 run')
   })
+
+  it('renders the load-failed placeholder for a list error', () => {
+    const { bindings } = makeBindings({ runs: { status: 'error', message: 'RPC 炸了' } })
+    const container = render(createElement(RunsView, { bindings, select: () => {}, sessionId: 's1', t }))
+    expect(container.textContent).toContain('加载失败：RPC 炸了')
+  })
+
+  it('shows the emptyActive hint plus the 历史 group when only terminal runs exist', () => {
+    const { bindings } = makeBindings({
+      runs: { status: 'ready', runs: [run('RUN-3', 'completed'), run('RUN-4', 'canceled')] },
+    })
+    const container = render(createElement(RunsView, { bindings, select: () => {}, sessionId: 's1', t }))
+    expect(container.textContent).toContain(zh['run.emptyActive'])
+    // 历史分组照常折叠呈现。
+    expect(byText(container, '▸ 历史（2）')).toBeDefined()
+  })
 })
 
 describe('RunsView detail (TICKET-0068/0069/0070)', () => {
@@ -297,6 +313,14 @@ describe('RunsView detail (TICKET-0068/0069/0070)', () => {
   it('the back button returns to the list', () => {
     const { bindings, spies } = makeBindings({ runDetail: detailReady })
     const container = render(createElement(RunsView, { bindings, select: () => {}, sessionId: 's1', t }))
+    click(byText(container, zh['run.back']) as HTMLElement)
+    expect(spies.calls.some(call => call.name === 'closeRunDetail')).toBe(true)
+  })
+
+  it('renders the detail error with a working back button', () => {
+    const { bindings, spies } = makeBindings({ runDetail: { status: 'error', id: 'RUN-9', message: 'NOT_FOUND' } })
+    const container = render(createElement(RunsView, { bindings, select: () => {}, sessionId: 's1', t }))
+    expect(container.textContent).toContain('加载失败：NOT_FOUND')
     click(byText(container, zh['run.back']) as HTMLElement)
     expect(spies.calls.some(call => call.name === 'closeRunDetail')).toBe(true)
   })

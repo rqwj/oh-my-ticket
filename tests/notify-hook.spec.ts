@@ -228,6 +228,36 @@ describe('run 终态总结', () => {
     expect(agent.followups).toHaveLength(0)
     expect(agent.injects).toHaveLength(0)
   })
+
+  it('delivers the terminal summary to EVERY distinct executor session', async () => {
+    const { run, ticketIds } = await runFixture(2)
+    const first = makeAgent('s1')
+    const second = makeAgent('s2')
+    await core.claimRunItem(run.id, 's1')
+    await core.reportRunItem(run.id, ticketIds[0]!, 'done')
+    await core.claimRunItem(run.id, 's2')
+    await core.reportRunItem(run.id, ticketIds[1]!, 'done')
+    await flush()
+
+    expect(core.getRun(run.id)?.status).toBe('completed')
+    // 两位执行者都收到终态总结（s2 的总结与其进度行合并为一条 followup）。
+    const firstTexts = textsOf(first.followups)
+    const secondTexts = textsOf(second.followups)
+    expect(firstTexts.some(text => text.includes(run.id) && text.includes('completed'))).toBe(true)
+    expect(secondTexts.some(text => text.includes(run.id) && text.includes('completed'))).toBe(true)
+  })
+
+  it('delivers nothing when no item has an executor session (contained, no throw)', async () => {
+    const { run } = await runFixture(1)
+    const bystander = makeAgent('s9')
+    // 无人认领直接取消：executor_session_id 全部缺失 → 不投递、不抛错。
+    await core.cancelRun(run.id)
+    await flush()
+
+    expect(core.getRun(run.id)?.status).toBe('canceled')
+    expect(bystander.followups).toHaveLength(0)
+    expect(bystander.injects).toHaveLength(0)
+  })
 })
 
 describe('错误包容', () => {

@@ -250,6 +250,58 @@ describe('joinRun flow (TICKET-0067)', () => {
     expect(notice).toMatchObject({ kind: 'error' })
     expect(notice?.text).toContain('跨 home')
   })
+
+  it('ignores a re-entrant joinRun while one is in flight (double click creates one run)', async () => {
+    listValue = [] // 无 active run → 直建路径
+    const first = controller.joinRun('TICKET-0001', 's1')
+    const second = controller.joinRun('TICKET-0001', 's1')
+    await Promise.all([first, second])
+    expect(calls.filter(call => call.endpoint === 'run-create')).toHaveLength(1)
+    // The guard releases once the first join settles.
+    await controller.joinRun('TICKET-0001', 's1')
+    expect(calls.filter(call => call.endpoint === 'run-create')).toHaveLength(2)
+  })
+})
+
+describe('notice 自动清除', () => {
+  it('an error notice auto-clears after 6s', async () => {
+    vi.useFakeTimers()
+    const failing = makeController({
+      'run-confirm': { ok: false, error: { message: 'CONFLICT: item is done' } },
+    })
+    await failing.runConfirm('RUN-1', 'TICKET-0002', 'reject', 's1')
+    expect(failing.notice.getSnapshot()).toMatchObject({ kind: 'error' })
+    vi.advanceTimersByTime(5999)
+    expect(failing.notice.getSnapshot()).toBeDefined()
+    vi.advanceTimersByTime(1)
+    expect(failing.notice.getSnapshot()).toBeUndefined()
+  })
+})
+
+describe('applyRunMutation item 合并', () => {
+  it('a retry response carrying an item patches only that item in the open detail', async () => {
+    const retried = makeController({
+      'run-control': {
+        ok: true,
+        value: {
+          run: run('RUN-1', 'running'),
+          item: { node_id: 'TICKET-0001', position: 0, state: 'pending', attempts: 1 },
+        },
+      },
+    })
+    await retried.openRun('RUN-1', 's1')
+    calls = []
+    await retried.runControl('RUN-1', 'retry', 'TICKET-0001', 's1')
+    const detail = retried.runDetail.getSnapshot()
+    if (detail.status !== 'ready') throw new Error('expected ready')
+    expect(detail.data.items).toHaveLength(2)
+    // The retried item is replaced in place; the other item is untouched.
+    expect(detail.data.items.find(item => item.node_id === 'TICKET-0001')).toMatchObject({ state: 'pending', attempts: 1 })
+    expect(detail.data.items.find(item => item.node_id === 'TICKET-0002')).toMatchObject({ state: 'running', attempts: 0 })
+    // Response-driven merge: no list/detail refetch (SSE covers it).
+    expect(calls.some(call => call.endpoint === 'run-show')).toBe(false)
+    expect(calls.some(call => call.endpoint === 'run-list')).toBe(false)
+  })
 })
 
 describe('SSE run hint (TICKET-0071)', () => {
@@ -299,6 +351,36 @@ describe('SSE run hint (TICKET-0071)', () => {
     await Promise.resolve()
     expect(calls.some(call => call.endpoint === 'run-list')).toBe(true)
     expect(calls.some(call => call.endpoint === 'run-show')).toBe(false)
+  })
+
+  it('accumulates run hints across the debounce window — a later hint-less message does not drop them (#4)', async () => {
+    vi.useFakeTimers()
+    const source = stubEventSource()
+    controller.connectEvents()
+    await controller.openRun('RUN-1', 's1')
+    calls = []
+    source.emit({ version: 2, home: '/home', run: { id: 'RUN-1', kind: 'item', nodeId: 'TICKET-0002' } })
+    vi.advanceTimersByTime(100)
+    // 无 hint 的后到消息重置了去抖窗口，但先到的 run hint 必须保留。
+    source.emit({ version: 2, home: '/home' })
+    vi.advanceTimersByTime(400)
+    await vi.waitFor(() => {
+      expect(calls.some(call => call.endpoint === 'run-list')).toBe(true)
+      expect(calls.some(call => call.endpoint === 'run-show' && call.payload.id === 'RUN-1')).toBe(true)
+    })
+  })
+
+  it('a hint-less message with the tickets section staged still skips the run-list round trip', async () => {
+    vi.useFakeTimers()
+    const source = stubEventSource()
+    controller.connectEvents()
+    calls = []
+    source.emit({ version: 2, home: '/home' })
+    vi.advanceTimersByTime(400)
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(calls.some(call => call.endpoint === 'tree')).toBe(true)
+    expect(calls.some(call => call.endpoint === 'run-list')).toBe(false)
   })
 })
 
