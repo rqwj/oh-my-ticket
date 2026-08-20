@@ -2,11 +2,11 @@
 id: TICKET-0064
 type: ticket
 title: awaiting_confirmation 信任策略
-status: open
+status: done
 priority: 2
 parent: STORY-0012
 created_at: '2026-08-19T09:11:19.289Z'
-updated_at: '2026-08-19T13:41:57.785Z'
+updated_at: '2026-08-19T23:05:20.649Z'
 ---
 
 ## 任务
@@ -33,3 +33,16 @@ updated_at: '2026-08-19T13:41:57.785Z'
 
 （暂无子节点）
 <!-- /omt:children -->
+
+## 完成记录（P2）
+
+- 机械分流落于 observeNodeStatus 的 done 分支：item running + 观察会话==执行者会话
+  + 非 report 通道 + run.autoVerify=false → awaiting_confirmation；其余（report、
+  非执行者会话、无会话、pending 项）直接 done。
+- report 信号通道：UpdateInput 新增内部 `reported` 标志，reportRunItem 的双写
+  update 携带 reported=true（结构上 item 已先 transition，双保险）。
+- 确认：awaiting_confirmation 是 in-flight，omt_run_report done 直接确认完成；
+  打回：ticket 重开 open → item interrupted（ITEM_TRANSITIONS 增加该出口）。
+- 行为变更：默认 run 下执行者裸 done 不再直接落 done；受影响旧测试改用
+  autoVerify=true（broadcast/paused/replay）或改写为信任门断言。
+- 测试：tests/run-tools.spec.ts「TICKET-0064 trust policy」8 例 + 0061 更新 4 例。

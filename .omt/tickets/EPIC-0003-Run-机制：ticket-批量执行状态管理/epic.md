@@ -5,7 +5,7 @@ title: Run 机制：ticket 批量执行状态管理
 status: open
 priority: 0
 created_at: '2026-08-19T09:08:48.423Z'
-updated_at: '2026-08-19T13:43:28.686Z'
+updated_at: '2026-08-20T01:19:26.653Z'
 ---
 
 # Run 机制：ticket 批量执行状态管理
@@ -119,3 +119,23 @@ run_items: run_id, node_id, position, state(pending/running/done/failed/blocked/
 - [STORY-0013 run UI](STORY-0013-run-UI/story.md) — open
 - [STORY-0014 skill 拆分渐进加载（omt / omt-runs）](STORY-0014-skill-拆分渐进加载（omt-omt-runs）/story.md) — open
 <!-- /omt:children -->
+
+
+## 进度记录
+
+- 2026-08-20 **P2 评审中途暂停**：实现全部完成并提交（至 1de319a，303 测试全绿）。
+  ce-code-review P2 段已完成评审+验证（run 20260820-085327-d745a2a7），**修复尚未应用**。
+  待应用的已验证发现（9 项）：
+  #2 打回不重开 ticket（P1，rpc.ts reject 分支改 core.update open + notify 文案）；
+  #4 SSE debounce latest-wins 丢 run hint（P2，hint id 集合累积）；
+  #7 joinRun 无重入守卫（P2）；#8 裸 done 绕过信任门（P2，awaiting_confirmation 项
+  非 report 完成应跳过）；#9 claim/claim 跳过不发 run 事件（P2）；
+  #10 disposed-hook 不含 paused（P2）；#11 子先父后销毁孤儿项（P2，handoff 跟踪）；
+  #12 disposed-hook 提前返回泄漏 running 标记（P2）；#13 join 时无标记的
+  in_progress 置 running 成楔形（P2，改置 pending）。
+  验证器拒收 3 项：#1 core.ts 超千行拆分（无仓库契约支撑）、#3 omt_run_add
+  （决策 14 明确无 add 工具）、#14 create 子树语义（决策 15 划归 UI）。
+  另有 5 项测试补强降级在 testing_gaps（notice 计时器、applyRunMutation、
+  RunsView 错误分支、disposed/notify 边界）。
+  **恢复点**：从应用 #2/#4/#7/#8/#9/#10/#11/#12/#13 开始，产物目录
+  /tmp/compound-engineering-501/ce-code-review/20260820-085327-d745a2a7/。

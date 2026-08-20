@@ -2,11 +2,11 @@
 id: TICKET-0068
 type: ticket
 title: run 列表与详情视图
-status: open
+status: done
 priority: 2
 parent: STORY-0013
 created_at: '2026-08-19T09:12:00.371Z'
-updated_at: '2026-08-19T13:42:29.828Z'
+updated_at: '2026-08-20T00:14:00.270Z'
 ---
 
 ## 任务
@@ -48,3 +48,13 @@ updated_at: '2026-08-19T13:42:29.828Z'
 
 （暂无子节点）
 <!-- /omt:children -->
+
+
+## 进度（P2 UI worker，2026-08-19）
+
+- TicketPanel 头部下新增 Tickets | Runs 区块导航（panelSection store），三壳（Drawer/FloatWindow/TicketTab）经同一 RunsView 组件复用；树节点无批次进度条。
+- run 列表：非终态主列表（interrupted 不折叠、左侧红条显著 + 行内恢复按钮）、终态折叠「历史（N）」分组可展开；行含状态徽章/进度/失败数/停滞数/创建时间。
+- run 详情：item 清单（状态点+标签、执行者谱系 ↳ label（子代理）、attempts、last_error、停滞徽章、Tier 3 需核对徽章）、config 只读、start（pending，host followup 注入）/pause/resume/cancel；行级 retry（failed/interrupted/停滞 pending）、remove（非 in-flight）；awaiting_confirmation 行确认/打回（见 0070）。
+- ticket 详情面板「所属 run」列出全部非终态 run 链接（title+进度+itemState 点），点击 showRunInPanel 深链到 run 详情。
+- 纯函数 run-view.ts（groupRuns/runControlActions/canRetryItem/canRemoveItem/canConfirmItem）+ controller/组件测试覆盖。浏览器测试以 jsdom 组件测试替代。
+

@@ -2,11 +2,11 @@
 id: TICKET-0065
 type: ticket
 title: item 完成通知与 run 终态总结
-status: open
+status: done
 priority: 2
 parent: STORY-0012
 created_at: '2026-08-19T09:11:19.297Z'
-updated_at: '2026-08-19T13:27:14.642Z'
+updated_at: '2026-08-19T23:14:16.920Z'
 ---
 
 ## 任务
@@ -41,3 +41,19 @@ updated_at: '2026-08-19T13:27:14.642Z'
 
 （暂无子节点）
 <!-- /omt:children -->
+
+## 完成记录（P2）
+
+- core 新增 run 事件广播（OmtRunEvent / onRunEvent）：transitionItem/retryItem/
+  replayItem 发 item 事件，setRunStatus 发 run 事件（含 stop-on-failure paused
+  与终态派生）；监听器异常包容；启动 janitor 在监听器挂载前运行，不会误触通知。
+- 新增 src/host/notify-hook.ts（createOmtRunNotifier）：四类通知——item 完成进度
+  inject（含 n/m 计数）、stop-on-failure paused 待决 followup（失败项+last_error+
+  resume/retry/cancel 选项）、awaiting_confirmation 待确认提示 inject、run 终态
+  总结 followup（各态计数+失败项 last_error）；interrupted 终态不注入。
+- 合并去重：同 tick 同会话多条合并为一条（wake 优先整批走 followup）——「末项
+  完成+终态总结」「failed+paused」同源事件只注入一次；与 idle nudge 不撞车
+  （nudge 只打 pending、paused 不 nudge、待确认项非 pending）。
+- 接线：pool 新增 onCoreOpened（core 打开即挂载 notifier，覆盖懒加载的
+  workspace home）；index.ts apply 注入。执行会话销毁/通道抛错均 warn 包容。
+- 测试：tests/notify-hook.spec.ts 11 例。

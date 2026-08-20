@@ -2,11 +2,11 @@
 id: TICKET-0067
 type: ticket
 title: 树与详情的「加入 run」按钮
-status: open
+status: done
 priority: 2
 parent: STORY-0013
 created_at: '2026-08-19T09:12:00.351Z'
-updated_at: '2026-08-19T13:27:14.619Z'
+updated_at: '2026-08-20T00:14:00.256Z'
 ---
 
 ## 任务
@@ -42,3 +42,12 @@ updated_at: '2026-08-19T13:27:14.619Z'
 
 （暂无子节点）
 <!-- /omt:children -->
+
+
+## 进度（P2 UI worker，2026-08-19）
+
+- 树节点操作区（归档钮旁 ▸▸）与详情面板动作行各一个「加入 run」按钮（TICKET-0067 按钮式，无多选勾选）。
+- 点击走 controller.joinRun → run-list 取活跃 run（active 标志，仅 pending/running/paused；interrupted 不可加入不进弹窗）；0 个 → run-create 默认配置直建；1 个 → run-add 直加；多个 → RunPickerModal（title 回退 id + 进度 done/total + 相对创建时间）。
+- 子树收集/done·archived 跳过/in_progress→running+executor 快照/同 home 校验全在 host run-create/run-add；前端展示结果提示（notice：加入数/进行中数/跳过 done·archived/重复数），跨 home 拒绝以 error notice 呈现。
+- 组件测试：tests/run-components.spec.tsx（picker 选项/取消/notice、树行按钮、详情按钮）；controller 测试 tests/run-ui.spec.ts joinRun 全路径。浏览器测试不可用（无 react-dom 浏览器环境），以 jsdom 组件测试替代。
+

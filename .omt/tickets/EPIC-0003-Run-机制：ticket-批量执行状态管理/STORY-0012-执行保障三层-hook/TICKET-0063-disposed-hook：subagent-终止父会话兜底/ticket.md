@@ -2,11 +2,11 @@
 id: TICKET-0063
 type: ticket
 title: disposed hook：subagent 终止父会话兜底
-status: open
+status: done
 priority: 2
 parent: STORY-0012
 created_at: '2026-08-19T09:11:19.279Z'
-updated_at: '2026-08-19T09:50:09.726Z'
+updated_at: '2026-08-19T23:08:21.799Z'
 ---
 
 ## 任务
@@ -31,3 +31,17 @@ Tier 2 hook：监听 `agent/disposed`：
 
 （暂无子节点）
 <!-- /omt:children -->
+
+## 完成记录（P2）
+
+- 新增 src/host/disposed-hook.ts：监听 cordis `agent/disposed`。
+- subagent 路径：header.origin==='subagent' 且 parentSession 可读 → 父会话存活时
+  followup（唤醒 idle）兜底通知，含未完成 run/item 清单 + 最终报告摘要
+  （best-effort 取会话事件流最后一条 assistant 文本，截断 500 字）；item 保持
+  running 交父会话接管。父会话不在 → janitor 降级 item→interrupted。
+- 主会话路径：名下 running run 有未完项 → core.janitorSweep（存活会话谓词，
+  显式剔除已 dispose 的会话）；已终态 run 不受扰动。死会话 RunningRegistry
+  标记同步清理。
+- core 新增 executorItems(sessionId)（active runs 的执行者介入探测）。
+- 测试：tests/disposed-hook.spec.ts 7 例（subagent 通知/降级/无介入/followup
+  抛错包容；主会话 interrupted/旁观会话无影响/终态不动）。

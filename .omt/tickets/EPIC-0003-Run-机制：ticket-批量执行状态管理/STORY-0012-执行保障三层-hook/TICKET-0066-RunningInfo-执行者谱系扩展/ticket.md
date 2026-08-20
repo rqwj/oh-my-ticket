@@ -2,11 +2,11 @@
 id: TICKET-0066
 type: ticket
 title: RunningInfo 执行者谱系扩展
-status: open
+status: done
 priority: 2
 parent: STORY-0012
 created_at: '2026-08-19T09:11:19.307Z'
-updated_at: '2026-08-19T09:50:09.756Z'
+updated_at: '2026-08-19T23:00:03.523Z'
 ---
 
 ## 任务
@@ -28,3 +28,11 @@ RunningRegistry.RunningInfo 扩展执行者谱系：
 
 （暂无子节点）
 <!-- /omt:children -->
+
+## 完成记录（P2）
+
+- RunningInfo 新增 parentSessionId/isSubagent；`start()` 接受 lineage 快照，
+  `lineageOfHeader()` 从 session header（parentSession + origin==='subagent'）读取。
+- 调用点接线：rpc.ts execute（AgentsLike header 扩展 parentSession/origin）、
+  tools.ts trackRunning（exec.agent.session.header）。RPC get 的 running 字段自动携带谱系。
+- 测试：tests/running.spec.ts — registry 谱系快照/空谱系 + execute 端点谱系填充。
