@@ -7,7 +7,22 @@
 import { createSnapshotStore, type SnapshotStore } from '@deepseek-ai/dsh-client-runtime/client'
 import type { RpcCaller } from './trigger/source.ts'
 import type { FloatPos, FloatSize } from './float-geometry.ts'
-import type { ActiveInfo, DocData, DocState, NodeSummary, OmtTreeNode, TreeState } from './store.ts'
+import type {
+  ActiveInfo,
+  DocData,
+  DocState,
+  NodeSummary,
+  Notice,
+  OmtRunChangeHint,
+  OmtTreeNode,
+  PanelSection,
+  RunDetailData,
+  RunDetailState,
+  RunListState,
+  RunPickerState,
+  RunSummary,
+  TreeState,
+} from './store.ts'
 
 /** ctx.layout face (ui-layout service). */
 export interface LayoutLike {
@@ -47,8 +62,20 @@ export class OmtController {
   readonly related: SnapshotStore<Record<string, readonly NodeSummary[]>> = createSnapshotStore({})
   /** id → summary cache (reference bar needs live title/status by bare ref). */
   readonly summaries: SnapshotStore<Record<string, NodeSummary>> = createSnapshotStore({})
+  /** Run list snapshot backing the Runs 区块 (TICKET-0068). */
+  readonly runs: SnapshotStore<RunListState> = createSnapshotStore({ status: 'idle' })
+  /** Open run detail (run-show) snapshot. */
+  readonly runDetail: SnapshotStore<RunDetailState> = createSnapshotStore({ status: 'idle' })
+  /** Panel section: the ticket tree vs the peer Runs 区块. */
+  readonly panelSection: SnapshotStore<PanelSection> = createSnapshotStore('tickets')
+  /** Join-run picker (TICKET-0067): set while the user picks a target run. */
+  readonly runPicker: SnapshotStore<RunPickerState | undefined> = createSnapshotStore(undefined)
+  /** Transient result notice (join counts / host errors); auto-clears. */
+  readonly notice: SnapshotStore<Notice | undefined> = createSnapshotStore(undefined)
   /** Session currently on stage (reported by session-scope components). */
   currentSessionId: string | undefined
+
+  private noticeTimer: ReturnType<typeof setTimeout> | undefined
 
   private detailsOff: (() => void) | undefined
   private shadowFactory: (() => () => void) | undefined
@@ -97,15 +124,27 @@ export class OmtController {
   /**
    * Subscribe to host change pushes (SSE /omt/events). Any mutation —
    * model tool call or UI action — refreshes the tree, the related list,
-   * and the open doc. Debounced: a burst of creates lands one refresh.
+   * the open doc, and the run views. Events caused by a run/item
+   * transition carry a `run` hint (TICKET-0071, additive JSON): the open
+   * run detail reloads only when the hint names it. Debounced: a burst of
+   * creates lands one refresh.
    */
   connectEvents = (): void => {
     if (this.events !== undefined || typeof EventSource === 'undefined') return
     this.events = new EventSource('/omt/events')
-    this.events.onmessage = () => this.scheduleRefresh()
+    this.events.onmessage = (message: MessageEvent<string>) => {
+      let hint: OmtRunChangeHint | undefined
+      try {
+        const parsed = JSON.parse(message.data) as { run?: OmtRunChangeHint }
+        hint = parsed.run
+      } catch {
+        hint = undefined
+      }
+      this.scheduleRefresh(hint)
+    }
   }
 
-  private scheduleRefresh(): void {
+  private scheduleRefresh(runHint?: OmtRunChangeHint): void {
     if (this.refreshTimer !== undefined) clearTimeout(this.refreshTimer)
     this.refreshTimer = setTimeout(() => {
       this.refreshTimer = undefined
@@ -114,6 +153,14 @@ export class OmtController {
       if (sessionId !== undefined) void this.refreshRelated(sessionId).catch(() => {})
       const active = this.active.getSnapshot()
       if (active !== undefined) void this.select(active.id, sessionId).catch(() => {})
+      // Run views (TICKET-0071): the list is cheap — always refresh; the
+      // open detail reloads only when the hint names it (a tree-only bump
+      // leaves the detail untouched).
+      void this.refreshRuns(sessionId).catch(() => {})
+      const detail = this.runDetail.getSnapshot()
+      if (runHint !== undefined && detail.status === 'ready' && detail.id === runHint.id) {
+        void this.openRun(detail.id, sessionId).catch(() => {})
+      }
     }, 300)
   }
 
@@ -353,5 +400,178 @@ export class OmtController {
   private async afterMutation(id: string, sessionId?: string): Promise<void> {
     await this.refreshTree(sessionId)
     if (this.active.getSnapshot()?.id === id) await this.select(id, sessionId)
+  }
+
+  // ── run flows (STORY-0013) ─────────────────────────────────────────────
+
+  /** Show a transient notice; auto-clears after a few seconds. */
+  private setNotice(notice: Notice): void {
+    if (this.noticeTimer !== undefined) clearTimeout(this.noticeTimer)
+    this.notice.set(notice)
+    this.noticeTimer = setTimeout(() => {
+      this.noticeTimer = undefined
+      this.notice.set(undefined)
+    }, 6000)
+  }
+
+  /** Switch the panel to the Runs 区块 and fetch the list. */
+  showRuns = (sessionId?: string): void => {
+    this.panelSection.set('runs')
+    void this.refreshRuns(sessionId).catch(() => {})
+  }
+
+  /** Switch the panel back to the ticket tree. */
+  showTickets = (): void => {
+    this.panelSection.set('tickets')
+  }
+
+  /** Fetch the run list. A ready list stays on screen while refetching. */
+  refreshRuns = async (sessionId?: string): Promise<void> => {
+    if (this.runs.getSnapshot().status !== 'ready') this.runs.set({ status: 'loading' })
+    const result = await this.rpc.call('/omt', 'run-list', sessionId === undefined ? {} : { sessionId })
+    if (result.ok) {
+      this.runs.set({ status: 'ready', runs: (result.value as { runs: readonly RunSummary[] }).runs })
+    } else {
+      this.runs.set({ status: 'error', message: errorMessage(result) })
+    }
+  }
+
+  /** Open a run detail (run-show); the previous detail stays while loading. */
+  openRun = async (id: string, sessionId?: string): Promise<void> => {
+    const current = this.runDetail.getSnapshot()
+    if (current.status !== 'ready' || current.id !== id) this.runDetail.set({ status: 'loading', id })
+    const result = await this.rpc.call('/omt', 'run-show', { id, sessionId })
+    if (result.ok) {
+      this.runDetail.set({ status: 'ready', id, data: result.value as RunDetailData })
+    } else {
+      this.runDetail.set({ status: 'error', id, message: errorMessage(result) })
+    }
+  }
+
+  /** Back from the run detail to the run list. */
+  closeRunDetail = (): void => {
+    this.runDetail.set({ status: 'idle' })
+  }
+
+  /** Deep-link (doc panel run links, TICKET-0068): open the panel on the run. */
+  showRunInPanel = async (id: string, sessionId?: string): Promise<void> => {
+    this.drawerOpen.set(true)
+    this.showRuns(sessionId)
+    await this.openRun(id, sessionId)
+  }
+
+  /** Run-level / row-level control (start/pause/resume/cancel/retry/remove). */
+  runControl = async (id: string, action: 'start' | 'pause' | 'resume' | 'cancel' | 'retry' | 'remove', nodeId?: string, sessionId?: string): Promise<void> => {
+    const result = await this.rpc.call('/omt', 'run-control', { id, action, ...(nodeId !== undefined ? { nodeId } : {}), sessionId })
+    if (!result.ok) {
+      this.setNotice({ kind: 'error', text: errorMessage(result) })
+    }
+    await this.refreshRuns(sessionId)
+    const detail = this.runDetail.getSnapshot()
+    if ((detail.status === 'ready' || detail.status === 'loading' || detail.status === 'error') && detail.id === id) {
+      await this.openRun(id, sessionId)
+    }
+  }
+
+  /** 确认完成 / 打回 (TICKET-0070): the awaiting_confirmation decision. */
+  runConfirm = async (id: string, nodeId: string, decision: 'confirm' | 'reject', sessionId?: string): Promise<void> => {
+    const result = await this.rpc.call('/omt', 'run-confirm', { id, nodeId, decision, sessionId })
+    if (!result.ok) {
+      this.setNotice({ kind: 'error', text: errorMessage(result) })
+      return
+    }
+    await this.refreshRuns(sessionId)
+    if (this.runDetail.getSnapshot().status === 'ready') await this.openRun(id, sessionId)
+    // confirm → ticket done; reject → the 待确认 badge clears. Reload the
+    // ticket doc when it is the one on stage.
+    if (this.active.getSnapshot()?.id === nodeId) await this.select(nodeId, sessionId)
+  }
+
+  /**
+   * 加入 run (TICKET-0067): collect the node + its subtree host-side.
+   * Zero active runs → 一键默认配置直建; exactly one → direct join;
+   * several → the picker opens (non-terminal runs only — interrupted is
+   * neither active nor history and accepts no new members). Host errors
+   * (跨 home 拒绝) surface as an error notice.
+   */
+  joinRun = async (nodeId: string, sessionId?: string): Promise<void> => {
+    const result = await this.rpc.call('/omt', 'run-list', sessionId === undefined ? {} : { sessionId })
+    if (!result.ok) {
+      this.setNotice({ kind: 'error', text: errorMessage(result) })
+      return
+    }
+    const runs = (result.value as { runs: readonly RunSummary[] }).runs
+    if (result.ok) this.runs.set({ status: 'ready', runs })
+    const active = runs.filter(entry => entry.active)
+    if (active.length === 0) {
+      const created = await this.rpc.call('/omt', 'run-create', { nodeIds: [nodeId], sessionId })
+      if (!created.ok) {
+        this.setNotice({ kind: 'error', text: errorMessage(created) })
+        return
+      }
+      const value = created.value as { run: RunSummary; added: readonly string[]; addedRunning: readonly string[]; skippedDone: number; skippedArchived: number }
+      this.setNotice({
+        kind: 'ok',
+        key: 'run.noticeCreated',
+        params: {
+          run: value.run.title ?? value.run.id,
+          added: value.added.length,
+          running: value.addedRunning.length,
+          skippedDone: value.skippedDone,
+          skippedArchived: value.skippedArchived,
+        },
+      })
+      await this.refreshRuns(sessionId)
+      return
+    }
+    if (active.length === 1 && active[0] !== undefined) {
+      await this.runAddTo(active[0].id, nodeId, sessionId)
+      return
+    }
+    this.runPicker.set({ nodeId, options: active })
+  }
+
+  /** Picker choice: join the selected run. */
+  pickRun = async (runId: string, sessionId?: string): Promise<void> => {
+    const picker = this.runPicker.getSnapshot()
+    this.runPicker.set(undefined)
+    if (picker === undefined) return
+    await this.runAddTo(runId, picker.nodeId, sessionId)
+  }
+
+  cancelRunPicker = (): void => {
+    this.runPicker.set(undefined)
+  }
+
+  /** run-add + result notice (加入数 / 跳过 done·archived / 重复数). */
+  private async runAddTo(runId: string, nodeId: string, sessionId?: string): Promise<void> {
+    const result = await this.rpc.call('/omt', 'run-add', { id: runId, nodeIds: [nodeId], sessionId })
+    if (!result.ok) {
+      this.setNotice({ kind: 'error', text: errorMessage(result) })
+      return
+    }
+    const value = result.value as {
+      run: RunSummary
+      added: readonly string[]
+      addedRunning: readonly string[]
+      duplicates: readonly string[]
+      skippedDone: number
+      skippedArchived: number
+    }
+    this.setNotice({
+      kind: 'ok',
+      key: 'run.noticeAdded',
+      params: {
+        run: value.run.title ?? value.run.id,
+        added: value.added.length,
+        running: value.addedRunning.length,
+        duplicates: value.duplicates.length,
+        skippedDone: value.skippedDone,
+        skippedArchived: value.skippedArchived,
+      },
+    })
+    await this.refreshRuns(sessionId)
+    const detail = this.runDetail.getSnapshot()
+    if (detail.status === 'ready' && detail.id === runId) await this.openRun(runId, sessionId)
   }
 }

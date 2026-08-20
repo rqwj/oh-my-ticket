@@ -139,6 +139,20 @@
   color: var(--dsw-alias-label-primary);
 }
 
+/* Run link in awaiting_confirmation (TICKET-0070): warning-family flag. */
+.chipAwaiting {
+  border-color: var(--omt-status-blocked);
+  color: var(--omt-status-blocked);
+}
+
+.awaitingBadge {
+  padding: 0 5px;
+  border-radius: 7px;
+  background: var(--omt-warn-bg);
+  color: var(--omt-status-blocked);
+  font-weight: 600;
+}
+
 
 
 .append {

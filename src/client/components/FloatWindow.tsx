@@ -12,9 +12,10 @@ import { clampFloatPos, clampFloatSize, type FloatPos, type FloatSize } from '..
 import type { ActiveInfo, TreeState } from '../store.ts'
 import type { Translate } from '../locales.ts'
 import { TicketPanel, type HeaderDragHandlers, type Selector } from './TicketPanel.tsx'
+import type { RunBindings } from './RunsView.tsx'
 import css from './FloatWindow.module.css'
 
-export interface FloatWindowProps {
+export interface FloatWindowProps extends RunBindings {
   readonly useDrawerOpen: Selector<boolean>
   readonly usePanelMode: Selector<PanelMode>
   readonly useFloatPos: Selector<FloatPos>
@@ -160,6 +161,7 @@ export function FloatWindow(props: FloatWindowProps) {
         reindex={props.reindex}
         select={props.select}
         archive={props.archive}
+        runView={props}
         sessionId={current}
         headerDrag={headerDrag}
         headerActions={

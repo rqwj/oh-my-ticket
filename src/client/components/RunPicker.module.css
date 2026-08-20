@@ -1,0 +1,137 @@
+/* RunPicker modal + NoticeBar. Colors read host --dsw-* tokens or the
+   plugin's --omt-* bridges; no literal colors here. */
+
+.overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--omt-overlay-scrim);
+  backdrop-filter: var(--dsw-mask-blur, none);
+}
+
+.modal {
+  width: min(360px, calc(100vw - 48px));
+  max-height: min(420px, calc(100vh - 96px));
+  display: flex;
+  flex-direction: column;
+  background: var(--dsw-alias-bg-layer-2);
+  border: 1px solid var(--dsw-alias-border-inverted);
+  border-radius: 10px;
+  box-shadow: var(--omt-overlay-shadow);
+  padding: 12px;
+  font-size: var(--dsw-font-xs-13-font-size);
+  color: var(--dsw-alias-label-primary);
+}
+
+.title {
+  font-weight: 600;
+  margin-bottom: 2px;
+}
+
+.subtitle {
+  font-size: var(--dsw-font-xxxs-11-font-size);
+  color: var(--dsw-alias-label-tertiary);
+  margin-bottom: 8px;
+}
+
+.options {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.option {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  font: inherit;
+  text-align: left;
+  padding: 6px 8px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--dsw-alias-label-primary);
+  cursor: pointer;
+}
+
+.option:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+  border-color: var(--dsw-alias-brand-text);
+}
+
+.optionTitle {
+  flex: 1;
+  min-width: 80px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.optionProgress {
+  flex: none;
+  font-size: var(--dsw-font-xxxs-11-font-size);
+  color: var(--dsw-alias-label-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.optionTime {
+  flex: none;
+  font-size: var(--dsw-font-xxxs-11-font-size);
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.footer {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 10px;
+}
+
+.cancel {
+  font: inherit;
+  font-size: var(--dsw-font-xxs-12-font-size);
+  color: var(--dsw-alias-label-secondary);
+  background: transparent;
+  border: 1px solid var(--dsw-alias-border-l3);
+  border-radius: 4px;
+  padding: 3px 12px;
+  cursor: pointer;
+}
+
+.cancel:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary);
+}
+
+.option:focus-visible,
+.cancel:focus-visible {
+  outline: 2px solid var(--omt-focus-ring);
+  outline-offset: 1px;
+}
+
+/* Transient notice (join counts / host errors). */
+.notice {
+  flex: none;
+  margin: 6px 10px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  font-size: var(--dsw-font-xxs-12-font-size);
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.noticeOk {
+  background: var(--omt-success-bg);
+  color: var(--omt-status-done);
+}
+
+.noticeError {
+  background: var(--omt-danger-bg);
+  color: var(--omt-item-failed);
+}
