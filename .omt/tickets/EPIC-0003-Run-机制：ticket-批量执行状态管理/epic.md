@@ -5,7 +5,7 @@ title: Run 机制：ticket 批量执行状态管理
 status: open
 priority: 0
 created_at: '2026-08-19T09:08:48.423Z'
-updated_at: '2026-08-20T01:19:26.653Z'
+updated_at: '2026-08-20T06:45:15.821Z'
 ---
 
 # Run 机制：ticket 批量执行状态管理
@@ -139,3 +139,17 @@ run_items: run_id, node_id, position, state(pending/running/done/failed/blocked/
   RunsView 错误分支、disposed/notify 边界）。
   **恢复点**：从应用 #2/#4/#7/#8/#9/#10/#11/#12/#13 开始，产物目录
   /tmp/compound-engineering-501/ce-code-review/20260820-085327-d745a2a7/。
+
+
+## 进度记录
+
+- 2026-08-20 **P2 全部完成**：评审修复 9 项全部应用并验证（commits ebbed69 /
+  fd191bb），全量 **323 测试**通过，typecheck/build 干净。ce-code-review P2 段
+  收据：status complete（run 20260820-085327-d745a2a7）。
+- 验证器拒收 3 项（不修）：core.ts 拆分（无仓库契约）、omt_run_add 与 create
+  子树语义（与已确认决策 14/15 一致，非缺陷）。
+- 残余（记录在案）：core.ts 1201 行拆分抉择留待后续；notify 批量投递无重试；
+  reindex/手工编辑绕过观察（既有边界）。
+- **EPIC-0003 P1+P2 全部 story done，仅剩 P3（基于 claim 的并发执行，无 ticket
+  待拆解）与 Open Questions 两项（goal-round-driver 评估、config 只读）及
+  TICKET-0073（run id 跨 home）。**
