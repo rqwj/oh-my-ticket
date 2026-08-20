@@ -10,13 +10,19 @@ import type { PanelMode } from '../controller.ts'
 import type { ActiveInfo, TreeState } from '../store.ts'
 import type { Translate } from '../locales.ts'
 import { TicketPanel, type Selector, type TicketPanelProps } from './TicketPanel.tsx'
+import type { RunBindings } from './RunsView.tsx'
 import css from './Drawer.module.css'
 
 // Selector moved to TicketPanel with the shared content; re-exported here so
 // the older component imports keep resolving.
 export type { Selector } from './TicketPanel.tsx'
 
-export interface DrawerProps {
+/**
+ * DrawerProps extends the run bindings flat (STORY-0013): the inject hooks
+ * channel binds run stores/callbacks as top-level props; the shell forwards
+ * itself as the panel's runView bindings object.
+ */
+export interface DrawerProps extends RunBindings {
   readonly useDrawerOpen: Selector<boolean>
   /** Panel-mode gate: the drawer yields to the floating window. */
   readonly usePanelMode: Selector<PanelMode>
@@ -158,6 +164,7 @@ export function Drawer(props: DrawerProps) {
         archive={props.archive}
         createNode={props.createNode}
         expandIds={props.expandIds}
+        runView={props}
         sessionId={current}
         headerActions={
           <button

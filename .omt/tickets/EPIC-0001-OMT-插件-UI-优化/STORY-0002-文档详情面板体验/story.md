@@ -30,7 +30,7 @@ updated_at: '2026-08-17T14:07:08.073Z'
 - [TICKET-0014 面包屑父链导航](TICKET-0014-面包屑父链导航/ticket.md) — open
 - [TICKET-0015 加载/错误/失效三态](TICKET-0015-加载错误失效三态/ticket.md) — done
 - [TICKET-0016 面板操作区（归档/复制/移动）](TICKET-0016-面板操作区（归档复制移动）/ticket.md) — done
-- [TICKET-0017 OMT 文档与工具详情共存策略](TICKET-0017-OMT-文档与工具详情共存策略/ticket.md) — open
+- [TICKET-0017 OMT 文档与工具详情共存策略](TICKET-0017-OMT-文档与工具详情共存策略/ticket.md) — done
 - [TICKET-0024 面板头尾固定布局](TICKET-0024-面板头尾固定布局/ticket.md) — done
 - [TICKET-0025 执行中状态与执行会话展示](TICKET-0025-执行中状态与执行会话展示/ticket.md) — done
 - [TICKET-0026 执行中锁定面板操作](TICKET-0026-执行中锁定面板操作/ticket.md) — done

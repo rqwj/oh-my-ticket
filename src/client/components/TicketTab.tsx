@@ -9,9 +9,10 @@ import type { PanelMode } from '../controller.ts'
 import type { ActiveInfo, TreeState } from '../store.ts'
 import type { Translate } from '../locales.ts'
 import { TicketPanel, type Selector } from './TicketPanel.tsx'
+import type { RunBindings } from './RunsView.tsx'
 import css from './TicketTab.module.css'
 
-export interface TicketTabProps {
+export interface TicketTabProps extends RunBindings {
   /** Framework standard prop (conversation.view owner): this view's session. */
   readonly sessionId: string
   readonly useTree: Selector<TreeState>
@@ -47,6 +48,7 @@ export function TicketTab(props: TicketTabProps) {
         archive={props.archive}
         createNode={props.createNode}
         expandIds={props.expandIds}
+        runView={props}
         sessionId={sessionId}
         headerActions={
           <button

@@ -80,6 +80,39 @@
   color: var(--dsw-alias-label-primary);
 }
 
+/* Section nav (STORY-0013): the ticket tree vs the peer Runs 区块. */
+.sectionNav {
+  display: flex;
+  gap: 4px;
+  padding: 6px 10px 0;
+}
+
+.sectionTab {
+  font: inherit;
+  font-size: var(--dsw-font-xxs-12-font-size);
+  color: var(--dsw-alias-label-tertiary);
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+
+.sectionTab:hover {
+  color: var(--dsw-alias-label-primary);
+}
+
+.sectionTabOn {
+  color: var(--dsw-alias-label-primary);
+  border-bottom-color: var(--dsw-alias-brand-text);
+  font-weight: 600;
+}
+
+.sectionTab:focus-visible {
+  outline: 2px solid var(--omt-focus-ring);
+  outline-offset: 1px;
+}
+
 .tree {
   flex: 1;
   overflow-y: auto;

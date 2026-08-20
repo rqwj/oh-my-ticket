@@ -25,7 +25,25 @@
   --omt-status-open: #9aa3b2;
   --omt-status-in_progress: var(--dsw-static-deepseek-500, #4d9fff);
   --omt-status-done: var(--dsw-alias-state-success-primary, #3fbf6f);
+  /* blocked/skipped (TICKET-0069): the host warning family (amber). */
+  --omt-status-blocked: var(--dsw-alias-state-warn-primary, #e09543);
+  --omt-status-skipped: var(--dsw-alias-state-warn-secondary, #eab463);
   --omt-status-archived-border: #75787e;
+
+  /* Run item states (STORY-0013). */
+  --omt-item-failed: var(--dsw-alias-state-error-primary, #d4554d);
+  --omt-item-interrupted: var(--dsw-alias-state-error-secondary, #dd6f68);
+  --omt-item-awaiting: var(--dsw-alias-state-warn-label, #b97914);
+
+  /* Tinted surfaces (badges, notices). The error family has no tertiary
+     token host-side, so the tint is mixed from the primary hue. */
+  --omt-success-bg: var(--dsw-alias-state-success-tertiary, #e2f6ea);
+  --omt-warn-bg: var(--dsw-alias-state-warn-tertiary, #fdf0dd);
+  --omt-danger-bg: color-mix(in srgb, var(--dsw-alias-state-error-primary, #d4554d) 12%, transparent);
+
+  /* Picker modal (host Modal primitive pattern). */
+  --omt-overlay-scrim: var(--dsw-alias-bg-mask-1, rgba(0, 0, 0, 0.24));
+  --omt-overlay-shadow: var(--dsw-shadow-lv3, 0 8px 28px rgba(0, 0, 0, 0.18));
 
   /* Priority signal bars (PriorityIcon + doc-panel select). */
   --omt-priority-p1: var(--dsw-static-deepseek-500, #4d9fff);
@@ -93,9 +111,41 @@
 .omt-status-open { background: var(--omt-status-open); }
 .omt-status-in_progress { background: var(--omt-status-in_progress); }
 .omt-status-done { background: var(--omt-status-done); }
+.omt-status-blocked { background: var(--omt-status-blocked); }
+.omt-status-skipped { background: var(--omt-status-skipped); }
 /* Archived = hollow dot: "boxed away" reads distinctly at 6px and for color-blind users. */
 .omt-status-archived {
   box-sizing: border-box;
   background: transparent;
   border: 1.5px solid var(--omt-status-archived-border);
 }
+
+/* Run item state dots (STORY-0013). */
+.omt-itemstate-pending { background: var(--omt-status-open); }
+.omt-itemstate-running { background: var(--omt-status-in_progress); }
+.omt-itemstate-done { background: var(--omt-status-done); }
+.omt-itemstate-failed { background: var(--omt-item-failed); }
+.omt-itemstate-blocked { background: var(--omt-status-blocked); }
+.omt-itemstate-skipped { background: var(--omt-status-skipped); }
+.omt-itemstate-interrupted { background: var(--omt-item-interrupted); }
+.omt-itemstate-awaiting_confirmation { background: var(--omt-item-awaiting); }
+
+/* Run status badge (runs list + detail + picker). */
+.omt-runbadge {
+  flex: none;
+  padding: 0 6px;
+  border-radius: 8px;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 15px;
+  color: var(--omt-on-accent);
+  white-space: nowrap;
+}
+
+.omt-runstatus-pending { background: var(--omt-status-open); }
+.omt-runstatus-running { background: var(--omt-status-in_progress); }
+.omt-runstatus-paused { background: var(--omt-status-blocked); }
+.omt-runstatus-interrupted { background: var(--omt-item-failed); }
+.omt-runstatus-completed { background: var(--omt-status-done); }
+.omt-runstatus-completed_with_failures { background: var(--omt-status-blocked); }
+.omt-runstatus-canceled { background: var(--omt-status-archived-border); }

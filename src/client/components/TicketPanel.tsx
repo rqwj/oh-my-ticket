@@ -14,6 +14,8 @@ import { ancestorIdsOf, CHILD_TYPES, flattenVisible, navigateVisible } from '../
 import { priorityMeta } from '../priority.ts'
 import { STATUS_KEY, type Translate } from '../locales.ts'
 import { PriorityIcon } from './PriorityIcon.tsx'
+import { RunsView, type RunBindings } from './RunsView.tsx'
+import { RunFlowExtras } from './RunPicker.tsx'
 import css from './TicketPanel.module.css'
 
 /** Renderer-bound selector hook (inject hooks compartment member). */
@@ -37,6 +39,8 @@ export interface TicketPanelProps {
   readonly archive: (id: string, sessionId?: string) => void
   readonly createNode: (input: { type: OmtTreeNode['type']; title: string; parentId?: string; body?: string }, sessionId?: string) => Promise<string | undefined>
   readonly expandIds: (ids: readonly string[]) => void
+  /** Run 区块 bindings (STORY-0013): section nav, RunsView, picker, notice. */
+  readonly runView: RunBindings
   /** Session whose workspace home the tree follows. */
   readonly sessionId: string | undefined
   /** Extra header buttons ahead of the close seat (mode switches). */
@@ -77,13 +81,14 @@ interface TreeRowProps {
   readonly onSelect: (id: string) => void
   readonly onArchive: (id: string) => void
   readonly onCreateChild: (parent: OmtTreeNode) => void
+  readonly onJoinRun: (id: string) => void
   readonly useCollapsed: Selector<Record<string, boolean>>
   readonly onToggleCollapsed: (id: string) => void
   readonly showId: boolean
   readonly t: Translate
 }
 
-function TreeRow({ node, depth, activeId, focusedId, onSelect, onArchive, onCreateChild, useCollapsed, onToggleCollapsed, showId, t }: TreeRowProps) {
+function TreeRow({ node, depth, activeId, focusedId, onSelect, onArchive, onCreateChild, onJoinRun, useCollapsed, onToggleCollapsed, showId, t }: TreeRowProps) {
   // Collapse state persists across sessions (shared store, TICKET-0011).
   const collapsed = useCollapsed(snapshot => snapshot[node.id] === true)
   const hasChildren = node.children.length > 0
@@ -113,6 +118,19 @@ function TreeRow({ node, depth, activeId, focusedId, onSelect, onArchive, onCrea
           <button
             type="button"
             className={css.archiveButton}
+            title={t('run.joinTitle')}
+            onClick={(event) => {
+              event.stopPropagation()
+              onJoinRun(node.id)
+            }}
+          >
+            ▸▸
+          </button>
+        )}
+        {!node.archived && (
+          <button
+            type="button"
+            className={css.archiveButton}
             title={t('drawer.archiveTitle', { id: node.id })}
             onClick={(event) => {
               event.stopPropagation()
@@ -136,7 +154,7 @@ function TreeRow({ node, depth, activeId, focusedId, onSelect, onArchive, onCrea
         <span className={`omt-dot omt-dot--lg ${dotClass(node)}`} />
       </div>
       {!collapsed && node.children.map(child => (
-        <TreeRow key={child.id} node={child} depth={depth + 1} activeId={activeId} focusedId={focusedId} onSelect={onSelect} onArchive={onArchive} onCreateChild={onCreateChild} useCollapsed={useCollapsed} onToggleCollapsed={onToggleCollapsed} showId={showId} t={t} />
+        <TreeRow key={child.id} node={child} depth={depth + 1} activeId={activeId} focusedId={focusedId} onSelect={onSelect} onArchive={onArchive} onCreateChild={onCreateChild} onJoinRun={onJoinRun} useCollapsed={useCollapsed} onToggleCollapsed={onToggleCollapsed} showId={showId} t={t} />
       ))}
     </div>
   )
@@ -174,6 +192,7 @@ export function TicketPanel(props: TicketPanelProps) {
   const tree = props.useTree(snapshot => snapshot)
   const active = props.useActive(snapshot => snapshot)
   const collapsed = props.useCollapsed(snapshot => snapshot)
+  const section = props.runView.usePanelSection(snapshot => snapshot)
   // Viewing-only filter state (search keyword + archived + type/status chips).
   const [query, setQuery] = useState('')
   const [showArchived, setShowArchived] = useState(false)
@@ -246,6 +265,26 @@ export function TicketPanel(props: TicketPanelProps) {
           </button>
         )}
       </div>
+      <div className={css.sectionNav}>
+        <button
+          type="button"
+          className={`${css.sectionTab} ${section === 'tickets' ? css.sectionTabOn : ''}`}
+          onClick={props.runView.showTickets}
+        >
+          {t('run.sectionTickets')}
+        </button>
+        <button
+          type="button"
+          className={`${css.sectionTab} ${section === 'runs' ? css.sectionTabOn : ''}`}
+          onClick={() => props.runView.showRuns(sessionId)}
+        >
+          {t('run.sectionRuns')}
+        </button>
+      </div>
+      {section === 'runs' ? (
+        <RunsView bindings={props.runView} select={props.select} sessionId={sessionId} t={t} />
+      ) : (
+        <>
       <div className={css.toolbar}>
         <input
           type="search"
@@ -268,7 +307,7 @@ export function TicketPanel(props: TicketPanelProps) {
           </button>
         ))}
         <span className={css.filterDivider} />
-        {(['open', 'in_progress', 'done'] as const).map(status => (
+        {(['open', 'in_progress', 'done', 'blocked', 'skipped'] as const).map(status => (
           <button
             key={status}
             type="button"
@@ -361,6 +400,7 @@ export function TicketPanel(props: TicketPanelProps) {
                     onSelect={id => props.select(id, sessionId)}
                     onArchive={id => props.archive(id, sessionId)}
                     onCreateChild={parent => setCreating({ type: CHILD_TYPES[parent.type][0]!, parentId: parent.id })}
+                    onJoinRun={id => props.runView.joinRun(id, sessionId)}
                     useCollapsed={props.useCollapsed}
                     onToggleCollapsed={props.toggleCollapsed}
                     showId={showId}
@@ -405,6 +445,16 @@ export function TicketPanel(props: TicketPanelProps) {
           </div>
         </form>
       )}
+        </>
+      )}
+      <RunFlowExtras
+        useNotice={props.runView.useNotice}
+        useRunPicker={props.runView.useRunPicker}
+        pickRun={props.runView.pickRun}
+        cancelRunPicker={props.runView.cancelRunPicker}
+        sessionId={sessionId}
+        t={t}
+      />
     </div>
   )
 }

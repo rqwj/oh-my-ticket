@@ -26,5 +26,5 @@ updated_at: '2026-08-18T06:38:31.407Z'
 ## 子节点
 
 - [TICKET-0001 对话末端相关 ticket 列表](TICKET-0001-对话末端相关-ticket-列表/ticket.md) — done
-- [TICKET-0021 相关列表会话归属修正](TICKET-0021-相关列表会话归属修正/ticket.md) — open
+- [TICKET-0021 相关列表会话归属修正](TICKET-0021-相关列表会话归属修正/ticket.md) — done
 <!-- /omt:children -->

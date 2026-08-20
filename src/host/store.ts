@@ -16,10 +16,15 @@ import {
   type NodeType,
   type OmtEdge,
   type OmtNode,
+  type OmtRun,
+  type OmtRunItem,
+  type RunConfig,
+  type RunItemState,
+  type RunStatus,
   type Status,
 } from './types.ts'
 
-const SCHEMA_VERSION = '2'
+const SCHEMA_VERSION = '3'
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS nodes (
@@ -66,11 +71,100 @@ function rowToNode(row: NodeRow): OmtNode {
   return { ...row, type: row.type as OmtNode['type'], status: row.status as Status, archived: row.archived === 1 }
 }
 
+interface RunRow {
+  id: string
+  title: string | null
+  status: string
+  config: string
+  created_at: string
+  finished_at: string | null
+}
+
+interface RunItemRow {
+  run_id: string
+  node_id: string
+  position: number
+  state: string
+  executor_session_id: string | null
+  attempts: number
+  last_error: string | null
+  nudged_at: string | null
+  nudge_count: number
+  started_at: string | null
+  finished_at: string | null
+}
+
+function rowToRun(row: RunRow): OmtRun {
+  const parsed: unknown = JSON.parse(row.config)
+  return {
+    id: row.id,
+    ...(row.title === null ? {} : { title: row.title }),
+    status: row.status as RunStatus,
+    config: parsed as RunConfig,
+    created_at: row.created_at,
+    ...(row.finished_at === null ? {} : { finished_at: row.finished_at }),
+  }
+}
+
+function rowToRunItem(row: RunItemRow): OmtRunItem {
+  return {
+    run_id: row.run_id,
+    node_id: row.node_id,
+    position: row.position,
+    state: row.state as RunItemState,
+    ...(row.executor_session_id === null ? {} : { executor_session_id: row.executor_session_id }),
+    attempts: row.attempts,
+    ...(row.last_error === null ? {} : { last_error: row.last_error }),
+    ...(row.nudged_at === null ? {} : { nudged_at: row.nudged_at }),
+    nudge_count: row.nudge_count,
+    ...(row.started_at === null ? {} : { started_at: row.started_at }),
+    ...(row.finished_at === null ? {} : { finished_at: row.finished_at }),
+  }
+}
+
 /** v1 → v2: archive becomes its own column; prior lifecycle status is unrecoverable (safe default 'open'). */
 const MIGRATION_V2 = `
 ALTER TABLE nodes ADD COLUMN archived INTEGER NOT NULL DEFAULT 0;
 UPDATE nodes SET archived = 1, status = 'open' WHERE status = 'archived';
 `
+
+/**
+ * v2 → v3: run tables (EPIC-0003). Purely additive: no existing data is
+ * touched. Runs live only in SQLite (no markdown files), and `rebuild`
+ * (reindex) explicitly never touches these two tables.
+ */
+const MIGRATION_V3 = `
+CREATE TABLE IF NOT EXISTS runs (
+  id          TEXT PRIMARY KEY,
+  title       TEXT,
+  status      TEXT NOT NULL DEFAULT 'pending',
+  config      TEXT NOT NULL,
+  created_at  TEXT NOT NULL,
+  finished_at TEXT
+);
+CREATE TABLE IF NOT EXISTS run_items (
+  run_id              TEXT NOT NULL REFERENCES runs(id),
+  node_id             TEXT NOT NULL,
+  position            INTEGER NOT NULL,
+  state               TEXT NOT NULL DEFAULT 'pending',
+  executor_session_id TEXT,
+  attempts            INTEGER NOT NULL DEFAULT 0,
+  last_error          TEXT,
+  nudged_at           TEXT,
+  nudge_count         INTEGER NOT NULL DEFAULT 0,
+  started_at          TEXT,
+  finished_at         TEXT,
+  PRIMARY KEY (run_id, node_id)
+);
+CREATE INDEX IF NOT EXISTS idx_run_items_node ON run_items(node_id);
+`
+
+/** Result of one atomic claim: the claimed item plus the archived-member skips drained in the same transaction. */
+export interface ClaimNextResult {
+  readonly claimed: OmtRunItem | undefined
+  /** Pending items of archived members marked skipped while draining the queue. */
+  readonly skipped: OmtRunItem[]
+}
 
 export class OmtStore {
   private constructor(private readonly db: DatabaseSync) {}
@@ -89,7 +183,19 @@ export class OmtStore {
     if (!columns.some(column => column.name === 'archived')) {
       db.exec(MIGRATION_V2)
     }
-    return new OmtStore(db)
+    // v2→v3 migration: add the run tables to databases created before they existed.
+    const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as { name: string }[]
+    if (!tables.some(table => table.name === 'runs')) {
+      db.exec(MIGRATION_V3)
+    }
+    const store = new OmtStore(db)
+    // Bump the version marker of pre-v3 databases (v1 databases carry no
+    // marker at all; the core's first-open reindex/mark path handles those).
+    const version = store.schemaVersion
+    if (version !== undefined && Number(version) < Number(SCHEMA_VERSION)) {
+      store.markSchemaVersion()
+    }
+    return store
   }
 
   close(): void {
@@ -126,13 +232,17 @@ export class OmtStore {
     this.setMeta(`counter_${TYPE_PREFIX[type]}`, String(value))
   }
 
-  /** Allocate the next id for a type (`EPIC-0001`, counters independent). */
-  nextId(type: NodeType): string {
-    const prefix = TYPE_PREFIX[type]
+  /** Allocate the next `PREFIX-NNNN` id from the shared meta counter. */
+  private allocateCounterId(prefix: string): string {
     const key = `counter_${prefix}`
     const next = Number(this.getMeta(key) ?? '0') + 1
     this.setMeta(key, String(next))
     return `${prefix}-${String(next).padStart(4, '0')}`
+  }
+
+  /** Allocate the next id for a type (`EPIC-0001`, counters independent). */
+  nextId(type: NodeType): string {
+    return this.allocateCounterId(TYPE_PREFIX[type])
   }
 
   /** After a reindex, move counters past every id seen on disk. */
@@ -155,14 +265,28 @@ export class OmtStore {
     ).run(node.id, node.type, node.title, node.status, node.archived ? 1 : 0, node.priority, node.path, node.created_at, node.updated_at)
   }
 
-  updateNode(id: string, patch: { title?: string; status?: Status; archived?: boolean; priority?: number; path?: string; updated_at?: string }): void {
-    const entries = Object.entries(patch)
-      .filter(([, value]) => value !== undefined)
-      .map(([key, value]) => [key, key === 'archived' ? (value === true ? 1 : 0) : value] as [string, string | number])
+  /**
+   * Shared dynamic-patch UPDATE: undefined values are skipped, every defined
+   * key becomes a `key = ?` assignment. No-op on an empty patch.
+   */
+  private applyPatch(
+    table: 'nodes' | 'runs' | 'run_items',
+    patch: Record<string, string | number | null | undefined>,
+    where: string,
+    ...keys: (string | number)[]
+  ): void {
+    const entries = Object.entries(patch).filter(([, value]) => value !== undefined)
     if (entries.length === 0) return
     const assignments = entries.map(([key]) => `${key} = ?`).join(', ')
-    this.db.prepare(`UPDATE nodes SET ${assignments} WHERE id = ?`)
-      .run(...entries.map(([, value]) => value), id)
+    this.db.prepare(`UPDATE ${table} SET ${assignments} WHERE ${where}`)
+      .run(...entries.map(([, value]) => value as string | number | null), ...keys)
+  }
+
+  updateNode(id: string, patch: { title?: string; status?: Status; archived?: boolean; priority?: number; path?: string; updated_at?: string }): void {
+    // archived is the only boolean column: convert to the stored integer.
+    this.applyPatch('nodes', Object.fromEntries(Object.entries(patch).map(
+      ([key, value]): [string, string | number] => [key, key === 'archived' ? (value === true ? 1 : 0) : (value as string | number)],
+    )), 'id = ?', id)
   }
 
   getNode(id: string): OmtNode | undefined {
@@ -251,9 +375,162 @@ export class OmtStore {
       .map(row => row.id)
   }
 
+  // ── runs ─────────────────────────────────────────────────────────────
+
+  /** Allocate the next run id (`RUN-0001`, counter shared via meta). */
+  nextRunId(): string {
+    return this.allocateCounterId('RUN')
+  }
+
+  insertRun(run: OmtRun): void {
+    this.db.prepare(
+      'INSERT INTO runs (id, title, status, config, created_at, finished_at) VALUES (?, ?, ?, ?, ?, ?)',
+    ).run(run.id, run.title ?? null, run.status, JSON.stringify(run.config), run.created_at, run.finished_at ?? null)
+  }
+
+  updateRun(id: string, patch: { title?: string | null; status?: RunStatus; finished_at?: string | null }): void {
+    this.applyPatch('runs', patch, 'id = ?', id)
+  }
+
+  getRun(id: string): OmtRun | undefined {
+    const row = this.db.prepare('SELECT * FROM runs WHERE id = ?').get(id) as RunRow | undefined
+    return row === undefined ? undefined : rowToRun(row)
+  }
+
+  listRuns(filter: { status?: RunStatus } = {}): OmtRun[] {
+    const where = filter.status === undefined ? '' : ' WHERE status = ?'
+    const params = filter.status === undefined ? [] : [filter.status]
+    const rows = this.db.prepare(`SELECT * FROM runs${where} ORDER BY id`).all(...params) as unknown as RunRow[]
+    return rows.map(rowToRun)
+  }
+
+  // ── run items ────────────────────────────────────────────────────────
+
+  insertRunItem(item: OmtRunItem): OmtRunItem {
+    this.db.prepare(
+      `INSERT INTO run_items (run_id, node_id, position, state, executor_session_id, attempts, last_error, nudged_at, nudge_count, started_at, finished_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      item.run_id, item.node_id, item.position, item.state, item.executor_session_id ?? null,
+      item.attempts, item.last_error ?? null, item.nudged_at ?? null, item.nudge_count,
+      item.started_at ?? null, item.finished_at ?? null,
+    )
+    return item
+  }
+
+  updateRunItem(runId: string, nodeId: string, patch: Partial<{
+    state: RunItemState
+    position: number
+    executor_session_id: string | null
+    attempts: number
+    last_error: string | null
+    nudged_at: string | null
+    nudge_count: number
+    started_at: string | null
+    finished_at: string | null
+  }>): void {
+    this.applyPatch('run_items', patch, 'run_id = ? AND node_id = ?', runId, nodeId)
+  }
+
+  getRunItem(runId: string, nodeId: string): OmtRunItem | undefined {
+    const row = this.db.prepare('SELECT * FROM run_items WHERE run_id = ? AND node_id = ?').get(runId, nodeId) as RunItemRow | undefined
+    return row === undefined ? undefined : rowToRunItem(row)
+  }
+
+  /** Item-level removal (omt_run_control remove): membership only, nodes untouched. */
+  deleteRunItem(runId: string, nodeId: string): void {
+    this.db.prepare('DELETE FROM run_items WHERE run_id = ? AND node_id = ?').run(runId, nodeId)
+  }
+
+  /**
+   * Every item for one node across runs in the given statuses (passive
+   * observation scans the active runs holding a ticket — EPIC-0003
+   * decision 1 cross-run broadcast). The JOIN also carries the run status
+   * so observers don't re-fetch one run row per item.
+   */
+  runItemsForNode(nodeId: string, runStatuses: readonly RunStatus[]): { item: OmtRunItem; runStatus: RunStatus }[] {
+    if (runStatuses.length === 0) return []
+    const placeholders = runStatuses.map(() => '?').join(', ')
+    const rows = this.db.prepare(
+      `SELECT i.*, r.status AS run_status FROM run_items i JOIN runs r ON r.id = i.run_id
+       WHERE i.node_id = ? AND r.status IN (${placeholders}) ORDER BY i.run_id`,
+    ).all(nodeId, ...runStatuses) as unknown as (RunItemRow & { run_status: string })[]
+    return rows.map(row => ({ item: rowToRunItem(row), runStatus: row.run_status as RunStatus }))
+  }
+
+  /**
+   * Atomic claim (TICKET-0058): select the next pending item and flip it to
+   * running with the executor in ONE immediate transaction, so two
+   * concurrent claimers can never receive the same item. Pending items of
+   * archived members can never execute (reports reject archived nodes):
+   * the same transaction marks them skipped so the queue drains past them
+   * instead of wedging on an unclaimable head. Both sides of the
+   * transaction are returned so the core can broadcast the transitions.
+   */
+  claimNextRunItem(runId: string, executorSessionId: string, now: string): ClaimNextResult {
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const skippedIds = (this.db.prepare(
+        `SELECT i.node_id FROM run_items i JOIN nodes n ON n.id = i.node_id
+         WHERE i.run_id = ? AND i.state = 'pending' AND n.archived = 1
+         ORDER BY i.position, i.node_id`,
+      ).all(runId) as { node_id: string }[]).map(row => row.node_id)
+      this.db.prepare(
+        `UPDATE run_items SET state = 'skipped', finished_at = ?
+         WHERE run_id = ? AND state = 'pending'
+           AND node_id IN (SELECT id FROM nodes WHERE archived = 1)`,
+      ).run(now, runId)
+      const row = this.db.prepare(
+        `SELECT i.node_id FROM run_items i JOIN nodes n ON n.id = i.node_id
+         WHERE i.run_id = ? AND i.state = 'pending' AND n.archived = 0
+         ORDER BY i.position, i.node_id LIMIT 1`,
+      ).get(runId) as { node_id: string } | undefined
+      if (row === undefined) {
+        this.db.exec('COMMIT')
+        return { claimed: undefined, skipped: skippedIds.map(nodeId => this.getRunItem(runId, nodeId) as OmtRunItem) }
+      }
+      this.db.prepare(
+        "UPDATE run_items SET state = 'running', executor_session_id = ?, started_at = COALESCE(started_at, ?) WHERE run_id = ? AND node_id = ? AND state = 'pending'",
+      ).run(executorSessionId, now, runId, row.node_id)
+      this.db.exec('COMMIT')
+      return {
+        claimed: this.getRunItem(runId, row.node_id),
+        skipped: skippedIds.map(nodeId => this.getRunItem(runId, nodeId) as OmtRunItem),
+      }
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  listRunItems(runId: string): OmtRunItem[] {
+    const rows = this.db.prepare('SELECT * FROM run_items WHERE run_id = ? ORDER BY position, node_id').all(runId) as unknown as RunItemRow[]
+    return rows.map(rowToRunItem)
+  }
+
+  /** Per-state member counts for one run (omt_run_list progress; single GROUP BY). */
+  runItemStateCounts(runId: string): { state: RunItemState; count: number }[] {
+    const rows = this.db.prepare(
+      'SELECT state, COUNT(*) AS count FROM run_items WHERE run_id = ? GROUP BY state',
+    ).all(runId) as unknown as { state: string; count: number }[]
+    return rows.map(row => ({ state: row.state as RunItemState, count: row.count }))
+  }
+
+  /** All runs whose status is one of `statuses` (janitor sweep). */
+  listRunsByStatus(statuses: readonly RunStatus[]): OmtRun[] {
+    const placeholders = statuses.map(() => '?').join(', ')
+    const rows = this.db.prepare(`SELECT * FROM runs WHERE status IN (${placeholders}) ORDER BY id`).all(...statuses) as unknown as RunRow[]
+    return rows.map(rowToRun)
+  }
+
   // ── rebuild ──────────────────────────────────────────────────────────
 
-  /** Replace the whole index content (reindex): nodes, edges, search mirror. */
+  /**
+   * Replace the whole index content (reindex): nodes, edges, search mirror.
+   * Reindex protection (EPIC-0003 decision 13): `runs`/`run_items` are
+   * deliberately NOT touched here — they have no on-disk representation and
+   * a rebuild must never drop them.
+   */
   rebuild(nodes: readonly OmtNode[], edges: readonly OmtEdge[], bodies: ReadonlyMap<string, { title: string; body: string }>): void {
     this.db.exec('BEGIN')
     try {

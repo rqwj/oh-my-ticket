@@ -6,15 +6,19 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import Schema from '@deepseek-ai/schemastery'
-import { ChangeHub } from './host/changes.ts'
+import type { AgentsLike } from './host/agents-like.ts'
+import { bridgeRunEvents, ChangeHub } from './host/changes.ts'
+import { registerOmtDisposedHook } from './host/disposed-hook.ts'
 import { registerOmtEvents } from './host/events.ts'
+import { registerOmtIdleHook } from './host/idle-hook.ts'
+import { createOmtRunNotifier } from './host/notify-hook.ts'
 import { OmtCorePool } from './host/pool.ts'
 import { DEFAULT_PROMPT_SETTINGS, InstalledSkillCache, resolveLiveAgent, selectBindableSkills, type PromptSettings } from './host/prompt-settings.ts'
 import { registerOmtPrompt } from './host/prompt.ts'
 import { RecentRegistry } from './host/recent.ts'
 import { registerOmtRpc } from './host/rpc.ts'
 import { RunningRegistry } from './host/running.ts'
-import { registerOmtSkill } from './host/skill.ts'
+import { registerOmtRunsSkill, registerOmtSkill } from './host/skill.ts'
 import { registerOmtTools } from './host/tools.ts'
 
 export const name = 'oh-my-ticket'
@@ -62,9 +66,29 @@ function attachPromptSettings(ctx: Context, setValue: (value: PromptSettings) =>
   })
 }
 
+/** Structural agent shape used here: just the session header (see rpc.ts). */
+type HeaderAgent = { session: { header?: { cwd?: string } } }
+
 export function apply(ctx: Context, config: Config): void {
   const globalHome = resolveHome(config.home)
-  const pool = new OmtCorePool(globalHome)
+  const agents = (ctx as unknown as { agents?: AgentsLike<HeaderAgent> }).agents
+  // Run-notification closure (TICKET-0065): attaches to every core as it
+  // opens, so lazily-opened workspace homes notify too.
+  const notifier = createOmtRunNotifier(ctx)
+  const changes = new ChangeHub()
+  // Workspace-aware pool: a workspace root with its own `.omt/` wins, the
+  // global home is the fallback. Cores open lazily per home (lazy
+  // node:sqlite import, possible first-run reindex). The startup janitor
+  // receives the live-session list so a plugin reload never demotes items
+  // whose executor session is still alive (review fix #4). Each opened core
+  // also bridges its run events into the SSE hub (TICKET-0071).
+  const pool = new OmtCorePool(globalHome, {
+    activeSessionIds: () => agents?.list().map(agent => agent.id) ?? [],
+    onCoreOpened: core => {
+      notifier.attach(core)
+      bridgeRunEvents(core, changes)
+    },
+  })
   console.log(`[omt] host plugin loaded (global home: ${globalHome}; workspace .omt/ wins when present)`)
   const recent = new RecentRegistry()
   const running = new RunningRegistry()
@@ -74,7 +98,6 @@ export function apply(ctx: Context, config: Config): void {
       ;(await pool.coreFor(undefined)).setSessionRecent(sessionId, ids)
     },
   })
-  const changes = new ChangeHub()
   const installed = new InstalledSkillCache()
   let promptSettings: PromptSettings = { ...DEFAULT_PROMPT_SETTINGS }
   const promptInputs = () => ({
@@ -84,13 +107,10 @@ export function apply(ctx: Context, config: Config): void {
   })
   registerOmtTools(ctx, pool, (sessionId, id) => recent.touch(sessionId, id), home => changes.bump(home), running)
   registerOmtSkill(ctx)
+  registerOmtRunsSkill(ctx)
   registerOmtPrompt(ctx, promptInputs)
-  const agents = ctx.agents as {
-    get: (id: string) => { session?: { header?: { cwd?: string } } } | undefined
-    list: () => { session?: { header?: { cwd?: string } } }[]
-  }
   const listCatalog = async (sessionId?: string) => {
-    const live = resolveLiveAgent(sessionId, id => agents.get(id), () => agents.list())
+    const live = resolveLiveAgent(sessionId, id => agents?.get(id), () => (agents?.list() ?? []) as HeaderAgent[])
     const presets = ctx.get('agentPresets') as { serviceFor?: (agent: unknown, name: string) => { list: (opts: { cwd?: string; scope?: unknown }) => Promise<{ name: string; description: string; invocation?: { modelInvocable?: boolean } }[]> } | undefined } | undefined
     const registry = (live === undefined ? undefined : presets?.serviceFor?.(live, 'skills')) ?? ctx.skills
     const cwd = live?.session?.header?.cwd
@@ -104,6 +124,8 @@ export function apply(ctx: Context, config: Config): void {
     listCatalog,
   })
   registerOmtEvents(ctx, changes)
+  registerOmtIdleHook(ctx, pool, running)
+  registerOmtDisposedHook(ctx, pool, running)
   const refreshInstalled = () => installed.refresh(async () => listCatalog())
   void refreshInstalled()
   ctx.on('skills/change', () => { void refreshInstalled() })
