@@ -33,7 +33,11 @@ export function sanitizeExtraPrompt(extra: string): string {
 /** Bound names that still exist in the installed catalog, in bind order. */
 export function liveBoundNames(bound: readonly string[], installed: readonly string[]): string[] {
   const live = new Set(installed)
-  return bound.filter(name => live.has(name))
+  const hit = bound.filter(name => live.has(name))
+  // Host apply often sees only the runtime `omt` skill before agents exist.
+  // Dropping every bind would omit ce-work from the system prompt.
+  if (hit.length === 0 && bound.length > 0) return [...bound]
+  return hit
 }
 
 const SPLIT_SKILLS = new Set(['ce-brainstorm', 'ce-plan', 'ce-ideate'])

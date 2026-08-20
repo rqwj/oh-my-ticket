@@ -108,6 +108,8 @@ export class InstalledSkillCache {
 
   async refresh(list: () => Promise<readonly { name: string; invocation?: { modelInvocable?: boolean } }[]>): Promise<void> {
     const skills = await list()
-    this.namesInternal = selectBindableSkills(skills).map(skill => skill.name)
+    const names = selectBindableSkills(skills).map(skill => skill.name)
+    if (names.length <= 1 && this.namesInternal.length > 1) return
+    this.namesInternal = names
   }
 }

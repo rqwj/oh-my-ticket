@@ -19,6 +19,10 @@ describe('liveBoundNames', () => {
   it('keeps only names that are still installed', () => {
     expect(liveBoundNames(['ce-plan', 'gone', 'omt'], ['ce-plan', 'omt', 'ce-work'])).toEqual(['ce-plan', 'omt'])
   })
+
+  it('keeps user binds when the catalog is runtime-only', () => {
+    expect(liveBoundNames(['ce-plan', 'ce-work'], ['omt'])).toEqual(['ce-plan', 'ce-work'])
+  })
 })
 
 describe('composeOmtPrompt', () => {

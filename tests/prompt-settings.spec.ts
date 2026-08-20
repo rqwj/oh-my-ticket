@@ -70,6 +70,16 @@ describe('InstalledSkillCache', () => {
     ])
     expect(cache.names()).toEqual(['ce-plan', 'plain'])
   })
+
+  it('does not shrink a full catalog down to runtime-only omt', async () => {
+    const cache = new InstalledSkillCache()
+    await cache.refresh(async () => [
+      { name: 'ce-plan', invocation: { modelInvocable: true } },
+      { name: 'ce-work', invocation: { modelInvocable: true } },
+    ])
+    await cache.refresh(async () => [{ name: 'omt', invocation: { modelInvocable: true } }])
+    expect(cache.names()).toEqual(['ce-plan', 'ce-work'])
+  })
 })
 
 describe('defaults', () => {
