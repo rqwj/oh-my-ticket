@@ -14,7 +14,7 @@ import { priorityMeta } from '../priority.ts'
 import { STATUS_KEY, type Translate } from '../locales.ts'
 import { PriorityIcon } from './PriorityIcon.tsx'
 import { RunsView, type RunBindings } from './RunsView.tsx'
-import { NoticeBar, RunPickerModal } from './RunPicker.tsx'
+import { RunFlowExtras } from './RunPicker.tsx'
 import css from './TicketPanel.module.css'
 
 /** Renderer-bound selector hook (inject hooks compartment member). */
@@ -348,8 +348,8 @@ export function TicketPanel(props: TicketPanelProps) {
       </div>
         </>
       )}
-      <NoticeBar useNotice={props.runView.useNotice} t={t} />
-      <RunPickerModal
+      <RunFlowExtras
+        useNotice={props.runView.useNotice}
         useRunPicker={props.runView.useRunPicker}
         pickRun={props.runView.pickRun}
         cancelRunPicker={props.runView.cancelRunPicker}

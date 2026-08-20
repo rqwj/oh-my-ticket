@@ -67,3 +67,28 @@ export function NoticeBar({ useNotice, t }: NoticeBarProps) {
     </div>
   )
 }
+
+export interface RunFlowExtrasProps {
+  readonly useNotice: Selector<Notice | undefined>
+  readonly useRunPicker: Selector<RunPickerState | undefined>
+  readonly pickRun: (runId: string, sessionId?: string) => void
+  readonly cancelRunPicker: () => void
+  readonly sessionId: string | undefined
+  readonly t: Translate
+}
+
+/** NoticeBar + RunPickerModal tail shared by the TicketPanel and DocPanel shells. */
+export function RunFlowExtras({ useNotice, useRunPicker, pickRun, cancelRunPicker, sessionId, t }: RunFlowExtrasProps) {
+  return (
+    <>
+      <NoticeBar useNotice={useNotice} t={t} />
+      <RunPickerModal
+        useRunPicker={useRunPicker}
+        pickRun={pickRun}
+        cancelRunPicker={cancelRunPicker}
+        sessionId={sessionId}
+        t={t}
+      />
+    </>
+  )
+}

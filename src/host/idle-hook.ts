@@ -23,9 +23,9 @@
  * plugin dispose; a firing timer revalidates everything (agent still idle,
  * run still running, item still pending) before nudging.
  */
-import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import type { OmtCore } from './core.ts'
+import { safeFollowup } from './messages.ts'
 import type { OmtCorePool } from './pool.ts'
 import type { RunningRegistry } from './running.ts'
 import { NUDGE_BUDGET, type OmtRun, type OmtRunItem } from './types.ts'
@@ -104,16 +104,7 @@ export function registerOmtIdleHook(ctx: Context, pool: OmtCorePool, running: Ru
   }
 
   const followup = (agent: AgentLike, text: string): void => {
-    try {
-      agent.followup({
-        id: randomUUID(),
-        role: 'user',
-        content: [{ type: 'text', text }],
-        source: { kind: 'plugin', plugin: 'oh-my-ticket' },
-      })
-    } catch (error: unknown) {
-      warn(`could not queue followup for agent "${agent.id}"`, error)
-    }
+    safeFollowup(agent, text, warn)
   }
 
   const recordNudge = (core: OmtCore, runId: string, nodeId: string): void => {

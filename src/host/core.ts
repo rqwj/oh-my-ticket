@@ -673,7 +673,7 @@ export class OmtCore {
         throw new OmtError('INVALID_INPUT', `run member ${member.nodeId} is archived (已归档成员不能加入 run；请先恢复)`)
       }
       const state = member.state ?? 'pending'
-      this.store.insertRunItem({
+      added.push(this.store.insertRunItem({
         run_id: runId,
         node_id: member.nodeId,
         position,
@@ -686,8 +686,7 @@ export class OmtCore {
             ...(member.executorSessionId !== undefined ? { executor_session_id: member.executorSessionId } : {}),
           }
           : {}),
-      })
-      added.push(this.store.getRunItem(runId, member.nodeId) as OmtRunItem)
+      }))
       position += 1
     }
     return { added, duplicates }

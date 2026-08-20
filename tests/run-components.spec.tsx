@@ -12,6 +12,7 @@ import { createElement, useSyncExternalStore, type ReactElement } from 'react'
 import { act } from 'react-dom/test-utils'
 import { createRoot, type Root } from 'react-dom/client'
 import { createSnapshotStore, type SnapshotStore } from './mocks/runtime-client.ts'
+import { runFixture, runProgress, type RunFixtureOptions } from './mocks/run-fixtures.ts'
 import { RunsView, type RunBindings } from '../src/client/components/RunsView.tsx'
 import { NoticeBar, RunPickerModal } from '../src/client/components/RunPicker.tsx'
 import { TicketPanel } from '../src/client/components/TicketPanel.tsx'
@@ -74,25 +75,15 @@ function click(element: Element): void {
   })
 }
 
-function progress(overrides: Record<string, number> = {}): any {
-  return {
-    total: 0, pending: 0, running: 0, done: 0, failed: 0, blocked: 0, skipped: 0, interrupted: 0, awaiting_confirmation: 0,
-    ...overrides,
-  }
-}
+const progress = runProgress
 
-function run(id: string, status: string, overrides: Record<string, unknown> = {}): RunSummary {
-  return {
-    id,
+/** 批次-labelled runs with a recent created_at (relative-time rendering). */
+function run(id: string, status: RunSummary['status'], overrides: RunFixtureOptions = {}): RunSummary {
+  return runFixture(id, status, {
     title: `批次 ${id}`,
-    status: status as RunSummary['status'],
-    active: ['pending', 'running', 'paused'].includes(status),
-    history: ['completed', 'completed_with_failures', 'canceled'].includes(status),
-    created_at: new Date(Date.now() - 5 * 60_000).toISOString(),
-    progress: progress({ total: 4, done: 1, failed: status === 'completed_with_failures' ? 1 : 0 }),
-    stalled: 0,
+    createdAt: new Date(Date.now() - 5 * 60_000).toISOString(),
     ...overrides,
-  } as RunSummary
+  })
 }
 
 interface BindingSpies {

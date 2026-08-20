@@ -7,6 +7,7 @@
 import { createSnapshotStore, type SnapshotStore } from '@deepseek-ai/dsh-client-runtime/client'
 import type { RpcCaller } from './trigger/source.ts'
 import type { FloatPos, FloatSize } from './float-geometry.ts'
+import type { RunControlCommand } from './run-view.ts'
 import type {
   ActiveInfo,
   DocData,
@@ -18,6 +19,7 @@ import type {
   PanelSection,
   RunDetailData,
   RunDetailState,
+  RunItemView,
   RunListState,
   RunPickerState,
   RunSummary,
@@ -153,10 +155,13 @@ export class OmtController {
       if (sessionId !== undefined) void this.refreshRelated(sessionId).catch(() => {})
       const active = this.active.getSnapshot()
       if (active !== undefined) void this.select(active.id, sessionId).catch(() => {})
-      // Run views (TICKET-0071): the list is cheap — always refresh; the
-      // open detail reloads only when the hint names it (a tree-only bump
-      // leaves the detail untouched).
-      void this.refreshRuns(sessionId).catch(() => {})
+      // Run views (TICKET-0071): the list refreshes when the hint names a
+      // run or the Runs 区块 is on screen (showRuns fetches on entry, so a
+      // tree-only bump with the tickets section staged skips the round
+      // trip); the open detail reloads only when the hint names it.
+      if (runHint !== undefined || this.panelSection.getSnapshot() === 'runs') {
+        void this.refreshRuns(sessionId).catch(() => {})
+      }
       const detail = this.runDetail.getSnapshot()
       if (runHint !== undefined && detail.status === 'ready' && detail.id === runHint.id) {
         void this.openRun(detail.id, sessionId).catch(() => {})
@@ -460,17 +465,50 @@ export class OmtController {
     await this.openRun(id, sessionId)
   }
 
+  /**
+   * Apply a run-mutation response's fresh payload directly to the stores
+   * (the host response carries the post-mutation run/item; the SSE hint
+   * covers other clients). A loaded runs list is patched in place; an open
+   * matching detail merges the summary (config preserved, run-control /
+   * run-confirm responses carry none) and the single changed item when
+   * present.
+   */
+  private applyRunMutation(id: string, value: { run?: RunSummary; item?: RunItemView }): void {
+    const run = value.run
+    if (run === undefined) return
+    const list = this.runs.getSnapshot()
+    if (list.status === 'ready') {
+      this.runs.set({
+        status: 'ready',
+        runs: list.runs.some(entry => entry.id === id)
+          ? list.runs.map(entry => (entry.id === id ? run : entry))
+          : [...list.runs, run],
+      })
+    }
+    const detail = this.runDetail.getSnapshot()
+    if (detail.status === 'ready' && detail.id === id) {
+      const item = value.item
+      this.runDetail.set({
+        status: 'ready',
+        id,
+        data: {
+          run: { ...run, config: detail.data.run.config },
+          items: item === undefined
+            ? detail.data.items
+            : detail.data.items.map(entry => (entry.node_id === item.node_id ? item : entry)),
+        },
+      })
+    }
+  }
+
   /** Run-level / row-level control (start/pause/resume/cancel/retry/remove). */
-  runControl = async (id: string, action: 'start' | 'pause' | 'resume' | 'cancel' | 'retry' | 'remove', nodeId?: string, sessionId?: string): Promise<void> => {
+  runControl = async (id: string, action: RunControlCommand, nodeId?: string, sessionId?: string): Promise<void> => {
     const result = await this.rpc.call('/omt', 'run-control', { id, action, ...(nodeId !== undefined ? { nodeId } : {}), sessionId })
     if (!result.ok) {
       this.setNotice({ kind: 'error', text: errorMessage(result) })
+      return
     }
-    await this.refreshRuns(sessionId)
-    const detail = this.runDetail.getSnapshot()
-    if ((detail.status === 'ready' || detail.status === 'loading' || detail.status === 'error') && detail.id === id) {
-      await this.openRun(id, sessionId)
-    }
+    this.applyRunMutation(id, result.value as { run?: RunSummary; item?: RunItemView })
   }
 
   /** 确认完成 / 打回 (TICKET-0070): the awaiting_confirmation decision. */
@@ -480,8 +518,7 @@ export class OmtController {
       this.setNotice({ kind: 'error', text: errorMessage(result) })
       return
     }
-    await this.refreshRuns(sessionId)
-    if (this.runDetail.getSnapshot().status === 'ready') await this.openRun(id, sessionId)
+    this.applyRunMutation(id, result.value as { run?: RunSummary; item?: RunItemView })
     // confirm → ticket done; reject → the 待确认 badge clears. Reload the
     // ticket doc when it is the one on stage.
     if (this.active.getSnapshot()?.id === nodeId) await this.select(nodeId, sessionId)
@@ -501,7 +538,7 @@ export class OmtController {
       return
     }
     const runs = (result.value as { runs: readonly RunSummary[] }).runs
-    if (result.ok) this.runs.set({ status: 'ready', runs })
+    this.runs.set({ status: 'ready', runs })
     const active = runs.filter(entry => entry.active)
     if (active.length === 0) {
       const created = await this.rpc.call('/omt', 'run-create', { nodeIds: [nodeId], sessionId })
@@ -521,7 +558,7 @@ export class OmtController {
           skippedArchived: value.skippedArchived,
         },
       })
-      await this.refreshRuns(sessionId)
+      this.applyRunMutation(value.run.id, value)
       return
     }
     if (active.length === 1 && active[0] !== undefined) {
@@ -570,8 +607,6 @@ export class OmtController {
         skippedArchived: value.skippedArchived,
       },
     })
-    await this.refreshRuns(sessionId)
-    const detail = this.runDetail.getSnapshot()
-    if (detail.status === 'ready' && detail.id === runId) await this.openRun(runId, sessionId)
+    this.applyRunMutation(runId, value)
   }
 }

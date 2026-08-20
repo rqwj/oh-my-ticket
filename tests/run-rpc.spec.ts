@@ -8,7 +8,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { ChangeHub, type OmtChangeEvent } from '../src/host/changes.ts'
+import { bridgeRunEvents, ChangeHub, type OmtChangeEvent } from '../src/host/changes.ts'
 import { OmtCore } from '../src/host/core.ts'
 import { OmtCorePool } from '../src/host/pool.ts'
 import { registerOmtRpc } from '../src/host/rpc.ts'
@@ -78,7 +78,10 @@ beforeEach(async () => {
       },
     },
   }
-  pool = new OmtCorePool(home)
+  // Production wiring (src/index.ts): every opened core bridges its run
+  // events into the hub, so run/item transitions bump without explicit RPC
+  // bumps.
+  pool = new OmtCorePool(home, { onCoreOpened: opened => { bridgeRunEvents(opened, hub) } })
   registerOmtRpc(stubCtx as never, pool, undefined, hub, running)
   // Open the pool core up front: its startup janitor assumes no live
   // sessions, so fixtures with running items must be created afterwards.

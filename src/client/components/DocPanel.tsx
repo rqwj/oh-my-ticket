@@ -10,7 +10,7 @@ import { priorityOptionLabel } from '../priority.ts'
 import { ITEM_STATE_KEY, STATUS_KEY, type Translate } from '../locales.ts'
 import type { DocRunLink, DocState, NodeSummary, OmtTreeNode } from '../store.ts'
 import type { Selector } from './Drawer.tsx'
-import { NoticeBar, RunPickerModal } from './RunPicker.tsx'
+import { RunFlowExtras } from './RunPicker.tsx'
 import type { RunBindings } from './RunsView.tsx'
 import css from './DocPanel.module.css'
 
@@ -272,7 +272,7 @@ export function DocPanel(props: DocPanelProps) {
           type="button"
           className={css.action}
           disabled={node.archived}
-          title={node.archived ? t('doc.executeArchived') : t('run.joinTitle')}
+          title={node.archived ? t('run.joinArchived') : t('run.joinTitle')}
           onClick={() => props.joinRun(node.id, props.sessionId)}
         >
           {t('run.join')}
@@ -328,8 +328,8 @@ export function DocPanel(props: DocPanelProps) {
       </div>
       </div>
 
-      <NoticeBar useNotice={props.useNotice} t={t} />
-      <RunPickerModal
+      <RunFlowExtras
+        useNotice={props.useNotice}
         useRunPicker={props.useRunPicker}
         pickRun={props.pickRun}
         cancelRunPicker={props.cancelRunPicker}

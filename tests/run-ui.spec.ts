@@ -9,36 +9,12 @@ import { OmtController } from '../src/client/controller.ts'
 import { canRemoveItem, canRetryItem, groupRuns, runControlActions } from '../src/client/run-view.ts'
 import type { RunSummary } from '../src/client/store.ts'
 import type { RpcResultLike } from '../src/client/trigger/source.ts'
+import { runFixture, type RunFixtureOptions } from './mocks/run-fixtures.ts'
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
-function progress(overrides: Record<string, number> = {}): any {
-  return {
-    total: 0,
-    pending: 0,
-    running: 0,
-    done: 0,
-    failed: 0,
-    blocked: 0,
-    skipped: 0,
-    interrupted: 0,
-    awaiting_confirmation: 0,
-    ...overrides,
-  }
-}
-
-function run(id: string, status: string, overrides: Record<string, unknown> = {}): RunSummary {
-  return {
-    id,
-    title: `Run ${id}`,
-    status: status as RunSummary['status'],
-    active: ['pending', 'running', 'paused'].includes(status),
-    history: ['completed', 'completed_with_failures', 'canceled'].includes(status),
-    created_at: '2026-08-19T09:00:00.000Z',
-    progress: progress({ total: 4, done: 1 }),
-    stalled: 0,
-    ...overrides,
-  } as RunSummary
+function run(id: string, status: string, overrides: RunFixtureOptions = {}): RunSummary {
+  return runFixture(id, status as RunSummary['status'], overrides)
 }
 
 const RUN_DETAIL = {
@@ -143,13 +119,23 @@ describe('run list / detail stores', () => {
 })
 
 describe('runControl / runConfirm', () => {
-  it('runControl sends the action and refreshes list and open detail', async () => {
-    await controller.openRun('RUN-1', 's1')
+  it('runControl sends the action and applies the response to list and open detail', async () => {
+    const controlled = makeController({ 'run-control': { ok: true, value: { run: run('RUN-1', 'paused') } } })
+    listValue = [run('RUN-1', 'running')]
+    await controlled.refreshRuns('s1')
+    await controlled.openRun('RUN-1', 's1')
     calls = []
-    await controller.runControl('RUN-1', 'pause', undefined, 's1')
-    expect(calls[0]).toEqual({ endpoint: 'run-control', payload: { id: 'RUN-1', action: 'pause', sessionId: 's1' } })
-    expect(calls.some(call => call.endpoint === 'run-list')).toBe(true)
-    expect(calls.some(call => call.endpoint === 'run-show')).toBe(true)
+    await controlled.runControl('RUN-1', 'pause', undefined, 's1')
+    expect(calls).toEqual([{ endpoint: 'run-control', payload: { id: 'RUN-1', action: 'pause', sessionId: 's1' } }])
+    // Response-driven stores: no manual list/detail refetch (SSE covers it).
+    const list = controlled.runs.getSnapshot()
+    if (list.status !== 'ready') throw new Error('expected ready')
+    expect(list.runs[0]).toMatchObject({ id: 'RUN-1', status: 'paused' })
+    const detail = controlled.runDetail.getSnapshot()
+    if (detail.status !== 'ready') throw new Error('expected ready')
+    expect(detail.data.run.status).toBe('paused')
+    // The summary merge preserves the detail-only config.
+    expect(detail.data.run.config).toEqual({ stopOnFailure: false, autoContinue: true, autoVerify: false, concurrency: 1 })
   })
 
   it('runControl retry/remove pass nodeId', async () => {
@@ -157,7 +143,7 @@ describe('runControl / runConfirm', () => {
     expect(calls[0]).toEqual({ endpoint: 'run-control', payload: { id: 'RUN-1', action: 'retry', nodeId: 'TICKET-0009', sessionId: 's1' } })
   })
 
-  it('runConfirm sends the decision and refreshes detail, list, and the open doc', async () => {
+  it('runConfirm sends the decision, applies the response, and reloads the open doc', async () => {
     await controller.select('TICKET-0002', 's1')
     await controller.openRun('RUN-1', 's1')
     calls = []
@@ -166,8 +152,9 @@ describe('runControl / runConfirm', () => {
       endpoint: 'run-confirm',
       payload: { id: 'RUN-1', nodeId: 'TICKET-0002', decision: 'confirm', sessionId: 's1' },
     })
-    expect(calls.some(call => call.endpoint === 'run-show')).toBe(true)
-    expect(calls.some(call => call.endpoint === 'run-list')).toBe(true)
+    // Response-driven stores: no manual list/detail refetch (SSE covers it).
+    expect(calls.some(call => call.endpoint === 'run-show')).toBe(false)
+    expect(calls.some(call => call.endpoint === 'run-list')).toBe(false)
     // The confirmed ticket's doc reloads (item done → ticket done).
     expect(calls.some(call => call.endpoint === 'get' && call.payload.id === 'TICKET-0002')).toBe(true)
   })

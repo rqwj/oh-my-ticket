@@ -24,20 +24,17 @@
  *
  * 执行会话已销毁或通道抛错都被包容（warn），绝不抛出。
  */
-import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
+import type { AgentsLike } from './agents-like.ts'
 import type { OmtCore, OmtRunEvent } from './core.ts'
-import { RUN_ITEM_FINAL_STATES, type OmtRun, type OmtRunItem, type RunItemState } from './types.ts'
+import { pluginUserMessage } from './messages.ts'
+import { isRunHistory, RUN_ITEM_FINAL_STATES, type OmtRun, type OmtRunItem, type RunItemState } from './types.ts'
 
 /** Structural agent face for delivery. */
 interface NotifyTarget {
   readonly id: string
   followup(message: unknown): void
   inject(message: unknown): void
-}
-
-interface AgentsLike {
-  get(id: string): NotifyTarget | undefined
 }
 
 export interface OmtRunNotifier {
@@ -47,15 +44,6 @@ export interface OmtRunNotifier {
 
 /** Item states that earn a per-item completion notification. */
 const NOTIFIED_ITEM_STATES: readonly RunItemState[] = ['done', 'failed', 'blocked', 'skipped']
-
-function message(text: string): unknown {
-  return {
-    id: randomUUID(),
-    role: 'user',
-    content: [{ type: 'text', text }],
-    source: { kind: 'plugin', plugin: 'oh-my-ticket' },
-  }
-}
 
 function progressLine(core: OmtCore, run: OmtRun, item: OmtRunItem): string {
   const counts = core.runItemStateCounts(run.id)
@@ -79,11 +67,15 @@ function awaitingLine(run: OmtRun, item: OmtRunItem): string {
     + '如确认完成，请用 omt_run_report 补报（outcome=done）；人工可在 run 详情确认（ticket 落 done）或打回（item 转 interrupted，ticket 保持 in_progress，可 retry 重跑）。'
 }
 
-function summaryLines(core: OmtCore, run: OmtRun): string[] {
-  const counts = core.runItemStateCounts(run.id)
-  const parts = counts.map(entry => `${entry.state} ×${entry.count}`).join(' · ')
+function summaryLines(run: OmtRun, items: readonly OmtRunItem[]): string[] {
+  // Same shape/order as a GROUP BY state scan (alphabetical by state).
+  const counts = new Map<RunItemState, number>()
+  for (const item of items) counts.set(item.state, (counts.get(item.state) ?? 0) + 1)
+  const parts = [...counts.entries()]
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([state, count]) => `${state} ×${count}`).join(' · ')
   const lines = [`run ${run.id} 已结束（${run.status}）：${parts === '' ? '无成员' : parts}`]
-  for (const item of core.runItems(run.id)) {
+  for (const item of items) {
     if (item.state === 'failed' && item.last_error !== undefined) {
       lines.push(`- 失败：${item.node_id} — ${item.last_error}`)
     }
@@ -92,9 +84,9 @@ function summaryLines(core: OmtCore, run: OmtRun): string[] {
 }
 
 /** Distinct executor sessions of a run's items (terminal-summary targets). */
-function executorSessions(core: OmtCore, runId: string): string[] {
+function executorSessions(items: readonly OmtRunItem[]): string[] {
   const sessions = new Set<string>()
-  for (const item of core.runItems(runId)) {
+  for (const item of items) {
     if (item.executor_session_id !== undefined) sessions.add(item.executor_session_id)
   }
   return [...sessions]
@@ -102,7 +94,7 @@ function executorSessions(core: OmtCore, runId: string): string[] {
 
 /** Create the notifier. Delivery batches per session per tick (wake wins). */
 export function createOmtRunNotifier(ctx: Context): OmtRunNotifier {
-  const agents = (ctx as unknown as { agents?: AgentsLike }).agents
+  const agents = (ctx as unknown as { agents?: AgentsLike<NotifyTarget> }).agents
 
   const warn = (messageText: string, error: unknown): void => {
     console.warn(`[omt] notify-hook: ${messageText}`, error)
@@ -116,7 +108,7 @@ export function createOmtRunNotifier(ctx: Context): OmtRunNotifier {
   const deliver = (sessionId: string, batch: Batch): void => {
     const agent = agents?.get(sessionId)
     if (agent === undefined) return // 执行会话已销毁：防御性跳过。
-    const payload = message(batch.lines.join('\n'))
+    const payload = pluginUserMessage(batch.lines.join('\n'))
     try {
       if (batch.wake) agent.followup(payload)
       else agent.inject(payload)
@@ -160,9 +152,12 @@ export function createOmtRunNotifier(ctx: Context): OmtRunNotifier {
     }
     // Run events: terminal summary only; interrupted 终态不注入.
     if (event.run.status === event.fromRunStatus) return
-    if (event.run.status === 'completed' || event.run.status === 'completed_with_failures' || event.run.status === 'canceled') {
-      const lines = summaryLines(core, event.run)
-      for (const sessionId of executorSessions(core, event.run.id)) {
+    if (isRunHistory(event.run.status)) {
+      // One membership scan feeds both the summary lines and the
+      // executor-session targets.
+      const items = core.runItems(event.run.id)
+      const lines = summaryLines(event.run, items)
+      for (const sessionId of executorSessions(items)) {
         enqueue(sessionId, lines, true)
       }
     }

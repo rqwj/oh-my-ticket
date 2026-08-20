@@ -19,12 +19,13 @@
  *   run-add     { id, nodeIds }                    → 加入既有 run（去重/跳过/home 校验）
  *   run-confirm { id, nodeId, decision }           → awaiting_confirmation 确认/打回
  */
-import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-client-connection'
 import type { RpcResult } from '@deepseek-ai/dsh-host-apiproxy/api'
+import type { AgentsLike } from './agents-like.ts'
 import type { OmtCore } from './core.ts'
+import { pluginUserMessage } from './messages.ts'
 import type { OmtCorePool } from './pool.ts'
 import type { ChangeHub } from './changes.ts'
 import type { RecentRegistry } from './recent.ts'
@@ -43,12 +44,10 @@ import {
   type RunItemState,
 } from './types.ts'
 
-/** Structural ctx.agents face: sessionId → agent → session header (+ wake for run start). */
-interface AgentsLike {
-  get(id: string): {
-    session: { header: { cwd: string; parentSession?: string; origin?: 'subagent' } }
-    followup?(message: unknown): void
-  } | undefined
+/** Structural agent face: sessionId → agent → session header (+ wake for run start). */
+interface SessionAgent {
+  session: { header: { cwd: string; parentSession?: string; origin?: 'subagent' } }
+  followup?(message: unknown): void
 }
 
 // Every payload may carry the calling session so the handler can resolve
@@ -119,6 +118,10 @@ function summarize(node: OmtNode): NodeSummary {
 
 type RunProgress = Record<RunItemState, number> & { total: number }
 
+function emptyProgress(): RunProgress {
+  return { total: 0, ...Object.fromEntries(RUN_ITEM_STATES.map(state => [state, 0])) } as RunProgress
+}
+
 export interface RunSummaryValue {
   readonly id: string
   readonly title?: string
@@ -134,8 +137,9 @@ export interface RunSummaryValue {
   readonly stalled: number
 }
 
+/** Counts-based progress (cheap SQL aggregate for the get endpoint's run links). */
 function runProgress(core: OmtCore, runId: string): RunProgress {
-  const progress = { total: 0, ...Object.fromEntries(RUN_ITEM_STATES.map(state => [state, 0])) } as RunProgress
+  const progress = emptyProgress()
   for (const { state, count } of core.runItemStateCounts(runId)) {
     progress.total += count
     progress[state] = count
@@ -143,7 +147,18 @@ function runProgress(core: OmtCore, runId: string): RunProgress {
   return progress
 }
 
-function runSummary(core: OmtCore, run: OmtRun): RunSummaryValue {
+/**
+ * Single-scan summary: progress and the stalled count both derive from one
+ * runItems fetch (run-list calls this per run — no N+1 double scan).
+ */
+function runSummary(core: OmtCore, run: OmtRun, items: readonly OmtRunItem[] = core.runItems(run.id)): RunSummaryValue {
+  const progress = emptyProgress()
+  let stalled = 0
+  for (const item of items) {
+    progress.total += 1
+    progress[item.state] += 1
+    if (isRunItemStalled(item)) stalled += 1
+  }
   return {
     id: run.id,
     ...(run.title !== undefined ? { title: run.title } : {}),
@@ -152,8 +167,8 @@ function runSummary(core: OmtCore, run: OmtRun): RunSummaryValue {
     history: isRunHistory(run.status),
     created_at: run.created_at,
     ...(run.finished_at !== undefined ? { finished_at: run.finished_at } : {}),
-    progress: runProgress(core, run.id),
-    stalled: core.runItems(run.id).filter(isRunItemStalled).length,
+    progress,
+    stalled,
   }
 }
 
@@ -203,16 +218,6 @@ function collectRunMembers(core: OmtCore, running: RunningRegistry | undefined, 
   return { members, skippedDone, skippedArchived }
 }
 
-/** Plugin-sourced user message (same wire shape as the notify-hook). */
-function pluginMessage(text: string): unknown {
-  return {
-    id: randomUUID(),
-    role: 'user',
-    content: [{ type: 'text', text }],
-    source: { kind: 'plugin', plugin: 'oh-my-ticket' },
-  }
-}
-
 type RpcSuccess = { ok: true; value: unknown }
 
 function ok(value: unknown): RpcSuccess {
@@ -229,7 +234,7 @@ function badRequest(message: string, issues: z.core.$ZodIssue[]): RpcResult<unkn
 
 /** Register the `/omt` RPC channel (loopback authority: local GUI only). */
 export function registerOmtRpc(ctx: Context, pool: OmtCorePool, recent?: RecentRegistry, changes?: ChangeHub, running?: RunningRegistry): void {
-  const agents = (ctx as unknown as { agents?: AgentsLike }).agents
+  const agents = (ctx as unknown as { agents?: AgentsLike<SessionAgent> }).agents
   const sessionLabelOf = (sessionId: string): string => {
     const cwd = agents?.get(sessionId)?.session.header.cwd
     const base = cwd === undefined ? undefined : cwd.split('/').filter(Boolean).pop()
@@ -258,12 +263,7 @@ export function registerOmtRpc(ctx: Context, pool: OmtCorePool, recent?: RecentR
       }
     }
     const header = agents?.get(sessionId)?.session.header
-    return {
-      sessionId,
-      label: sessionLabelOf(sessionId),
-      ...(header?.parentSession !== undefined ? { parentSessionId: header.parentSession } : {}),
-      ...(header?.origin === 'subagent' ? { isSubagent: true } : {}),
-    }
+    return { sessionId, label: sessionLabelOf(sessionId), ...lineageOfHeader(header) }
   }
 
   /** Run-detail item row: state/谱系/attempts/last_error/stalled + ticket join. */
@@ -279,7 +279,6 @@ export function registerOmtRpc(ctx: Context, pool: OmtCorePool, recent?: RecentR
       ...(isRunItemStalled(item) ? { stalled: true } : {}),
       ...(item.started_at !== undefined ? { started_at: item.started_at } : {}),
       ...(item.finished_at !== undefined ? { finished_at: item.finished_at } : {}),
-      ...(item.executor_session_id !== undefined ? { executor_session_id: item.executor_session_id } : {}),
       ...(executor !== undefined ? { executor } : {}),
       ...(node !== undefined ? { node: { id: node.id, title: node.title, status: node.status, archived: node.archived } } : {}),
     }
@@ -292,8 +291,7 @@ export function registerOmtRpc(ctx: Context, pool: OmtCorePool, recent?: RecentR
    */
   const assertSameHome = async (baselineHome: string | undefined, rootIds: readonly string[], cwd: string | undefined, runId?: string): Promise<string> => {
     let home = baselineHome
-    for (const rootId of rootIds) {
-      const owner = await pool.coreForNode(rootId, cwd)
+    for (const { rootId, core: owner } of await pool.ownerCores(rootIds, cwd)) {
       if (owner.getNode(rootId) === undefined) throw new OmtError('NOT_FOUND', `unknown node: ${rootId}`)
       home ??= owner.home
       if (owner.home !== home) {
@@ -326,8 +324,7 @@ export function registerOmtRpc(ctx: Context, pool: OmtCorePool, recent?: RecentR
         case 'get': {
           const parsed = getPayloadSchema.safeParse(payload)
           if (!parsed.success) return badRequest('invalid get payload', parsed.error.issues)
-          const cwd = parsed.data.sessionId === undefined ? undefined : agents?.get(parsed.data.sessionId)?.session.header.cwd
-          const core = await pool.coreForNode(parsed.data.id, cwd)
+          const core = await pool.coreForNode(parsed.data.id, cwdOf(parsed.data.sessionId))
           const result = await core.show(parsed.data.id)
           recent?.touch(parsed.data.sessionId, parsed.data.id)
           const runningInfo = running?.get(parsed.data.id)
@@ -357,7 +354,7 @@ export function registerOmtRpc(ctx: Context, pool: OmtCorePool, recent?: RecentR
           if ([title, status, archived, priority, append].every(v => v === undefined)) {
             return badRequest('update requires at least one change (title/status/archived/priority/append)', [])
           }
-          const cwd = parsed.data.sessionId === undefined ? undefined : agents?.get(parsed.data.sessionId)?.session.header.cwd
+          const cwd = cwdOf(parsed.data.sessionId)
           const core = await pool.coreForNode(parsed.data.id, cwd)
           // Passive observation (TICKET-0061) rides on core.update; the
           // session becomes the executor of any item this change dispatches.
@@ -373,7 +370,7 @@ export function registerOmtRpc(ctx: Context, pool: OmtCorePool, recent?: RecentR
         case 'execute': {
           const parsed = executePayloadSchema.safeParse(payload)
           if (!parsed.success) return badRequest('invalid execute payload', parsed.error.issues)
-          const cwd = agents?.get(parsed.data.sessionId)?.session.header.cwd
+          const cwd = cwdOf(parsed.data.sessionId)
           const core = await pool.coreForNode(parsed.data.id, cwd)
           // Executing un-archives nothing and starts work: in_progress + running mark.
           // Passive observation (TICKET-0061) rides on core.update: the
@@ -395,7 +392,7 @@ export function registerOmtRpc(ctx: Context, pool: OmtCorePool, recent?: RecentR
           const parsed = recentPayloadSchema.safeParse(payload)
           if (!parsed.success) return badRequest('invalid recent payload', parsed.error.issues)
           const sessionId = parsed.data.sessionId
-          const cwd = agents?.get(sessionId)?.session.header.cwd
+          const cwd = cwdOf(sessionId)
           const summaries: NodeSummary[] = []
           for (const id of (recent !== undefined ? await recent.resolve(sessionId) : [])) {
             const owner = await pool.coreForNode(id, cwd)
@@ -425,9 +422,11 @@ export function registerOmtRpc(ctx: Context, pool: OmtCorePool, recent?: RecentR
           if (!parsed.success) return badRequest('invalid run-show payload', parsed.error.issues)
           const core = await pool.coreForRun(parsed.data.id, cwdOf(parsed.data.sessionId))
           const run = core.requireRun(parsed.data.id)
+          // One membership scan feeds both the summary and the item views.
+          const items = core.runItems(run.id)
           return ok({
-            run: { ...runSummary(core, run), config: run.config },
-            items: core.runItems(run.id).map(item => runItemView(core, item)),
+            run: { ...runSummary(core, run, items), config: run.config },
+            items: items.map(item => runItemView(core, item)),
           })
         }
         case 'run-control': {
@@ -444,9 +443,9 @@ export function registerOmtRpc(ctx: Context, pool: OmtCorePool, recent?: RecentR
               // session never fails the start.
               const agent = parsed.data.sessionId === undefined ? undefined : agents?.get(parsed.data.sessionId)
               if (agent?.followup !== undefined) {
-                const count = core.runItems(id).length
+                const count = core.runItemStateCounts(id).reduce((sum, entry) => sum + entry.count, 0)
                 try {
-                  agent.followup(pluginMessage(
+                  agent.followup(pluginUserMessage(
                     `用户从 UI 触发了 run ${id} 的开始执行（共 ${count} 个成员）。`
                     + `请调用 omt_run_claim（id="${id}"）认领下一个待执行项并执行；`
                     + '每项完成后用 omt_run_report 报告结果（done/failed/blocked/skipped）。',
@@ -475,7 +474,10 @@ export function registerOmtRpc(ctx: Context, pool: OmtCorePool, recent?: RecentR
               await core.removeRunItem(id, nodeId)
               break
           }
-          changes?.bump(core.home, { id, kind: item !== undefined ? 'item' : 'run', ...(item !== undefined ? { nodeId: item.node_id } : {}) })
+          // removeRunItem emits no run event, so it bumps explicitly; every
+          // other action's transition already reached the hub through
+          // bridgeRunEvents (TICKET-0071).
+          if (action === 'remove') changes?.bump(core.home, { id, kind: 'run' })
           return ok({
             run: runSummary(core, core.requireRun(id)),
             ...(item !== undefined ? { item: runItemView(core, item) } : {}),
@@ -545,7 +547,7 @@ export function registerOmtRpc(ctx: Context, pool: OmtCorePool, recent?: RecentR
             // status (aligned with the failed semantics of TICKET-0059).
             item = await core.transitionItem(id, nodeId, 'interrupted')
           }
-          changes?.bump(core.home, { id, kind: 'item', nodeId })
+          // The item transition already reached the hub through bridgeRunEvents.
           return ok({ run: runSummary(core, core.requireRun(id)), item: runItemView(core, item) })
         }
         default:

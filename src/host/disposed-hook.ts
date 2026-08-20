@@ -17,8 +17,9 @@
  * （decision 12）语义一致；已终态的 run 不受影响。死会话的
  * RunningRegistry 标记一并清理。所有注入失败都被包容（warn），绝不抛出。
  */
-import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
+import type { AgentsLike } from './agents-like.ts'
+import { safeFollowup, type FollowupTargetLike } from './messages.ts'
 import type { OmtCorePool } from './pool.ts'
 import type { RunningRegistry } from './running.ts'
 import { RUN_ITEM_FINAL_STATES } from './types.ts'
@@ -33,15 +34,7 @@ interface DisposedAgentLike {
   }
 }
 
-interface FollowupTarget {
-  readonly id: string
-  followup(message: unknown): void
-}
-
-interface AgentsLike {
-  get(id: string): FollowupTarget | undefined
-  list(): { id: string }[]
-}
+type FollowupTarget = FollowupTargetLike
 
 interface DisposedEvents {
   on(event: 'agent/disposed', listener: (payload: { agent: DisposedAgentLike }) => void): unknown
@@ -74,23 +67,14 @@ function finalReportOf(agent: DisposedAgentLike): string | undefined {
 
 /** Register the disposed hook. */
 export function registerOmtDisposedHook(ctx: Context, pool: OmtCorePool, running: RunningRegistry): void {
-  const agents = (ctx as unknown as { agents?: AgentsLike }).agents
+  const agents = (ctx as unknown as { agents?: AgentsLike<FollowupTarget> }).agents
 
   const warn = (message: string, error: unknown): void => {
     console.warn(`[omt] disposed-hook: ${message}`, error)
   }
 
   const followup = (agent: FollowupTarget, text: string): void => {
-    try {
-      agent.followup({
-        id: randomUUID(),
-        role: 'user',
-        content: [{ type: 'text', text }],
-        source: { kind: 'plugin', plugin: 'oh-my-ticket' },
-      })
-    } catch (error: unknown) {
-      warn(`could not queue followup for agent "${agent.id}"`, error)
-    }
+    safeFollowup(agent, text, warn)
   }
 
   const onDisposed = async (agent: DisposedAgentLike): Promise<void> => {

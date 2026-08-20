@@ -524,11 +524,10 @@ export function registerOmtTools(
       // same owning home — resolve by ownership, not by caller cwd.
       // Membership itself is validated by core.createRun (requireNode).
       let core: OmtCore | undefined
-      for (const nodeId of args.nodeIds) {
-        const owner = await pool.coreForNode(nodeId, cwd)
+      for (const { rootId, core: owner } of await pool.ownerCores(args.nodeIds, cwd)) {
         core ??= owner
         if (owner.home !== core.home) {
-          throw new Error(`omt_run_create 的成员必须同属一个 OMT home（${nodeId} 属于 ${owner.home}，与 ${core.home} 不同）`)
+          throw new Error(`omt_run_create 的成员必须同属一个 OMT home（${rootId} 属于 ${owner.home}，与 ${core.home} 不同）`)
         }
       }
       core ??= await pool.coreFor(cwd)

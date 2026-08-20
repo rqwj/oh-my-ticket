@@ -141,6 +141,16 @@ export class OmtCorePool {
   }
 
   /**
+   * Owning core per root id, in input order (run-create/run-add single-home
+   * membership resolution, TICKET-0067). Resolved concurrently; conflict and
+   * NOT_FOUND reporting stay with the caller (error types differ per
+   * surface: OmtError on RPC, plain Error on tools).
+   */
+  ownerCores(rootIds: readonly string[], cwd: string | undefined): Promise<{ rootId: string; core: OmtCore }[]> {
+    return Promise.all(rootIds.map(async rootId => ({ rootId, core: await this.coreForNode(rootId, cwd) })))
+  }
+
+  /**
    * Resolve the core CONTAINING a run id. Run ids count per home, so the
    * same id can exist in several homes — resolution follows the node rule
    * (workspace home first, then global; the caller's workspace context

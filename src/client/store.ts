@@ -115,7 +115,6 @@ export interface RunItemView {
   readonly stalled?: boolean
   readonly started_at?: string
   readonly finished_at?: string
-  readonly executor_session_id?: string
   readonly executor?: RunExecutor
   readonly node?: { readonly id: string; readonly title: string; readonly status: OmtTreeNode['status']; readonly archived: boolean }
 }

@@ -14,7 +14,7 @@
 import { useState } from 'react'
 import { formatRelative } from '../relative-time.ts'
 import { ITEM_STATE_KEY, RUN_STATUS_KEY, type Translate } from '../locales.ts'
-import { canConfirmItem, canRemoveItem, canRetryItem, groupRuns, runControlActions, type RunControlAction } from '../run-view.ts'
+import { canConfirmItem, canRemoveItem, canRetryItem, groupRuns, runControlActions, type RunControlAction, type RunControlCommand } from '../run-view.ts'
 import type {
   Notice,
   PanelSection,
@@ -46,7 +46,7 @@ export interface RunBindings {
   readonly closeRunDetail: () => void
   /** Deep-link from the doc panel: open the panel on this run's detail. */
   readonly showRunInPanel: (id: string, sessionId?: string) => void
-  readonly runControl: (id: string, action: RunControlAction | 'retry' | 'remove', nodeId?: string, sessionId?: string) => void
+  readonly runControl: (id: string, action: RunControlCommand, nodeId?: string, sessionId?: string) => void
   readonly runConfirm: (id: string, nodeId: string, decision: 'confirm' | 'reject', sessionId?: string) => void
   /** 加入 run entry (tree row + doc panel): collect node + subtree. */
   readonly joinRun: (nodeId: string, sessionId?: string) => void

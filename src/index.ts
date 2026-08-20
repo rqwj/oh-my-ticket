@@ -6,6 +6,7 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import Schema from '@deepseek-ai/schemastery'
+import type { AgentsLike } from './host/agents-like.ts'
 import { bridgeRunEvents, ChangeHub } from './host/changes.ts'
 import { registerOmtDisposedHook } from './host/disposed-hook.ts'
 import { registerOmtEvents } from './host/events.ts'
@@ -39,15 +40,12 @@ export function resolveHome(configHome: string, env: NodeJS.ProcessEnv = process
   return join(homedir(), '.omt')
 }
 
-/** Structural ctx.agents face (see rpc.ts AgentsLike for the same cast). */
-interface AgentsLike {
-  get(id: string): { session: { header: { cwd?: string } } } | undefined
-  list(): { id: string }[]
-}
+/** Structural agent shape used here: just the session header (see rpc.ts). */
+type HeaderAgent = { session: { header: { cwd?: string } } }
 
 export function apply(ctx: Context, config: Config): void {
   const globalHome = resolveHome(config.home)
-  const agents = (ctx as unknown as { agents?: AgentsLike }).agents
+  const agents = (ctx as unknown as { agents?: AgentsLike<HeaderAgent> }).agents
   // Run-notification closure (TICKET-0065): attaches to every core as it
   // opens, so lazily-opened workspace homes notify too.
   const notifier = createOmtRunNotifier(ctx)

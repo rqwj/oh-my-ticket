@@ -399,7 +399,7 @@ export class OmtStore {
 
   // ── run items ────────────────────────────────────────────────────────
 
-  insertRunItem(item: OmtRunItem): void {
+  insertRunItem(item: OmtRunItem): OmtRunItem {
     this.db.prepare(
       `INSERT INTO run_items (run_id, node_id, position, state, executor_session_id, attempts, last_error, nudged_at, nudge_count, started_at, finished_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -408,6 +408,7 @@ export class OmtStore {
       item.attempts, item.last_error ?? null, item.nudged_at ?? null, item.nudge_count,
       item.started_at ?? null, item.finished_at ?? null,
     )
+    return item
   }
 
   updateRunItem(runId: string, nodeId: string, patch: Partial<{

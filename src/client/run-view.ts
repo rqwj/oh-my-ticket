@@ -24,6 +24,9 @@ export function groupRuns(runs: readonly RunSummary[]): { main: RunSummary[]; hi
 
 export type RunControlAction = 'start' | 'pause' | 'resume' | 'cancel'
 
+/** Full run-control verb set (run-level actions + row-level retry/remove). */
+export type RunControlCommand = RunControlAction | 'retry' | 'remove'
+
 /**
  * Run-level controls by status (host CONFLICT rules): start only from
  * pending; pause only while running; resume from paused/interrupted;
