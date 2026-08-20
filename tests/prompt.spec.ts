@@ -53,6 +53,9 @@ describe('composeOmtPrompt', () => {
     expect(text).toContain('拆任务')
     expect(text).toContain('TICKET-')
     expect(text).toContain('skill')
+    expect(text).toContain('遵循')
+    expect(text).toContain('brainstorming')
+    expect(text).toContain('不得 `omt_create`')
   })
 
   it('does not instruct loading omt unless the user bound that name', () => {
