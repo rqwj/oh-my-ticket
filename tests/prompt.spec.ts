@@ -70,6 +70,19 @@ describe('composeOmtPrompt', () => {
     expect(text).toContain('OMT 阶段')
     expect(text).not.toBe(OMT_SKILL_CONTENT)
   })
+
+  it('requires ce-work when implementing a bound ticket', () => {
+    const text = composeOmtPrompt({
+      extraPrompt: '',
+      boundSkillNames: ['ce-brainstorm', 'ce-plan', 'ce-work', 'ce-worktree', 'ce-test-browser'],
+      installedNames: ['ce-brainstorm', 'ce-plan', 'ce-work', 'ce-worktree', 'ce-test-browser'],
+    })
+    expect(text).toContain('实施 ticket')
+    expect(text).toContain('`ce-work`')
+    expect(text).toContain('`ce-worktree`')
+    expect(text).toContain('`ce-test-browser`')
+    expect(text).toContain('禁止不 load `ce-work` 就直接改代码')
+  })
 })
 
 it('registers plugin:omt at order 150 from current inputs', () => {
