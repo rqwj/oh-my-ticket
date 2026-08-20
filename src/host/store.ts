@@ -159,6 +159,13 @@ CREATE TABLE IF NOT EXISTS run_items (
 CREATE INDEX IF NOT EXISTS idx_run_items_node ON run_items(node_id);
 `
 
+/** Result of one atomic claim: the claimed item plus the archived-member skips drained in the same transaction. */
+export interface ClaimNextResult {
+  readonly claimed: OmtRunItem | undefined
+  /** Pending items of archived members marked skipped while draining the queue. */
+  readonly skipped: OmtRunItem[]
+}
+
 export class OmtStore {
   private constructor(private readonly db: DatabaseSync) {}
 
@@ -457,11 +464,17 @@ export class OmtStore {
    * concurrent claimers can never receive the same item. Pending items of
    * archived members can never execute (reports reject archived nodes):
    * the same transaction marks them skipped so the queue drains past them
-   * instead of wedging on an unclaimable head.
+   * instead of wedging on an unclaimable head. Both sides of the
+   * transaction are returned so the core can broadcast the transitions.
    */
-  claimNextRunItem(runId: string, executorSessionId: string, now: string): OmtRunItem | undefined {
+  claimNextRunItem(runId: string, executorSessionId: string, now: string): ClaimNextResult {
     this.db.exec('BEGIN IMMEDIATE')
     try {
+      const skippedIds = (this.db.prepare(
+        `SELECT i.node_id FROM run_items i JOIN nodes n ON n.id = i.node_id
+         WHERE i.run_id = ? AND i.state = 'pending' AND n.archived = 1
+         ORDER BY i.position, i.node_id`,
+      ).all(runId) as { node_id: string }[]).map(row => row.node_id)
       this.db.prepare(
         `UPDATE run_items SET state = 'skipped', finished_at = ?
          WHERE run_id = ? AND state = 'pending'
@@ -474,13 +487,16 @@ export class OmtStore {
       ).get(runId) as { node_id: string } | undefined
       if (row === undefined) {
         this.db.exec('COMMIT')
-        return undefined
+        return { claimed: undefined, skipped: skippedIds.map(nodeId => this.getRunItem(runId, nodeId) as OmtRunItem) }
       }
       this.db.prepare(
         "UPDATE run_items SET state = 'running', executor_session_id = ?, started_at = COALESCE(started_at, ?) WHERE run_id = ? AND node_id = ? AND state = 'pending'",
       ).run(executorSessionId, now, runId, row.node_id)
       this.db.exec('COMMIT')
-      return this.getRunItem(runId, row.node_id)
+      return {
+        claimed: this.getRunItem(runId, row.node_id),
+        skipped: skippedIds.map(nodeId => this.getRunItem(runId, nodeId) as OmtRunItem),
+      }
     } catch (error) {
       this.db.exec('ROLLBACK')
       throw error

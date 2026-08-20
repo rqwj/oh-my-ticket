@@ -64,7 +64,7 @@ function pausedLines(run: OmtRun, item: OmtRunItem): string[] {
 
 function awaitingLine(run: OmtRun, item: OmtRunItem): string {
   return `${run.id} / ${item.node_id} 进入待确认（awaiting_confirmation）：ticket 未经 omt_run_report 直接落 done。`
-    + '如确认完成，请用 omt_run_report 补报（outcome=done）；人工可在 run 详情确认（ticket 落 done）或打回（item 转 interrupted，ticket 保持 in_progress，可 retry 重跑）。'
+    + '如确认完成，请用 omt_run_report 补报（outcome=done）；人工可在 run 详情确认（ticket 落 done）或打回（item 转 interrupted，ticket 重开为 open，可 retry 重跑）。'
 }
 
 function summaryLines(run: OmtRun, items: readonly OmtRunItem[]): string[] {

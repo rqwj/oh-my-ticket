@@ -172,7 +172,7 @@ function runSummary(core: OmtCore, run: OmtRun, items: readonly OmtRunItem[] = c
   }
 }
 
-/** One collectable run member: pending by default, running for in_progress tickets. */
+/** One collectable run member: pending by default, running only for in_progress tickets with a live running mark. */
 interface CollectedMember {
   readonly nodeId: string
   readonly state: 'pending' | 'running'
@@ -188,8 +188,11 @@ interface MemberCollection {
 /**
  * 加入-run collection (TICKET-0067): each root + its whole subtree in tree
  * (DFS pre-order) order. done/archived nodes are skipped and counted (their
- * children are still collected); in_progress nodes join as running with the
- * RunningRegistry executor snapshot. Overlapping roots dedupe via `seen`.
+ * children are still collected); in_progress nodes join as running ONLY
+ * when the RunningRegistry holds a live mark for them (executor snapshot) —
+ * an unmarked in_progress ticket is not really executing, so it joins as
+ * pending and lets the run re-dispatch it. Overlapping roots dedupe via
+ * `seen`.
  */
 function collectRunMembers(core: OmtCore, running: RunningRegistry | undefined, rootIds: readonly string[]): MemberCollection {
   const members: CollectedMember[] = []
@@ -205,7 +208,11 @@ function collectRunMembers(core: OmtCore, running: RunningRegistry | undefined, 
         skippedDone += 1
       } else if (node.status === 'in_progress') {
         const info = running?.get(node.id)
-        members.push({ nodeId: node.id, state: 'running', ...(info !== undefined ? { executorSessionId: info.sessionId } : {}) })
+        if (info !== undefined) {
+          members.push({ nodeId: node.id, state: 'running', executorSessionId: info.sessionId })
+        } else {
+          members.push({ nodeId: node.id, state: 'pending' })
+        }
       } else {
         members.push({ nodeId: node.id, state: 'pending' })
       }
@@ -543,9 +550,13 @@ export function registerOmtRpc(ctx: Context, pool: OmtCorePool, recent?: RecentR
             item = (await core.reportRunItem(id, nodeId, 'done')).item
             running?.stop(nodeId)
           } else {
-            // 打回: item interrupted; the ticket keeps its in_progress
-            // status (aligned with the failed semantics of TICKET-0059).
-            item = await core.transitionItem(id, nodeId, 'interrupted')
+            // 打回: reopen the ticket (open over an awaiting_confirmation
+            // item is the TICKET-0064 rejection path). The observation
+            // interrupt lands the item AND replays other active runs holding
+            // the ticket (decision 1 cross-run broadcast) — a bare
+            // transitionItem would leave those members falsely done.
+            await core.update({ id: nodeId, status: 'open' })
+            item = core.getRunItem(id, nodeId) as OmtRunItem
           }
           // The item transition already reached the hub through bridgeRunEvents.
           return ok({ run: runSummary(core, core.requireRun(id)), item: runItemView(core, item) })

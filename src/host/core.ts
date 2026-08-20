@@ -845,6 +845,9 @@ export class OmtCore {
    * executor session, so concurrent claimers never share an item. Returns
    * undefined when the queue is empty (an explicit signal, not an error).
    * Claimed ownership wins over passive observation (decision 14).
+   * Every transition the claim transaction makes is broadcast as an item
+   * event (pending → running for the claim, pending → skipped for archived
+   * members drained along the way) so SSE listeners see them.
    */
   async claimRunItem(runId: string, executorSessionId: string): Promise<OmtRunItem | undefined> {
     const run = this.requireRun(runId)
@@ -857,7 +860,13 @@ export class OmtCore {
     if (run.status !== 'running') {
       throw new OmtError('CONFLICT', `run ${runId} is ${run.status}; only a running run dispatches claims`)
     }
-    const claimed = await this.store.claimNextRunItem(runId, executorSessionId, new Date().toISOString())
+    const { claimed, skipped } = await this.store.claimNextRunItem(runId, executorSessionId, new Date().toISOString())
+    for (const item of skipped) {
+      this.emitRunEvent({ kind: 'item', run: this.requireRun(runId), item, fromItemState: 'pending' })
+    }
+    if (claimed !== undefined) {
+      this.emitRunEvent({ kind: 'item', run: this.requireRun(runId), item: claimed, fromItemState: 'pending' })
+    }
     // The claim transaction skips pending items of archived members (store
     // side); when that drained the queue the run may be derivable now.
     if (claimed === undefined) this.deriveRunTerminal(runId)
@@ -1033,6 +1042,11 @@ export class OmtCore {
           break
         case 'done': {
           if (!advance) break
+          // A bare done must not complete a gated item: once an item sits in
+          // awaiting_confirmation, only an explicit report (omt_run_report /
+          // UI confirm, both reported=true) may finish it — a repeated bare
+          // done would otherwise bypass the trust gate on the second pass.
+          if (item.state === 'awaiting_confirmation' && options.reported !== true) break
           // Trust gate (TICKET-0064): only the executor session's OWN bare
           // done on its RUNNING item is gated. Reports (reported=true),
           // other sessions, agent-less updates, and pending items land done
