@@ -1,7 +1,7 @@
 # Oh-My-Ticket (OMT)
 
-![version](https://img.shields.io/badge/version-0.2.24-blue)
-![tests](https://img.shields.io/badge/tests-115%20passing-brightgreen)
+![version](https://img.shields.io/badge/version-0.3.0-blue)
+![tests](https://img.shields.io/badge/tests-323%20passing-brightgreen)
 ![platform](https://img.shields.io/badge/platform-DeepSeek%20Harness-purple)
 
 **DSH 的 ticket 管理插件**：`Epic → Story → [SubStory] → Ticket → [SubTicket]` 五级任务体系，
@@ -64,11 +64,11 @@ SQLite 存元数据与层级关系，Markdown 存正文。ticket 随项目走（
 
 ```sh
 # 本仓库构建并打包（首次需先链接 DSH checkout，见「开发」一节）：
-pnpm install && pnpm build && npm pack    # → oh-my-ticket-0.2.24.tgz
+pnpm install && pnpm build && npm pack    # → oh-my-ticket-0.3.0.tgz
 
 # 安装进目标 DSH profile（profile 的 dsh.profile.bundles 依次为）：
 #   @deepseek-ai/dsh-base, @deepseek-ai/dsh-web-app, oh-my-ticket
-pnpm dsh plugin --profile <profile> add /path/to/oh-my-ticket-0.2.24.tgz
+pnpm dsh plugin --profile <profile> add /path/to/oh-my-ticket-0.3.0.tgz
 ```
 
 在工作区根目录 `mkdir .omt` 即可让该项目拥有独立的 ticket 库（随项目进 git）。
