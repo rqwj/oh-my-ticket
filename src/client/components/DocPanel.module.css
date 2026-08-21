@@ -35,17 +35,21 @@
   color: var(--dsw-alias-label-tertiary);
 }
 
-/* Single-line header sized for the 360px details default width. */
+/* Header wraps when tight (the host details column owns its width and
+   defaults to 360px): the ticket code never shrinks — the status/priority
+   controls wrap to a second line instead. */
 .header {
   display: flex;
   align-items: center;
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
   gap: 6px;
 }
 
 .id {
-  flex: 1 1 auto;
-  min-width: 0;
+  /* flex:none keeps the full code visible at any column width; max-width
+     still clips a pathological id longer than the whole panel. */
+  flex: none;
+  max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
