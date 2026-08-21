@@ -7,6 +7,14 @@
 export const NODE_TYPES = ['epic', 'story', 'substory', 'ticket', 'subticket'] as const
 export type NodeType = (typeof NODE_TYPES)[number]
 
+/** Only task-bearing nodes execute inside a run; hierarchy containers are context. */
+export const RUN_MEMBER_NODE_TYPES = ['ticket', 'subticket'] as const
+export type RunMemberNodeType = (typeof RUN_MEMBER_NODE_TYPES)[number]
+
+export function isRunMemberNodeType(type: NodeType): type is RunMemberNodeType {
+  return (RUN_MEMBER_NODE_TYPES as readonly NodeType[]).includes(type)
+}
+
 /**
  * Node lifecycle statuses. `blocked`/`skipped` (EPIC-0003 decision 4):
  * blocked = cannot continue due to an external condition (resumable once it

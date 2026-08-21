@@ -12,6 +12,7 @@
 import type { DatabaseSync } from 'node:sqlite'
 import {
   ID_PATTERN,
+  RUN_MEMBER_NODE_TYPES,
   TYPE_PREFIX,
   type NodeType,
   type OmtEdge,
@@ -159,10 +160,10 @@ CREATE TABLE IF NOT EXISTS run_items (
 CREATE INDEX IF NOT EXISTS idx_run_items_node ON run_items(node_id);
 `
 
-/** Result of one atomic claim: the claimed item plus the archived-member skips drained in the same transaction. */
+/** Result of one atomic claim: the claimed item plus unexecutable skips drained in the same transaction. */
 export interface ClaimNextResult {
   readonly claimed: OmtRunItem | undefined
-  /** Pending items of archived members marked skipped while draining the queue. */
+  /** Pending archived or legacy container members marked skipped while draining the queue. */
   readonly skipped: OmtRunItem[]
 }
 
@@ -459,32 +460,38 @@ export class OmtStore {
   }
 
   /**
-   * Atomic claim (TICKET-0058): select the next pending item and flip it to
-   * running with the executor in ONE immediate transaction, so two
-   * concurrent claimers can never receive the same item. Pending items of
-   * archived members can never execute (reports reject archived nodes):
-   * the same transaction marks them skipped so the queue drains past them
-   * instead of wedging on an unclaimable head. Both sides of the
-   * transaction are returned so the core can broadcast the transitions.
+   * Atomic claim (TICKET-0058): select the next executable pending item and
+   * flip it to running with the executor in ONE immediate transaction, so two
+   * concurrent claimers can never receive the same item. Archived members and
+   * legacy Epic/Story/SubStory rows can never execute: the same transaction
+   * marks them skipped so upgraded queues drain instead of wedging. Both sides
+   * are returned so the core can broadcast the transitions.
    */
   claimNextRunItem(runId: string, executorSessionId: string, now: string): ClaimNextResult {
     this.db.exec('BEGIN IMMEDIATE')
     try {
+      const typePlaceholders = RUN_MEMBER_NODE_TYPES.map(() => '?').join(', ')
+      const memberTypes = [...RUN_MEMBER_NODE_TYPES]
       const skippedIds = (this.db.prepare(
         `SELECT i.node_id FROM run_items i JOIN nodes n ON n.id = i.node_id
-         WHERE i.run_id = ? AND i.state = 'pending' AND n.archived = 1
+         WHERE i.run_id = ? AND i.state = 'pending'
+           AND (n.archived = 1 OR n.type NOT IN (${typePlaceholders}))
          ORDER BY i.position, i.node_id`,
-      ).all(runId) as { node_id: string }[]).map(row => row.node_id)
+      ).all(runId, ...memberTypes) as { node_id: string }[]).map(row => row.node_id)
       this.db.prepare(
         `UPDATE run_items SET state = 'skipped', finished_at = ?
          WHERE run_id = ? AND state = 'pending'
-           AND node_id IN (SELECT id FROM nodes WHERE archived = 1)`,
-      ).run(now, runId)
+           AND node_id IN (
+             SELECT id FROM nodes
+             WHERE archived = 1 OR type NOT IN (${typePlaceholders})
+           )`,
+      ).run(now, runId, ...memberTypes)
       const row = this.db.prepare(
         `SELECT i.node_id FROM run_items i JOIN nodes n ON n.id = i.node_id
          WHERE i.run_id = ? AND i.state = 'pending' AND n.archived = 0
+           AND n.type IN (${typePlaceholders})
          ORDER BY i.position, i.node_id LIMIT 1`,
-      ).get(runId) as { node_id: string } | undefined
+      ).get(runId, ...memberTypes) as { node_id: string } | undefined
       if (row === undefined) {
         this.db.exec('COMMIT')
         return { claimed: undefined, skipped: skippedIds.map(nodeId => this.getRunItem(runId, nodeId) as OmtRunItem) }

@@ -65,6 +65,59 @@ describe('createRun', () => {
     const run = await core.createRun({ nodeIds: [a!.id, b!.id] })
     expect(run.status).toBe('pending')
   })
+
+  it('rejects epic/story/substory containers as run members', async () => {
+    const epic = await core.create({ type: 'epic', title: '背景' })
+    const story = await core.create({ type: 'story', title: '范围', parentId: epic.id })
+    const substory = await core.create({ type: 'substory', title: '补充背景', parentId: story.id })
+
+    await expect(core.createRun({ nodeIds: [epic.id] })).rejects.toThrow(/executable|ticket|可执行/i)
+    await expect(core.createRun({ nodeIds: [story.id] })).rejects.toThrow(/executable|ticket|可执行/i)
+
+    const run = await core.createRun({ nodeIds: [] })
+    await expect(core.addRunMembers(run.id, [{ nodeId: substory.id }])).rejects.toThrow(/executable|ticket|可执行/i)
+  })
+})
+
+describe('legacy container run members', () => {
+  it('skips persisted containers during claim/report without mutating their nodes', async () => {
+    const epic = await core.create({ type: 'epic', title: '旧 Epic 背景' })
+    const story = await core.create({ type: 'story', title: '旧 Story 背景', parentId: epic.id })
+    const ticket = await core.create({ type: 'ticket', title: '实际任务', parentId: story.id })
+    const storyBodyBefore = (await core.show(story.id)).body
+    await core.update({ id: story.id, archived: true })
+    const now = new Date().toISOString()
+    const store = await OmtStore.open(join(home, 'omt.db'))
+    const runId = store.nextRunId()
+    store.insertRun({
+      id: runId,
+      status: 'running',
+      config: { stopOnFailure: false, autoContinue: true, autoVerify: false, concurrency: 1 },
+      created_at: now,
+    })
+    store.insertRunItem({ run_id: runId, node_id: epic.id, position: 0, state: 'pending', attempts: 0, nudge_count: 0 })
+    store.insertRunItem({
+      run_id: runId,
+      node_id: story.id,
+      position: 1,
+      state: 'running',
+      executor_session_id: 'legacy-session',
+      attempts: 0,
+      nudge_count: 0,
+      started_at: now,
+    })
+    store.insertRunItem({ run_id: runId, node_id: ticket.id, position: 2, state: 'pending', attempts: 0, nudge_count: 0 })
+    store.close()
+
+    const claimed = await core.claimRunItem(runId, 'new-session')
+    expect(claimed?.node_id).toBe(ticket.id)
+    expect(core.getRunItem(runId, epic.id)?.state).toBe('skipped')
+
+    const reported = await core.reportRunItem(runId, story.id, 'done', '不应写入容器')
+    expect(reported.item.state).toBe('skipped')
+    expect(reported.node).toMatchObject({ status: 'open', archived: true })
+    expect((await core.show(story.id)).body).toBe(storyBodyBefore)
+  })
 })
 
 describe('run state machine', () => {

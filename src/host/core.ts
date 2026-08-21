@@ -27,6 +27,7 @@ import {
   isRunActive,
   isRunItemInFlight,
   isRunItemState,
+  isRunMemberNodeType,
   isStatus,
   type NodeFrontmatter,
   type NodeType,
@@ -93,7 +94,7 @@ export interface CreateRunInput {
   readonly title?: string
   /** Config overrides; missing keys take DEFAULT_RUN_CONFIG. */
   readonly config?: Partial<RunConfig>
-  /** Member node ids in execution order (snapshot; duplicates rejected). */
+  /** Executable ticket/subticket ids in execution order (snapshot; duplicates rejected). */
   readonly nodeIds: readonly string[]
 }
 
@@ -584,12 +585,7 @@ export class OmtCore {
     for (const nodeId of input.nodeIds) {
       if (seen.has(nodeId)) throw new OmtError('INVALID_INPUT', `duplicate run member: ${nodeId}`)
       seen.add(nodeId)
-      const node = this.requireNode(nodeId)
-      // Archived nodes are read-only (reports reject them): admitting one
-      // would wedge its item, so refuse the run up front.
-      if (node.archived) {
-        throw new OmtError('INVALID_INPUT', `run member ${nodeId} is archived (已归档成员不能加入 run；请先恢复)`)
-      }
+      this.requireRunMemberNode(nodeId)
     }
     const config: RunConfig = { ...DEFAULT_RUN_CONFIG, ...input.config }
     if (!Number.isInteger(config.concurrency) || config.concurrency < 1) {
@@ -668,10 +664,7 @@ export class OmtCore {
         continue
       }
       seen.add(member.nodeId)
-      const node = this.requireNode(member.nodeId)
-      if (node.archived) {
-        throw new OmtError('INVALID_INPUT', `run member ${member.nodeId} is archived (已归档成员不能加入 run；请先恢复)`)
-      }
+      this.requireRunMemberNode(member.nodeId)
       const state = member.state ?? 'pending'
       added.push(this.store.insertRunItem({
         run_id: runId,
@@ -959,13 +952,21 @@ export class OmtCore {
     }
     this.requireRun(runId)
     const node = this.requireNode(nodeId)
-    if (node.archived) {
+    const executable = isRunMemberNodeType(node.type)
+    // Preserve the archived-ticket rejection while allowing legacy archived
+    // containers to reach the quarantine path below.
+    if (node.archived && executable) {
       throw new OmtError('CONFLICT', `${nodeId} 已归档，无法接受 report`)
     }
     const item = this.store.getRunItem(runId, nodeId)
     if (item === undefined) throw new OmtError('NOT_FOUND', `run ${runId} has no item for node: ${nodeId}`)
     if (!isRunItemInFlight(item.state)) {
       throw new OmtError('CONFLICT', `only in-flight items can report (${nodeId} is ${item.state})`)
+    }
+    // Upgrade safety: pre-filter runs may still contain an in-flight hierarchy
+    // container. Quarantine the item without writing its status/body.
+    if (!executable) {
+      return { item: await this.transitionItem(runId, nodeId, 'skipped'), node }
     }
 
     const noteText = note !== undefined && note.trim() !== '' ? note : undefined
@@ -1160,6 +1161,19 @@ export class OmtCore {
   private requireNode(id: string): OmtNode {
     const node = this.store.getNode(id)
     if (node === undefined) throw new OmtError('NOT_FOUND', `unknown node: ${id}`)
+    return node
+  }
+
+  /** Run items are executable, writable task nodes; hierarchy containers are context only. */
+  private requireRunMemberNode(id: string): OmtNode {
+    const node = this.requireNode(id)
+    if (!isRunMemberNodeType(node.type)) {
+      throw new OmtError('INVALID_INPUT', `run member ${id} must be an executable ticket/subticket (${node.type} is context only)`)
+    }
+    // Archived nodes are read-only, so they could never accept a report.
+    if (node.archived) {
+      throw new OmtError('INVALID_INPUT', `run member ${id} is archived (已归档成员不能加入 run；请先恢复)`)
+    }
     return node
   }
 

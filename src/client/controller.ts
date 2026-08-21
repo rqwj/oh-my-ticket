@@ -535,7 +535,8 @@ export class OmtController {
   private joining = false
 
   /**
-   * 加入 run (TICKET-0067): collect the node + its subtree host-side.
+   * 加入 run (TICKET-0067): collect executable ticket/subticket nodes from
+   * the selected node's subtree host-side; hierarchy containers stay context.
    * Zero active runs → 一键默认配置直建; exactly one → direct join;
    * several → the picker opens (non-terminal runs only — interrupted is
    * neither active nor history and accepts no new members). Host errors

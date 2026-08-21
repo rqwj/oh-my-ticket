@@ -105,8 +105,9 @@ run 是 ticket 的批量执行机制：一次做完一批 ticket，有队列、�
 
 ## 概念模型
 
-- **run = 任意 ticket 的有序快照**：创建时把成员 ticket（可跨 Story/Epic
-  挑选）按执行顺序快照进 run；此后 run 与 ticket 树不维持结构链接。
+- **run = Ticket/SubTicket 的有序快照**：创建时把可执行成员（可跨
+  Story/Epic 挑选）按执行顺序快照进 run；Epic/Story/SubStory 只提供背景与
+  选择范围，绝不作为可认领 item。此后 run 与 ticket 树不维持结构链接。
   同一 ticket 可同时属于多个活跃 run；所有成员必须同属一个 OMT home。
 - **item 状态机**：\`pending → running → done / failed / blocked / skipped /
   interrupted\`；另有 \`awaiting_confirmation\`（见「信任策略」）。

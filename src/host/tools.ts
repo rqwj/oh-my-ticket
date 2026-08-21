@@ -487,11 +487,11 @@ export function registerOmtTools(
   ctx.tools.register(defineTool({
     name: 'omt_run_create',
     description:
-      '创建一个 run：任意 ticket 的有序执行批次（可跨 Story/Epic 挑选，创建时快照写入成员）。'
-      + '所有成员必须同属一个 OMT home，重复成员会被拒绝。返回 run 与成员清单。',
+      '创建一个 run：Ticket/SubTicket 的有序执行批次（可跨 Story/Epic 挑选，创建时快照写入成员）。'
+      + 'Epic/Story/SubStory 仅作为背景，不能成为 run 成员。所有成员必须同属一个 OMT home，重复成员会被拒绝。返回 run 与成员清单。',
     parameters: {
       title: { type: 'string', description: '可选标题（多 run 选择时展示）' },
-      nodeIds: { type: 'array', items: { type: 'string' }, required: true, description: '成员 ticket id（按执行顺序）' },
+      nodeIds: { type: 'array', items: { type: 'string' }, required: true, description: '成员 Ticket/SubTicket id（按执行顺序）' },
       config: {
         type: 'object',
         additionalProperties: false,

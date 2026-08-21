@@ -112,6 +112,12 @@ describe('omt-runs skill: content conventions', () => {
     expect(OMT_RUNS_SKILL_CONTENT).toContain('omt_run_report')
   })
 
+  it('limits executable members to Ticket/SubTicket and keeps hierarchy containers as context', () => {
+    expect(OMT_RUNS_SKILL_CONTENT).toContain('Ticket/SubTicket')
+    expect(OMT_RUNS_SKILL_CONTENT).toContain('Epic/Story/SubStory')
+    expect(OMT_RUNS_SKILL_CONTENT).toContain('绝不作为可认领 item')
+  })
+
   it('teaches the trust policy (awaiting_confirmation) and nudge behavior', () => {
     expect(OMT_RUNS_SKILL_CONTENT).toContain('awaiting_confirmation')
     expect(OMT_RUNS_SKILL_CONTENT).toMatch(/nudge|续跑提醒|idle/)
