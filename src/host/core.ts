@@ -83,6 +83,19 @@ export interface ShowResult {
   readonly children: OmtNode[]
 }
 
+export type LineageContent =
+  | {
+      readonly node: OmtNode
+      /** User-owned Markdown only; the managed children block is excluded. */
+      readonly body: string
+      readonly error?: never
+    }
+  | {
+      readonly node: OmtNode
+      readonly body?: never
+      readonly error: string
+    }
+
 export interface ReindexResult {
   readonly nodes: number
   readonly edges: number
@@ -473,6 +486,31 @@ export class OmtCore {
       parent: this.store.parentOf(id),
       children: this.store.childrenOf(id),
     }
+  }
+
+  /**
+   * Read one node and all ancestors as user-owned Markdown, root first. The
+   * metadata chain is captured synchronously, then bounded-depth file reads
+   * start together; callers receive best-effort live content, not a snapshot.
+   */
+  async readLineage(id: string): Promise<LineageContent[]> {
+    const closestFirst: OmtNode[] = []
+    const seen = new Set<string>()
+    let current: OmtNode | undefined = this.requireNode(id)
+    while (current !== undefined && !seen.has(current.id)) {
+      seen.add(current.id)
+      closestFirst.push(current)
+      current = this.store.parentOf(current.id)
+    }
+    const rootFirst = closestFirst.reverse()
+    return Promise.all(rootFirst.map(async (node): Promise<LineageContent> => {
+      try {
+        const file = await this.files.readNode(node.path)
+        return { node, body: stripChildrenBlock(file.body) }
+      } catch (error) {
+        return { node, error: String((error as Error).message ?? error) }
+      }
+    }))
   }
 
   /** Assemble the forest (epics as roots), children ordered by edge ord. */

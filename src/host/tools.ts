@@ -7,7 +7,7 @@
  */
 import type { Context } from '@deepseek-ai/cordis'
 import { defineTool, type ToolRunContext } from '@deepseek-ai/dsh-tools'
-import { RUN_REPORT_OUTCOMES, type OmtCore, type ReindexResult, type ReportResult, type ShowResult } from './core.ts'
+import { RUN_REPORT_OUTCOMES, type LineageContent, type OmtCore, type ReindexResult, type ReportResult, type ShowResult } from './core.ts'
 import type { OmtCorePool } from './pool.ts'
 import { endsExecution, lineageOfHeader, type RunningRegistry } from './running.ts'
 import { stripChildrenBlock } from './markdown.ts'
@@ -57,6 +57,171 @@ function nodeValue(node: OmtNode): NodeValue {
 
 function renderNodeLine(node: NodeValue): string {
   return `- ${node.id} [${node.type} · ${node.status}] ${node.title}（${node.path}）`
+}
+
+/** Ancestor-body budget for one claim; the current executable body is never truncated here. */
+export const RUN_CLAIM_ANCESTOR_CONTEXT_MAX_BYTES = 16 * 1024
+
+interface ClaimContextNodeValue {
+  node: NodeValue
+  body: string
+  truncated: boolean
+  original_bytes: number
+  included_bytes: number
+}
+
+interface ClaimContextReadErrorValue {
+  node: NodeValue
+  error: string
+}
+
+interface ClaimContextValue {
+  ancestor_budget_bytes: number
+  ancestor_used_bytes: number
+  truncated: boolean
+  ancestors: ClaimContextNodeValue[]
+  read_errors: ClaimContextReadErrorValue[]
+  current: {
+    node: NodeValue
+    body: string
+  }
+}
+
+const CLAIM_CONTEXT_NODE_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    node: NODE_SCHEMA,
+    body: { type: 'string', required: true },
+    truncated: { type: 'boolean', required: true },
+    original_bytes: { type: 'integer', required: true },
+    included_bytes: { type: 'integer', required: true },
+  },
+} as const
+
+const CLAIM_CONTEXT_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    ancestor_budget_bytes: { type: 'integer', required: true },
+    ancestor_used_bytes: { type: 'integer', required: true },
+    truncated: { type: 'boolean', required: true },
+    ancestors: { type: 'array', items: CLAIM_CONTEXT_NODE_SCHEMA, required: true },
+    read_errors: {
+      type: 'array',
+      required: true,
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          node: NODE_SCHEMA,
+          error: { type: 'string', required: true },
+        },
+      },
+    },
+    current: {
+      type: 'object',
+      additionalProperties: false,
+      required: true,
+      properties: {
+        node: NODE_SCHEMA,
+        body: { type: 'string', required: true },
+      },
+    },
+  },
+} as const
+
+function truncateUtf8(text: string, maxBytes: number): string {
+  if (maxBytes <= 0) return ''
+  const bytes = Buffer.from(text, 'utf8')
+  if (bytes.byteLength <= maxBytes) return text
+  return bytes.subarray(0, maxBytes).toString('utf8').replace(/\uFFFD+$/u, '')
+}
+
+/**
+ * Read the live user-owned lineage after a claim. Allocation walks nearest
+ * parent first, then the result is restored to root→leaf presentation order.
+ */
+async function buildClaimContext(core: OmtCore, node: OmtNode): Promise<ClaimContextValue> {
+  const lineage = await core.readLineage(node.id)
+  const current = lineage.at(-1)
+  if (current === undefined) throw new Error(`节点 ${node.id} 没有可读取的执行上下文`)
+  if (current.body === undefined) throw new Error(current.error)
+
+  const ancestorLineage = lineage.slice(0, -1)
+  const readErrors: ClaimContextReadErrorValue[] = ancestorLineage.flatMap(entry =>
+    entry.error === undefined ? [] : [{ node: nodeValue(entry.node), error: entry.error }])
+  const closestFirst = ancestorLineage
+    .filter((entry): entry is Extract<LineageContent, { body: string }> => entry.body !== undefined)
+    .reverse()
+
+  let remaining = RUN_CLAIM_ANCESTOR_CONTEXT_MAX_BYTES
+  let usedBytes = 0
+  const allocatedClosestFirst = closestFirst.map((entry): ClaimContextNodeValue => {
+    const originalBytes = Buffer.byteLength(entry.body, 'utf8')
+    const allowance = remaining
+    const body = truncateUtf8(entry.body, allowance)
+    const includedBytes = Buffer.byteLength(body, 'utf8')
+    const truncated = includedBytes < originalBytes
+    usedBytes += includedBytes
+    // Once a nearer ancestor consumes its allowance, do not leak a partial
+    // UTF-8 codepoint's spare bytes to a more distant ancestor.
+    remaining = truncated ? 0 : remaining - includedBytes
+    return {
+      node: nodeValue(entry.node),
+      body,
+      truncated,
+      original_bytes: originalBytes,
+      included_bytes: includedBytes,
+    }
+  })
+
+  return {
+    ancestor_budget_bytes: RUN_CLAIM_ANCESTOR_CONTEXT_MAX_BYTES,
+    ancestor_used_bytes: usedBytes,
+    truncated: allocatedClosestFirst.some(entry => entry.truncated),
+    ancestors: allocatedClosestFirst.reverse(),
+    read_errors: readErrors,
+    current: {
+      node: nodeValue(current.node),
+      body: current.body,
+    },
+  }
+}
+
+function renderContextNode(entry: ClaimContextNodeValue): string {
+  const body = entry.body === '' ? '（空）' : entry.body
+  const truncation = entry.truncated
+    ? `\n\n[上下文已截断：原始 ${entry.original_bytes} 字节，本次保留 ${entry.included_bytes} 字节]`
+    : ''
+  return `### ${entry.node.id} [${entry.node.type}] ${entry.node.title}\n\n${body}${truncation}`
+}
+
+function renderClaimContext(context: ClaimContextValue): string {
+  const ancestors = context.ancestors.length === 0
+    ? '（无可用祖先背景）'
+    : context.ancestors.map(renderContextNode).join('\n\n')
+  const readErrors = context.read_errors.length === 0
+    ? []
+    : [
+        '',
+        '### 部分祖先上下文读取失败',
+        '',
+        ...context.read_errors.map(entry => `- ${entry.node.id} ${entry.node.title}：${entry.error}`),
+      ]
+  const currentBody = context.current.body === '' ? '（空）' : context.current.body
+  return [
+    '## 背景（只读，不可执行）',
+    '',
+    ancestors,
+    ...readErrors,
+    '',
+    '## 当前执行项（唯一可执行、可报告）',
+    '',
+    `### ${context.current.node.id} [${context.current.node.type}] ${context.current.node.title}`,
+    '',
+    currentBody,
+  ].join('\n')
 }
 
 // ── run tool values (EPIC-0003 / STORY-0011) ─────────────────────────────
@@ -676,8 +841,10 @@ export function registerOmtTools(
   ctx.tools.register(defineTool({
     name: 'omt_run_claim',
     description:
-      '原子认领 run 的下一个 pending 成员：单事务置 running 并绑定当前会话为执行者，返回该成员的 ticket 摘要。'
-      + '并发认领不会拿到同一项；run 未 start 或已 pause 时拒绝；无会话（agent-less）调用不可认领。',
+      '原子认领 run 的下一个 pending Ticket/SubTicket：单事务置 running 并绑定当前会话为执行者。'
+      + '认领结果包含当前执行项完整用户正文（不含插件管理的子节点块），以及认领成功后即时读取的 Epic/Story/SubStory/父 Ticket 祖先背景（非跨文件原子快照）；'
+      + '祖先背景只读且受显式字节预算约束；单个祖先读取失败会显式标记并保留其他内容。并发认领不会拿到同一项；run 未 start 或已 pause 时拒绝；'
+      + '无会话（agent-less）调用不可认领。',
     parameters: {
       id: { type: 'string', required: true, description: 'run id' },
     },
@@ -690,13 +857,27 @@ export function registerOmtTools(
           claimed: { type: 'boolean', required: true },
           item: RUN_ITEM_SCHEMA,
           ticket: NODE_SCHEMA,
+          context: CLAIM_CONTEXT_SCHEMA,
+          context_error: { type: 'string' },
         },
       },
-      render: (_args, value: { run_id: string; claimed: boolean; item?: RunItemValue; ticket?: NodeValue }) => [{
+      render: (_args, value: {
+        run_id: string
+        claimed: boolean
+        item?: RunItemValue
+        ticket?: NodeValue
+        context?: ClaimContextValue
+        context_error?: string
+      }) => [{
         type: 'text',
         text: value.claimed && value.item !== undefined
-          ? `已认领 ${value.item.node_id}${value.ticket !== undefined ? `「${value.ticket.title}」` : ''}，执行者已绑定当前会话。`
-            + '完成后请用 omt_run_report 报告结果（done/failed/blocked/skipped）。'
+          ? [
+              `已认领 ${value.item.node_id}${value.ticket !== undefined ? `「${value.ticket.title}」` : ''}，执行者已绑定当前会话。`,
+              value.context !== undefined
+                ? renderClaimContext(value.context)
+                : `## 执行上下文读取失败\n\n${value.context_error ?? '未知错误'}\n请用 omt_show 读取当前节点及其父级后再执行。`,
+              '完成当前执行项后请用 omt_run_report 报告结果（done/failed/blocked/skipped）。',
+            ].join('\n\n')
           : `run ${value.run_id} 没有可认领的待执行项（无 pending 成员）。`,
       }],
     },
@@ -710,11 +891,24 @@ export function registerOmtTools(
       changed?.(core.home)
       if (item === undefined) return { run_id: args.id, claimed: false }
       const node = core.getNode(item.node_id)
+      let context: ClaimContextValue | undefined
+      let contextError: string | undefined
+      if (node !== undefined) {
+        try {
+          context = await buildClaimContext(core, node)
+        } catch (error) {
+          contextError = String((error as Error).message ?? error)
+        }
+      } else {
+        contextError = `已认领成员 ${item.node_id}，但节点元数据不存在`
+      }
       return {
         run_id: args.id,
         claimed: true,
         item: runItemValue(item, node?.title),
         ...(node !== undefined ? { ticket: nodeValue(node) } : {}),
+        ...(context !== undefined ? { context } : {}),
+        ...(contextError !== undefined ? { context_error: contextError } : {}),
       }
     },
   }))

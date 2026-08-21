@@ -69,6 +69,22 @@ describe('create', () => {
     expect(nestedTicket.path).toContain('SUBSTORY-0001-第三方登录')
   })
 
+  it('uses role-specific templates that encode hierarchy content boundaries', async () => {
+    const epic = await core.create({ type: 'epic', title: '平台能力' })
+    const story = await core.create({ type: 'story', title: '批量执行', parentId: epic.id })
+    const substory = await core.create({ type: 'substory', title: '失败恢复', parentId: story.id })
+    const ticket = await core.create({ type: 'ticket', title: '重试入口', parentId: story.id })
+    const subticket = await core.create({ type: 'subticket', title: '错误提示', parentId: ticket.id })
+
+    expect((await core.show(epic.id)).body).toMatch(/## 总体目标[\s\S]*## 范围[\s\S]*## 非范围[\s\S]*## 全局约束[\s\S]*## 成功标准/)
+    for (const node of [story, substory]) {
+      expect((await core.show(node.id)).body).toMatch(/## 能力结果[\s\S]*## 使用者或调用方[\s\S]*## 范围[\s\S]*## 非范围[\s\S]*## 共享规则与约束[\s\S]*## 验收标准/)
+    }
+    for (const node of [ticket, subticket]) {
+      expect((await core.show(node.id)).body).toMatch(/## 交付结果[\s\S]*## 工作范围[\s\S]*## 依赖[\s\S]*## 验收标准[\s\S]*## 进度记录/)
+    }
+  })
+
   it('rejects hierarchy violations', async () => {
     const { epic, story, ticket } = await standardFixture()
 
