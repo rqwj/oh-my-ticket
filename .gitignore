@@ -25,4 +25,4 @@ lib/
 *.log
 
 # Personal UI preference state (saved tree filters, STORY-0023)
-.omt/ui-filters.json
+.omt/
