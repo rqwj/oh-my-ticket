@@ -391,7 +391,35 @@ export class OmtCore {
       executorSessionId: input.executorSessionId,
       reported: input.reported,
     })
+    // A status change shows up in the parent's managed children list too.
+    if ((patch.title !== undefined || patch.status !== undefined) && parent !== undefined) {
+      await this.refreshChildrenBlock(parent.id)
+    }
+    // Ancestor activation (STORY-0022): work starting anywhere lights up the
+    // chain above it. Recursion through update() is idempotent — each level
+    // re-walks only its own remaining open ancestors.
+    if (input.status === 'in_progress') await this.activateAncestors(input.id)
     return updated
+  }
+
+  /**
+   * Upgrade every open ancestor of `childId` to in_progress (STORY-0022).
+   * done/blocked/skipped ancestors are never reopened and archived ones are
+   * skipped silently: activation is coordination sugar and must never fail
+   * or mutate state that carries a human decision.
+   */
+  async activateAncestors(childId: string): Promise<OmtNode[]> {
+    const activated: OmtNode[] = []
+    const seen = new Set<string>([childId])
+    let parent = this.store.parentOf(childId)
+    while (parent !== undefined && !seen.has(parent.id)) {
+      seen.add(parent.id)
+      if (!parent.archived && parent.status === 'open') {
+        activated.push(await this.update({ id: parent.id, status: 'in_progress' }))
+      }
+      parent = this.store.parentOf(parent.id)
+    }
+    return activated
   }
 
   // ── move ─────────────────────────────────────────────────────────────
@@ -897,6 +925,14 @@ export class OmtCore {
     }
     if (claimed !== undefined) {
       this.emitRunEvent({ kind: 'item', run: this.requireRun(runId), item: claimed, fromItemState: 'pending' })
+      // Ancestor activation (STORY-0022) is best-effort on the claim path:
+      // the claim transaction is already committed, so a failed cosmetic
+      // status write must never fail or undo the claim itself.
+      try {
+        await this.activateAncestors(claimed.node_id)
+      } catch {
+        /* activation is coordination sugar; executor updates will retry it */
+      }
     }
     // The claim transaction skips pending items of archived members (store
     // side); when that drained the queue the run may be derivable now.

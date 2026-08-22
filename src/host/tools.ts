@@ -843,7 +843,8 @@ export function registerOmtTools(
     description:
       '原子认领 run 的下一个 pending Ticket/SubTicket：单事务置 running 并绑定当前会话为执行者。'
       + '认领结果包含当前执行项完整用户正文（不含插件管理的子节点块），以及认领成功后即时读取的 Epic/Story/SubStory/父 Ticket 祖先背景（非跨文件原子快照）；'
-      + '祖先背景只读且受显式字节预算约束；单个祖先读取失败会显式标记并保留其他内容。并发认领不会拿到同一项；run 未 start 或已 pause 时拒绝；'
+      + '祖先背景只读且受显式字节预算约束；单个祖先读取失败会显式标记并保留其他内容。'
+      + '认领成功会自动把祖先链中仍为 open 的父 Ticket/SubStory/Story/Epic 置为 in_progress。并发认领不会拿到同一项；run 未 start 或已 pause 时拒绝；'
       + '无会话（agent-less）调用不可认领。',
     parameters: {
       id: { type: 'string', required: true, description: 'run id' },

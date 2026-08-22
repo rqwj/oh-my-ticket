@@ -80,6 +80,11 @@ describe('omt skill: node-status enum extension and runs routing', () => {
     expect(OMT_SKILL_CONTENT).toMatch(/Ticket.*一次认领.*单一结果/s)
     expect(OMT_SKILL_CONTENT).toMatch(/不要.*复制.*父级背景/s)
   })
+
+  it('teaches automatic ancestor activation on ticket start', () => {
+    expect(OMT_SKILL_CONTENT).toMatch(/自动把祖先链中仍为 open/s)
+    expect(OMT_SKILL_CONTENT).toMatch(/不要手动改父级状态/s)
+  })
 })
 
 describe('omt-runs skill: routing description', () => {
@@ -132,6 +137,11 @@ describe('omt-runs skill: content conventions', () => {
     expect(OMT_RUNS_SKILL_CONTENT).toContain('完整用户正文')
     expect(OMT_RUNS_SKILL_CONTENT).toMatch(/祖先读取失败.*保留/s)
     expect(OMT_RUNS_SKILL_CONTENT).toMatch(/截断.*最近/s)
+  })
+
+  it('teaches claim-time ancestor activation as system behavior', () => {
+    expect(OMT_RUNS_SKILL_CONTENT).toMatch(/claim 成功会兜底把祖先链中仍为 open/s)
+    expect(OMT_RUNS_SKILL_CONTENT).toContain('祖先激活')
   })
 
   it('teaches the trust policy (awaiting_confirmation) and nudge behavior', () => {

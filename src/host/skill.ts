@@ -81,6 +81,9 @@ ticket 按工作区归属：当前工作区根目录下存在 \`.omt/\` 时使�
 - **状态流转**：开始处理时将状态置为 in_progress；完成时把关键结论通过
   omt_update 的 append 追加到正文（进度记录），并将状态置为 done；
   做不下去置 blocked（外部条件阻塞）、必须跳过置 skipped，均附 append 说明。
+  ticket 置 in_progress（或 run 认领成功）时，系统会自动把祖先链中仍为 open
+  的父 Ticket/SubStory/Story/Epic 一并置为 in_progress——不要手动改父级状态，
+  也不要重开已 done/blocked/skipped 的父级。
 - **归档是独立维度**（archived=true/false），与状态（open/in_progress/done/
   blocked/skipped）正交；归档节点只读——除恢复外的修改都会被拒绝，先恢复再改。
 - **任务拆解**：先建 Epic/Story 骨架，再逐层细化 Ticket；拆解结果落成
@@ -146,6 +149,9 @@ run 是 ticket 的批量执行机制：一次做完一批 ticket，有队列、�
   背景和当前执行项；按提示用 \`omt_show\` 补读失败节点。
 - 祖先正文超出预算时会显示截断标记，并优先保留离当前执行项最近的父级背景；
   不要把截断内容误当成完整约束，必要时用 \`omt_show\` 读取对应父节点。
+- **祖先激活**：claim 成功会兜底把祖先链中仍为 open 的节点置为 in_progress
+  （执行者随后置 in_progress 也会触发同一级联）。这是系统行为：不要手动升级
+  或降级父级状态，也不要把祖先的 in_progress 当成需要你执行的任务。
 
 ## 工具
 

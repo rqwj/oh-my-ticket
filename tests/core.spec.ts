@@ -138,6 +138,45 @@ describe('update', () => {
   })
 })
 
+describe('ancestor activation', () => {
+  it('activates the full ancestor chain when a ticket starts', async () => {
+    const { epic, story, ticket } = await standardFixture()
+
+    await core.update({ id: ticket.id, status: 'in_progress' })
+
+    expect(core.getNode(epic.id)?.status).toBe('in_progress')
+    expect(core.getNode(story.id)?.status).toBe('in_progress')
+    const storyFile = await readFile(join(home, story.path), 'utf8')
+    expect(storyFile).toContain('status: in_progress')
+  })
+
+  it('activates through the parent ticket for subtickets', async () => {
+    const { story, ticket } = await standardFixture()
+    const epic = core.getNode((await core.show(ticket.id)).parent!.id)!
+    const subticket = await core.create({ type: 'subticket', title: '参数校验', parentId: ticket.id })
+
+    await core.update({ id: subticket.id, status: 'in_progress' })
+
+    for (const node of [epic, story, ticket]) {
+      expect(core.getNode(node.id)?.status).toBe('in_progress')
+    }
+  })
+
+  it('never reopens non-open ancestors and skips archived ones without failing', async () => {
+    const { epic, story, ticket } = await standardFixture()
+    await core.update({ id: story.id, status: 'blocked' })
+    await core.update({ id: epic.id, archived: true })
+
+    const updated = await core.update({ id: ticket.id, status: 'in_progress' })
+    expect(updated.status).toBe('in_progress')
+
+    expect(core.getNode(story.id)?.status).toBe('blocked')
+    const archivedEpic = core.getNode(epic.id)!
+    expect(archivedEpic.archived).toBe(true)
+    expect(archivedEpic.status).toBe('open')
+  })
+})
+
 describe('move', () => {
   it('moves a ticket to another story and syncs both parents', async () => {
     const { epic, ticket } = await standardFixture()

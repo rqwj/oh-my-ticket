@@ -345,6 +345,21 @@ describe('TICKET-0058 omt_run_claim', () => {
     expect(renderText('omt_run_claim', { id: run.id }, claimed)).toContain('执行上下文读取失败')
   })
 
+  it('claim alone activates open ancestors without executor bookkeeping', async () => {
+    const epic = await tool('omt_create').execute({ type: 'epic', title: '联动平台', body: 'E' }, NO_EXEC)
+    const story = await tool('omt_create').execute({ type: 'story', title: '联动批次', parentId: epic.id, body: 'S' }, NO_EXEC)
+    const ticket = await tool('omt_create').execute({ type: 'ticket', title: '联动任务', parentId: story.id, body: 'T' }, NO_EXEC)
+    const run = await startedRun([ticket.id])
+    const core = await pool.coreFor(undefined)
+
+    const claimed = await tool('omt_run_claim').execute({ id: run.id }, agentExec('sess-activation'))
+    expect(claimed.claimed).toBe(true)
+
+    expect(core.getNode(epic.id)?.status).toBe('in_progress')
+    expect(core.getNode(story.id)?.status).toBe('in_progress')
+    expect(core.getNode(ticket.id)?.status).toBe('open')
+  })
+
   it('two concurrent claims never receive the same item; empty queue is an explicit signal', async () => {
     const ids = await ticketFixture(2)
     const run = await startedRun(ids)
