@@ -62,33 +62,65 @@ export function apply(ctx: ClientContextLike): void {
     }, ctx.locale.bind(NS) as Translate),
   )
 
+  // Run 区块 (STORY-0013): the five run hooks + eleven run callbacks every
+  // run-capable slot registration shares. Spread into each inject closure.
+  const runInject = () => ({
+    hooks: {
+      runs: controller.runs,
+      runDetail: controller.runDetail,
+      runPicker: controller.runPicker,
+      notice: controller.notice,
+      panelSection: controller.panelSection,
+    },
+    callbacks: {
+      showRuns: controller.showRuns,
+      showTickets: controller.showTickets,
+      refreshRuns: controller.refreshRuns,
+      openRun: controller.openRun,
+      closeRunDetail: controller.closeRunDetail,
+      showRunInPanel: controller.showRunInPanel,
+      runControl: controller.runControl,
+      runConfirm: controller.runConfirm,
+      joinRun: controller.joinRun,
+      pickRun: controller.pickRun,
+      cancelRunPicker: controller.cancelRunPicker,
+    },
+  })
+
   // Tree overlay presentations (STORY-0006): the drawer and the floating
   // window share the panel-open fact (drawerOpen) and the panelMode gate —
   // exactly one renders at a time, so switching modes mid-session swaps the
   // shell while the tree/filter state carries over. The shared inject
   // compartment below feeds both shells.
-  const overlayInject = () => ({
-    hooks: {
-      drawerOpen: controller.drawerOpen,
-      panelMode: controller.panelMode,
-      tree: controller.tree,
-      active: controller.active,
-      drawerWidth: controller.drawerWidth,
-      collapsed: controller.collapsed,
-      floatPos: controller.floatPos,
-      floatSize: controller.floatSize,
-    },
-    setDrawerWidth: controller.setDrawerWidth,
-    setFloatPos: controller.setFloatPos,
-    setFloatSize: controller.setFloatSize,
-    setPanelMode: controller.setPanelMode,
-    toggleCollapsed: controller.toggleCollapsed,
-    toggleDrawer: controller.toggleDrawer,
-    refreshTree: controller.refreshTree,
-    reindex: controller.reindex,
-    select: controller.select,
-    archive: (id: string, sessionId?: string) => controller.setArchived(id, true, sessionId),
-  })
+  const overlayInject = () => {
+    const run = runInject()
+    return {
+      hooks: {
+        drawerOpen: controller.drawerOpen,
+        panelMode: controller.panelMode,
+        tree: controller.tree,
+        active: controller.active,
+        drawerWidth: controller.drawerWidth,
+        collapsed: controller.collapsed,
+        floatPos: controller.floatPos,
+        floatSize: controller.floatSize,
+        ...run.hooks,
+      },
+      setDrawerWidth: controller.setDrawerWidth,
+      setFloatPos: controller.setFloatPos,
+      setFloatSize: controller.setFloatSize,
+      setPanelMode: controller.setPanelMode,
+      toggleCollapsed: controller.toggleCollapsed,
+      toggleDrawer: controller.toggleDrawer,
+      refreshTree: controller.refreshTree,
+      reindex: controller.reindex,
+      loadFilters: controller.loadFilters,
+      saveFilters: controller.saveFilters,
+      select: controller.select,
+      archive: (id: string, sessionId?: string) => controller.setArchived(id, true, sessionId),
+      ...run.callbacks,
+    }
+  }
 
   // Left side drawer (frame-wide overlay).
   ctx.slots.inject('shell.overlay', () =>
@@ -123,20 +155,27 @@ export function apply(ctx: ClientContextLike): void {
         order: 20,
         label: 'OMT',
         locale: NS,
-        inject: () => ({
-          hooks: {
-            tree: controller.tree,
-            active: controller.active,
-            collapsed: controller.collapsed,
-          },
-          toggleCollapsed: controller.toggleCollapsed,
-          refreshTree: controller.refreshTree,
-          reindex: controller.reindex,
-          select: controller.select,
-          archive: (id: string, sessionId?: string) => controller.setArchived(id, true, sessionId),
-          setPanelMode: controller.setPanelMode,
-          openPanel: controller.openPanel,
-        }),
+        inject: () => {
+          const run = runInject()
+          return {
+            hooks: {
+              tree: controller.tree,
+              active: controller.active,
+              collapsed: controller.collapsed,
+              ...run.hooks,
+            },
+            toggleCollapsed: controller.toggleCollapsed,
+            refreshTree: controller.refreshTree,
+            reindex: controller.reindex,
+            loadFilters: controller.loadFilters,
+            saveFilters: controller.saveFilters,
+            select: controller.select,
+            archive: (id: string, sessionId?: string) => controller.setArchived(id, true, sessionId),
+            setPanelMode: controller.setPanelMode,
+            openPanel: controller.openPanel,
+            ...run.callbacks,
+          }
+        },
       }, TicketTab)))
 
   // Drawer toggle buttons: session header + sidebar footer.
@@ -192,18 +231,25 @@ export function apply(ctx: ClientContextLike): void {
         name: 'details',
         priority: -10,
         locale: NS,
-        inject: () => ({
-          hooks: { doc: controller.doc },
-          executeTicket: controller.executeTicket,
-          closeDoc: controller.closeDoc,
-          setStatus: controller.setStatus,
-          setArchived: controller.setArchived,
-          rename: controller.rename,
-          setPriority: controller.setPriority,
-          appendNote: controller.appendNote,
-          select: controller.select,
-          forget: controller.forget,
-        }),
+        inject: () => {
+          const run = runInject()
+          return {
+            hooks: {
+              doc: controller.doc,
+              ...run.hooks,
+            },
+            executeTicket: controller.executeTicket,
+            closeDoc: controller.closeDoc,
+            setStatus: controller.setStatus,
+            setArchived: controller.setArchived,
+            rename: controller.rename,
+            setPriority: controller.setPriority,
+            appendNote: controller.appendNote,
+            select: controller.select,
+            forget: controller.forget,
+            ...run.callbacks,
+          }
+        },
       }, DocPanel)))
 
   // omt_show tool result renders as a markdown document.

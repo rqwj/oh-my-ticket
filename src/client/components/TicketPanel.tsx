@@ -7,12 +7,15 @@
  * The owning shell supplies positioning, sizing, and drag furniture; the
  * panel fills whatever box it is given (flex column, min-height 0).
  */
-import { useEffect, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react'
 import type { ActiveInfo, OmtTreeNode, TreeState } from '../store.ts'
 import { filterForest, sortForest, type TreeFilter, type TreeSortOrder } from '../tree-filter.ts'
+import { DEFAULT_SAVED_FILTERS, type SavedFilters } from '../saved-filters.ts'
 import { priorityMeta } from '../priority.ts'
 import { STATUS_KEY, type Translate } from '../locales.ts'
 import { PriorityIcon } from './PriorityIcon.tsx'
+import { RunsView, type RunBindings } from './RunsView.tsx'
+import { RunFlowExtras } from './RunPicker.tsx'
 import css from './TicketPanel.module.css'
 
 /** Renderer-bound selector hook (inject hooks compartment member). */
@@ -32,8 +35,14 @@ export interface TicketPanelProps {
   readonly toggleCollapsed: (id: string) => void
   readonly refreshTree: (sessionId?: string) => void
   readonly reindex: (sessionId?: string) => void
+  /** Load the persisted filter bag for the session's workspace (STORY-0023). */
+  readonly loadFilters: (sessionId?: string) => Promise<SavedFilters>
+  /** Persist a full filter bag; called debounced on change, immediate on reset. */
+  readonly saveFilters: (sessionId: string | undefined, filters: SavedFilters) => Promise<void>
   readonly select: (id: string, sessionId?: string) => void
   readonly archive: (id: string, sessionId?: string) => void
+  /** Run 区块 bindings (STORY-0013): section nav, RunsView, picker, notice. */
+  readonly runView: RunBindings
   /** Session whose workspace home the tree follows. */
   readonly sessionId: string | undefined
   /** Extra header buttons ahead of the close seat (mode switches). */
@@ -72,13 +81,14 @@ interface TreeRowProps {
   readonly activeId: string | undefined
   readonly onSelect: (id: string) => void
   readonly onArchive: (id: string) => void
+  readonly onJoinRun: (id: string) => void
   readonly useCollapsed: Selector<Record<string, boolean>>
   readonly onToggleCollapsed: (id: string) => void
   readonly showId: boolean
   readonly t: Translate
 }
 
-function TreeRow({ node, depth, activeId, onSelect, onArchive, useCollapsed, onToggleCollapsed, showId, t }: TreeRowProps) {
+function TreeRow({ node, depth, activeId, onSelect, onArchive, onJoinRun, useCollapsed, onToggleCollapsed, showId, t }: TreeRowProps) {
   // Collapse state persists across sessions (shared store, TICKET-0011).
   const collapsed = useCollapsed(snapshot => snapshot[node.id] === true)
   const hasChildren = node.children.length > 0
@@ -107,6 +117,19 @@ function TreeRow({ node, depth, activeId, onSelect, onArchive, useCollapsed, onT
           <button
             type="button"
             className={css.archiveButton}
+            title={t('run.joinTitle')}
+            onClick={(event) => {
+              event.stopPropagation()
+              onJoinRun(node.id)
+            }}
+          >
+            ▸▸
+          </button>
+        )}
+        {!node.archived && (
+          <button
+            type="button"
+            className={css.archiveButton}
             title={t('drawer.archiveTitle', { id: node.id })}
             onClick={(event) => {
               event.stopPropagation()
@@ -119,7 +142,7 @@ function TreeRow({ node, depth, activeId, onSelect, onArchive, useCollapsed, onT
         <span className={`omt-dot omt-dot--lg ${dotClass(node)}`} />
       </div>
       {!collapsed && node.children.map(child => (
-        <TreeRow key={child.id} node={child} depth={depth + 1} activeId={activeId} onSelect={onSelect} onArchive={onArchive} useCollapsed={useCollapsed} onToggleCollapsed={onToggleCollapsed} showId={showId} t={t} />
+        <TreeRow key={child.id} node={child} depth={depth + 1} activeId={activeId} onSelect={onSelect} onArchive={onArchive} onJoinRun={onJoinRun} useCollapsed={useCollapsed} onToggleCollapsed={onToggleCollapsed} showId={showId} t={t} />
       ))}
     </div>
   )
@@ -156,6 +179,7 @@ export function TicketPanel(props: TicketPanelProps) {
   const t = props.t
   const tree = props.useTree(snapshot => snapshot)
   const active = props.useActive(snapshot => snapshot)
+  const section = props.runView.usePanelSection(snapshot => snapshot)
   // Viewing-only filter state (search keyword + archived + type/status chips).
   const [query, setQuery] = useState('')
   const [showArchived, setShowArchived] = useState(false)
@@ -175,6 +199,56 @@ export function TicketPanel(props: TicketPanelProps) {
     void props.refreshTree(sessionId)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId])
+
+  // Saved viewing filters (STORY-0023): hydrate once per workspace, then
+  // autosave every change (debounced — search typing stays one write).
+  const hydratedRef = useRef(false)
+  const savedFiltersOf = (): SavedFilters => ({
+    query,
+    showArchived,
+    types: typeFilter,
+    statuses: statusFilter,
+    priorities: priorityFilter,
+    showId,
+    sortOrder,
+  })
+  useEffect(() => {
+    let cancelled = false
+    hydratedRef.current = false
+    void props.loadFilters(sessionId)
+      .catch(() => DEFAULT_SAVED_FILTERS)
+      .then(saved => {
+        if (cancelled) return
+        setQuery(saved.query)
+        setShowArchived(saved.showArchived)
+        setTypeFilter(saved.types)
+        setStatusFilter(saved.statuses)
+        setPriorityFilter(saved.priorities)
+        setShowId(saved.showId)
+        setSortOrder(saved.sortOrder)
+        hydratedRef.current = true
+      })
+    return () => { cancelled = true }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId])
+  useEffect(() => {
+    if (!hydratedRef.current) return
+    const timer = setTimeout(() => { void props.saveFilters(sessionId, savedFiltersOf()) }, 300)
+    return () => clearTimeout(timer)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [query, showArchived, typeFilter, statusFilter, priorityFilter, showId, sortOrder, sessionId])
+
+  /** Reset to the default view and persist immediately (no debounce). */
+  const resetFilters = (): void => {
+    setQuery(DEFAULT_SAVED_FILTERS.query)
+    setShowArchived(DEFAULT_SAVED_FILTERS.showArchived)
+    setTypeFilter(DEFAULT_SAVED_FILTERS.types)
+    setStatusFilter(DEFAULT_SAVED_FILTERS.statuses)
+    setPriorityFilter(DEFAULT_SAVED_FILTERS.priorities)
+    setShowId(DEFAULT_SAVED_FILTERS.showId)
+    setSortOrder(DEFAULT_SAVED_FILTERS.sortOrder)
+    void props.saveFilters(sessionId, DEFAULT_SAVED_FILTERS)
+  }
 
   const filter: TreeFilter = { query, showArchived, types: typeFilter, statuses: statusFilter, priorities: priorityFilter }
 
@@ -197,6 +271,26 @@ export function TicketPanel(props: TicketPanelProps) {
           </button>
         )}
       </div>
+      <div className={css.sectionNav}>
+        <button
+          type="button"
+          className={`${css.sectionTab} ${section === 'tickets' ? css.sectionTabOn : ''}`}
+          onClick={props.runView.showTickets}
+        >
+          {t('run.sectionTickets')}
+        </button>
+        <button
+          type="button"
+          className={`${css.sectionTab} ${section === 'runs' ? css.sectionTabOn : ''}`}
+          onClick={() => props.runView.showRuns(sessionId)}
+        >
+          {t('run.sectionRuns')}
+        </button>
+      </div>
+      {section === 'runs' ? (
+        <RunsView bindings={props.runView} select={props.select} sessionId={sessionId} t={t} />
+      ) : (
+        <>
       <div className={css.toolbar}>
         <input
           type="search"
@@ -219,7 +313,7 @@ export function TicketPanel(props: TicketPanelProps) {
           </button>
         ))}
         <span className={css.filterDivider} />
-        {(['open', 'in_progress', 'done'] as const).map(status => (
+        {(['open', 'in_progress', 'done', 'blocked', 'skipped'] as const).map(status => (
           <button
             key={status}
             type="button"
@@ -274,6 +368,15 @@ export function TicketPanel(props: TicketPanelProps) {
             {t(key)}
           </button>
         ))}
+        <span className={css.filterDivider} />
+        <button
+          type="button"
+          className={`${css.filterChip} ${css.filterReset}`}
+          title={t('drawer.resetFiltersTitle')}
+          onClick={resetFilters}
+        >
+          {t('drawer.resetFilters')}
+        </button>
       </div>
       <div className={css.tree}>
         {tree.status === 'idle' || tree.status === 'loading' ? (
@@ -296,6 +399,7 @@ export function TicketPanel(props: TicketPanelProps) {
                   activeId={active?.id}
                   onSelect={id => props.select(id, sessionId)}
                   onArchive={id => props.archive(id, sessionId)}
+                  onJoinRun={id => props.runView.joinRun(id, sessionId)}
                   useCollapsed={props.useCollapsed}
                   onToggleCollapsed={props.toggleCollapsed}
                   showId={showId}
@@ -306,6 +410,16 @@ export function TicketPanel(props: TicketPanelProps) {
           })()
         )}
       </div>
+        </>
+      )}
+      <RunFlowExtras
+        useNotice={props.runView.useNotice}
+        useRunPicker={props.runView.useRunPicker}
+        pickRun={props.runView.pickRun}
+        cancelRunPicker={props.runView.cancelRunPicker}
+        sessionId={sessionId}
+        t={t}
+      />
     </div>
   )
 }

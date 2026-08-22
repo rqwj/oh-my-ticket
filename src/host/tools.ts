@@ -7,11 +7,11 @@
  */
 import type { Context } from '@deepseek-ai/cordis'
 import { defineTool, type ToolRunContext } from '@deepseek-ai/dsh-tools'
-import type { OmtCore, ReindexResult, ShowResult } from './core.ts'
+import { RUN_REPORT_OUTCOMES, type LineageContent, type OmtCore, type ReindexResult, type ReportResult, type ShowResult } from './core.ts'
 import type { OmtCorePool } from './pool.ts'
-import type { RunningRegistry } from './running.ts'
+import { endsExecution, lineageOfHeader, type RunningRegistry } from './running.ts'
 import { stripChildrenBlock } from './markdown.ts'
-import { NODE_TYPES, STATUSES, type OmtNode } from './types.ts'
+import { isRunItemStalled, NODE_TYPES, RUN_ITEM_STATES, RUN_STATUSES, STATUSES, type OmtNode, type OmtRun, type OmtRunItem } from './types.ts'
 
 const NODE_SCHEMA = {
   type: 'object',
@@ -59,6 +59,282 @@ function renderNodeLine(node: NodeValue): string {
   return `- ${node.id} [${node.type} · ${node.status}] ${node.title}（${node.path}）`
 }
 
+/** Ancestor-body budget for one claim; the current executable body is never truncated here. */
+export const RUN_CLAIM_ANCESTOR_CONTEXT_MAX_BYTES = 16 * 1024
+
+interface ClaimContextNodeValue {
+  node: NodeValue
+  body: string
+  truncated: boolean
+  original_bytes: number
+  included_bytes: number
+}
+
+interface ClaimContextReadErrorValue {
+  node: NodeValue
+  error: string
+}
+
+interface ClaimContextValue {
+  ancestor_budget_bytes: number
+  ancestor_used_bytes: number
+  truncated: boolean
+  ancestors: ClaimContextNodeValue[]
+  read_errors: ClaimContextReadErrorValue[]
+  current: {
+    node: NodeValue
+    body: string
+  }
+}
+
+const CLAIM_CONTEXT_NODE_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    node: NODE_SCHEMA,
+    body: { type: 'string', required: true },
+    truncated: { type: 'boolean', required: true },
+    original_bytes: { type: 'integer', required: true },
+    included_bytes: { type: 'integer', required: true },
+  },
+} as const
+
+const CLAIM_CONTEXT_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    ancestor_budget_bytes: { type: 'integer', required: true },
+    ancestor_used_bytes: { type: 'integer', required: true },
+    truncated: { type: 'boolean', required: true },
+    ancestors: { type: 'array', items: CLAIM_CONTEXT_NODE_SCHEMA, required: true },
+    read_errors: {
+      type: 'array',
+      required: true,
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          node: NODE_SCHEMA,
+          error: { type: 'string', required: true },
+        },
+      },
+    },
+    current: {
+      type: 'object',
+      additionalProperties: false,
+      required: true,
+      properties: {
+        node: NODE_SCHEMA,
+        body: { type: 'string', required: true },
+      },
+    },
+  },
+} as const
+
+function truncateUtf8(text: string, maxBytes: number): string {
+  if (maxBytes <= 0) return ''
+  const bytes = Buffer.from(text, 'utf8')
+  if (bytes.byteLength <= maxBytes) return text
+  return bytes.subarray(0, maxBytes).toString('utf8').replace(/\uFFFD+$/u, '')
+}
+
+/**
+ * Read the live user-owned lineage after a claim. Allocation walks nearest
+ * parent first, then the result is restored to root→leaf presentation order.
+ */
+async function buildClaimContext(core: OmtCore, node: OmtNode): Promise<ClaimContextValue> {
+  const lineage = await core.readLineage(node.id)
+  const current = lineage.at(-1)
+  if (current === undefined) throw new Error(`节点 ${node.id} 没有可读取的执行上下文`)
+  if (current.body === undefined) throw new Error(current.error)
+
+  const ancestorLineage = lineage.slice(0, -1)
+  const readErrors: ClaimContextReadErrorValue[] = ancestorLineage.flatMap(entry =>
+    entry.error === undefined ? [] : [{ node: nodeValue(entry.node), error: entry.error }])
+  const closestFirst = ancestorLineage
+    .filter((entry): entry is Extract<LineageContent, { body: string }> => entry.body !== undefined)
+    .reverse()
+
+  let remaining = RUN_CLAIM_ANCESTOR_CONTEXT_MAX_BYTES
+  let usedBytes = 0
+  const allocatedClosestFirst = closestFirst.map((entry): ClaimContextNodeValue => {
+    const originalBytes = Buffer.byteLength(entry.body, 'utf8')
+    const allowance = remaining
+    const body = truncateUtf8(entry.body, allowance)
+    const includedBytes = Buffer.byteLength(body, 'utf8')
+    const truncated = includedBytes < originalBytes
+    usedBytes += includedBytes
+    // Once a nearer ancestor consumes its allowance, do not leak a partial
+    // UTF-8 codepoint's spare bytes to a more distant ancestor.
+    remaining = truncated ? 0 : remaining - includedBytes
+    return {
+      node: nodeValue(entry.node),
+      body,
+      truncated,
+      original_bytes: originalBytes,
+      included_bytes: includedBytes,
+    }
+  })
+
+  return {
+    ancestor_budget_bytes: RUN_CLAIM_ANCESTOR_CONTEXT_MAX_BYTES,
+    ancestor_used_bytes: usedBytes,
+    truncated: allocatedClosestFirst.some(entry => entry.truncated),
+    ancestors: allocatedClosestFirst.reverse(),
+    read_errors: readErrors,
+    current: {
+      node: nodeValue(current.node),
+      body: current.body,
+    },
+  }
+}
+
+function renderContextNode(entry: ClaimContextNodeValue): string {
+  const body = entry.body === '' ? '（空）' : entry.body
+  const truncation = entry.truncated
+    ? `\n\n[上下文已截断：原始 ${entry.original_bytes} 字节，本次保留 ${entry.included_bytes} 字节]`
+    : ''
+  return `### ${entry.node.id} [${entry.node.type}] ${entry.node.title}\n\n${body}${truncation}`
+}
+
+function renderClaimContext(context: ClaimContextValue): string {
+  const ancestors = context.ancestors.length === 0
+    ? '（无可用祖先背景）'
+    : context.ancestors.map(renderContextNode).join('\n\n')
+  const readErrors = context.read_errors.length === 0
+    ? []
+    : [
+        '',
+        '### 部分祖先上下文读取失败',
+        '',
+        ...context.read_errors.map(entry => `- ${entry.node.id} ${entry.node.title}：${entry.error}`),
+      ]
+  const currentBody = context.current.body === '' ? '（空）' : context.current.body
+  return [
+    '## 背景（只读，不可执行）',
+    '',
+    ancestors,
+    ...readErrors,
+    '',
+    '## 当前执行项（唯一可执行、可报告）',
+    '',
+    `### ${context.current.node.id} [${context.current.node.type}] ${context.current.node.title}`,
+    '',
+    currentBody,
+  ].join('\n')
+}
+
+// ── run tool values (EPIC-0003 / STORY-0011) ─────────────────────────────
+
+const RUN_CONFIG_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    stopOnFailure: { type: 'boolean', required: true },
+    autoContinue: { type: 'boolean', required: true },
+    autoVerify: { type: 'boolean', required: true },
+    concurrency: { type: 'integer', required: true },
+  },
+} as const
+
+const RUN_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    id: { type: 'string', required: true },
+    title: { type: 'string' },
+    status: { type: 'string', enum: RUN_STATUSES, required: true },
+    config: RUN_CONFIG_SCHEMA,
+    created_at: { type: 'string', required: true },
+    finished_at: { type: 'string' },
+  },
+} as const
+
+const RUN_ITEM_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    run_id: { type: 'string', required: true },
+    node_id: { type: 'string', required: true },
+    position: { type: 'integer', required: true },
+    state: { type: 'string', enum: RUN_ITEM_STATES, required: true },
+    executor_session_id: { type: 'string' },
+    attempts: { type: 'integer', required: true },
+    last_error: { type: 'string' },
+    /** Derived (TICKET-0062): pending item whose 续跑 nudge budget is exhausted — needs human attention. */
+    stalled: { type: 'boolean' },
+    started_at: { type: 'string' },
+    finished_at: { type: 'string' },
+    /** Joined node title (show/claim only). */
+    title: { type: 'string' },
+  },
+} as const
+
+interface RunValue {
+  id: string
+  title?: string
+  status: OmtRun['status']
+  config: OmtRun['config']
+  created_at: string
+  finished_at?: string
+}
+
+interface RunItemValue {
+  run_id: string
+  node_id: string
+  position: number
+  state: OmtRunItem['state']
+  executor_session_id?: string
+  attempts: number
+  last_error?: string
+  /** Derived stalled marker (pending + nudge budget exhausted, TICKET-0062). */
+  stalled?: boolean
+  started_at?: string
+  finished_at?: string
+  title?: string
+}
+
+function runValue(run: OmtRun): RunValue {
+  return {
+    id: run.id,
+    ...(run.title !== undefined ? { title: run.title } : {}),
+    status: run.status,
+    config: run.config,
+    created_at: run.created_at,
+    ...(run.finished_at !== undefined ? { finished_at: run.finished_at } : {}),
+  }
+}
+
+function runItemValue(item: OmtRunItem, title?: string): RunItemValue {
+  return {
+    run_id: item.run_id,
+    node_id: item.node_id,
+    position: item.position,
+    state: item.state,
+    ...(item.executor_session_id !== undefined ? { executor_session_id: item.executor_session_id } : {}),
+    attempts: item.attempts,
+    ...(item.last_error !== undefined ? { last_error: item.last_error } : {}),
+    ...(isRunItemStalled(item) ? { stalled: true } : {}),
+    ...(item.started_at !== undefined ? { started_at: item.started_at } : {}),
+    ...(item.finished_at !== undefined ? { finished_at: item.finished_at } : {}),
+    ...(title !== undefined ? { title } : {}),
+  }
+}
+
+function renderRunLine(run: RunValue): string {
+  return `- ${run.id} [${run.status}]${run.title !== undefined ? ` ${run.title}` : ''}（创建 ${run.created_at}）`
+}
+
+function renderItemLine(item: RunItemValue): string {
+  const parts = [`- ${item.node_id} [${item.state}]`]
+  if (item.title !== undefined) parts.push(` ${item.title}`)
+  if (item.executor_session_id !== undefined) parts.push(`（执行者 ${item.executor_session_id}）`)
+  if (item.attempts > 0) parts.push(`（第 ${item.attempts + 1} 次尝试）`)
+  if (item.last_error !== undefined) parts.push(`（上次失败：${item.last_error}）`)
+  if (item.stalled === true) parts.push('（停滞：续跑 nudge 预算已耗尽，请人工介入或 omt_run_control retry 重置）')
+  return parts.join('')
+}
+
 function renderShow(result: ShowResult): string {
   const { node, parent, children, body } = result
   const header = [
@@ -82,6 +358,11 @@ function renderShow(result: ShowResult): string {
 /** Resolve the workspace-routed core for one execution (global fallback). */
 function coreOf(pool: OmtCorePool, exec: ToolRunContext) {
   return pool.coreFor(exec.agent?.session.header.cwd)
+}
+
+/** Resolve the core owning a run id (caller's workspace disambiguates). */
+function runCoreOf(pool: OmtCorePool, exec: ToolRunContext, id: string) {
+  return pool.coreForRun(id, exec.agent?.session.header.cwd)
 }
 
 /** Structural ctx.userQuestions face (UI-backed ask service). */
@@ -158,8 +439,10 @@ export function registerOmtTools(
   /** Status transitions drive the running marker (model-flow executions). */
   const trackRunning = (exec: ToolRunContext, id: string, status?: string, archived?: boolean): void => {
     if (running === undefined) return
-    if (status === 'in_progress') running.start(id, sessionOf(exec) ?? '', labelOf(exec))
-    if (status === 'done' || archived === true) running.stop(id)
+    // Executor lineage snapshot (TICKET-0066) from the session header.
+    if (status === 'in_progress') running.start(id, sessionOf(exec) ?? '', labelOf(exec), lineageOfHeader(exec.agent?.session.header))
+    // done/blocked/skipped/archive all end active execution: clear the mark.
+    if (endsExecution(status, archived)) running.stop(id)
   }
   ctx.tools.register(defineTool({
     name: 'omt_create',
@@ -267,13 +550,13 @@ export function registerOmtTools(
   ctx.tools.register(defineTool({
     name: 'omt_update',
     description:
-      '更新一个 OMT 节点：标题、状态（open/in_progress/done/archived）、优先级、'
+      '更新一个 OMT 节点：标题、状态（open/in_progress/done/blocked/skipped/archived）、优先级、'
       + '替换正文（body）或追加进度记录（append）。至少需要提供一项变更。'
       + '开始处理某节点时将状态置为 in_progress，完成时置为 done 并 append 结论。',
     parameters: {
       id: { type: 'string', required: true, description: '节点 id' },
       title: { type: 'string', description: '新标题' },
-      status: { type: 'string', enum: STATUSES, description: '新状态（open/in_progress/done；已归档节点不可改状态，先恢复）' },
+      status: { type: 'string', enum: STATUSES, description: '新状态（open/in_progress/done/blocked/skipped；已归档节点不可改状态，先恢复）' },
       archived: { type: 'boolean', description: 'true 归档 / false 恢复；归档是独立于状态的封存维度，归档后节点只读' },
       priority: { type: 'integer', description: '新优先级' },
       body: { type: 'string', description: '替换整个正文（与 append 互斥，body 优先）' },
@@ -294,9 +577,13 @@ export function registerOmtTools(
         id: args.id,
         title: args.title,
         status: args.status,
+        archived: args.archived,
         priority: args.priority,
         body: args.body,
         append: args.append,
+        // Passive observation (TICKET-0061) rides on core.update; the session
+        // becomes the executor of any item this change dispatches.
+        executorSessionId: sessionOf(exec),
       })
       changed?.(core.home)
       return nodeValue(updated)
@@ -353,6 +640,319 @@ export function registerOmtTools(
       const result = await core.reindex()
       changed?.(core.home)
       return result
+    },
+  }))
+
+  // ── run tools (EPIC-0003 / STORY-0011) ─────────────────────────────────
+  // Runs live in exactly one home (single-home membership rule). create
+  // routes by member ownership; id-addressed tools resolve the owning home
+  // via pool.coreForRun (run ids count per home, so the caller's workspace
+  // context disambiguates, exactly like node ids).
+
+  ctx.tools.register(defineTool({
+    name: 'omt_run_create',
+    description:
+      '创建一个 run：Ticket/SubTicket 的有序执行批次（可跨 Story/Epic 挑选，创建时快照写入成员）。'
+      + 'Epic/Story/SubStory 仅作为背景，不能成为 run 成员。所有成员必须同属一个 OMT home，重复成员会被拒绝。返回 run 与成员清单。',
+    parameters: {
+      title: { type: 'string', description: '可选标题（多 run 选择时展示）' },
+      nodeIds: { type: 'array', items: { type: 'string' }, required: true, description: '成员 Ticket/SubTicket id（按执行顺序）' },
+      config: {
+        type: 'object',
+        additionalProperties: false,
+        description: '覆盖默认配置（缺省键取默认值）',
+        properties: {
+          stopOnFailure: { type: 'boolean', description: 'item failed 时 run 自动暂停（默认 false）' },
+          autoContinue: { type: 'boolean', description: '允许 idle 续跑提醒（默认 true）' },
+          autoVerify: { type: 'boolean', description: '信任策略（TICKET-0064）：false 时执行者会话未经 omt_run_report 直接落 done 的项进入 awaiting_confirmation 待确认；true 直接落 done（默认 false）' },
+          concurrency: { type: 'integer', description: '并发执行上限（P3 预留，默认 1）' },
+        },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          run: RUN_SCHEMA,
+          items: { type: 'array', items: RUN_ITEM_SCHEMA },
+        },
+      },
+      render: (_args, value: { run: RunValue; items: RunItemValue[] }) => [{
+        type: 'text',
+        text: `已创建 run：\n${renderRunLine(value.run)}\n成员 ${value.items.length} 项：\n${value.items.map(renderItemLine).join('\n')}`,
+      }],
+    },
+    async execute(args, exec) {
+      const cwd = exec.agent?.session.header.cwd
+      // Single-home rule (decision 2): every member must resolve to the
+      // same owning home — resolve by ownership, not by caller cwd.
+      // Membership itself is validated by core.createRun (requireNode).
+      let core: OmtCore | undefined
+      for (const { rootId, core: owner } of await pool.ownerCores(args.nodeIds, cwd)) {
+        core ??= owner
+        if (owner.home !== core.home) {
+          throw new Error(`omt_run_create 的成员必须同属一个 OMT home（${rootId} 属于 ${owner.home}，与 ${core.home} 不同）`)
+        }
+      }
+      core ??= await pool.coreFor(cwd)
+      const run = await core.createRun({ title: args.title, config: args.config, nodeIds: args.nodeIds })
+      changed?.(core.home)
+      return { run: runValue(run), items: core.runItems(run.id).map(item => runItemValue(item)) }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'omt_run_list',
+    description: '列出当前工作区的 run，可按状态过滤；每个 run 附带成员状态统计（进度）。',
+    parameters: {
+      status: { type: 'string', enum: RUN_STATUSES, description: '按 run 状态过滤' },
+    },
+    output: {
+      schema: {
+        type: 'array',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            run: RUN_SCHEMA,
+            progress: {
+              type: 'object',
+              additionalProperties: false,
+              properties: Object.fromEntries([
+                ['total', { type: 'integer', required: true }],
+                ...RUN_ITEM_STATES.map(state => [state, { type: 'integer', required: true }]),
+              ]),
+            },
+          },
+        },
+      },
+      render: (_args, value: { run: RunValue; progress: Record<string, number> }[]) => [{
+        type: 'text',
+        text: value.length === 0
+          ? '没有匹配的 run。'
+          : `共 ${value.length} 个 run：\n${value.map(entry => `${renderRunLine(entry.run)} — ${entry.progress.done}/${entry.progress.total} 完成`).join('\n')}`,
+      }],
+    },
+    async execute(args, exec) {
+      const core = await coreOf(pool, exec)
+      return core.listRuns({ status: args.status }).map(run => {
+        const progress: Record<string, number> = { total: 0, ...Object.fromEntries(RUN_ITEM_STATES.map(state => [state, 0])) }
+        // One GROUP BY per run (runs come from listRuns, so no re-validation).
+        for (const { state, count } of core.runItemStateCounts(run.id)) {
+          progress.total += count
+          progress[state] = count
+        }
+        return { run: runValue(run), progress }
+      })
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'omt_run_show',
+    description: '查看一个 run 的详情：状态、配置与成员清单（状态/执行者/attempts/last_error）。按 id 跨 home 解析。',
+    parameters: {
+      id: { type: 'string', required: true, description: 'run id，如 RUN-0001' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          run: RUN_SCHEMA,
+          items: { type: 'array', items: RUN_ITEM_SCHEMA },
+        },
+      },
+      render: (_args, value: { run: RunValue; items: RunItemValue[] }) => [{
+        type: 'text',
+        text: `# ${value.run.id}${value.run.title !== undefined ? ` ${value.run.title}` : ''} [${value.run.status}]\n\n${value.items.map(renderItemLine).join('\n')}`,
+      }],
+    },
+    async execute(args, exec) {
+      const core = await runCoreOf(pool, exec, args.id)
+      // runItems throws NOT_FOUND for unknown runs (consistent error path).
+      const items = core.runItems(args.id).map(item => runItemValue(item, core.getNode(item.node_id)?.title))
+      return { run: runValue(core.requireRun(args.id)), items }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'omt_run_control',
+    description:
+      '控制一个 run：start（pending→running）/ pause（停止派发，进行中的项继续观察）/ resume（paused 或 interrupted 续跑）/'
+      + 'cancel（冻结，不碰 ticket）/ retry（nodeId 指定的 failed/interrupted/停滞项就地重置回 pending）/'
+      + 'remove（nodeId 指定移除成员，不改动对应 ticket 节点状态）。按 id 跨 home 解析。',
+    parameters: {
+      id: { type: 'string', required: true, description: 'run id' },
+      action: { type: 'string', enum: ['start', 'pause', 'resume', 'cancel', 'retry', 'remove'], required: true, description: '控制动作' },
+      nodeId: { type: 'string', description: 'retry/remove 的目标成员节点 id' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          run: RUN_SCHEMA,
+          item: RUN_ITEM_SCHEMA,
+        },
+      },
+      render: (args, value: { run: RunValue; item?: RunItemValue }) => [{
+        type: 'text',
+        text: `run ${value.run.id} 已执行 ${String((args as { action: string }).action)}：${renderRunLine(value.run)}`
+          + (value.item !== undefined ? `\n${renderItemLine(value.item)}` : ''),
+      }],
+    },
+    async execute(args, exec) {
+      const core = await runCoreOf(pool, exec, args.id)
+      let run: OmtRun | undefined
+      let item: OmtRunItem | undefined
+      switch (args.action as string) {
+        case 'start':
+          run = await core.startRun(args.id)
+          break
+        case 'pause':
+          run = await core.pauseRun(args.id)
+          break
+        case 'resume':
+          run = await core.resumeRun(args.id)
+          break
+        case 'cancel':
+          run = await core.cancelRun(args.id)
+          break
+        case 'retry':
+          if (args.nodeId === undefined) throw new Error('omt_run_control retry 需要 nodeId（指定要重试的成员）')
+          item = await core.retryItem(args.id, args.nodeId)
+          break
+        case 'remove':
+          if (args.nodeId === undefined) throw new Error('omt_run_control remove 需要 nodeId（指定要移除的成员）')
+          await core.removeRunItem(args.id, args.nodeId)
+          break
+        default:
+          throw new Error(`omt_run_control 不支持的动作: ${String(args.action)}（start/pause/resume/cancel/retry/remove）`)
+      }
+      changed?.(core.home)
+      return {
+        run: runValue(run ?? core.requireRun(args.id)),
+        ...(item !== undefined ? { item: runItemValue(item, core.getNode(item.node_id)?.title) } : {}),
+      }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'omt_run_claim',
+    description:
+      '原子认领 run 的下一个 pending Ticket/SubTicket：单事务置 running 并绑定当前会话为执行者。'
+      + '认领结果包含当前执行项完整用户正文（不含插件管理的子节点块），以及认领成功后即时读取的 Epic/Story/SubStory/父 Ticket 祖先背景（非跨文件原子快照）；'
+      + '祖先背景只读且受显式字节预算约束；单个祖先读取失败会显式标记并保留其他内容。'
+      + '认领成功会自动把祖先链中仍为 open 的父 Ticket/SubStory/Story/Epic 置为 in_progress。并发认领不会拿到同一项；run 未 start 或已 pause 时拒绝；'
+      + '无会话（agent-less）调用不可认领。',
+    parameters: {
+      id: { type: 'string', required: true, description: 'run id' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          run_id: { type: 'string', required: true },
+          claimed: { type: 'boolean', required: true },
+          item: RUN_ITEM_SCHEMA,
+          ticket: NODE_SCHEMA,
+          context: CLAIM_CONTEXT_SCHEMA,
+          context_error: { type: 'string' },
+        },
+      },
+      render: (_args, value: {
+        run_id: string
+        claimed: boolean
+        item?: RunItemValue
+        ticket?: NodeValue
+        context?: ClaimContextValue
+        context_error?: string
+      }) => [{
+        type: 'text',
+        text: value.claimed && value.item !== undefined
+          ? [
+              `已认领 ${value.item.node_id}${value.ticket !== undefined ? `「${value.ticket.title}」` : ''}，执行者已绑定当前会话。`,
+              value.context !== undefined
+                ? renderClaimContext(value.context)
+                : `## 执行上下文读取失败\n\n${value.context_error ?? '未知错误'}\n请用 omt_show 读取当前节点及其父级后再执行。`,
+              '完成当前执行项后请用 omt_run_report 报告结果（done/failed/blocked/skipped）。',
+            ].join('\n\n')
+          : `run ${value.run_id} 没有可认领的待执行项（无 pending 成员）。`,
+      }],
+    },
+    async execute(args, exec) {
+      const sessionId = sessionOf(exec)
+      if (sessionId === undefined) {
+        throw new Error('omt_run_claim 需要执行者会话：agent-less 调用不可认领（无从绑定 executor）')
+      }
+      const core = await runCoreOf(pool, exec, args.id)
+      const item = await core.claimRunItem(args.id, sessionId)
+      changed?.(core.home)
+      if (item === undefined) return { run_id: args.id, claimed: false }
+      const node = core.getNode(item.node_id)
+      let context: ClaimContextValue | undefined
+      let contextError: string | undefined
+      if (node !== undefined) {
+        try {
+          context = await buildClaimContext(core, node)
+        } catch (error) {
+          contextError = String((error as Error).message ?? error)
+        }
+      } else {
+        contextError = `已认领成员 ${item.node_id}，但节点元数据不存在`
+      }
+      return {
+        run_id: args.id,
+        claimed: true,
+        item: runItemValue(item, node?.title),
+        ...(node !== undefined ? { ticket: nodeValue(node) } : {}),
+        ...(context !== undefined ? { context } : {}),
+        ...(contextError !== undefined ? { context_error: contextError } : {}),
+      }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'omt_run_report',
+    description:
+      '显式报告 run 成员的执行结果：outcome ∈ done/failed/blocked/skipped，note 追加到 ticket 进度记录。'
+      + 'done：ticket 与 item 同置 done；failed：仅 item 置 failed（ticket 保持 in_progress），note 记入 last_error；'
+      + 'blocked/skipped：ticket 与 item 同步置对应状态。failed 会触发 run 的 stop-on-failure 判定。',
+    parameters: {
+      id: { type: 'string', required: true, description: 'run id' },
+      nodeId: { type: 'string', required: true, description: '成员节点 id' },
+      outcome: { type: 'string', enum: RUN_REPORT_OUTCOMES, required: true, description: '执行结果' },
+      note: { type: 'string', description: '结果说明（追加到 ticket 正文；failed 时同时记入 last_error）' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          run: RUN_SCHEMA,
+          item: RUN_ITEM_SCHEMA,
+          node: NODE_SCHEMA,
+        },
+      },
+      render: (_args, value: { run: RunValue; item: RunItemValue; node: NodeValue }) => [{
+        type: 'text',
+        text: `已报告 ${value.item.node_id} → ${value.item.state}：\n${renderItemLine(value.item)}\n${renderRunLine(value.run)}`,
+      }],
+    },
+    async execute(args, exec) {
+      const core = await runCoreOf(pool, exec, args.id)
+      const result: ReportResult = await core.reportRunItem(args.id, args.nodeId, args.outcome, args.note)
+      // A report concludes the current execution: clear the running mark
+      // (failed keeps the ticket in_progress; a retry re-marks it).
+      running?.stop(args.nodeId)
+      changed?.(core.home)
+      return {
+        run: runValue(core.requireRun(args.id)),
+        item: runItemValue(result.item, result.node.title),
+        node: nodeValue(result.node),
+      }
     },
   }))
 }

@@ -7,9 +7,11 @@ import { useState } from 'react'
 import { MarkdownText } from '@deepseek-ai/dsh-client-ui-primitives'
 import { formatRelative } from '../relative-time.ts'
 import { priorityOptionLabel } from '../priority.ts'
-import { STATUS_KEY, type Translate } from '../locales.ts'
-import type { DocState, NodeSummary, OmtTreeNode } from '../store.ts'
+import { ITEM_STATE_KEY, STATUS_KEY, type Translate } from '../locales.ts'
+import type { DocRunLink, DocState, NodeSummary, OmtTreeNode } from '../store.ts'
 import type { Selector } from './Drawer.tsx'
+import { RunFlowExtras } from './RunPicker.tsx'
+import type { RunBindings } from './RunsView.tsx'
 import css from './DocPanel.module.css'
 
 /** Public composer actions (session provide channel; may be absent). */
@@ -18,7 +20,12 @@ interface InputActionsLike {
   submit(): void
 }
 
-export interface DocPanelProps {
+/**
+ * DocPanelProps extends the run bindings flat: the inject hooks channel
+ * binds stores/callbacks as top-level use<Name>/callback props (STORY-0013:
+ * 加入 run button, run links, picker/notice hosting).
+ */
+export interface DocPanelProps extends RunBindings {
   /** Framework session-scope prop; routes RPC to the workspace home. */
   readonly sessionId?: string
   /** Composer actions from the session kit (used by the Execute button). */
@@ -43,6 +50,8 @@ const STATUS_OPTIONS: { value: OmtTreeNode['status']; icon: string }[] = [
   { value: 'open', icon: '⚪' },
   { value: 'in_progress', icon: '🔵' },
   { value: 'done', icon: '🟢' },
+  { value: 'blocked', icon: '🟡' },
+  { value: 'skipped', icon: '⏭' },
 ]
 
 const CHILDREN_BEGIN = '<!-- omt:children -->'
@@ -68,6 +77,23 @@ function RelationChip({ node, onSelect, t }: { node: NodeSummary; onSelect: (id:
     >
       <span className={`omt-dot ${node.archived ? 'omt-status-archived' : `omt-status-${node.status}`}`} />
       {node.id} {node.title}
+    </button>
+  )
+}
+
+/** Run link chip (TICKET-0068): one per non-terminal run holding this ticket. */
+function RunLinkChip({ link, onOpen, t }: { link: DocRunLink; onOpen: (id: string) => void; t: Translate }) {
+  const awaiting = link.itemState === 'awaiting_confirmation'
+  return (
+    <button
+      type="button"
+      className={`${css.chip} ${awaiting ? css.chipAwaiting : ''}`}
+      onClick={() => onOpen(link.id)}
+      title={awaiting ? t('doc.awaitingConfirmation') : link.id}
+    >
+      <span className={`omt-dot omt-itemstate-${link.itemState}`} />
+      {link.title ?? link.id} {link.progress.done}/{link.progress.total}
+      {awaiting && <span className={css.awaitingBadge}>{t(ITEM_STATE_KEY.awaiting_confirmation)}</span>}
     </button>
   )
 }
@@ -215,6 +241,16 @@ export function DocPanel(props: DocPanelProps) {
           </div>
         </div>
       )}
+      {doc.data.runs !== undefined && doc.data.runs.length > 0 && (
+        <div className={css.relation}>
+          <span className={css.relationLabel}>{t('doc.runs')}</span>
+          <div className={css.chipRow}>
+            {doc.data.runs.map(link => (
+              <RunLinkChip key={link.id} link={link} onOpen={id => props.showRunInPanel(id, props.sessionId)} t={t} />
+            ))}
+          </div>
+        </div>
+      )}
 
       <div className={css.actions}>
         <button
@@ -231,6 +267,15 @@ export function DocPanel(props: DocPanelProps) {
           }}
         >
           {t('doc.execute')}
+        </button>
+        <button
+          type="button"
+          className={css.action}
+          disabled={node.archived}
+          title={node.archived ? t('run.joinArchived') : t('run.joinTitle')}
+          onClick={() => props.joinRun(node.id, props.sessionId)}
+        >
+          {t('run.join')}
         </button>
         <button
           type="button"
@@ -282,6 +327,15 @@ export function DocPanel(props: DocPanelProps) {
         </button>
       </div>
       </div>
+
+      <RunFlowExtras
+        useNotice={props.useNotice}
+        useRunPicker={props.useRunPicker}
+        pickRun={props.pickRun}
+        cancelRunPicker={props.cancelRunPicker}
+        sessionId={props.sessionId}
+        t={t}
+      />
     </div>
   )
 }

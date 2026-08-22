@@ -7,11 +7,13 @@
  */
 import type { PanelMode } from '../controller.ts'
 import type { ActiveInfo, TreeState } from '../store.ts'
+import type { SavedFilters } from '../saved-filters.ts'
 import type { Translate } from '../locales.ts'
 import { TicketPanel, type Selector } from './TicketPanel.tsx'
+import type { RunBindings } from './RunsView.tsx'
 import css from './TicketTab.module.css'
 
-export interface TicketTabProps {
+export interface TicketTabProps extends RunBindings {
   /** Framework standard prop (conversation.view owner): this view's session. */
   readonly sessionId: string
   readonly useTree: Selector<TreeState>
@@ -20,6 +22,8 @@ export interface TicketTabProps {
   readonly toggleCollapsed: (id: string) => void
   readonly refreshTree: (sessionId?: string) => void
   readonly reindex: (sessionId?: string) => void
+  readonly loadFilters: (sessionId?: string) => Promise<SavedFilters>
+  readonly saveFilters: (sessionId: string | undefined, filters: SavedFilters) => Promise<void>
   readonly select: (id: string, sessionId?: string) => void
   readonly archive: (id: string, sessionId?: string) => void
   /** Pop-out seats: switch the overlay to float mode and open it. */
@@ -41,8 +45,11 @@ export function TicketTab(props: TicketTabProps) {
         toggleCollapsed={props.toggleCollapsed}
         refreshTree={props.refreshTree}
         reindex={props.reindex}
+        loadFilters={props.loadFilters}
+        saveFilters={props.saveFilters}
         select={props.select}
         archive={props.archive}
+        runView={props}
         sessionId={sessionId}
         headerActions={
           <button

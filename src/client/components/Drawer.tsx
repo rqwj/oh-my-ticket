@@ -8,15 +8,22 @@
 import { useEffect, useRef, useState } from 'react'
 import type { PanelMode } from '../controller.ts'
 import type { ActiveInfo, TreeState } from '../store.ts'
+import type { SavedFilters } from '../saved-filters.ts'
 import type { Translate } from '../locales.ts'
 import { TicketPanel, type Selector } from './TicketPanel.tsx'
+import type { RunBindings } from './RunsView.tsx'
 import css from './Drawer.module.css'
 
 // Selector moved to TicketPanel with the shared content; re-exported here so
 // the older component imports keep resolving.
 export type { Selector } from './TicketPanel.tsx'
 
-export interface DrawerProps {
+/**
+ * DrawerProps extends the run bindings flat (STORY-0013): the inject hooks
+ * channel binds run stores/callbacks as top-level props; the shell forwards
+ * itself as the panel's runView bindings object.
+ */
+export interface DrawerProps extends RunBindings {
   readonly useDrawerOpen: Selector<boolean>
   /** Panel-mode gate: the drawer yields to the floating window. */
   readonly usePanelMode: Selector<PanelMode>
@@ -28,6 +35,8 @@ export interface DrawerProps {
   readonly toggleDrawer: (sessionId?: string) => void
   readonly refreshTree: (sessionId?: string) => void
   readonly reindex: (sessionId?: string) => void
+  readonly loadFilters: (sessionId?: string) => Promise<SavedFilters>
+  readonly saveFilters: (sessionId: string | undefined, filters: SavedFilters) => Promise<void>
   readonly select: (id: string, sessionId?: string) => void
   readonly archive: (id: string, sessionId?: string) => void
   readonly useDrawerWidth: Selector<number>
@@ -152,8 +161,11 @@ export function Drawer(props: DrawerProps) {
         toggleCollapsed={props.toggleCollapsed}
         refreshTree={props.refreshTree}
         reindex={props.reindex}
+        loadFilters={props.loadFilters}
+        saveFilters={props.saveFilters}
         select={props.select}
         archive={props.archive}
+        runView={props}
         sessionId={current}
         headerActions={
           <button

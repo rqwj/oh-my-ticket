@@ -23,6 +23,24 @@ describe('RunningRegistry', () => {
     registry.stop('TICKET-0001')
     expect(registry.get('TICKET-0001')).toBeUndefined()
   })
+
+  it('snapshots executor lineage for subagent sessions (TICKET-0066)', () => {
+    const registry = new RunningRegistry()
+    registry.start('TICKET-0001', 'child-1', 'demo 的会话', { parentSessionId: 'parent-1', isSubagent: true })
+    expect(registry.get('TICKET-0001')).toMatchObject({
+      sessionId: 'child-1',
+      parentSessionId: 'parent-1',
+      isSubagent: true,
+    })
+  })
+
+  it('plain sessions carry an empty lineage', () => {
+    const registry = new RunningRegistry()
+    registry.start('TICKET-0001', 's1', 'demo 的会话')
+    const info = registry.get('TICKET-0001')
+    expect(info?.parentSessionId).toBeUndefined()
+    expect(info?.isSubagent).toBeUndefined()
+  })
 })
 
 describe('/omt execute endpoint', () => {
@@ -65,5 +83,30 @@ describe('/omt execute endpoint', () => {
     await handler('update', { id: 'EPIC-0001', status: 'done' }, new AbortController().signal)
     const detail = await handler('get', { id: 'EPIC-0001' }, new AbortController().signal)
     expect(detail.value.running).toBeUndefined()
+  })
+
+  it('execute snapshots the session lineage into the running mark (TICKET-0066)', async () => {
+    // Re-register with an agents registry whose session header carries the
+    // subagent lineage (parentSession + origin).
+    const extraPool = new OmtCorePool(home)
+    const withAgents = {
+      connection: { rpc: { handle: (_c: string, h: any) => { handler = h } } },
+      agents: {
+        get: (id: string) => (id === 'child-1'
+          ? { session: { header: { cwd: undefined, parentSession: 'parent-1', origin: 'subagent' } } }
+          : undefined),
+      },
+    }
+    registerOmtRpc(withAgents as never, extraPool, new RecentRegistry(), undefined, running)
+
+    const result = await handler('execute', { id: 'EPIC-0001', sessionId: 'child-1' }, new AbortController().signal)
+    expect(result.ok).toBe(true)
+    const detail = await handler('get', { id: 'EPIC-0001' }, new AbortController().signal)
+    expect(detail.value.running).toMatchObject({
+      sessionId: 'child-1',
+      parentSessionId: 'parent-1',
+      isSubagent: true,
+    })
+    await extraPool.closeAll()
   })
 })

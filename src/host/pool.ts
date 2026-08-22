@@ -11,11 +11,31 @@ import { join } from 'node:path'
 import { OmtCore } from './core.ts'
 import { TYPE_PREFIX, type NodeType } from './types.ts'
 
+export interface OmtCorePoolOptions {
+  /**
+   * Live DSH session ids, consulted by the startup janitor every time a
+   * core (re)opens (review fix #4): without it the janitor assumes NO
+   * session is alive and demotes every running item to interrupted on
+   * plugin load/reload. Cores open lazily — well after the agents registry
+   * is injected — so evaluating the provider at open time is safe.
+   */
+  readonly activeSessionIds?: () => readonly string[]
+  /**
+   * Observer attached to each core right after it opens (run-event
+   * listeners, TICKET-0065). Attached post-open, so the startup janitor's
+   * demotions never reach it.
+   */
+  readonly onCoreOpened?: (core: OmtCore) => void
+}
+
 export class OmtCorePool {
   private readonly cores = new Map<string, Promise<OmtCore>>()
 
   /** @param globalHome - fallback home (already resolved from config/env). */
-  constructor(readonly globalHome: string) {}
+  constructor(
+    readonly globalHome: string,
+    private readonly options: OmtCorePoolOptions = {},
+  ) {}
 
   /** Resolve the home directory for one workspace cwd (or the global fallback). */
   homeFor(cwd: string | undefined): string {
@@ -69,7 +89,13 @@ export class OmtCorePool {
   coreForHome(home: string): Promise<OmtCore> {
     let core = this.cores.get(home)
     if (core === undefined) {
-      core = OmtCore.open(home)
+      core = OmtCore.open(home, { activeSessionIds: this.options.activeSessionIds?.() })
+      const onCoreOpened = this.options.onCoreOpened
+      if (onCoreOpened !== undefined) {
+        // Rejection is owned by the awaited promise above (callers see it);
+        // this branch only skips the observer on a failed open.
+        void core.then(opened => onCoreOpened(opened), () => {})
+      }
       this.cores.set(home, core)
     }
     return core
@@ -86,22 +112,53 @@ export class OmtCorePool {
   }
 
   /**
+   * Shared ownership resolution: workspace home (when present) first, then
+   * global; the first core where `contains` holds wins. When no home
+   * contains the id, the fallback core is returned so the caller's
+   * NOT_FOUND error path stays consistent (homes is never empty — the
+   * global home is always included).
+   */
+  private async coreForId(id: string, cwd: string | undefined, contains: (core: OmtCore, id: string) => boolean): Promise<OmtCore> {
+    const homes = this.candidateHomes(cwd)
+    let fallback: OmtCore | undefined
+    for (const home of homes) {
+      const core = await this.coreForHome(home)
+      fallback ??= core
+      if (contains(core, id)) return core
+    }
+    return fallback as OmtCore
+  }
+
+  /**
    * Resolve the core CONTAINING a node id: workspace home (when present)
    * first, then global. Child nodes must live in their parent's home, so
    * id-addressed operations route by ownership rather than by cwd. When no
    * home contains the id, the default-resolution core is returned so the
    * caller's NOT_FOUND error path stays consistent.
    */
-  async coreForNode(id: string, cwd: string | undefined): Promise<OmtCore> {
-    const homes = this.candidateHomes(cwd)
-    let fallback: OmtCore | undefined
-    for (const home of homes) {
-      const core = await this.coreForHome(home)
-      fallback ??= core
-      if (core.getNode(id) !== undefined) return core
-    }
-    // homes is never empty (globalHome always included).
-    return fallback as OmtCore
+  coreForNode(id: string, cwd: string | undefined): Promise<OmtCore> {
+    return this.coreForId(id, cwd, (core, nodeId) => core.getNode(nodeId) !== undefined)
+  }
+
+  /**
+   * Owning core per root id, in input order (run-create/run-add single-home
+   * membership resolution, TICKET-0067). Resolved concurrently; conflict and
+   * NOT_FOUND reporting stay with the caller (error types differ per
+   * surface: OmtError on RPC, plain Error on tools).
+   */
+  ownerCores(rootIds: readonly string[], cwd: string | undefined): Promise<{ rootId: string; core: OmtCore }[]> {
+    return Promise.all(rootIds.map(async rootId => ({ rootId, core: await this.coreForNode(rootId, cwd) })))
+  }
+
+  /**
+   * Resolve the core CONTAINING a run id. Run ids count per home, so the
+   * same id can exist in several homes — resolution follows the node rule
+   * (workspace home first, then global; the caller's workspace context
+   * disambiguates). When no home contains the id, the fallback core is
+   * returned so the caller's NOT_FOUND path stays consistent.
+   */
+  coreForRun(id: string, cwd: string | undefined): Promise<OmtCore> {
+    return this.coreForId(id, cwd, (core, runId) => core.getRun(runId) !== undefined)
   }
 
   /** Close every open core (tests and plugin teardown). */

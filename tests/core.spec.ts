@@ -69,6 +69,22 @@ describe('create', () => {
     expect(nestedTicket.path).toContain('SUBSTORY-0001-第三方登录')
   })
 
+  it('uses role-specific templates that encode hierarchy content boundaries', async () => {
+    const epic = await core.create({ type: 'epic', title: '平台能力' })
+    const story = await core.create({ type: 'story', title: '批量执行', parentId: epic.id })
+    const substory = await core.create({ type: 'substory', title: '失败恢复', parentId: story.id })
+    const ticket = await core.create({ type: 'ticket', title: '重试入口', parentId: story.id })
+    const subticket = await core.create({ type: 'subticket', title: '错误提示', parentId: ticket.id })
+
+    expect((await core.show(epic.id)).body).toMatch(/## 总体目标[\s\S]*## 范围[\s\S]*## 非范围[\s\S]*## 全局约束[\s\S]*## 成功标准/)
+    for (const node of [story, substory]) {
+      expect((await core.show(node.id)).body).toMatch(/## 能力结果[\s\S]*## 使用者或调用方[\s\S]*## 范围[\s\S]*## 非范围[\s\S]*## 共享规则与约束[\s\S]*## 验收标准/)
+    }
+    for (const node of [ticket, subticket]) {
+      expect((await core.show(node.id)).body).toMatch(/## 交付结果[\s\S]*## 工作范围[\s\S]*## 依赖[\s\S]*## 验收标准[\s\S]*## 进度记录/)
+    }
+  })
+
   it('rejects hierarchy violations', async () => {
     const { epic, story, ticket } = await standardFixture()
 
@@ -119,6 +135,45 @@ describe('update', () => {
     const shown = await core.show(ticket.id)
     expect(shown.body).toContain('全新正文')
     expect(shown.body).not.toContain('进度记录')
+  })
+})
+
+describe('ancestor activation', () => {
+  it('activates the full ancestor chain when a ticket starts', async () => {
+    const { epic, story, ticket } = await standardFixture()
+
+    await core.update({ id: ticket.id, status: 'in_progress' })
+
+    expect(core.getNode(epic.id)?.status).toBe('in_progress')
+    expect(core.getNode(story.id)?.status).toBe('in_progress')
+    const storyFile = await readFile(join(home, story.path), 'utf8')
+    expect(storyFile).toContain('status: in_progress')
+  })
+
+  it('activates through the parent ticket for subtickets', async () => {
+    const { story, ticket } = await standardFixture()
+    const epic = core.getNode((await core.show(ticket.id)).parent!.id)!
+    const subticket = await core.create({ type: 'subticket', title: '参数校验', parentId: ticket.id })
+
+    await core.update({ id: subticket.id, status: 'in_progress' })
+
+    for (const node of [epic, story, ticket]) {
+      expect(core.getNode(node.id)?.status).toBe('in_progress')
+    }
+  })
+
+  it('never reopens non-open ancestors and skips archived ones without failing', async () => {
+    const { epic, story, ticket } = await standardFixture()
+    await core.update({ id: story.id, status: 'blocked' })
+    await core.update({ id: epic.id, archived: true })
+
+    const updated = await core.update({ id: ticket.id, status: 'in_progress' })
+    expect(updated.status).toBe('in_progress')
+
+    expect(core.getNode(story.id)?.status).toBe('blocked')
+    const archivedEpic = core.getNode(epic.id)!
+    expect(archivedEpic.archived).toBe(true)
+    expect(archivedEpic.status).toBe('open')
   })
 })
 
