@@ -2,10 +2,10 @@
 id: EPIC-0001
 type: epic
 title: OMT 插件 UI 优化
-status: open
+status: in_progress
 priority: 0
 created_at: '2026-08-17T13:59:15.996Z'
-updated_at: '2026-08-17T13:59:15.996Z'
+updated_at: '2026-08-22T00:47:51.458Z'
 ---
 
 ## 目标
@@ -28,4 +28,5 @@ updated_at: '2026-08-17T13:59:15.996Z'
 - [STORY-0004 DSH UI 规范对齐](STORY-0004-DSH-UI-规范对齐/story.md) — done
 - [STORY-0005 会话联动展示](STORY-0005-会话联动展示/story.md) — done
 - [STORY-0006 ticket list 三种展现方式（抽屉/浮窗/tab）](STORY-0006-ticket-list-三种展现方式（抽屉浮窗tab）/story.md) — done
+- [STORY-0023 过滤器状态持久化与重置](STORY-0023-过滤器状态持久化与重置/story.md) — done
 <!-- /omt:children -->

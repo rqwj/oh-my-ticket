@@ -7,9 +7,10 @@
  * The owning shell supplies positioning, sizing, and drag furniture; the
  * panel fills whatever box it is given (flex column, min-height 0).
  */
-import { useEffect, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react'
 import type { ActiveInfo, OmtTreeNode, TreeState } from '../store.ts'
 import { filterForest, sortForest, type TreeFilter, type TreeSortOrder } from '../tree-filter.ts'
+import { DEFAULT_SAVED_FILTERS, type SavedFilters } from '../saved-filters.ts'
 import { priorityMeta } from '../priority.ts'
 import { STATUS_KEY, type Translate } from '../locales.ts'
 import { PriorityIcon } from './PriorityIcon.tsx'
@@ -34,6 +35,10 @@ export interface TicketPanelProps {
   readonly toggleCollapsed: (id: string) => void
   readonly refreshTree: (sessionId?: string) => void
   readonly reindex: (sessionId?: string) => void
+  /** Load the persisted filter bag for the session's workspace (STORY-0023). */
+  readonly loadFilters: (sessionId?: string) => Promise<SavedFilters>
+  /** Persist a full filter bag; called debounced on change, immediate on reset. */
+  readonly saveFilters: (sessionId: string | undefined, filters: SavedFilters) => Promise<void>
   readonly select: (id: string, sessionId?: string) => void
   readonly archive: (id: string, sessionId?: string) => void
   /** Run 区块 bindings (STORY-0013): section nav, RunsView, picker, notice. */
@@ -195,6 +200,56 @@ export function TicketPanel(props: TicketPanelProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId])
 
+  // Saved viewing filters (STORY-0023): hydrate once per workspace, then
+  // autosave every change (debounced — search typing stays one write).
+  const hydratedRef = useRef(false)
+  const savedFiltersOf = (): SavedFilters => ({
+    query,
+    showArchived,
+    types: typeFilter,
+    statuses: statusFilter,
+    priorities: priorityFilter,
+    showId,
+    sortOrder,
+  })
+  useEffect(() => {
+    let cancelled = false
+    hydratedRef.current = false
+    void props.loadFilters(sessionId)
+      .catch(() => DEFAULT_SAVED_FILTERS)
+      .then(saved => {
+        if (cancelled) return
+        setQuery(saved.query)
+        setShowArchived(saved.showArchived)
+        setTypeFilter(saved.types)
+        setStatusFilter(saved.statuses)
+        setPriorityFilter(saved.priorities)
+        setShowId(saved.showId)
+        setSortOrder(saved.sortOrder)
+        hydratedRef.current = true
+      })
+    return () => { cancelled = true }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId])
+  useEffect(() => {
+    if (!hydratedRef.current) return
+    const timer = setTimeout(() => { void props.saveFilters(sessionId, savedFiltersOf()) }, 300)
+    return () => clearTimeout(timer)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [query, showArchived, typeFilter, statusFilter, priorityFilter, showId, sortOrder, sessionId])
+
+  /** Reset to the default view and persist immediately (no debounce). */
+  const resetFilters = (): void => {
+    setQuery(DEFAULT_SAVED_FILTERS.query)
+    setShowArchived(DEFAULT_SAVED_FILTERS.showArchived)
+    setTypeFilter(DEFAULT_SAVED_FILTERS.types)
+    setStatusFilter(DEFAULT_SAVED_FILTERS.statuses)
+    setPriorityFilter(DEFAULT_SAVED_FILTERS.priorities)
+    setShowId(DEFAULT_SAVED_FILTERS.showId)
+    setSortOrder(DEFAULT_SAVED_FILTERS.sortOrder)
+    void props.saveFilters(sessionId, DEFAULT_SAVED_FILTERS)
+  }
+
   const filter: TreeFilter = { query, showArchived, types: typeFilter, statuses: statusFilter, priorities: priorityFilter }
 
   return (
@@ -313,6 +368,15 @@ export function TicketPanel(props: TicketPanelProps) {
             {t(key)}
           </button>
         ))}
+        <span className={css.filterDivider} />
+        <button
+          type="button"
+          className={`${css.filterChip} ${css.filterReset}`}
+          title={t('drawer.resetFiltersTitle')}
+          onClick={resetFilters}
+        >
+          {t('drawer.resetFilters')}
+        </button>
       </div>
       <div className={css.tree}>
         {tree.status === 'idle' || tree.status === 'loading' ? (

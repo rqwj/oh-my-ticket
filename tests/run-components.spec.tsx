@@ -383,7 +383,11 @@ function treeNode(id: string, status: OmtTreeNode['status'], children: OmtTreeNo
 }
 
 describe('TicketPanel (TICKET-0067/0069)', () => {
-  function renderPanel(treeState?: TreeState) {
+  interface PanelSpies {
+    readonly saved: { filters: any; sessionId: string | undefined }[]
+    loadFilters: (sessionId?: string) => Promise<any>
+  }
+  function renderPanel(treeState?: TreeState, saved: any = undefined) {
     const { bindings, spies, stores } = makeBindings()
     const tree = createSnapshotStore<TreeState>(treeState ?? {
       status: 'ready',
@@ -391,24 +395,42 @@ describe('TicketPanel (TICKET-0067/0069)', () => {
     })
     const active = createSnapshotStore(undefined)
     const collapsed = createSnapshotStore<Record<string, boolean>>({})
-    const container = render(createElement(TicketPanel, {
+    const panelSpies: PanelSpies = {
+      saved: [],
+      loadFilters: () => Promise.resolve(saved ?? {
+        query: '', showArchived: false, types: [], statuses: [], priorities: [], showId: false, sortOrder: 'none',
+      }),
+    }
+    const mounted = render(createElement(TicketPanel, {
       useTree: useStore(tree),
       useActive: useStore(active),
       useCollapsed: useStore(collapsed),
       toggleCollapsed: () => {},
       refreshTree: () => {},
       reindex: () => {},
+      loadFilters: panelSpies.loadFilters,
+      saveFilters: (sessionId, filters) => {
+        panelSpies.saved.push({ sessionId, filters })
+        return Promise.resolve()
+      },
       select: () => {},
       archive: () => {},
       runView: bindings,
       sessionId: 's1',
       t,
     }))
-    return { container, spies, stores }
+    return { container: mounted, spies, stores, panelSpies }
   }
 
-  it('offers blocked/skipped filter chips alongside the lifecycle states', () => {
+  const flush = async (): Promise<void> => { await act(async () => { await new Promise(resolve => setTimeout(resolve, 400)) }) }
+  /** Resolve the hydration promise (no debounce wait) — keeps legacy sync tests act-clean. */
+  const settle = async (): Promise<void> => { await act(async () => { await Promise.resolve() }) }
+  const searchInput = (container: HTMLElement): HTMLInputElement =>
+    container.querySelector('input[type="search"]') as HTMLInputElement
+
+  it('offers blocked/skipped filter chips alongside the lifecycle states', async () => {
     const { container } = renderPanel()
+    await settle()
     expect(byText(container, zh['status.blocked'])).toBeDefined()
     expect(byText(container, zh['status.skipped'])).toBeDefined()
     // The blocked/skipped rows render (dots are CSS-stubbed; text survives).
@@ -416,22 +438,57 @@ describe('TicketPanel (TICKET-0067/0069)', () => {
     expect(container.textContent).toContain('节点 TICKET-0002')
   })
 
-  it('every non-archived tree row has a 加入 run button that fires joinRun', () => {
+  it('every non-archived tree row has a 加入 run button that fires joinRun', async () => {
     const { container, spies } = renderPanel()
+    await settle()
     const joinButtons = Array.from(container.querySelectorAll('button')).filter(el => el.title === zh['run.joinTitle'])
     expect(joinButtons.length).toBe(3) // epic + 2 tickets
     click(joinButtons[1] as HTMLElement)
     expect(spies.calls.some(call => call.name === 'joinRun' && call.args[0] === 'TICKET-0001')).toBe(true)
   })
 
-  it('the section nav switches between the tree and the Runs 区块', () => {
+  it('the section nav switches between the tree and the Runs 区块', async () => {
     const { container, spies, stores } = renderPanel()
+    await settle()
     expect(byText(container, zh['run.sectionTickets'])).toBeDefined()
     click(byText(container, zh['run.sectionRuns']) as HTMLElement)
     expect(spies.calls.some(call => call.name === 'showRuns')).toBe(true)
     expect(stores.panelSection.getSnapshot()).toBe('runs')
     // Runs 区块 replaces the tree (loading state with no RPC behind it).
     expect(container.textContent).toContain(zh['run.loading'])
+  })
+
+  it('hydrates saved filters on mount so a reload restores the view (STORY-0023)', async () => {
+    const { container } = renderPanel(undefined, {
+      query: 'ticket-0001', showArchived: false, types: [], statuses: ['blocked'], priorities: [], showId: true, sortOrder: 'priority-desc',
+    })
+    await flush()
+    expect(searchInput(container).value).toBe('ticket-0001')
+    // The query filters the forest; the skipped sibling stays hidden.
+    expect(container.textContent).toContain('节点 TICKET-0001')
+    expect(container.textContent).not.toContain('节点 TICKET-0002')
+  })
+
+  it('autosaves filter changes (debounced) and reset persists immediately (STORY-0023)', async () => {
+    const { container, panelSpies } = renderPanel()
+    await flush() // hydration completes → autosave armed
+
+    click(byText(container, zh['status.blocked']) as HTMLElement)
+    await flush()
+    const afterChip = panelSpies.saved.at(-1)
+    expect(afterChip?.filters.statuses).toEqual(['blocked'])
+    expect(afterChip?.sessionId).toBe('s1')
+
+    // Reset: right-aligned button at the end of the filter rows; defaults
+    // persist immediately (no debounce) and the panel returns to defaults.
+    const savedBefore = panelSpies.saved.length
+    click(byText(container, zh['drawer.resetFilters']) as HTMLElement)
+    const resetWrite = panelSpies.saved.at(-1)
+    expect(resetWrite?.filters).toEqual({
+      query: '', showArchived: false, types: [], statuses: [], priorities: [], showId: false, sortOrder: 'none',
+    })
+    expect(searchInput(container).value).toBe('')
+    expect(panelSpies.saved.length).toBeGreaterThanOrEqual(savedBefore + 1)
   })
 })
 

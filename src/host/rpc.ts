@@ -18,6 +18,8 @@
  *   run-create  { nodeIds, title? }                → 一键直建（默认配置，收集子树中的 ticket）
  *   run-add     { id, nodeIds }                    → 加入既有 run（只收集 ticket，去重/跳过/home 校验）
  *   run-confirm { id, nodeId, decision }           → awaiting_confirmation 确认/打回
+ *   filters-get { sessionId? }                     → SavedFilters（缺失/损坏回退默认）
+ *   filters-set { sessionId?, filters }            → 校验合并后持久化到 <home>/ui-filters.json
  */
 import { z } from 'zod'
 import type { Context } from '@deepseek-ai/cordis'
@@ -99,6 +101,14 @@ const runConfirmPayloadSchema = z.object({
   id: z.string().min(1),
   nodeId: z.string().min(1),
   decision: z.enum(['confirm', 'reject']),
+  ...sessionField,
+}).strict()
+
+// ── saved tree filters (STORY-0023 UI channel) ───────────────────────────
+const filtersGetPayloadSchema = z.object({ ...sessionField }).strict()
+const filtersSetPayloadSchema = z.object({
+  /** Partial patch; the server merges onto defaults and validates the bag. */
+  filters: z.record(z.string(), z.unknown()),
   ...sessionField,
 }).strict()
 
@@ -564,6 +574,21 @@ export function registerOmtRpc(ctx: Context, pool: OmtCorePool, recent?: RecentR
           }
           // The item transition already reached the hub through bridgeRunEvents.
           return ok({ run: runSummary(core, core.requireRun(id)), item: runItemView(core, item) })
+        }
+        case 'filters-get': {
+          const parsed = filtersGetPayloadSchema.safeParse(payload ?? {})
+          if (!parsed.success) return badRequest('invalid filters-get payload', parsed.error.issues)
+          const core = await coreFor(parsed.data.sessionId)
+          return ok(await core.savedFilters())
+        }
+        case 'filters-set': {
+          const parsed = filtersSetPayloadSchema.safeParse(payload)
+          if (!parsed.success) return badRequest('invalid filters-set payload', parsed.error.issues)
+          const core = await coreFor(parsed.data.sessionId)
+          // Merge the partial patch onto the saved bag so the client can
+          // send single-field updates; the merged result is fully validated.
+          const current = await core.savedFilters()
+          return ok(await core.saveSavedFilters({ ...current, ...parsed.data.filters }))
         }
         default:
           return badRequest(`unknown endpoint: ${endpoint}`, [])

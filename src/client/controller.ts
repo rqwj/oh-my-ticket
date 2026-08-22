@@ -8,6 +8,7 @@ import { createSnapshotStore, type SnapshotStore } from '@deepseek-ai/dsh-client
 import type { RpcCaller } from './trigger/source.ts'
 import type { FloatPos, FloatSize } from './float-geometry.ts'
 import type { RunControlCommand } from './run-view.ts'
+import { DEFAULT_SAVED_FILTERS, type SavedFilters } from './saved-filters.ts'
 import type {
   ActiveInfo,
   DocData,
@@ -290,6 +291,22 @@ export class OmtController {
     const active = this.active.getSnapshot()
     if (active !== undefined) await this.select(active.id, sessionId)
   }
+
+  /**
+   * Saved tree filters for the session's workspace home (STORY-0023).
+   * Failures degrade to defaults — preference state never blocks the panel.
+   */
+  loadFilters = async (sessionId?: string): Promise<SavedFilters> => {
+    const result = await this.rpc.call('/omt', 'filters-get', sessionId === undefined ? {} : { sessionId })
+    if (!result.ok) return { ...DEFAULT_SAVED_FILTERS }
+    return { ...DEFAULT_SAVED_FILTERS, ...(result.value as Partial<SavedFilters>) }
+  }
+
+  /** Persist a full filter bag; fire-and-forget callers may ignore errors. */
+  saveFilters = async (sessionId: string | undefined, filters: SavedFilters): Promise<void> => {
+    await this.rpc.call('/omt', 'filters-set', { sessionId, filters })
+  }
+
 
   /** Select a node: load its doc, pin it active, shadow the details panel. */
   select = async (id: string, sessionId?: string): Promise<void> => {

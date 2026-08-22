@@ -16,6 +16,7 @@ import {
   stripChildrenBlock,
 } from './markdown.ts'
 import { OmtStore } from './store.ts'
+import { readSavedFilters, savedFiltersSchema, writeSavedFilters, type SavedFilters } from './ui-state.ts'
 import {
   DEFAULT_RUN_CONFIG,
   HIERARCHY,
@@ -560,6 +561,27 @@ export class OmtCore {
       return [root]
     }
     return roots.sort((a, b) => a.id.localeCompare(b.id))
+  }
+
+  // ── saved UI filters (STORY-0023) ────────────────────────────────────
+
+  /**
+   * The tree panel's persisted viewing filters for this home. A missing or
+   * corrupt file degrades to defaults — preference state never blocks the
+   * panel.
+   */
+  async savedFilters(): Promise<SavedFilters> {
+    return readSavedFilters(this.home)
+  }
+
+  /** Validate and persist one filter bag (partial patches merge onto defaults). */
+  async saveSavedFilters(filters: unknown): Promise<SavedFilters> {
+    const parsed = savedFiltersSchema.safeParse(filters)
+    if (!parsed.success) {
+      throw new OmtError('INVALID_INPUT', `invalid filters payload: ${parsed.error.issues.map(issue => issue.path.join('.')).join(', ')}`)
+    }
+    await writeSavedFilters(this.home, parsed.data)
+    return parsed.data
   }
 
   // ── reindex ──────────────────────────────────────────────────────────
