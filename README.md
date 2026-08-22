@@ -1,7 +1,7 @@
 # Oh-My-Ticket (OMT)
 
-![version](https://img.shields.io/badge/version-0.4.0-blue)
-![tests](https://img.shields.io/badge/tests-340%20passing-brightgreen)
+![version](https://img.shields.io/badge/version-0.4.1-blue)
+![tests](https://img.shields.io/badge/tests-344%20passing-brightgreen)
 ![platform](https://img.shields.io/badge/platform-DeepSeek%20Harness-purple)
 
 **DSH 的 ticket 管理插件**：`Epic → Story → [SubStory] → Ticket → [SubTicket]` 五级任务体系，
@@ -23,7 +23,8 @@ SQLite 存元数据与层级关系，Markdown 存正文。ticket 随项目走（
 ### 完整的树交互
 
 - 类型徽章（E/S/SS/T/ST）、状态点（归档空心化）、优先级信号条（P1–P3 渐强着色）
-- 搜索、类型/状态/优先级多选过滤、优先级排序、编号显示开关
+- 搜索、类型/状态/优先级多选过滤、优先级排序、编号显示开关；过滤器状态
+  自动保存到工作区 `.omt/ui-filters.json`，刷新自动恢复，面板内一键重置
 - 归档独立维度（与生命周期状态正交，归档只读）、折叠状态跨会话记忆
 - 窄视口适配（<640px 抽屉全宽、拖拽把手退役）、键盘焦点环规范
 - 变更即时推送：自有 SSE 通道（`/omt/events`），模型改完 UI 立刻刷新
@@ -64,11 +65,11 @@ SQLite 存元数据与层级关系，Markdown 存正文。ticket 随项目走（
 
 ```sh
 # 本仓库构建并打包（首次需先链接 DSH checkout，见「开发」一节）：
-pnpm install && pnpm build && npm pack    # → oh-my-ticket-0.4.0.tgz
+pnpm install && pnpm build && npm pack    # → oh-my-ticket-0.4.1.tgz
 
 # 安装进目标 DSH profile（profile 的 dsh.profile.bundles 依次为）：
 #   @deepseek-ai/dsh-base, @deepseek-ai/dsh-web-app, oh-my-ticket
-pnpm dsh plugin --profile <profile> add /path/to/oh-my-ticket-0.4.0.tgz
+pnpm dsh plugin --profile <profile> add /path/to/oh-my-ticket-0.4.1.tgz
 ```
 
 在工作区根目录 `mkdir .omt` 即可让该项目拥有独立的 ticket 库（随项目进 git）。
