@@ -16,6 +16,7 @@ import {
   stripChildrenBlock,
 } from './markdown.ts'
 import { OmtStore } from './store.ts'
+import { readSavedFilters, savedFiltersSchema, writeSavedFilters, type SavedFilters } from './ui-state.ts'
 import {
   DEFAULT_RUN_CONFIG,
   HIERARCHY,
@@ -27,6 +28,7 @@ import {
   isRunActive,
   isRunItemInFlight,
   isRunItemState,
+  isRunMemberNodeType,
   isStatus,
   type NodeFrontmatter,
   type NodeType,
@@ -82,6 +84,19 @@ export interface ShowResult {
   readonly children: OmtNode[]
 }
 
+export type LineageContent =
+  | {
+      readonly node: OmtNode
+      /** User-owned Markdown only; the managed children block is excluded. */
+      readonly body: string
+      readonly error?: never
+    }
+  | {
+      readonly node: OmtNode
+      readonly body?: never
+      readonly error: string
+    }
+
 export interface ReindexResult {
   readonly nodes: number
   readonly edges: number
@@ -93,7 +108,7 @@ export interface CreateRunInput {
   readonly title?: string
   /** Config overrides; missing keys take DEFAULT_RUN_CONFIG. */
   readonly config?: Partial<RunConfig>
-  /** Member node ids in execution order (snapshot; duplicates rejected). */
+  /** Executable ticket/subticket ids in execution order (snapshot; duplicates rejected). */
   readonly nodeIds: readonly string[]
 }
 
@@ -377,7 +392,35 @@ export class OmtCore {
       executorSessionId: input.executorSessionId,
       reported: input.reported,
     })
+    // A status change shows up in the parent's managed children list too.
+    if ((patch.title !== undefined || patch.status !== undefined) && parent !== undefined) {
+      await this.refreshChildrenBlock(parent.id)
+    }
+    // Ancestor activation (STORY-0022): work starting anywhere lights up the
+    // chain above it. Recursion through update() is idempotent — each level
+    // re-walks only its own remaining open ancestors.
+    if (input.status === 'in_progress') await this.activateAncestors(input.id)
     return updated
+  }
+
+  /**
+   * Upgrade every open ancestor of `childId` to in_progress (STORY-0022).
+   * done/blocked/skipped ancestors are never reopened and archived ones are
+   * skipped silently: activation is coordination sugar and must never fail
+   * or mutate state that carries a human decision.
+   */
+  async activateAncestors(childId: string): Promise<OmtNode[]> {
+    const activated: OmtNode[] = []
+    const seen = new Set<string>([childId])
+    let parent = this.store.parentOf(childId)
+    while (parent !== undefined && !seen.has(parent.id)) {
+      seen.add(parent.id)
+      if (!parent.archived && parent.status === 'open') {
+        activated.push(await this.update({ id: parent.id, status: 'in_progress' }))
+      }
+      parent = this.store.parentOf(parent.id)
+    }
+    return activated
   }
 
   // ── move ─────────────────────────────────────────────────────────────
@@ -486,6 +529,31 @@ export class OmtCore {
     }
   }
 
+  /**
+   * Read one node and all ancestors as user-owned Markdown, root first. The
+   * metadata chain is captured synchronously, then bounded-depth file reads
+   * start together; callers receive best-effort live content, not a snapshot.
+   */
+  async readLineage(id: string): Promise<LineageContent[]> {
+    const closestFirst: OmtNode[] = []
+    const seen = new Set<string>()
+    let current: OmtNode | undefined = this.requireNode(id)
+    while (current !== undefined && !seen.has(current.id)) {
+      seen.add(current.id)
+      closestFirst.push(current)
+      current = this.store.parentOf(current.id)
+    }
+    const rootFirst = closestFirst.reverse()
+    return Promise.all(rootFirst.map(async (node): Promise<LineageContent> => {
+      try {
+        const file = await this.files.readNode(node.path)
+        return { node, body: stripChildrenBlock(file.body) }
+      } catch (error) {
+        return { node, error: String((error as Error).message ?? error) }
+      }
+    }))
+  }
+
   /** Assemble the forest (epics as roots), children ordered by edge ord. */
   tree(rootId?: string): OmtTreeNode[] {
     const nodes = this.store.allNodes()
@@ -505,6 +573,27 @@ export class OmtCore {
       return [root]
     }
     return roots.sort((a, b) => a.id.localeCompare(b.id))
+  }
+
+  // ── saved UI filters (STORY-0023) ────────────────────────────────────
+
+  /**
+   * The tree panel's persisted viewing filters for this home. A missing or
+   * corrupt file degrades to defaults — preference state never blocks the
+   * panel.
+   */
+  async savedFilters(): Promise<SavedFilters> {
+    return readSavedFilters(this.home)
+  }
+
+  /** Validate and persist one filter bag (partial patches merge onto defaults). */
+  async saveSavedFilters(filters: unknown): Promise<SavedFilters> {
+    const parsed = savedFiltersSchema.safeParse(filters)
+    if (!parsed.success) {
+      throw new OmtError('INVALID_INPUT', `invalid filters payload: ${parsed.error.issues.map(issue => issue.path.join('.')).join(', ')}`)
+    }
+    await writeSavedFilters(this.home, parsed.data)
+    return parsed.data
   }
 
   // ── reindex ──────────────────────────────────────────────────────────
@@ -596,12 +685,7 @@ export class OmtCore {
     for (const nodeId of input.nodeIds) {
       if (seen.has(nodeId)) throw new OmtError('INVALID_INPUT', `duplicate run member: ${nodeId}`)
       seen.add(nodeId)
-      const node = this.requireNode(nodeId)
-      // Archived nodes are read-only (reports reject them): admitting one
-      // would wedge its item, so refuse the run up front.
-      if (node.archived) {
-        throw new OmtError('INVALID_INPUT', `run member ${nodeId} is archived (已归档成员不能加入 run；请先恢复)`)
-      }
+      this.requireRunMemberNode(nodeId)
     }
     const config: RunConfig = { ...DEFAULT_RUN_CONFIG, ...input.config }
     if (!Number.isInteger(config.concurrency) || config.concurrency < 1) {
@@ -680,10 +764,7 @@ export class OmtCore {
         continue
       }
       seen.add(member.nodeId)
-      const node = this.requireNode(member.nodeId)
-      if (node.archived) {
-        throw new OmtError('INVALID_INPUT', `run member ${member.nodeId} is archived (已归档成员不能加入 run；请先恢复)`)
-      }
+      this.requireRunMemberNode(member.nodeId)
       const state = member.state ?? 'pending'
       added.push(this.store.insertRunItem({
         run_id: runId,
@@ -878,6 +959,14 @@ export class OmtCore {
     }
     if (claimed !== undefined) {
       this.emitRunEvent({ kind: 'item', run: this.requireRun(runId), item: claimed, fromItemState: 'pending' })
+      // Ancestor activation (STORY-0022) is best-effort on the claim path:
+      // the claim transaction is already committed, so a failed cosmetic
+      // status write must never fail or undo the claim itself.
+      try {
+        await this.activateAncestors(claimed.node_id)
+      } catch {
+        /* activation is coordination sugar; executor updates will retry it */
+      }
     }
     // The claim transaction skips pending items of archived members (store
     // side); when that drained the queue the run may be derivable now.
@@ -971,13 +1060,21 @@ export class OmtCore {
     }
     this.requireRun(runId)
     const node = this.requireNode(nodeId)
-    if (node.archived) {
+    const executable = isRunMemberNodeType(node.type)
+    // Preserve the archived-ticket rejection while allowing legacy archived
+    // containers to reach the quarantine path below.
+    if (node.archived && executable) {
       throw new OmtError('CONFLICT', `${nodeId} 已归档，无法接受 report`)
     }
     const item = this.store.getRunItem(runId, nodeId)
     if (item === undefined) throw new OmtError('NOT_FOUND', `run ${runId} has no item for node: ${nodeId}`)
     if (!isRunItemInFlight(item.state)) {
       throw new OmtError('CONFLICT', `only in-flight items can report (${nodeId} is ${item.state})`)
+    }
+    // Upgrade safety: pre-filter runs may still contain an in-flight hierarchy
+    // container. Quarantine the item without writing its status/body.
+    if (!executable) {
+      return { item: await this.transitionItem(runId, nodeId, 'skipped'), node }
     }
 
     const noteText = note !== undefined && note.trim() !== '' ? note : undefined
@@ -1172,6 +1269,19 @@ export class OmtCore {
   private requireNode(id: string): OmtNode {
     const node = this.store.getNode(id)
     if (node === undefined) throw new OmtError('NOT_FOUND', `unknown node: ${id}`)
+    return node
+  }
+
+  /** Run items are executable, writable task nodes; hierarchy containers are context only. */
+  private requireRunMemberNode(id: string): OmtNode {
+    const node = this.requireNode(id)
+    if (!isRunMemberNodeType(node.type)) {
+      throw new OmtError('INVALID_INPUT', `run member ${id} must be an executable ticket/subticket (${node.type} is context only)`)
+    }
+    // Archived nodes are read-only, so they could never accept a report.
+    if (node.archived) {
+      throw new OmtError('INVALID_INPUT', `run member ${id} is archived (已归档成员不能加入 run；请先恢复)`)
+    }
     return node
   }
 

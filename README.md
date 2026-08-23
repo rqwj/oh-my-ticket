@@ -1,12 +1,14 @@
 # Oh-My-Ticket (OMT)
 
-![version](https://img.shields.io/badge/version-0.3.0-blue)
-![tests](https://img.shields.io/badge/tests-323%20passing-brightgreen)
+![version](https://img.shields.io/badge/version-0.4.1-blue)
+![tests](https://img.shields.io/badge/tests-344%20passing-brightgreen)
 ![platform](https://img.shields.io/badge/platform-DeepSeek%20Harness-purple)
+![dsh](https://img.shields.io/badge/DeepSeek%20Harness%20tested-0.1.1--rc.1-blue)
 
 **DSH 的 ticket 管理插件**：`Epic → Story → [SubStory] → Ticket → [SubTicket]` 五级任务体系，
 SQLite 存元数据与层级关系，Markdown 存正文。ticket 随项目走（`.omt/` 目录可直接进 git），
-模型通过工具创建/推进，人通过三种可切换的 UI 展现方式浏览与管理。
+模型通过工具创建/推进，人通过三种可切换的 UI 展现方式浏览与管理；
+run 机制支持把一批 ticket 交给模型批量执行，全程有状态机、进度与信任策略兜底。
 插件启用后，完整 OMT 操作规范默认写入系统提示，不必先 load `omt` skill。
 设置页可追加约定，并从已装 skill 勾选拆票 skill；实质性开发（新功能 / 重新对接 / 改造）以及提到 ticket / 拆任务 / 节点 id 时进入 OMT 阶段并 load 绑定 skill。
 
@@ -14,7 +16,7 @@ SQLite 存元数据与层级关系，Markdown 存正文。ticket 随项目走（
 
 ## ✨ 功能特性
 
-### 三种展现方式，一键切换（STORY-0006）
+### 三种展现方式，一键切换
 
 同一份 ticket 树，三种外壳共享同一套过滤/排序/搜索交互：
 
@@ -25,7 +27,8 @@ SQLite 存元数据与层级关系，Markdown 存正文。ticket 随项目走（
 ### 完整的树交互
 
 - 类型徽章（E/S/SS/T/ST）、状态点（归档空心化）、优先级信号条（P1–P3 渐强着色）
-- 搜索、类型/状态/优先级多选过滤、优先级排序、编号显示开关
+- 搜索、类型/状态/优先级多选过滤、优先级排序、编号显示开关；过滤器状态
+  自动保存到工作区 `.omt/ui-filters.json`，刷新自动恢复，面板内一键重置
 - 归档独立维度（与生命周期状态正交，归档只读）、折叠状态跨会话记忆
 - 窄视口适配（<640px 抽屉全宽、拖拽把手退役）、键盘焦点环规范
 - 变更即时推送：自有 SSE 通道（`/omt/events`），模型改完 UI 立刻刷新
@@ -49,6 +52,20 @@ SQLite 存元数据与层级关系，Markdown 存正文。ticket 随项目走（
 - 创建 Epic 时弹窗选择归属；id 跨 home 全局唯一
 - 树跟随当前会话的工作区自动切换
 
+### Run 批量执行
+
+把一批 Ticket/SubTicket 快照成有序 run，交给模型逐项认领、执行、如实报告：
+
+- **item 状态机**：`pending → running → done / failed / blocked / skipped / interrupted`，
+  另有信任策略态 `awaiting_confirmation`——非 report 的裸 done 需人在 run 详情确认或打回
+- **续跑**：run 可 pause/resume，interrupted 项 retry 后重新入队；idle 续跑 nudge 自动提醒
+- **UI 联动**：Runs 区块展示列表/详情/进度统计，树行"▸▸"一键加入 run；
+  从 UI 触发「开始执行」会自动唤醒执行会话进入 claim 循环
+- **执行上下文注入**：claim 成功即时读取祖先链（Epic → Story → SubStory → 父 Ticket）
+  正文作为只读背景返回，16 KiB 预算内最近父级优先，截断显式标记，单点读取失败降级不阻塞
+- **祖先激活**：ticket 开工（置 in_progress 或 claim 成功）自动点亮仍为 open 的
+  祖先链；done/blocked/skipped 祖先永不重开，归档祖先静默跳过
+
 ## 🤖 模型工具
 
 | 工具 | 用途 |
@@ -59,21 +76,29 @@ SQLite 存元数据与层级关系，Markdown 存正文。ticket 随项目走（
 | `omt_update` | 标题/状态/优先级/归档，替换正文或追加进度记录 |
 | `omt_move` | 移动节点（连同子树） |
 | `omt_reindex` | 磁盘 markdown 手工修改后重建 SQLite 索引 |
+| `omt_run_create` | 创建 run：按顺序快照 Ticket/SubTicket 为执行批次 |
+| `omt_run_list` | 列出 run（状态过滤 + 成员进度统计） |
+| `omt_run_show` | 查看 run 详情：配置、成员状态、执行者谱系、attempts、last_error |
+| `omt_run_control` | start / pause / resume / cancel / retry(nodeId) / remove(nodeId) |
+| `omt_run_claim` | 原子认领下一项并绑定执行者；返回只读祖先上下文，激活 open 祖先 |
+| `omt_run_report` | 报告单项结果（done/failed/blocked/skipped），note 记入 ticket 进度 |
 
-另附带内嵌 `omt` skill：向模型教授 ticket 体系的操作规范与状态流转约定。
+内嵌两个 skill：`omt` 教 ticket 体系操作规范与状态流转约定，`omt-runs` 教
+run 批次纪律（创建/认领/报告/续跑响应）。
 
 ## 📦 安装
 
 ```sh
 # 本仓库构建并打包（首次需先链接 DSH checkout，见「开发」一节）：
-pnpm install && pnpm build && npm pack    # → oh-my-ticket-0.3.0.tgz
+pnpm install && pnpm build && npm pack    # → oh-my-ticket-0.4.1.tgz
 
 # 安装进目标 DSH profile（profile 的 dsh.profile.bundles 依次为）：
 #   @deepseek-ai/dsh-base, @deepseek-ai/dsh-web-app, oh-my-ticket
-pnpm dsh plugin --profile <profile> add /path/to/oh-my-ticket-0.3.0.tgz
+pnpm dsh plugin --profile <profile> add /path/to/oh-my-ticket-0.4.1.tgz
 ```
 
 在工作区根目录 `mkdir .omt` 即可让该项目拥有独立的 ticket 库（随项目进 git）。
+安装/升级后需重启 `dsh web` 进程，新版本的工具与 UI 才会生效。
 
 ## 🛠 开发
 
@@ -103,7 +128,7 @@ pnpm install
 pnpm build        # lib/index.js（host 半）+ lib/client.js（浏览器半）
 pnpm watch        # 增量重建
 pnpm typecheck    # tsc --noEmit
-pnpm test         # vitest（115 例）
+pnpm test         # vitest（344 例）
 ```
 
 ### 仓库结构
@@ -113,14 +138,19 @@ pnpm test         # vitest（115 例）
 ├── cordis.patch.yml      # 组合层：insert omt 行
 ├── tsdown.config.ts      # host 半 + client bundle 构建
 ├── src/
-│   ├── index.ts          # host 插件入口（home 解析 + core 装配 + 工具注册）
-│   ├── host/             # 数据核心：core/store/markdown/files/pool/rpc/events/tools/skill
+│   ├── index.ts          # host 插件入口（home 解析 + core 装配 + 工具/skill/hook 注册）
+│   ├── host/
+│   │   ├── core/store/markdown/files/pool   # 数据核心：SQLite + Markdown 双写、多 home 池
+│   │   ├── rpc/events/changes               # 浏览器通道：RPC 端点 + SSE 变更推送
+│   │   ├── tools/skill                      # omt_* 工具面 + omt / omt-runs skill
+│   │   ├── running/recent/idle-hook/disposed-hook/notify-hook   # 执行态与提醒
+│   │   └── ui-state.ts                      # 过滤器持久化（ui-filters.json）
 │   └── client/
 │       ├── index.ts      # 浏览器半入口（slot 注册装配）
 │       ├── controller.ts # snapshot stores 与全部异步流
 │       └── components/   # TicketPanel（共享树面板）+ Drawer/FloatWindow/TicketTab 三壳
-│                         # + DocPanel/ToggleButton/ActiveDock/ReferencedBar/TurnTickets 等
-├── tests/                # vitest 单测（115 例）
+│                         # + DocPanel/RunsView/RunPicker/TurnTickets 等
+├── tests/                # vitest 单测（27 文件 / 344 例）
 └── .omt/tickets/         # 本项目的 ticket 库（SQLite 索引已 gitignore，可 omt_reindex 重建）
 ```
 

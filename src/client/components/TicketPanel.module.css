@@ -286,6 +286,11 @@ button.filterChip:global(.omt-type-subticket) {
   margin: 0 2px;
 }
 
+/* Reset sits at the very end of the filter rows, pushed to the right edge. */
+.filterReset {
+  margin-left: auto;
+}
+
 .rowId {
   flex: none;
   font-size: var(--dsw-font-xxxs-11-font-size);

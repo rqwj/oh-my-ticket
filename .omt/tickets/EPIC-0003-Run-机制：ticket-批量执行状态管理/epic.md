@@ -115,9 +115,11 @@ run_items: run_id, node_id, position, state(pending/running/done/failed/blocked/
 
 - [STORY-0010 run 数据核心与状态机](STORY-0010-run-数据核心与状态机/story.md) — done
 - [STORY-0011 run 工具面与节点状态扩展](STORY-0011-run-工具面与节点状态扩展/story.md) — done
-- [STORY-0012 执行保障三层 hook](STORY-0012-执行保障三层-hook/story.md) — open
-- [STORY-0013 run UI](STORY-0013-run-UI/story.md) — open
-- [STORY-0014 skill 拆分渐进加载（omt / omt-runs）](STORY-0014-skill-拆分渐进加载（omt-omt-runs）/story.md) — open
+- [STORY-0012 执行保障三层 hook](STORY-0012-执行保障三层-hook/story.md) — done
+- [STORY-0013 run UI](STORY-0013-run-UI/story.md) — done
+- [STORY-0014 skill 拆分渐进加载（omt / omt-runs）](STORY-0014-skill-拆分渐进加载（omt-omt-runs）/story.md) — done
+- [STORY-0017 层级语义与 Run 执行上下文](STORY-0017-层级语义与-Run-执行上下文/story.md) — done
+- [STORY-0022 父级状态联动（祖先激活）](STORY-0022-父级状态联动（祖先激活）/story.md) — open
 <!-- /omt:children -->
 
 

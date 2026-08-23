@@ -50,6 +50,17 @@ ticket 按工作区归属：当前工作区根目录下存在 \`.omt/\` 时使�
 - 只有 epic 可以没有父节点；SubStory/SubTicket 各最多一层，不可再嵌套。
 - 非法挂载会被工具拒绝——不要重试同样的挂载，改用合法层级。
 
+## 内容边界
+
+- **Epic**：描述总体目标、范围、非目标、全局约束与成功标准；不写具体执行步骤。
+- **Story/SubStory**：描述一个可独立验收的产品或系统能力、使用者、共享规则与
+  边界。默认按能力拆分，不按前端/Host/数据库等技术模块机械拆分。
+- **Ticket/SubTicket**：描述一次认领可完成、可独立报告的单一结果、工作范围、
+  依赖与验收标准。一个 Ticket 可以跨多个技术层，但不能包含多个可独立交付结果。
+- **上下文继承**：不要在 Ticket 中复制 Epic/Story 的父级背景；父级已有的目标、
+  范围和共享约束由 run claim 在执行时注入。Ticket 只写相对父级新增的具体任务信息。
+- 创建节点时按上述边界组织正文；省略 body 时，默认模板会为不同节点类型提供对应章节。
+
 ## 工具
 
 | 工具 | 用途 |
@@ -71,6 +82,9 @@ ticket 按工作区归属：当前工作区根目录下存在 \`.omt/\` 时使�
 - **状态流转**：开始处理时将状态置为 in_progress；完成时把关键结论通过
   omt_update 的 append 追加到正文（进度记录），并将状态置为 done；
   做不下去置 blocked（外部条件阻塞）、必须跳过置 skipped，均附 append 说明。
+  ticket 置 in_progress（或 run 认领成功）时，系统会自动把祖先链中仍为 open
+  的父 Ticket/SubStory/Story/Epic 一并置为 in_progress——不要手动改父级状态，
+  也不要重开已 done/blocked/skipped 的父级。
 - **归档是独立维度**（archived=true/false），与状态（open/in_progress/done/
   blocked/skipped）正交；归档节点只读——除恢复外的修改都会被拒绝，先恢复再改。
 - **实质性开发先建单**：新功能 / 重新对接 / 改造 / 非琐碎实现，先 omt_create
@@ -108,8 +122,9 @@ run 是 ticket 的批量执行机制：一次做完一批 ticket，有队列、�
 
 ## 概念模型
 
-- **run = 任意 ticket 的有序快照**：创建时把成员 ticket（可跨 Story/Epic
-  挑选）按执行顺序快照进 run；此后 run 与 ticket 树不维持结构链接。
+- **run = Ticket/SubTicket 的有序快照**：创建时把可执行成员（可跨
+  Story/Epic 挑选）按执行顺序快照进 run；Epic/Story/SubStory 只提供背景与
+  选择范围，绝不作为可认领 item。此后 run 与 ticket 树不维持结构链接。
   同一 ticket 可同时属于多个活跃 run；所有成员必须同属一个 OMT home。
 - **item 状态机**：\`pending → running → done / failed / blocked / skipped /
   interrupted\`；另有 \`awaiting_confirmation\`（见「信任策略」）。
@@ -123,6 +138,23 @@ run 是 ticket 的批量执行机制：一次做完一批 ticket，有队列、�
 - **run 终态**：\`completed\`（全 done/skipped）/ \`completed_with_failures\`
   （含 failed 或 interrupted 项）/ \`canceled\` / \`interrupted\`。
   run 本身没有 failed；\`interrupted\` 不是绝对终态——可 resume 回 running 续跑。
+
+## 执行上下文
+
+- \`omt_run_claim\` 在 claim 成功后立即读取各节点最新正文（这是即时读取，
+  不是跨文件原子快照），按层级顺序返回所有祖先（\`Epic → Story → [SubStory]
+  → [父 Ticket]\`），并单独返回当前 Ticket/SubTicket 的完整用户正文
+  （不含插件管理的子节点清单，避免注入兄弟节点或子树）。
+- 祖先内容是**只读背景**：用于理解目标、范围与共享约束；不要执行、更新或
+  report 任何祖先节点。只执行和报告“当前 Ticket/SubTicket”。
+- claim 不注入兄弟节点或整个子树，也不使用 run 创建时的旧快照；父级正文修改后，
+  后续 claim 会看到最新内容。单个祖先读取失败时，结果会标记该节点并保留其余可读
+  背景和当前执行项；按提示用 \`omt_show\` 补读失败节点。
+- 祖先正文超出预算时会显示截断标记，并优先保留离当前执行项最近的父级背景；
+  不要把截断内容误当成完整约束，必要时用 \`omt_show\` 读取对应父节点。
+- **祖先激活**：claim 成功会兜底把祖先链中仍为 open 的节点置为 in_progress
+  （执行者随后置 in_progress 也会触发同一级联）。这是系统行为：不要手动升级
+  或降级父级状态，也不要把祖先的 in_progress 当成需要你执行的任务。
 
 ## 工具
 

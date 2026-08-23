@@ -78,11 +78,59 @@ export function stripChildrenBlock(body: string): string {
 export function defaultBody(type: string): string {
   switch (type) {
     case 'epic':
-      return '## 目标\n\n\n\n## 范围\n'
+      return [
+        '## 总体目标',
+        '',
+        '',
+        '## 范围',
+        '',
+        '',
+        '## 非范围',
+        '',
+        '',
+        '## 全局约束',
+        '',
+        '',
+        '## 成功标准',
+        '',
+      ].join('\n')
     case 'story':
     case 'substory':
-      return '## 描述\n\n\n\n## 验收标准\n'
+      return [
+        '## 能力结果',
+        '',
+        '',
+        '## 使用者或调用方',
+        '',
+        '',
+        '## 范围',
+        '',
+        '',
+        '## 非范围',
+        '',
+        '',
+        '## 共享规则与约束',
+        '',
+        '',
+        '## 验收标准',
+        '',
+      ].join('\n')
     default:
-      return '## 描述\n\n\n\n## 验收标准\n\n\n\n## 进度记录\n'
+      return [
+        '## 交付结果',
+        '',
+        '',
+        '## 工作范围',
+        '',
+        '',
+        '## 依赖',
+        '',
+        '',
+        '## 验收标准',
+        '',
+        '',
+        '## 进度记录',
+        '',
+      ].join('\n')
   }
 }

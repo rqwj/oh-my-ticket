@@ -145,3 +145,42 @@ it('skills returns catalog rows plus missing binds', async () => {
     { name: 'gone', description: '', bound: true, missing: true },
   ])
 })
+
+it('filters-get defaults and filters-set persists to <home>/ui-filters.json (STORY-0023)', async () => {
+  const signal = new AbortController().signal
+  const fresh = await handler('filters-get', {}, signal)
+  expect(fresh.ok).toBe(true)
+  expect(fresh.value).toEqual({
+    query: '', showArchived: false, types: [], statuses: [], priorities: [], showId: false, sortOrder: 'none',
+  })
+
+  const saved = await handler('filters-set', {
+    filters: { query: '登录', statuses: ['open', 'in_progress'], sortOrder: 'priority-desc' },
+  }, signal)
+  expect(saved.ok).toBe(true)
+  expect(saved.value).toEqual({
+    query: '登录', showArchived: false, types: [], statuses: ['open', 'in_progress'], priorities: [], showId: false, sortOrder: 'priority-desc',
+  })
+
+  const reloaded = await handler('filters-get', {}, signal)
+  expect(reloaded.value).toEqual(saved.value)
+
+  const { readFile } = await import('node:fs/promises')
+  const onDisk = JSON.parse(await readFile(join(home, 'ui-filters.json'), 'utf8'))
+  expect(onDisk.query).toBe('登录')
+  expect(onDisk.sortOrder).toBe('priority-desc')
+})
+
+it('filters-set rejects unknown fields and invalid values; corrupt files degrade to defaults', async () => {
+  const signal = new AbortController().signal
+  const junk = await handler('filters-set', { filters: { sortOrder: 'sideways' } }, signal)
+  expect(junk.ok).toBe(false)
+  expect(junk.error.message).toContain('INVALID_INPUT')
+
+  const { writeFile } = await import('node:fs/promises')
+  await writeFile(join(home, 'ui-filters.json'), '{not json', 'utf8')
+  const degraded = await handler('filters-get', {}, signal)
+  expect(degraded.ok).toBe(true)
+  expect(degraded.value.query).toBe('')
+  expect(degraded.value.sortOrder).toBe('none')
+})

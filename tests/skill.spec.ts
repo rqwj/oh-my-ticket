@@ -73,6 +73,18 @@ describe('omt skill: node-status enum extension and runs routing', () => {
     expect(OMT_SKILL_CONTENT).toContain('omt-runs')
     expect(OMT_SKILL_CONTENT).toMatch(/批量执行/)
   })
+
+  it('defines distinct Epic/Story/Ticket content contracts and avoids copied context', () => {
+    expect(OMT_SKILL_CONTENT).toMatch(/Epic.*总体目标.*范围.*非目标.*全局约束.*成功标准/s)
+    expect(OMT_SKILL_CONTENT).toMatch(/Story.*独立验收.*产品或系统能力/s)
+    expect(OMT_SKILL_CONTENT).toMatch(/Ticket.*一次认领.*单一结果/s)
+    expect(OMT_SKILL_CONTENT).toMatch(/不要.*复制.*父级背景/s)
+  })
+
+  it('teaches automatic ancestor activation on ticket start', () => {
+    expect(OMT_SKILL_CONTENT).toMatch(/自动把祖先链中仍为 open/s)
+    expect(OMT_SKILL_CONTENT).toMatch(/不要手动改父级状态/s)
+  })
 })
 
 describe('omt-runs skill: routing description', () => {
@@ -110,6 +122,26 @@ describe('omt-runs skill: content conventions', () => {
     expect(OMT_RUNS_SKILL_CONTENT).toMatch(/done.*failed.*blocked.*skipped/s)
     expect(OMT_RUNS_SKILL_CONTENT).toContain('omt_run_claim')
     expect(OMT_RUNS_SKILL_CONTENT).toContain('omt_run_report')
+  })
+
+  it('limits executable members to Ticket/SubTicket and keeps hierarchy containers as context', () => {
+    expect(OMT_RUNS_SKILL_CONTENT).toContain('Ticket/SubTicket')
+    expect(OMT_RUNS_SKILL_CONTENT).toContain('Epic/Story/SubStory')
+    expect(OMT_RUNS_SKILL_CONTENT).toContain('绝不作为可认领 item')
+  })
+
+  it('teaches claim-time live ancestor context and read-only execution boundaries', () => {
+    expect(OMT_RUNS_SKILL_CONTENT).toMatch(/claim.*最新.*Epic.*Story.*SubStory/s)
+    expect(OMT_RUNS_SKILL_CONTENT).toContain('只读背景')
+    expect(OMT_RUNS_SKILL_CONTENT).toContain('当前 Ticket/SubTicket')
+    expect(OMT_RUNS_SKILL_CONTENT).toContain('完整用户正文')
+    expect(OMT_RUNS_SKILL_CONTENT).toMatch(/祖先读取失败.*保留/s)
+    expect(OMT_RUNS_SKILL_CONTENT).toMatch(/截断.*最近/s)
+  })
+
+  it('teaches claim-time ancestor activation as system behavior', () => {
+    expect(OMT_RUNS_SKILL_CONTENT).toMatch(/claim 成功会兜底把祖先链中仍为 open/s)
+    expect(OMT_RUNS_SKILL_CONTENT).toContain('祖先激活')
   })
 
   it('teaches the trust policy (awaiting_confirmation) and nudge behavior', () => {

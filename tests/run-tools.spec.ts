@@ -256,6 +256,110 @@ describe('TICKET-0058 omt_run_claim', () => {
     expect(renderText('omt_run_claim', { id: run.id }, claimed)).toContain(ids[0]!)
   })
 
+  it('returns the latest ancestor bodies as read-only context and the full current ticket', async () => {
+    const epic = await tool('omt_create').execute({ type: 'epic', title: '运行平台', body: 'Epic 全局目标' }, NO_EXEC)
+    const story = await tool('omt_create').execute({ type: 'story', title: '批量执行', parentId: epic.id, body: 'Story 初始约束' }, NO_EXEC)
+    const substory = await tool('omt_create').execute({ type: 'substory', title: '失败恢复', parentId: story.id, body: 'SubStory 局部规则' }, NO_EXEC)
+    const parentTicket = await tool('omt_create').execute({ type: 'ticket', title: '实现重试', parentId: substory.id, body: '父 Ticket 约束' }, NO_EXEC)
+    const subticket = await tool('omt_create').execute({ type: 'subticket', title: '重试校验', parentId: parentTicket.id, body: 'SubTicket 完整任务\n\n## 验收标准\n- 重试成功' }, NO_EXEC)
+    const run = await startedRun([subticket.id])
+    await tool('omt_update').execute({ id: story.id, body: 'Story 最新约束' }, NO_EXEC)
+
+    const claimed = await tool('omt_run_claim').execute({ id: run.id }, agentExec('sess-context'))
+
+    expect(claimed.context.ancestors.map((entry: any) => entry.node.id)).toEqual([epic.id, story.id, substory.id, parentTicket.id])
+    expect(claimed.context.ancestors.map((entry: any) => entry.body)).toEqual([
+      'Epic 全局目标',
+      'Story 最新约束',
+      'SubStory 局部规则',
+      '父 Ticket 约束',
+    ])
+    expect(claimed.context.read_errors).toEqual([])
+    expect(claimed.context.current.node.id).toBe(subticket.id)
+    expect(claimed.context.current.body).toContain('SubTicket 完整任务')
+    expect(claimed.context.ancestors.every((entry: any) => !entry.body.includes('omt:children'))).toBe(true)
+    const rendered = renderText('omt_run_claim', { id: run.id }, claimed)
+    expect(rendered).toMatch(/背景（只读，不可执行）/)
+    expect(rendered).toMatch(/当前执行项（唯一可执行、可报告）/)
+    expect(rendered).toContain('Story 最新约束')
+    expect(rendered).toContain('SubTicket 完整任务')
+  })
+
+  it('truncates oversized ancestor bodies visibly while prioritizing the nearest parent', async () => {
+    const epicBody = `EPIC:${'界'.repeat(12_000)}`
+    const storyBody = `STORY:${'S'.repeat(12_000)}`
+    const epic = await tool('omt_create').execute({ type: 'epic', title: '大背景', body: epicBody }, NO_EXEC)
+    const story = await tool('omt_create').execute({ type: 'story', title: '近端背景', parentId: epic.id, body: storyBody }, NO_EXEC)
+    const ticket = await tool('omt_create').execute({ type: 'ticket', title: '当前任务', parentId: story.id, body: '完整 Ticket 正文' }, NO_EXEC)
+    const run = await startedRun([ticket.id])
+
+    const claimed = await tool('omt_run_claim').execute({ id: run.id }, agentExec('sess-budget'))
+    const [epicContext, storyContext] = claimed.context.ancestors
+
+    expect(claimed.context.truncated).toBe(true)
+    expect(claimed.context.ancestor_used_bytes).toBeLessThanOrEqual(claimed.context.ancestor_budget_bytes)
+    expect(storyContext).toMatchObject({ truncated: false, original_bytes: Buffer.byteLength(storyBody) })
+    expect(storyContext.body).toBe(storyBody)
+    expect(epicContext.truncated).toBe(true)
+    expect(Buffer.byteLength(epicContext.body)).toBeLessThan(Buffer.byteLength(epicBody))
+    expect(epicContext.body).not.toContain('�')
+    expect(claimed.context.current.body).toBe('完整 Ticket 正文')
+    expect(renderText('omt_run_claim', { id: run.id }, claimed)).toContain('上下文已截断')
+  })
+
+  it('preserves the current body and readable ancestors when one ancestor file is missing', async () => {
+    const epic = await tool('omt_create').execute({ type: 'epic', title: '缺失背景', body: 'Epic 正文' }, NO_EXEC)
+    const story = await tool('omt_create').execute({ type: 'story', title: '可用背景', parentId: epic.id, body: 'Story 正文' }, NO_EXEC)
+    const ticket = await tool('omt_create').execute({ type: 'ticket', title: '仍可执行', parentId: story.id, body: '当前 Ticket 正文' }, NO_EXEC)
+    const run = await startedRun([ticket.id])
+    await rm(join(home, epic.path), { force: true })
+
+    const claimed = await tool('omt_run_claim').execute({ id: run.id }, agentExec('sess-partial-context'))
+
+    expect(claimed.context.current).toMatchObject({ node: { id: ticket.id }, body: '当前 Ticket 正文' })
+    expect(claimed.context.ancestors.map((entry: any) => entry.node.id)).toEqual([story.id])
+    expect(claimed.context.read_errors).toEqual([
+      expect.objectContaining({ node: expect.objectContaining({ id: epic.id }), error: expect.stringMatching(/node file missing/i) }),
+    ])
+    expect(claimed.context_error).toBeUndefined()
+    const rendered = renderText('omt_run_claim', { id: run.id }, claimed)
+    expect(rendered).toContain('部分祖先上下文读取失败')
+    expect(rendered).toContain('当前 Ticket 正文')
+  })
+
+  it('keeps the claimed result visible when the current context file cannot be read', async () => {
+    const [ticketId] = await ticketFixture(1)
+    const core = await pool.coreFor(undefined)
+    const ticket = core.getNode(ticketId!)!
+    const run = await startedRun([ticket.id])
+    await rm(join(home, ticket.path), { force: true })
+
+    const claimed = await tool('omt_run_claim').execute({ id: run.id }, agentExec('sess-missing-context'))
+
+    expect(claimed).toMatchObject({
+      claimed: true,
+      item: { node_id: ticket.id, state: 'running', executor_session_id: 'sess-missing-context' },
+    })
+    expect(claimed.context).toBeUndefined()
+    expect(claimed.context_error).toMatch(/node file missing|ENOENT|no such file/i)
+    expect(renderText('omt_run_claim', { id: run.id }, claimed)).toContain('执行上下文读取失败')
+  })
+
+  it('claim alone activates open ancestors without executor bookkeeping', async () => {
+    const epic = await tool('omt_create').execute({ type: 'epic', title: '联动平台', body: 'E' }, NO_EXEC)
+    const story = await tool('omt_create').execute({ type: 'story', title: '联动批次', parentId: epic.id, body: 'S' }, NO_EXEC)
+    const ticket = await tool('omt_create').execute({ type: 'ticket', title: '联动任务', parentId: story.id, body: 'T' }, NO_EXEC)
+    const run = await startedRun([ticket.id])
+    const core = await pool.coreFor(undefined)
+
+    const claimed = await tool('omt_run_claim').execute({ id: run.id }, agentExec('sess-activation'))
+    expect(claimed.claimed).toBe(true)
+
+    expect(core.getNode(epic.id)?.status).toBe('in_progress')
+    expect(core.getNode(story.id)?.status).toBe('in_progress')
+    expect(core.getNode(ticket.id)?.status).toBe('open')
+  })
+
   it('two concurrent claims never receive the same item; empty queue is an explicit signal', async () => {
     const ids = await ticketFixture(2)
     const run = await startedRun(ids)

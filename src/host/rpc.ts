@@ -15,9 +15,11 @@
  *   run-list    {}                                 → { runs: RunSummary[] } (progress/stalled/grouping flags)
  *   run-show    { id }                             → { run: RunSummary & config, items: RunItemView[] }
  *   run-control { id, action, nodeId? }            → start/pause/resume/cancel/retry/remove
- *   run-create  { nodeIds, title? }                → 一键直建（默认配置，子树收集）
- *   run-add     { id, nodeIds }                    → 加入既有 run（去重/跳过/home 校验）
+ *   run-create  { nodeIds, title? }                → 一键直建（默认配置，收集子树中的 ticket）
+ *   run-add     { id, nodeIds }                    → 加入既有 run（只收集 ticket，去重/跳过/home 校验）
  *   run-confirm { id, nodeId, decision }           → awaiting_confirmation 确认/打回
+ *   filters-get { sessionId? }                     → SavedFilters（缺失/损坏回退默认）
+ *   filters-set { sessionId?, filters }            → 校验合并后持久化到 <home>/ui-filters.json
  */
 import { z } from 'zod'
 import type { Context } from '@deepseek-ai/cordis'
@@ -35,6 +37,7 @@ import {
   isRunActive,
   isRunHistory,
   isRunItemStalled,
+  isRunMemberNodeType,
   OmtError,
   RUN_ITEM_STATES,
   STATUSES,
@@ -99,14 +102,14 @@ const runControlPayloadSchema = z.object({
   ...sessionField,
 }).strict()
 const runCreatePayloadSchema = z.object({
-  /** Root nodes; each root + its whole subtree is collected (TICKET-0067). */
+  /** Scope roots; only ticket/subticket nodes in each subtree are collected. */
   nodeIds: z.array(z.string().min(1)).min(1),
   title: z.string().min(1).optional(),
   ...sessionField,
 }).strict()
 const runAddPayloadSchema = z.object({
   id: z.string().min(1),
-  /** Root nodes; each root + its whole subtree is collected (TICKET-0067). */
+  /** Scope roots; only ticket/subticket nodes in each subtree are collected. */
   nodeIds: z.array(z.string().min(1)).min(1),
   ...sessionField,
 }).strict()
@@ -114,6 +117,14 @@ const runConfirmPayloadSchema = z.object({
   id: z.string().min(1),
   nodeId: z.string().min(1),
   decision: z.enum(['confirm', 'reject']),
+  ...sessionField,
+}).strict()
+
+// ── saved tree filters (STORY-0023 UI channel) ───────────────────────────
+const filtersGetPayloadSchema = z.object({ ...sessionField }).strict()
+const filtersSetPayloadSchema = z.object({
+  /** Partial patch; the server merges onto defaults and validates the bag. */
+  filters: z.record(z.string(), z.unknown()),
   ...sessionField,
 }).strict()
 
@@ -202,13 +213,14 @@ interface MemberCollection {
 }
 
 /**
- * 加入-run collection (TICKET-0067): each root + its whole subtree in tree
- * (DFS pre-order) order. done/archived nodes are skipped and counted (their
- * children are still collected); in_progress nodes join as running ONLY
- * when the RunningRegistry holds a live mark for them (executor snapshot) —
- * an unmarked in_progress ticket is not really executing, so it joins as
- * pending and lets the run re-dispatch it. Overlapping roots dedupe via
- * `seen`.
+ * 加入-run collection (TICKET-0067): walk each root + its whole subtree in
+ * DFS pre-order, but collect only executable ticket/subticket nodes. Epic,
+ * story, and substory nodes provide context and scope; they never become run
+ * items. done/archived executable nodes are skipped and counted (their
+ * children are still visited); in_progress nodes join as running ONLY when
+ * the RunningRegistry holds a live mark for them (executor snapshot) — an
+ * unmarked in_progress ticket is re-dispatched as pending. Overlapping roots
+ * dedupe via `seen`.
  */
 function collectRunMembers(core: OmtCore, running: RunningRegistry | undefined, rootIds: readonly string[]): MemberCollection {
   const members: CollectedMember[] = []
@@ -218,19 +230,21 @@ function collectRunMembers(core: OmtCore, running: RunningRegistry | undefined, 
   const visit = (node: OmtTreeNode): void => {
     if (!seen.has(node.id)) {
       seen.add(node.id)
-      if (node.archived) {
-        skippedArchived += 1
-      } else if (node.status === 'done') {
-        skippedDone += 1
-      } else if (node.status === 'in_progress') {
-        const info = running?.get(node.id)
-        if (info !== undefined) {
-          members.push({ nodeId: node.id, state: 'running', executorSessionId: info.sessionId })
+      if (isRunMemberNodeType(node.type)) {
+        if (node.archived) {
+          skippedArchived += 1
+        } else if (node.status === 'done') {
+          skippedDone += 1
+        } else if (node.status === 'in_progress') {
+          const info = running?.get(node.id)
+          if (info !== undefined) {
+            members.push({ nodeId: node.id, state: 'running', executorSessionId: info.sessionId })
+          } else {
+            members.push({ nodeId: node.id, state: 'pending' })
+          }
         } else {
           members.push({ nodeId: node.id, state: 'pending' })
         }
-      } else {
-        members.push({ nodeId: node.id, state: 'pending' })
       }
     }
     for (const child of node.children) visit(child)
@@ -608,6 +622,21 @@ export function registerOmtRpc(ctx: Context, pool: OmtCorePool, recent?: RecentR
           }
           // The item transition already reached the hub through bridgeRunEvents.
           return ok({ run: runSummary(core, core.requireRun(id)), item: runItemView(core, item) })
+        }
+        case 'filters-get': {
+          const parsed = filtersGetPayloadSchema.safeParse(payload ?? {})
+          if (!parsed.success) return badRequest('invalid filters-get payload', parsed.error.issues)
+          const core = await coreFor(parsed.data.sessionId)
+          return ok(await core.savedFilters())
+        }
+        case 'filters-set': {
+          const parsed = filtersSetPayloadSchema.safeParse(payload)
+          if (!parsed.success) return badRequest('invalid filters-set payload', parsed.error.issues)
+          const core = await coreFor(parsed.data.sessionId)
+          // Merge the partial patch onto the saved bag so the client can
+          // send single-field updates; the merged result is fully validated.
+          const current = await core.savedFilters()
+          return ok(await core.saveSavedFilters({ ...current, ...parsed.data.filters }))
         }
         default:
           return badRequest(`unknown endpoint: ${endpoint}`, [])

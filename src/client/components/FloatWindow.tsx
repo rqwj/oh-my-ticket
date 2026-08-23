@@ -13,6 +13,7 @@ import type { ActiveInfo, TreeState } from '../store.ts'
 import type { Translate } from '../locales.ts'
 import { TicketPanel, type HeaderDragHandlers, type Selector } from './TicketPanel.tsx'
 import type { RunBindings } from './RunsView.tsx'
+import type { SavedFilters } from '../saved-filters.ts'
 import css from './FloatWindow.module.css'
 
 export interface FloatWindowProps extends RunBindings {
@@ -32,6 +33,8 @@ export interface FloatWindowProps extends RunBindings {
   readonly toggleDrawer: (sessionId?: string) => void
   readonly refreshTree: (sessionId?: string) => void
   readonly reindex: (sessionId?: string) => void
+  readonly loadFilters: (sessionId?: string) => Promise<SavedFilters>
+  readonly saveFilters: (sessionId: string | undefined, filters: SavedFilters) => Promise<void>
   readonly select: (id: string, sessionId?: string) => void
   readonly archive: (id: string, sessionId?: string) => void
   readonly createNode: import('./TicketPanel.tsx').TicketPanelProps['createNode']
@@ -161,6 +164,8 @@ export function FloatWindow(props: FloatWindowProps) {
         toggleCollapsed={props.toggleCollapsed}
         refreshTree={props.refreshTree}
         reindex={props.reindex}
+        loadFilters={props.loadFilters}
+        saveFilters={props.saveFilters}
         select={props.select}
         archive={props.archive}
         createNode={props.createNode}

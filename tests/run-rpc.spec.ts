@@ -258,20 +258,39 @@ describe('run-create', () => {
     expect(result.value.run.title).toBe('面板批次')
     expect(result.value.run.status).toBe('pending')
     expect(result.value.run.config).toBeUndefined() // list-style summary; config via run-show
-    expect(result.value.added).toEqual([story.id, open!.id, inProgress!.id])
+    expect(result.value.added).toEqual([open!.id, inProgress!.id])
     expect(result.value.addedRunning).toEqual([inProgress!.id])
     expect(result.value.skippedDone).toBe(1)
     expect(result.value.skippedArchived).toBe(1)
 
     const items = pc.runItems(result.value.run.id)
     expect(items.map(item => [item.node_id, item.state])).toEqual([
-      [story.id, 'pending'],
       [open!.id, 'pending'],
       [inProgress!.id, 'running'],
     ])
-    expect(items[2]!.executor_session_id).toBe(SESSION)
-    expect(items[2]!.started_at).toBeDefined()
+    expect(items[1]!.executor_session_id).toBe(SESSION)
+    expect(items[1]!.started_at).toBeDefined()
     expect(events.some(event => event.run?.id === result.value.run.id)).toBe(true)
+  })
+
+  it('treats epic/story/substory as context and collects only ticket/subticket work', async () => {
+    const epic = await core.create({ type: 'epic', title: '发布背景' })
+    const story = await core.create({ type: 'story', title: '执行范围', parentId: epic.id })
+    const substory = await core.create({ type: 'substory', title: '补充背景', parentId: story.id })
+    const nestedTicket = await core.create({ type: 'ticket', title: '嵌套任务', parentId: substory.id })
+    const ticket = await core.create({ type: 'ticket', title: '直接任务', parentId: story.id })
+    const subticket = await core.create({ type: 'subticket', title: '细分任务', parentId: ticket.id })
+    const pc = await pcore()
+
+    const result = await handler('run-create', { nodeIds: [epic.id], sessionId: SESSION }, new AbortController().signal)
+
+    expect(result.ok).toBe(true)
+    expect(result.value.added).toEqual([nestedTicket.id, ticket.id, subticket.id])
+    expect(pc.runItems(result.value.run.id).map(item => item.node_id)).toEqual([
+      nestedTicket.id,
+      ticket.id,
+      subticket.id,
+    ])
   })
 
   it('an in_progress ticket WITHOUT a running mark joins as pending (re-dispatch)', async () => {
@@ -284,12 +303,11 @@ describe('run-create', () => {
 
     const result = await handler('run-create', { nodeIds: [story.id], sessionId: SESSION }, new AbortController().signal)
     expect(result.ok).toBe(true)
-    expect(result.value.added).toEqual([story.id, open!.id, inProgress!.id])
+    expect(result.value.added).toEqual([open!.id, inProgress!.id])
     expect(result.value.addedRunning).toEqual([])
 
     const items = pc.runItems(result.value.run.id)
     expect(items.map(item => [item.node_id, item.state])).toEqual([
-      [story.id, 'pending'],
       [open!.id, 'pending'],
       [inProgress!.id, 'pending'],
     ])
@@ -333,7 +351,7 @@ describe('run-add', () => {
 
     const result = await handler('run-add', { id: run.id, nodeIds: [story.id], sessionId: SESSION }, new AbortController().signal)
     expect(result.ok).toBe(true)
-    expect(result.value.added).toEqual([story.id, inProgress!.id])
+    expect(result.value.added).toEqual([inProgress!.id])
     expect(result.value.addedRunning).toEqual([inProgress!.id])
     expect(result.value.duplicates).toEqual([member!.id])
     expect(result.value.skippedDone).toBe(1)
@@ -342,10 +360,9 @@ describe('run-add', () => {
     const items = pc.runItems(run.id)
     expect(items.map(item => [item.node_id, item.position, item.state])).toEqual([
       [member!.id, 0, 'pending'],
-      [story.id, 1, 'pending'],
-      [inProgress!.id, 2, 'running'],
+      [inProgress!.id, 1, 'running'],
     ])
-    expect(items[2]!.executor_session_id).toBe(SESSION)
+    expect(items[1]!.executor_session_id).toBe(SESSION)
     expect(events.some(event => event.run?.id === run.id)).toBe(true)
   })
 
