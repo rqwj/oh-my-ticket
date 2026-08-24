@@ -11,10 +11,103 @@ use std::time::{Duration, Instant};
 
 pub static COUNTER: AtomicU64 = AtomicU64::new(1);
 
+// ── daemon leak-reaper (U5d) ────────────────────────────────────────────
+//
+// U5b open question: suites that panic (or exit early) leave spawned
+// `omt-daemon` processes alive past the test process. The reaper closes
+// that leak two ways:
+//
+// 1. Every [`DaemonProcess`] kills its child on Drop — including during
+//    panic unwinding — and de-registers the pid.
+// 2. An `atexit` hook sweeps anything still registered: raw pids recorded
+//    at spawn plus every tracked runtime dir's `descriptor.json` pid
+//    (covers daemons spawned by OTHER processes, e.g. `omt daemon-start`
+//    from the CLI suites, whose Child belongs to the CLI, not to us).
+//
+// Known residual: a pid recorded but never reaped could in principle be
+// reused by an unrelated process before process-exit; the window is the
+// lifetime of one test binary and is accepted for test tooling.
+
+struct ReaperState {
+    pids: std::sync::Mutex<std::collections::HashSet<i32>>,
+    runtime_dirs: std::sync::Mutex<Vec<PathBuf>>,
+}
+
+fn reaper() -> &'static ReaperState {
+    static REAPER: std::sync::OnceLock<ReaperState> = std::sync::OnceLock::new();
+    REAPER.get_or_init(|| ReaperState {
+        pids: std::sync::Mutex::new(std::collections::HashSet::new()),
+        runtime_dirs: std::sync::Mutex::new(Vec::new()),
+    })
+}
+
+extern "C" fn reap_daemons_at_exit() {
+    let state = reaper();
+    let kill_pid = |pid: i64| {
+        if pid_alive(pid) {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(pid as i32, libc::SIGKILL);
+            }
+        }
+    };
+    if let Ok(pids) = state.pids.lock() {
+        for pid in pids.iter() {
+            kill_pid(*pid as i64);
+        }
+    }
+    if let Ok(dirs) = state.runtime_dirs.lock() {
+        for dir in dirs.iter() {
+            if let Some(descriptor) = Descriptor::read(dir) {
+                kill_pid(descriptor.pid);
+            }
+        }
+    }
+}
+
+fn install_reaper_hook() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        #[cfg(unix)]
+        unsafe {
+            let registered = libc::atexit(reap_daemons_at_exit);
+            debug_assert_eq!(registered, 0, "atexit registration failed");
+        }
+    });
+}
+
+fn reaper_track_runtime_dir(dir: PathBuf) {
+    install_reaper_hook();
+    let state = reaper();
+    state
+        .runtime_dirs
+        .lock()
+        .expect("reaper dirs lock")
+        .push(dir);
+}
+
+fn reaper_track_pid(pid: u32) -> i32 {
+    install_reaper_hook();
+    let state = reaper();
+    state.pids.lock().expect("reaper pids lock").insert(pid as i32);
+    pid as i32
+}
+
+fn reaper_forget_pid(pid: i32) {
+    let state = reaper();
+    state.pids.lock().expect("reaper pids lock").remove(&pid);
+}
+
 /// One spawned `omt-daemon` process bound to a temp runtime dir.
+///
+/// Dropping the handle KILLS the daemon (idempotent with an explicit
+/// [`DaemonProcess::kill`]) so no suite leaks a live daemon past its own
+/// scope, panic or not.
 pub struct DaemonProcess {
     child: std::sync::Mutex<Child>,
     stderr_path: PathBuf,
+    /// Registry slot handed back by the leak-reaper at spawn time.
+    reap_slot: i32,
 }
 
 impl DaemonProcess {
@@ -31,9 +124,11 @@ impl DaemonProcess {
             .stderr(Stdio::from(stderr_file))
             .spawn()
             .expect("spawn omt-daemon");
+        let reap_slot = reaper_track_pid(child.id());
         DaemonProcess {
             child: std::sync::Mutex::new(child),
             stderr_path,
+            reap_slot,
         }
     }
 
@@ -59,9 +154,11 @@ impl DaemonProcess {
             command.env(key, value);
         }
         let child = command.spawn().expect("spawn omt-daemon");
+        let reap_slot = reaper_track_pid(child.id());
         DaemonProcess {
             child: std::sync::Mutex::new(child),
             stderr_path,
+            reap_slot,
         }
     }
 
@@ -116,6 +213,18 @@ impl DaemonProcess {
     }
 }
 
+impl Drop for DaemonProcess {
+    fn drop(&mut self) {
+        // Leak-reaper primary path: kill on scope exit (also runs while a
+        // panicking test unwinds). Idempotent with an explicit kill().
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        reaper_forget_pid(self.reap_slot);
+    }
+}
+
 pub struct ExitInfo {
     pub code: Option<i32>,
     pub stderr: String,
@@ -139,6 +248,9 @@ impl TestCtx {
         std::fs::create_dir_all(&home).expect("mkdir home");
         let global_home = dir.path().join("global-home");
         std::fs::create_dir_all(&global_home).expect("mkdir global");
+        // Leak-reaper: track this runtime dir so ANY daemon publishing a
+        // descriptor here (including CLI-spawned ones) is reaped at exit.
+        reaper_track_runtime_dir(runtime_dir.clone());
         let _ = tag;
         TestCtx {
             dir,
@@ -150,6 +262,21 @@ impl TestCtx {
 
     pub fn spawn() -> TestCtx {
         TestCtx::spawn_named("t")
+    }
+
+    /// Multi-home envelope context (U5d): one temp root holding the runtime
+    /// dir plus `homes` workspace home directories named `home-NN`.
+    /// Returns the ctx and the home paths in allocation order.
+    pub fn spawn_with_homes(tag: &str, homes: usize) -> (TestCtx, Vec<PathBuf>) {
+        let mut ctx = TestCtx::spawn_named(tag);
+        let mut paths = Vec::with_capacity(homes);
+        for index in 0..homes {
+            let path = ctx.dir.path().join(format!("home-{index:02}"));
+            std::fs::create_dir_all(&path).expect("mkdir envelope home");
+            paths.push(path);
+        }
+        ctx.home = paths[0].clone();
+        (ctx, paths)
     }
 
     pub fn runtime_dir_str(&self) -> &str {

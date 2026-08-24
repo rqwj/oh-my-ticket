@@ -171,3 +171,41 @@ the blocked read) and exits 130.
 - **Windows transport** compiles as a skeleton (pipe-name derivation +
   cfg-gated stubs); peer credentials via `GetNamedPipeClientProcessId` land
   with the windows release leg (U10). All suites here run on unix.
+
+## Verification gates & benchmark tier (U5d)
+
+Blocking verification lives in `tests/envelope_gates.rs` and runs as part of
+a normal `cargo test -p omt-runtime`:
+
+- `gate_envelope_multi_client_correctness` — up to 8 homes × N nodes/home ×
+  4 concurrent authenticated clients × R runs: mixed-op storm over real
+  connections asserting zero duplicate committed commandIds, zero lost
+  accepted updates (read-your-write + gap-free revision chains), revision
+  CONFLICT exactly when a concurrent winner exists, lease-fencing negatives
+  (`lease-stale`/`lease-attempt`/`lease-token`/`actor-mismatch`/
+  `report-state-gate`), and per-home SQL invariants. Scale is env-tunable:
+  `OMT_ENV_HOMES/_NODES/_CLIENTS/_RUNS/_RUN_ITEMS/_ITERS`, or
+  `OMT_ENV_FULL=1` for the full envelope. The default is the plan's blocking
+  minimum ratio (8 × 500 nodes/home × 4 clients × 3 runs×50 items) — the
+  full envelope is fsync-bound (~400 s of seeding alone on the dev machine);
+  see `docs/runtime/bench-baseline.md`.
+- `gate_sigkill_to_ready_under_five_seconds` — SIGKILLs the daemon
+  mid-mutation, injects one `prepared` and one demoted `db_committed`
+  journal row, respawns via bootstrap and asserts readiness <5 s with full
+  convergence (journal roll-forward/replay, planned-bytes scan of every node
+  file, all pre-kill acknowledgments visible).
+- The crash-recovery kill-point grid is NOT rebuilt here — see
+  `crates/omt-storage/tests/kill_grid.rs` (53 cells) and `kill_grid_runs.rs`
+  (5 cells).
+
+Non-blocking benchmarks live in `tests/bench_tier.rs` (`#[ignore]`; run with
+`cargo test --release -p omt-runtime --test bench_tier -- --ignored
+--nocapture --test-threads=1`): b1 = 10k-command mixed stress, b2 = soak
+(`OMT_SOAK_SECONDS` overrides duration, default 1800; asserts ≥20 cmd/s
+aggregate and interactive p95 <100 ms), b3 = 100k-event resume <2 s.
+Recorded numbers: `docs/runtime/bench-baseline.md`.
+
+All suites share `tests/common`, which installs an exit reaper that kills
+any daemon process leaked by a failing test (tracked pids plus descriptor
+pids found under registered runtime dirs), so panics cannot strand
+`omt-daemon` processes.
