@@ -15,7 +15,12 @@ export type EventCursor = number;
  * Any committed event payload, discriminated by its kind constant.
  */
 export type EventPayload =
-  NodeChangedEvent | RunChangedEvent | RunItemChangedEvent | AttentionRaisedEvent | SnapshotResyncEvent;
+  | NodeChangedEvent
+  | RunChangedEvent
+  | RunItemChangedEvent
+  | AttentionRaisedEvent
+  | SnapshotResyncEvent
+  | NodeQuarantinedEvent;
 /**
  * Mirror of payload.kind carried on the envelope for cheap switching.
  */
@@ -23,7 +28,8 @@ export type EventPayload =
 /**
  * Mirror of payload.kind carried on the envelope for cheap switching.
  */
-export type EventType = "node.changed" | "run.changed" | "run.item_changed" | "attention.raised" | "snapshot.resync";
+export type EventType =
+  "node.changed" | "run.changed" | "run.item_changed" | "attention.raised" | "snapshot.resync" | "node.quarantined";
 
 /**
  * A node was created/updated/moved/archived/unarchived.
@@ -118,6 +124,26 @@ export interface SnapshotResyncEvent {
    * Stable public identifier of one OMT home. Every public reference in the protocol must be qualified with a HomeId (R4). Bare filesystem/workspace paths are DSH-adapter compatibility inputs and are resolved to a HomeId before anything crosses the wire.
    */
   homeId: string;
+  reason: string;
+  [k: string]: unknown;
+}
+/**
+ * Reindex quarantined a DB node whose Markdown file is gone (R19): identity snapshot preserved in the quarantine table; nothing silently deleted or rebound. Consumers must refresh any cached tree.
+ */
+
+/**
+ * Reindex quarantined a DB node whose Markdown file is gone (R19): identity snapshot preserved in the quarantine table; nothing silently deleted or rebound. Consumers must refresh any cached tree.
+ */
+export interface NodeQuarantinedEvent {
+  kind: "node.quarantined";
+  /**
+   * Ticket node identifier within one home, e.g. TICKET-0001, EPIC-0003.
+   */
+  nodeId: string;
+  /**
+   * Last known home-relative Markdown path of the missing member.
+   */
+  path: string;
   reason: string;
   [k: string]: unknown;
 }

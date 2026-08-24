@@ -95,8 +95,12 @@ impl Store {
     /// After a reindex, move counters past every id seen on disk.
     pub fn reset_counters(&mut self, ids: &[String]) {
         for id in ids {
-            let Some((prefix, digits)) = id.split_once('-') else { continue };
-            let Ok(seen) = digits.parse::<i64>() else { continue };
+            let Some((prefix, digits)) = id.split_once('-') else {
+                continue;
+            };
+            let Ok(seen) = digits.parse::<i64>() else {
+                continue;
+            };
             if prefix_type(prefix).is_none() {
                 continue;
             }
@@ -166,7 +170,8 @@ impl Store {
     // ── edges ────────────────────────────────────────────────────────
 
     pub fn insert_edge(&mut self, parent_id: &str, child_id: &str, ord: i64) {
-        self.edges.retain(|edge| !(edge.parent_id == parent_id && edge.child_id == child_id));
+        self.edges
+            .retain(|edge| !(edge.parent_id == parent_id && edge.child_id == child_id));
         self.edges.push(EdgeRow {
             parent_id: parent_id.to_string(),
             child_id: child_id.to_string(),
@@ -212,10 +217,13 @@ impl Store {
     // ── content search ───────────────────────────────────────────────
 
     pub fn index_node(&mut self, id: &str, title: &str, body: &str) {
-        self.search.insert(id.to_string(), SearchEntry {
-            title: title.to_string(),
-            body: body.to_string(),
-        });
+        self.search.insert(
+            id.to_string(),
+            SearchEntry {
+                title: title.to_string(),
+                body: body.to_string(),
+            },
+        );
     }
 
     /// Content search over titles and bodies: every whitespace-separated
@@ -229,9 +237,7 @@ impl Store {
         }
         let contains_token = |haystack: &str, token: &str| -> bool {
             let needle_lower = token.to_ascii_lowercase();
-            haystack
-                .to_ascii_lowercase()
-                .contains(&needle_lower)
+            haystack.to_ascii_lowercase().contains(&needle_lower)
         };
         let mut scored: Vec<(bool, String)> = self
             .search
@@ -242,7 +248,9 @@ impl Store {
                 })
             })
             .map(|(id, entry)| {
-                let title_hit = tokens.iter().all(|token| contains_token(&entry.title, token));
+                let title_hit = tokens
+                    .iter()
+                    .all(|token| contains_token(&entry.title, token));
                 (title_hit, id.clone())
             })
             .collect();
@@ -256,12 +264,7 @@ impl Store {
         self.runs.insert(run.id.clone(), run);
     }
 
-    pub fn update_run_status(
-        &mut self,
-        id: &str,
-        status: RunStatus,
-        finished_at: Option<String>,
-    ) {
+    pub fn update_run_status(&mut self, id: &str, status: RunStatus, finished_at: Option<String>) {
         if let Some(run) = self.runs.get_mut(id) {
             run.status = status;
             run.finished_at = finished_at;
@@ -300,7 +303,8 @@ impl Store {
     // ── run items ────────────────────────────────────────────────────
 
     pub fn insert_run_item(&mut self, item: RunItemRow) {
-        self.run_items.insert((item.run_id.clone(), item.node_id.clone()), item);
+        self.run_items
+            .insert((item.run_id.clone(), item.node_id.clone()), item);
     }
 
     /// Patch selected fields of one item row (`applyPatch` equivalent:
@@ -320,7 +324,10 @@ impl Store {
         started_at: Option<Option<String>>,
         finished_at: Option<Option<String>>,
     ) {
-        if let Some(item) = self.run_items.get_mut(&(run_id.to_string(), node_id.to_string())) {
+        if let Some(item) = self
+            .run_items
+            .get_mut(&(run_id.to_string(), node_id.to_string()))
+        {
             if let Some(state) = state {
                 item.state = state;
             }
@@ -352,11 +359,13 @@ impl Store {
     }
 
     pub fn get_run_item(&self, run_id: &str, node_id: &str) -> Option<&RunItemRow> {
-        self.run_items.get(&(run_id.to_string(), node_id.to_string()))
+        self.run_items
+            .get(&(run_id.to_string(), node_id.to_string()))
     }
 
     pub fn delete_run_item(&mut self, run_id: &str, node_id: &str) {
-        self.run_items.remove(&(run_id.to_string(), node_id.to_string()));
+        self.run_items
+            .remove(&(run_id.to_string(), node_id.to_string()));
     }
 
     /// Items of one run `ORDER BY position, node_id`.
@@ -408,7 +417,9 @@ impl Store {
             })
             .collect();
         rows.sort_by(|a, b| a.0.cmp(b.0));
-        rows.into_iter().map(|(_, item, status)| (item, status)).collect()
+        rows.into_iter()
+            .map(|(_, item, status)| (item, status))
+            .collect()
     }
 
     /// Atomic claim (TICKET-0058): drain unexecutable pending members to
@@ -471,13 +482,18 @@ impl Store {
                 None,
                 None,
                 None,
-                Some(started_at_preserve(self.get_run_item(run_id, node_id).and_then(|item| item.started_at.clone()), now)),
+                Some(started_at_preserve(
+                    self.get_run_item(run_id, node_id)
+                        .and_then(|item| item.started_at.clone()),
+                    now,
+                )),
                 None,
             );
         }
 
         ClaimNextResult {
-            claimed: claimed_id.map(|node_id| self.get_run_item(run_id, &node_id).cloned().unwrap()),
+            claimed: claimed_id
+                .map(|node_id| self.get_run_item(run_id, &node_id).cloned().unwrap()),
             skipped: skipped_ids
                 .into_iter()
                 .map(|node_id| self.get_run_item(run_id, &node_id).cloned().unwrap())
@@ -557,10 +573,7 @@ pub fn read_node_file(files: &mut dyn FileStore, rel_path: &str) -> Result<Parse
 }
 
 /// Build frontmatter attribute lines in `frontmatterOf` insertion order.
-pub fn frontmatter_lines(
-    node: &NodeRow,
-    parent_id: Option<&str>,
-) -> Vec<(&'static str, Value)> {
+pub fn frontmatter_lines(node: &NodeRow, parent_id: Option<&str>) -> Vec<(&'static str, Value)> {
     let mut lines: Vec<(&'static str, Value)> = vec![
         ("id", Value::String(node.id.clone())),
         ("type", Value::String(node.node_type.to_string())),

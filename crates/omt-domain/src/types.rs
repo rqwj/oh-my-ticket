@@ -59,8 +59,13 @@ pub fn prefix_type(prefix: &str) -> Option<NodeType> {
 
 /// `^(EPIC|STORY|SUBSTORY|TICKET|SUBTICKET)-(\d{4,})$`
 pub fn id_matches_pattern(id: &str) -> bool {
-    let Some((prefix, digits)) = id.split_once('-') else { return false };
-    prefix_type(prefix).is_some() && !digits.is_empty() && digits.len() >= 4 && digits.bytes().all(|b| b.is_ascii_digit())
+    let Some((prefix, digits)) = id.split_once('-') else {
+        return false;
+    };
+    prefix_type(prefix).is_some()
+        && !digits.is_empty()
+        && digits.len() >= 4
+        && digits.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Only task-bearing nodes execute inside a run (`RUN_MEMBER_NODE_TYPES`);
@@ -126,7 +131,12 @@ pub struct RunConfigValue {
 
 impl Default for RunConfigValue {
     fn default() -> Self {
-        RunConfigValue { stop_on_failure: false, auto_continue: true, auto_verify: false, concurrency: 1 }
+        RunConfigValue {
+            stop_on_failure: false,
+            auto_continue: true,
+            auto_verify: false,
+            concurrency: 1,
+        }
     }
 }
 
@@ -191,8 +201,14 @@ pub fn run_transition_allowed(from: RunStatus, to: RunStatus) -> bool {
     use RunStatus::*;
     match from {
         Pending => matches!(to, Running | Canceled),
-        Running => matches!(to, Paused | Canceled | Completed | CompletedWithFailures | Interrupted),
-        Paused => matches!(to, Running | Canceled | Completed | CompletedWithFailures | Interrupted),
+        Running => matches!(
+            to,
+            Paused | Canceled | Completed | CompletedWithFailures | Interrupted
+        ),
+        Paused => matches!(
+            to,
+            Running | Canceled | Completed | CompletedWithFailures | Interrupted
+        ),
         Interrupted => matches!(to, Running | Canceled),
         Completed => false,
         CompletedWithFailures => matches!(to, Running),
@@ -237,7 +253,10 @@ pub fn is_run_item_failure(state: RunItemState) -> bool {
 /// Paused runs let only in-flight items advance; in-flight items cannot be
 /// removed and accept reports.
 pub fn is_run_item_in_flight(state: RunItemState) -> bool {
-    matches!(state, RunItemState::Running | RunItemState::AwaitingConfirmation)
+    matches!(
+        state,
+        RunItemState::Running | RunItemState::AwaitingConfirmation
+    )
 }
 
 /// Stalled convention (TICKET-0062): pending + exhausted nudge budget IS the
@@ -248,10 +267,16 @@ pub fn is_run_item_stalled(state: RunItemState, nudge_count: i64) -> bool {
 
 /// Active runs accept members (`RUN_ACTIVE_STATUSES`): pending/running/paused.
 pub fn is_run_active(status: RunStatus) -> bool {
-    matches!(status, RunStatus::Pending | RunStatus::Running | RunStatus::Paused)
+    matches!(
+        status,
+        RunStatus::Pending | RunStatus::Running | RunStatus::Paused
+    )
 }
 
 /// History runs fold into the collapsed 历史 group.
 pub fn is_run_history(status: RunStatus) -> bool {
-    matches!(status, RunStatus::Completed | RunStatus::CompletedWithFailures | RunStatus::Canceled)
+    matches!(
+        status,
+        RunStatus::Completed | RunStatus::CompletedWithFailures | RunStatus::Canceled
+    )
 }

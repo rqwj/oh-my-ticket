@@ -8,12 +8,14 @@
 
 use std::collections::BTreeSet;
 
+use omt_contracts::{RunItemState, RunStatus};
 use omt_domain::janitor::{plan_sweep, SweepRun};
 use omt_domain::ports::{LeaseGrant, LeaseTable, MemoryLeases};
-use omt_domain::runs::{authorize_report, derive_terminal, trust_gate_gates, validate_concurrency, ReportAuthority};
-use omt_domain::types::*;
 use omt_domain::runs::ReportVerdict;
-use omt_contracts::{RunItemState, RunStatus};
+use omt_domain::runs::{
+    authorize_report, derive_terminal, trust_gate_gates, validate_concurrency, ReportAuthority,
+};
+use omt_domain::types::*;
 
 /// Deterministic LCG so failures reproduce exactly.
 struct Lcg(u64);
@@ -23,7 +25,10 @@ impl Lcg {
         Lcg(seed.wrapping_mul(2685821657736338717).wrapping_add(1))
     }
     fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         self.0 >> 11
     }
     fn below(&mut self, bound: u64) -> u64 {
@@ -58,9 +63,37 @@ const ALL_RUN_STATUSES: [RunStatus; 7] = [
 fn item_transition_matrix_matches_frozen_table() {
     // (from → allowed targets), copied from core.ts ITEM_TRANSITIONS.
     let expected: Vec<(RunItemState, Vec<RunItemState>)> = vec![
-        (RunItemState::Pending, vec![RunItemState::Running, RunItemState::Done, RunItemState::Blocked, RunItemState::Skipped]),
-        (RunItemState::Running, vec![RunItemState::Done, RunItemState::Failed, RunItemState::Blocked, RunItemState::Skipped, RunItemState::AwaitingConfirmation, RunItemState::Interrupted]),
-        (RunItemState::AwaitingConfirmation, vec![RunItemState::Done, RunItemState::Failed, RunItemState::Blocked, RunItemState::Skipped, RunItemState::Running, RunItemState::Interrupted]),
+        (
+            RunItemState::Pending,
+            vec![
+                RunItemState::Running,
+                RunItemState::Done,
+                RunItemState::Blocked,
+                RunItemState::Skipped,
+            ],
+        ),
+        (
+            RunItemState::Running,
+            vec![
+                RunItemState::Done,
+                RunItemState::Failed,
+                RunItemState::Blocked,
+                RunItemState::Skipped,
+                RunItemState::AwaitingConfirmation,
+                RunItemState::Interrupted,
+            ],
+        ),
+        (
+            RunItemState::AwaitingConfirmation,
+            vec![
+                RunItemState::Done,
+                RunItemState::Failed,
+                RunItemState::Blocked,
+                RunItemState::Skipped,
+                RunItemState::Running,
+                RunItemState::Interrupted,
+            ],
+        ),
         (RunItemState::Done, vec![]),
         (RunItemState::Failed, vec![]),
         (RunItemState::Blocked, vec![]),
@@ -83,10 +116,34 @@ fn item_transition_matrix_matches_frozen_table() {
 #[test]
 fn run_transition_matrix_matches_frozen_table() {
     let expected: Vec<(RunStatus, Vec<RunStatus>)> = vec![
-        (RunStatus::Pending, vec![RunStatus::Running, RunStatus::Canceled]),
-        (RunStatus::Running, vec![RunStatus::Paused, RunStatus::Canceled, RunStatus::Completed, RunStatus::CompletedWithFailures, RunStatus::Interrupted]),
-        (RunStatus::Paused, vec![RunStatus::Running, RunStatus::Canceled, RunStatus::Completed, RunStatus::CompletedWithFailures, RunStatus::Interrupted]),
-        (RunStatus::Interrupted, vec![RunStatus::Running, RunStatus::Canceled]),
+        (
+            RunStatus::Pending,
+            vec![RunStatus::Running, RunStatus::Canceled],
+        ),
+        (
+            RunStatus::Running,
+            vec![
+                RunStatus::Paused,
+                RunStatus::Canceled,
+                RunStatus::Completed,
+                RunStatus::CompletedWithFailures,
+                RunStatus::Interrupted,
+            ],
+        ),
+        (
+            RunStatus::Paused,
+            vec![
+                RunStatus::Running,
+                RunStatus::Canceled,
+                RunStatus::Completed,
+                RunStatus::CompletedWithFailures,
+                RunStatus::Interrupted,
+            ],
+        ),
+        (
+            RunStatus::Interrupted,
+            vec![RunStatus::Running, RunStatus::Canceled],
+        ),
         (RunStatus::Completed, vec![]),
         (RunStatus::CompletedWithFailures, vec![RunStatus::Running]),
         (RunStatus::Canceled, vec![]),
@@ -127,8 +184,7 @@ fn terminal_derivation_is_exact_over_all_state_combinations() {
                     assert_eq!(derived, None, "{first:?}+{second:?} must not derive");
                     continue;
                 }
-                let any_failure =
-                    is_run_item_failure(first) || is_run_item_failure(second);
+                let any_failure = is_run_item_failure(first) || is_run_item_failure(second);
                 let want = Some(if any_failure {
                     RunStatus::CompletedWithFailures
                 } else {
@@ -139,13 +195,25 @@ fn terminal_derivation_is_exact_over_all_state_combinations() {
         }
     }
     // Non-active statuses never participate in derivation.
-    for status in [RunStatus::Pending, RunStatus::Interrupted, RunStatus::Completed, RunStatus::CompletedWithFailures, RunStatus::Canceled] {
+    for status in [
+        RunStatus::Pending,
+        RunStatus::Interrupted,
+        RunStatus::Completed,
+        RunStatus::CompletedWithFailures,
+        RunStatus::Canceled,
+    ] {
         let all_done = vec![item(RunItemState::Done)];
         assert_eq!(derive_terminal(status, &all_done), None);
     }
     // Empty runs derive only when started (running/paused + zero items).
-    assert_eq!(derive_terminal(RunStatus::Running, &[]), Some(RunStatus::Completed));
-    assert_eq!(derive_terminal(RunStatus::Paused, &[]), Some(RunStatus::Completed));
+    assert_eq!(
+        derive_terminal(RunStatus::Running, &[]),
+        Some(RunStatus::Completed)
+    );
+    assert_eq!(
+        derive_terminal(RunStatus::Paused, &[]),
+        Some(RunStatus::Completed)
+    );
     assert_eq!(derive_terminal(RunStatus::Pending, &[]), None);
 }
 
@@ -157,12 +225,7 @@ use serde_json::json;
 /// strings, nulls and booleans are INVALID_CONCURRENCY (TICKET-0055 R9).
 #[test]
 fn concurrency_validation_accepts_exactly_positive_integers() {
-    for value in [
-        json!(1),
-        json!(2),
-        json!(64),
-        json!(9007199254740992i64),
-    ] {
+    for value in [json!(1), json!(2), json!(64), json!(9007199254740992i64)] {
         validate_concurrency(&value)
             .unwrap_or_else(|error| panic!("{value} must be accepted: {error}"));
     }
@@ -179,11 +242,14 @@ fn concurrency_validation_accepts_exactly_positive_integers() {
         json!([]),
         json!({}),
     ] {
-        let problem = validate_concurrency(&value)
-            .expect_err(&format!("{value} must be rejected"));
+        let problem = validate_concurrency(&value).expect_err(&format!("{value} must be rejected"));
         assert_eq!(problem.code, "INVALID_CONCURRENCY", "{value}");
         let details = problem.details.expect("details carry the raw value");
-        assert_eq!(details.get("value"), Some(&value), "details echo the raw value");
+        assert_eq!(
+            details.get("value"),
+            Some(&value),
+            "details echo the raw value"
+        );
     }
 }
 
@@ -203,13 +269,8 @@ fn trust_gate_gates_exactly_the_narrow_predicate() {
             for auto_verify in AUTO_VERIFY {
                 for observer in OBSERVERS {
                     for executor in EXECUTORS {
-                        let gated = trust_gate_gates(
-                            state,
-                            reported,
-                            observer,
-                            executor,
-                            auto_verify,
-                        );
+                        let gated =
+                            trust_gate_gates(state, reported, observer, executor, auto_verify);
                         let want = !reported
                             && !auto_verify
                             && state == RunItemState::Running
@@ -241,9 +302,9 @@ fn grant(attempt: i64, expires_at: i64) -> LeaseGrant {
 fn stale_or_mismatched_leases_are_denied_with_distinct_rules() {
     let now = 10_000;
     let cases: Vec<(&str, Option<LeaseGrant>, i64)> = vec![
-        ("lease-stale", Some(grant(1, 9_000)), 1),          // expired at now
-        ("lease-attempt", Some(grant(1, 20_000)), 2),       // attempt mismatch
-        ("lease-stale", None, 1),                              // nothing issued
+        ("lease-stale", Some(grant(1, 9_000)), 1), // expired at now
+        ("lease-attempt", Some(grant(1, 20_000)), 2), // attempt mismatch
+        ("lease-stale", None, 1),                  // nothing issued
     ];
     for (rule, lease_entry, attempt) in cases {
         let presented = lease_entry.clone();
@@ -251,14 +312,21 @@ fn stale_or_mismatched_leases_are_denied_with_distinct_rules() {
             RunItemState::Running,
             attempt,
             presented.as_ref(),
-            &ReportAuthority::ExecutorLease { token: "lease-session-a-1".into(), actor: "session-a".into() },
+            &ReportAuthority::ExecutorLease {
+                token: "lease-session-a-1".into(),
+                actor: "session-a".into(),
+            },
             now,
             Some("lease-session-a-1"),
         )
         .expect_err(&format!("{rule} must deny"));
         assert_eq!(verdict.code, "CONFLICT");
         assert_eq!(
-            verdict.details.as_ref().and_then(|d| d.get("rule")).and_then(|r| r.as_str()),
+            verdict
+                .details
+                .as_ref()
+                .and_then(|d| d.get("rule"))
+                .and_then(|r| r.as_str()),
             Some(rule),
         );
     }
@@ -270,13 +338,20 @@ fn stale_or_mismatched_leases_are_denied_with_distinct_rules() {
         RunItemState::Running,
         1,
         stored.as_ref(),
-        &ReportAuthority::ExecutorLease { token: "forged-token".into(), actor: "session-a".into() },
+        &ReportAuthority::ExecutorLease {
+            token: "forged-token".into(),
+            actor: "session-a".into(),
+        },
         now,
         Some("lease-session-a-1"),
     )
     .expect_err("forged token must be denied");
     assert_eq!(
-        problem.details.as_ref().and_then(|d| d.get("rule")).and_then(|r| r.as_str()),
+        problem
+            .details
+            .as_ref()
+            .and_then(|d| d.get("rule"))
+            .and_then(|r| r.as_str()),
         Some("lease-token")
     );
 
@@ -286,7 +361,10 @@ fn stale_or_mismatched_leases_are_denied_with_distinct_rules() {
         RunItemState::Running,
         1,
         valid.as_ref(),
-        &ReportAuthority::ExecutorLease { token: "lease-session-a-1".into(), actor: "session-a".into() },
+        &ReportAuthority::ExecutorLease {
+            token: "lease-session-a-1".into(),
+            actor: "session-a".into(),
+        },
         now,
         Some("lease-session-a-1"),
     ) {
@@ -300,7 +378,9 @@ fn stale_or_mismatched_leases_are_denied_with_distinct_rules() {
             RunItemState::Running,
             99,
             lease_entry.as_ref(),
-            &ReportAuthority::Administrator { reason: "human decision".into() },
+            &ReportAuthority::Administrator {
+                reason: "human decision".into(),
+            },
             now,
             None,
         ) {
@@ -317,13 +397,20 @@ fn stale_or_mismatched_leases_are_denied_with_distinct_rules() {
         RunItemState::Running,
         1,
         held.as_ref(),
-        &ReportAuthority::ExecutorLease { token: "lease-session-a-1".into(), actor: "session-z".into() },
+        &ReportAuthority::ExecutorLease {
+            token: "lease-session-a-1".into(),
+            actor: "session-z".into(),
+        },
         now,
         Some("lease-session-a-1"),
     )
     .expect_err("foreign actor must be denied");
     assert_eq!(
-        problem.details.as_ref().and_then(|d| d.get("rule")).and_then(|r| r.as_str()),
+        problem
+            .details
+            .as_ref()
+            .and_then(|d| d.get("rule"))
+            .and_then(|r| r.as_str()),
         Some("actor-mismatch")
     );
 
@@ -333,20 +420,31 @@ fn stale_or_mismatched_leases_are_denied_with_distinct_rules() {
         RunItemState::Pending,
         1,
         held.as_ref(),
-        &ReportAuthority::ExecutorLease { token: "lease-session-a-1".into(), actor: "session-a".into() },
+        &ReportAuthority::ExecutorLease {
+            token: "lease-session-a-1".into(),
+            actor: "session-a".into(),
+        },
         now,
         Some("lease-session-a-1"),
     )
     .expect_err("pending item must not accept reports");
     assert_eq!(
-        problem.details.as_ref().and_then(|d| d.get("rule")).and_then(|r| r.as_str()),
+        problem
+            .details
+            .as_ref()
+            .and_then(|d| d.get("rule"))
+            .and_then(|r| r.as_str()),
         Some("report-state-gate")
     );
 }
 
 // ── 6. sweep equivalence against the membership oracle (decision 1/2) ───
 
-const STATUSES: [RunStatus; 3] = [RunStatus::Running, RunStatus::Paused, RunStatus::Interrupted];
+const STATUSES: [RunStatus; 3] = [
+    RunStatus::Running,
+    RunStatus::Paused,
+    RunStatus::Interrupted,
+];
 const STATES: [RunItemState; 8] = ALL_ITEM_STATES;
 
 struct Fleet {
@@ -358,7 +456,11 @@ struct Fleet {
 
 fn random_fleet(rng: &mut Lcg) -> Fleet {
     let run_total = rng.below(4) as usize;
-    let mut fleet = Fleet { runs: Vec::new(), executors: Vec::new(), attempts: Vec::new() };
+    let mut fleet = Fleet {
+        runs: Vec::new(),
+        executors: Vec::new(),
+        attempts: Vec::new(),
+    };
     for run_index in 0..run_total {
         let status = STATUSES[rng.below(STATUSES.len() as u64) as usize];
         let item_count = rng.below(4) as usize;
@@ -376,8 +478,7 @@ fn random_fleet(rng: &mut Lcg) -> Fleet {
             row.attempts = rng.below(3) as i64;
             attempts.push(row.attempts);
             let has_executor = rng.below(4) > 0;
-            row.executor_session_id =
-                has_executor.then(|| format!("session-{}", rng.below(3)));
+            row.executor_session_id = has_executor.then(|| format!("session-{}", rng.below(3)));
             executors.push(row.executor_session_id.clone());
             rows.push(row);
         }
@@ -405,7 +506,10 @@ fn random_fleet(rng: &mut Lcg) -> Fleet {
 
 /// The TS-leg oracle: liveness == session-membership of RUNNING items'
 /// executors (undefined executors are always orphaned).
-fn oracle_live<'a>(fleet: &'a Fleet, live_sessions: &'a BTreeSet<String>) -> impl Fn(&str, i64) -> bool + 'a {
+fn oracle_live<'a>(
+    fleet: &'a Fleet,
+    live_sessions: &'a BTreeSet<String>,
+) -> impl Fn(&str, i64) -> bool + 'a {
     move |session_id: &str, _attempt: i64| {
         let executing_now = fleet.runs.iter().any(|sweep_run| {
             sweep_run.run.status == RunStatus::Running
@@ -422,7 +526,10 @@ fn plan_signature(plan: &omt_domain::janitor::SweepPlan) -> String {
     format!(
         "demotions={:?} interrupted_items={:?} derived={:?} interrupted_runs={:?}",
         plan.demotions,
-        plan.interrupted_items.iter().map(|row| (row.run_id.clone(), row.node_id.clone())).collect::<Vec<_>>(),
+        plan.interrupted_items
+            .iter()
+            .map(|row| (row.run_id.clone(), row.node_id.clone()))
+            .collect::<Vec<_>>(),
         plan.derived,
         plan.interrupted_runs,
     )
@@ -474,8 +581,12 @@ fn sweep_plan_is_equivalent_under_lease_and_membership_liveness() {
             }
         }
 
-        let by_leases = plan_sweep(&fleet.runs, |session, attempt| leases.lease_alive(session, attempt), now_iso)
-            .unwrap_or_else(|error| panic!("seed {seed}: {error}"));
+        let by_leases = plan_sweep(
+            &fleet.runs,
+            |session, attempt| leases.lease_alive(session, attempt),
+            now_iso,
+        )
+        .unwrap_or_else(|error| panic!("seed {seed}: {error}"));
         let by_oracle = plan_sweep(&fleet.runs, |session, _| oracle(session, 0), now_iso)
             .unwrap_or_else(|error| panic!("seed {seed}: {error}"));
         assert_eq!(
@@ -492,7 +603,9 @@ fn sweep_plan_is_equivalent_under_lease_and_membership_liveness() {
             for row in &sweep_run.items {
                 if row.state == RunItemState::Running && row.executor_session_id.is_none() {
                     assert!(
-                        by_leases.demotions.contains(&(sweep_run.run.id.clone(), row.node_id.clone())),
+                        by_leases
+                            .demotions
+                            .contains(&(sweep_run.run.id.clone(), row.node_id.clone())),
                         "seed {seed}: undefined-executor running item {}/{} must demote",
                         sweep_run.run.id,
                         row.node_id
@@ -505,18 +618,25 @@ fn sweep_plan_is_equivalent_under_lease_and_membership_liveness() {
         // (a) interrupted_items contains ONLY this sweep's demotions;
         for (_, node_id) in &by_leases.demotions {
             assert!(
-                by_leases.interrupted_items.iter().any(|row| &row.node_id == node_id),
+                by_leases
+                    .interrupted_items
+                    .iter()
+                    .any(|row| &row.node_id == node_id),
                 "demoted item {node_id} missing from interrupted_items"
             );
         }
         // (b) derived runs are exactly the candidates that ended fully-final;
         for (run_id, terminal) in &by_leases.derived {
             let sweep_run = fleet.runs.iter().find(|sr| &sr.run.id == run_id).unwrap();
-            assert!(terminal == &RunStatus::Completed || terminal == &RunStatus::CompletedWithFailures);
+            assert!(
+                terminal == &RunStatus::Completed || terminal == &RunStatus::CompletedWithFailures
+            );
             assert!(
                 sweep_run.items.iter().all(|row| {
                     is_run_item_final(row.state)
-                        || by_leases.demotions.contains(&(sweep_run.run.id.clone(), row.node_id.clone()))
+                        || by_leases
+                            .demotions
+                            .contains(&(sweep_run.run.id.clone(), row.node_id.clone()))
                 }),
                 "derived run {run_id} had unfinished items"
             );
@@ -529,7 +649,10 @@ fn sweep_plan_is_equivalent_under_lease_and_membership_liveness() {
         // (c) a candidate never appears BOTH derived and interrupted.
         for run_id in &by_leases.interrupted_runs {
             assert!(
-                !by_leases.derived.iter().any(|(derived_id, _)| derived_id == run_id),
+                !by_leases
+                    .derived
+                    .iter()
+                    .any(|(derived_id, _)| derived_id == run_id),
                 "run {run_id} both derived and interrupted (ordering violated)"
             );
         }

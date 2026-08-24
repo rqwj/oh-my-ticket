@@ -78,6 +78,17 @@
       },
       "required": ["kind", "homeId", "reason"]
     },
+    "NodeQuarantinedEvent": {
+      "type": "object",
+      "description": "Reindex quarantined a DB node whose Markdown file is gone (R19): identity snapshot preserved in the quarantine table; nothing silently deleted or rebound. Consumers must refresh any cached tree.",
+      "properties": {
+        "kind": { "type": "string", "enum": ["node.quarantined"] },
+        "nodeId": { "$ref": "common.schema.json#/$defs/NodeId" },
+        "path": { "type": "string", "description": "Last known home-relative Markdown path of the missing member." },
+        "reason": { "type": "string" }
+      },
+      "required": ["kind", "nodeId", "path", "reason"]
+    },
     "EventPayload": {
       "description": "Any committed event payload, discriminated by its kind constant.",
       "oneOf": [
@@ -85,12 +96,13 @@
         { "$ref": "#/$defs/RunChangedEvent" },
         { "$ref": "#/$defs/RunItemChangedEvent" },
         { "$ref": "#/$defs/AttentionRaisedEvent" },
-        { "$ref": "#/$defs/SnapshotResyncEvent" }
+        { "$ref": "#/$defs/SnapshotResyncEvent" },
+        { "$ref": "#/$defs/NodeQuarantinedEvent" }
       ]
     },
     "EventType": {
       "type": "string",
-      "enum": ["node.changed", "run.changed", "run.item_changed", "attention.raised", "snapshot.resync"],
+      "enum": ["node.changed", "run.changed", "run.item_changed", "attention.raised", "snapshot.resync", "node.quarantined"],
       "description": "Mirror of payload.kind carried on the envelope for cheap switching."
     },
     "EventEnvelope": {

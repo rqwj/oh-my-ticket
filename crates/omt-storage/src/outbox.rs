@@ -157,3 +157,118 @@ pub fn append_with_clock(
         &crate::clock::iso_from_ms(clock.now_ms()),
     )
 }
+
+/// Retention expiry WITH stream signaling (R11/F4, orchestrator decision 2):
+/// prune, then — when the eviction frontier passed a protected consumer —
+/// append a REAL [`EVENT_SNAPSHOT_RESYNC`] stream event so every consumer
+/// resnapshots even without polling the report. The report-only path
+/// ([`prune`]) remains available for read-only inspection.
+///
+/// The appended event is part of the durable stream: consumers resume from
+/// their cursor, see `snapshot.resync`, and rebuild from a snapshot. Its
+/// payload carries the eviction frontier and the protected cursor that was
+/// overtaken.
+pub fn prune_and_signal(
+    conn: &Connection,
+    home_id: &str,
+    retention: &Retention,
+    clock: &dyn MillisClock,
+) -> Result<PruneReport> {
+    let report = prune(conn, retention)?;
+    if !report.requires_resync {
+        return Ok(report);
+    }
+    let payload = serde_json::json!({
+        "kind": EVENT_SNAPSHOT_RESYNC,
+        "homeId": home_id,
+        "reason": format!(
+            "retention expired past consumer cursor {} (evicted through {})",
+            retention.consumer_cursor.unwrap_or(0),
+            report.pruned_through_seq
+        ),
+        "prunedThroughSeq": report.pruned_through_seq,
+        "consumerCursor": retention.consumer_cursor,
+    });
+    append_with_clock(conn, home_id, EVENT_SNAPSHOT_RESYNC, &payload, clock)?;
+    Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clock::FixedClock;
+    use crate::store::{apply_open_pragmas, create_fresh_v4};
+    use rusqlite::Connection;
+
+    fn fresh_conn() -> Connection {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        apply_open_pragmas(&conn).expect("pragmas");
+        // WAL is meaningless in-memory but the schema + pragmas match disk.
+        create_fresh_v4(&conn, "2026-08-24T05:00:00.000Z", "/tmp/test-home", None)
+            .expect("fresh v4");
+        conn
+    }
+
+    /// Decision 2: retention expiry appends a REAL snapshot.resync stream
+    /// event (queryable via resume_since), not just a report flag.
+    #[test]
+    fn prune_and_signal_appends_resync_event_when_consumer_overtaken() {
+        let clock = FixedClock::at_ms(1_787_547_600_000);
+        let conn = fresh_conn();
+        for index in 0..6 {
+            append(
+                &conn,
+                "home-1",
+                "node.changed",
+                &serde_json::json!({ "index": index }),
+                "2026-08-24T05:00:00.000Z",
+            )
+            .expect("append");
+        }
+        // Consumer has only consumed up to 2; retention keeps 3 → eviction
+        // frontier passes the cursor → requires resync AND emits the event.
+        let retention = Retention {
+            max_events: 3,
+            consumer_cursor: Some(2),
+        };
+        let report = prune_and_signal(&conn, "home-1", &retention, &clock).expect("prune+signal");
+        assert!(report.requires_resync);
+        assert_eq!(report.pruned_count, 3);
+
+        let events = resume_since(&conn, 2, 10).expect("resume");
+        assert_eq!(events.len(), 4, "3 retained + 1 appended resync event");
+        let signal = events.last().expect("resync event");
+        assert_eq!(signal.event_type, EVENT_SNAPSHOT_RESYNC);
+        assert_eq!(signal.payload["kind"], EVENT_SNAPSHOT_RESYNC);
+        assert_eq!(signal.payload["homeId"], "home-1");
+        assert_eq!(signal.payload["prunedThroughSeq"], 3);
+        assert_eq!(signal.payload["consumerCursor"], 2);
+    }
+
+    #[test]
+    fn prune_without_overtaken_cursor_stays_silent() {
+        let clock = FixedClock::at_ms(1_787_547_600_000);
+        let conn = fresh_conn();
+        for index in 0..4 {
+            append(
+                &conn,
+                "home-1",
+                "node.changed",
+                &serde_json::json!({ "index": index }),
+                "2026-08-24T05:00:00.000Z",
+            )
+            .expect("append");
+        }
+        let retention = Retention {
+            max_events: 2,
+            consumer_cursor: Some(4),
+        };
+        let report = prune_and_signal(&conn, "home-1", &retention, &clock).expect("prune");
+        assert!(!report.requires_resync);
+        let events = resume_since(&conn, 0, 10).expect("resume");
+        assert_eq!(events.len(), 2, "no extra event appended");
+        assert!(events
+            .iter()
+            .all(|event| event.event_type != EVENT_SNAPSHOT_RESYNC));
+    }
+}

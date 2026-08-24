@@ -52,7 +52,11 @@ fn load_scenarios() -> Vec<(String, Value)> {
 #[test]
 fn scenario_inventory_is_non_trivial() {
     let files = load_scenarios();
-    assert!(files.len() >= 40, "expected >= 40 scenarios, found {}", files.len());
+    assert!(
+        files.len() >= 40,
+        "expected >= 40 scenarios, found {}",
+        files.len()
+    );
 }
 
 /// One driver iterating all scenarios in deterministic filename order,
@@ -67,7 +71,10 @@ fn rust_leg_matches_frozen_corpus_zero_divergence() {
         let summary: ScenarioSummary = run_scenario(doc);
         total_checks += summary.checks;
         if summary.ok {
-            println!("PASS {:<48} — {} ({} checks)", file, summary.name, summary.checks);
+            println!(
+                "PASS {:<48} — {} ({} checks)",
+                file, summary.name, summary.checks
+            );
         } else {
             println!("FAIL {file} — {} ({} checks)", summary.name, summary.checks);
             for failure in &summary.failures {
@@ -76,11 +83,18 @@ fn rust_leg_matches_frozen_corpus_zero_divergence() {
             if std::env::var("OMT_DEBUG").is_ok() {
                 if let Some(results) = &summary.debug_results {
                     for (index, result) in results.iter().enumerate() {
-                        println!("      result[{index}] = {}", serde_json::to_string(result).unwrap_or_default());
+                        println!(
+                            "      result[{index}] = {}",
+                            serde_json::to_string(result).unwrap_or_default()
+                        );
                     }
                 }
             }
-            failed.push((file.clone(), summary.failures.len(), summary.failures.clone()));
+            failed.push((
+                file.clone(),
+                summary.failures.len(),
+                summary.failures.clone(),
+            ));
         }
     }
 

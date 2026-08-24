@@ -7,18 +7,18 @@
 //! unreachable through the public API and exists as defensive depth only.
 
 use super::error::{Problem, Result};
+use super::error::{INVALID_HIERARCHY, NOT_FOUND};
 use super::store::Store;
 use super::types::{hierarchy_allows, NodeRow, NodeType};
-use super::error::{INVALID_HIERARCHY, NOT_FOUND};
 
 /// Require an existing node or NOT_FOUND `{kind:'node', id}`.
 pub fn require_node<'a>(store: &'a Store, id: &str) -> Result<&'a NodeRow> {
-    store
-        .get_node(id)
-        .ok_or_else(|| Problem::with_details(NOT_FOUND, format!("unknown node: {id}"), |d| {
+    store.get_node(id).ok_or_else(|| {
+        Problem::with_details(NOT_FOUND, format!("unknown node: {id}"), |d| {
             d.insert("kind".into(), "node".into());
             d.insert("id".into(), id.into());
-        }))
+        })
+    })
 }
 
 /// Root creation rule: only epic may be created without a parent.

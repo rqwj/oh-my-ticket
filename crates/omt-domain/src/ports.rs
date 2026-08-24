@@ -117,7 +117,10 @@ impl LeaseTable for MemoryLeases {
     fn lease_alive(&self, session_id: &str, _attempt: i64) -> bool {
         match &self.exclusive {
             Some(live) => live.contains(session_id),
-            None => self.dynamic.get(session_id).map_or(false, |g| self.now_ms < g.expires_at),
+            None => self
+                .dynamic
+                .get(session_id)
+                .map_or(false, |g| self.now_ms < g.expires_at),
         }
     }
 

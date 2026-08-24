@@ -277,3 +277,22 @@ export interface U2SubdivisionDescriptors {
     [k: string]: unknown;
   };
 }
+/**
+ * Subdivided codes introduced by U4's storage plane (additive; each carries a coarseFallback so older clients interpret unknown codes). Open map: any key matching ^[A-Z][A-Z0-9_]+$ may appear.
+ */
+
+/**
+ * Subdivided codes introduced by U4's storage plane (additive; each carries a coarseFallback so older clients interpret unknown codes). Open map: any key matching ^[A-Z][A-Z0-9_]+$ may appear.
+ */
+export interface U4SubdivisionDescriptors {
+  /**
+   * Manual drift / ambiguous crash residue gate (U4/R19): observed on-disk content diverges from what the journaled plan wrote; nothing is overwritten — reindex first, then retry. Emitted by the recovery layer when a pending plan's target files were hand-edited while the writer was down, or when move source/target presence is ambiguous.
+   */
+  REINDEX_REQUIRED?: {
+    summary: "Observed on-disk content diverges from what the journaled plan wrote (manual drift or ambiguous crash residue); nothing was overwritten — run reindex and retry.";
+    detailsShape: "{ requiresReindex: true, commandId?: string, from?: string, to?: string } — commandId identifies the pending journal plan; from/to appear for move-drift refusals.";
+    coarseFallback: "CONFLICT";
+    stability: "stable";
+    [k: string]: unknown;
+  };
+}

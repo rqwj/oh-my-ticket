@@ -32,7 +32,11 @@ pub fn derive_terminal(status: RunStatus, items: &[RunItemRow]) -> Option<RunSta
         return None;
     }
     let failed = items.iter().any(|item| is_run_item_failure(item.state));
-    Some(if failed { RunStatus::CompletedWithFailures } else { RunStatus::Completed })
+    Some(if failed {
+        RunStatus::CompletedWithFailures
+    } else {
+        RunStatus::Completed
+    })
 }
 
 /// Trust gate (TICKET-0064) — ratified U3 semantics decision 5: the gate is
@@ -151,26 +155,41 @@ pub fn authorize_report(
         ReportAuthority::Administrator { .. } => Ok(ReportVerdict::AdminAuthorized),
         ReportAuthority::ExecutorLease { token, actor } => {
             let Some(grant) = grant else {
-                return Err(conflict_rule("lease-stale", "no live lease holds this item"));
+                return Err(conflict_rule(
+                    "lease-stale",
+                    "no live lease holds this item",
+                ));
             };
             if now_ms >= grant.expires_at {
-                return Err(conflict_rule("lease-stale", "the claiming lease has expired"));
+                return Err(conflict_rule(
+                    "lease-stale",
+                    "the claiming lease has expired",
+                ));
             }
             if grant.attempt != item_attempts {
                 return Err(conflict_rule(
                     "lease-attempt",
-                    format!("lease attempt {} is stale; item is at attempt {item_attempts}", grant.attempt),
+                    format!(
+                        "lease attempt {} is stale; item is at attempt {item_attempts}",
+                        grant.attempt
+                    ),
                 ));
             }
             if let Some(expected_token) = expected_token {
                 if expected_token != token {
-                    return Err(conflict_rule("lease-token", "presented token does not fence this item"));
+                    return Err(conflict_rule(
+                        "lease-token",
+                        "presented token does not fence this item",
+                    ));
                 }
             }
             if grant.principal != *actor {
                 return Err(conflict_rule(
                     "actor-mismatch",
-                    format!("actor {actor} does not belong to lease principal {}", grant.principal),
+                    format!(
+                        "actor {actor} does not belong to lease principal {}",
+                        grant.principal
+                    ),
                 ));
             }
             Ok(ReportVerdict::ExecutorAuthorized)

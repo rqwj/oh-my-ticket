@@ -97,7 +97,8 @@ pub fn plan_sweep(
             }
             item.state = RunItemState::Interrupted;
             item.finished_at = Some(now.to_string());
-            plan.demotions.push((candidate.run.id.clone(), item.node_id.clone()));
+            plan.demotions
+                .push((candidate.run.id.clone(), item.node_id.clone()));
             plan.interrupted_items.push(item.clone());
         }
         folded.push(run_snapshot);
@@ -105,7 +106,11 @@ pub fn plan_sweep(
 
     // ── pass two: derive terminal first, then interrupt running runs ──
     for snapshot in &folded {
-        if snapshot.items.iter().any(|item| item.state == RunItemState::Running) {
+        if snapshot
+            .items
+            .iter()
+            .any(|item| item.state == RunItemState::Running)
+        {
             continue; // still actively executed work
         }
         // The demotion may have finished the last in-flight item: derive the

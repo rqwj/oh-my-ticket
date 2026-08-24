@@ -16,8 +16,9 @@ serde_json = "1"
 # U4 storage stack (KTD3/KTD8): bundled SQLite so no system dependency exists,
 # kernel advisory file locks (fs4, guard-free flock on the lock fd) for the
 # daemon home-ownership layer, SHA-256 for journal before/after content
-# hashes, OS entropy for lock tokens / home ids.
-rusqlite = { version = "0.37", features = ["bundled"] }
+# hashes, OS entropy for lock tokens / home ids. The backup feature enables
+# the SQLite online backup API behind whole-home bundles (U4c).
+rusqlite = { version = "0.37", features = ["bundled", "backup"] }
 fs4 = "1"
 sha2 = "0.10"
 getrandom = "0.3"

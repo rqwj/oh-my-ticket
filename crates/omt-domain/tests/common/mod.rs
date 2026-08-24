@@ -26,8 +26,13 @@ use omt_domain::Problem;
 pub const MASK_PLACEHOLDER: &str = "__MASKED__";
 
 /// Volatile wall-clock stamps masked by default (envelope may override).
-pub const DEFAULT_MASK_KEYS: [&str; 5] =
-    ["created_at", "updated_at", "nudged_at", "started_at", "finished_at"];
+pub const DEFAULT_MASK_KEYS: [&str; 5] = [
+    "created_at",
+    "updated_at",
+    "nudged_at",
+    "started_at",
+    "finished_at",
+];
 
 /// Fixed nudge stamp used by the `nudge` op (masked anyway).
 pub const FIXED_NUDGE_AT: &str = "2026-08-19T00:00:00.000Z";
@@ -62,7 +67,10 @@ pub struct MemoryFiles {
 
 impl MemoryFiles {
     pub fn mount(home: &str, vfs: &Vfs) -> Rc<RefCell<MemoryFiles>> {
-        Rc::new(RefCell::new(MemoryFiles { home: home.to_string(), vfs: Rc::clone(vfs) }))
+        Rc::new(RefCell::new(MemoryFiles {
+            home: home.to_string(),
+            vfs: Rc::clone(vfs),
+        }))
     }
 
     fn key(&self, rel_path: &str) -> String {
@@ -179,9 +187,7 @@ impl FileStore for MemoryFiles {
         let mut found: Vec<String> = vfs
             .iter()
             .filter(|(key, entry)| {
-                matches!(entry, Entry::File(_))
-                    && key.starts_with(&prefix)
-                    && key.ends_with(".md")
+                matches!(entry, Entry::File(_)) && key.starts_with(&prefix) && key.ends_with(".md")
             })
             .map(|(key, _)| key[self.home.len() + 1..].to_string())
             .collect();
@@ -244,15 +250,29 @@ impl Executor {
         }
     }
 
-    fn ensure_handle(&mut self, home: &str) -> (Rc<RefCell<MemoryFiles>>, Rc<RefCell<Store>>, Rc<RefCell<MemoryLeases>>) {
-        let handle = self.homes.entry(home.to_string()).or_insert_with(|| HomeHandle {
-            files: MemoryFiles::mount(home, &self.vfs),
-            store: Rc::new(RefCell::new(Store::default())),
-            leases: Rc::new(RefCell::new(MemoryLeases::new())),
-            core: None,
-            listener: None,
-        });
-        (Rc::clone(&handle.files), Rc::clone(&handle.store), Rc::clone(&handle.leases))
+    fn ensure_handle(
+        &mut self,
+        home: &str,
+    ) -> (
+        Rc<RefCell<MemoryFiles>>,
+        Rc<RefCell<Store>>,
+        Rc<RefCell<MemoryLeases>>,
+    ) {
+        let handle = self
+            .homes
+            .entry(home.to_string())
+            .or_insert_with(|| HomeHandle {
+                files: MemoryFiles::mount(home, &self.vfs),
+                store: Rc::new(RefCell::new(Store::default())),
+                leases: Rc::new(RefCell::new(MemoryLeases::new())),
+                core: None,
+                listener: None,
+            });
+        (
+            Rc::clone(&handle.files),
+            Rc::clone(&handle.store),
+            Rc::clone(&handle.leases),
+        )
     }
 
     /// Full open flow: directories, database, reindex-if-fresh, exclusive
@@ -295,7 +315,10 @@ impl Executor {
                     if let Some(item) = &event.item {
                         sink.borrow_mut().push((
                             item.node_id.clone(),
-                            event.from_item_state.map(|s| s.to_string()).unwrap_or_default(),
+                            event
+                                .from_item_state
+                                .map(|s| s.to_string())
+                                .unwrap_or_default(),
                             item.state.to_string(),
                         ));
                     }
@@ -314,21 +337,43 @@ impl Executor {
     }
 
     pub fn active_store(&mut self) -> Rc<RefCell<Store>> {
-        Rc::clone(&self.homes.get(&self.active_home).expect("active home").store)
+        Rc::clone(
+            &self
+                .homes
+                .get(&self.active_home)
+                .expect("active home")
+                .store,
+        )
     }
 
     pub fn active_leases(&mut self) -> Rc<RefCell<MemoryLeases>> {
-        Rc::clone(&self.homes.get(&self.active_home).expect("active home").leases)
+        Rc::clone(
+            &self
+                .homes
+                .get(&self.active_home)
+                .expect("active home")
+                .leases,
+        )
     }
 
     /// Pool routing rule (option A): a workspace cwd carrying `.omt/` wins;
     /// everything else falls back to the global home.
     pub fn home_for(&self, cwd: Option<&str>) -> String {
-        let global = self.fixture.as_ref().expect("pool fixture").global_home.clone();
+        let global = self
+            .fixture
+            .as_ref()
+            .expect("pool fixture")
+            .global_home
+            .clone();
         match cwd {
             Some(cwd) => {
                 let local = join(cwd, ".omt");
-                if self.vfs.borrow().get(&local).map_or(false, |e| matches!(e, Entry::Dir)) {
+                if self
+                    .vfs
+                    .borrow()
+                    .get(&local)
+                    .map_or(false, |e| matches!(e, Entry::Dir))
+                {
                     local
                 } else {
                     global
@@ -344,7 +389,12 @@ impl Executor {
         let raw = raw?;
         let text = raw.as_str()?;
         if let Some(name) = text.strip_prefix('$') {
-            return Some(self.vars.get(name).cloned().unwrap_or_else(|| text.to_string()));
+            return Some(
+                self.vars
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| text.to_string()),
+            );
         }
         Some(text.to_string())
     }
@@ -352,7 +402,9 @@ impl Executor {
     pub fn read_virtual_file(&self, abs_path: &str) -> Result<String, String> {
         match self.vfs.borrow().get(abs_path) {
             Some(Entry::File(content)) => Ok(content.clone()),
-            _ => Err(format!("ENOENT: no such file or directory, open '{abs_path}'")),
+            _ => Err(format!(
+                "ENOENT: no such file or directory, open '{abs_path}'"
+            )),
         }
     }
 }
@@ -486,7 +538,9 @@ fn p_opt<'a>(params: &'a Map<String, Value>, key: &str) -> Option<&'a Value> {
 }
 
 fn p_opt_str(params: &Map<String, Value>, key: &str) -> Option<String> {
-    p_opt(params, key).and_then(Value::as_str).map(str::to_string)
+    p_opt(params, key)
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 fn p_opt_i64(params: &Map<String, Value>, key: &str) -> Option<i64> {
@@ -526,7 +580,9 @@ pub fn apply_op(ex: &mut Executor, op: &str, params: &Value) -> Value {
             Ok(node_value(&node))
         }),
         "move" => caught(|| {
-            let node = ex.core().move_node(p_str(p, "id"), p_str(p, "newParentId"))?;
+            let node = ex
+                .core()
+                .move_node(p_str(p, "id"), p_str(p, "newParentId"))?;
             Ok(node_value(&node))
         }),
         "show" => caught(|| {
@@ -536,7 +592,9 @@ pub fn apply_op(ex: &mut Executor, op: &str, params: &Value) -> Value {
         "list" => {
             let nodes = ex.core().list(
                 p_opt_str(p, "type").as_deref().and_then(parse_node_type),
-                p_opt_str(p, "status").as_deref().and_then(parse_node_status),
+                p_opt_str(p, "status")
+                    .as_deref()
+                    .and_then(parse_node_status),
                 p_opt_str(p, "query").as_deref(),
             );
             Value::Array(nodes.iter().map(node_value).collect())
@@ -574,9 +632,7 @@ pub fn apply_op(ex: &mut Executor, op: &str, params: &Value) -> Value {
         }
         "deleteFile" => {
             let rel = p_str(p, "path");
-            let files = Rc::clone(
-                &ex.homes.get(&ex.active_home).expect("active home").files,
-            );
+            let files = Rc::clone(&ex.homes.get(&ex.active_home).expect("active home").files);
             let outcome = files.borrow_mut().delete_file(rel);
             match outcome {
                 Ok(()) => json!({ "deleted": rel }),
@@ -592,7 +648,10 @@ pub fn apply_op(ex: &mut Executor, op: &str, params: &Value) -> Value {
                 node_ids: p_opt(p, "nodeIds")
                     .and_then(Value::as_array)
                     .map(|array| {
-                        array.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()
+                        array
+                            .iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
                     })
                     .unwrap_or_default(),
             })?;
@@ -603,7 +662,9 @@ pub fn apply_op(ex: &mut Executor, op: &str, params: &Value) -> Value {
             None => Value::Null,
         },
         "listRuns" => {
-            let status_filter = p_opt_str(p, "status").as_deref().and_then(|raw: &str| raw.parse().ok());
+            let status_filter = p_opt_str(p, "status")
+                .as_deref()
+                .and_then(|raw: &str| raw.parse().ok());
             let runs = ex.core().list_runs(status_filter);
             Value::Array(runs.iter().map(run_value).collect())
         }
@@ -611,7 +672,10 @@ pub fn apply_op(ex: &mut Executor, op: &str, params: &Value) -> Value {
             let items = ex.core().run_items(p_str(p, "runId"))?;
             Ok(Value::Array(items.iter().map(item_value).collect()))
         }),
-        "getRunItem" => match ex.core().get_run_item(p_str(p, "runId"), p_str(p, "nodeId")) {
+        "getRunItem" => match ex
+            .core()
+            .get_run_item(p_str(p, "runId"), p_str(p, "nodeId"))
+        {
             Some(item) => item_value(&item),
             None => Value::Null,
         },
@@ -636,7 +700,10 @@ pub fn apply_op(ex: &mut Executor, op: &str, params: &Value) -> Value {
                                 .and_then(Value::as_str)
                                 .unwrap_or_default()
                                 .to_string(),
-                            state: member.get("state").and_then(Value::as_str).map(str::to_string),
+                            state: member
+                                .get("state")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
                             executor_session_id: member
                                 .get("executorSessionId")
                                 .and_then(Value::as_str)
@@ -674,16 +741,25 @@ pub fn apply_op(ex: &mut Executor, op: &str, params: &Value) -> Value {
             Ok(item_value(&item))
         }),
         "retryItem" => caught(|| {
-            let item = ex.core().retry_item(p_str(p, "runId"), p_str(p, "nodeId"))?;
+            let item = ex
+                .core()
+                .retry_item(p_str(p, "runId"), p_str(p, "nodeId"))?;
             Ok(item_value(&item))
         }),
         "replayItem" => caught(|| {
-            let item = ex.core().replay_item(p_str(p, "runId"), p_str(p, "nodeId"))?;
+            let item = ex
+                .core()
+                .replay_item(p_str(p, "runId"), p_str(p, "nodeId"))?;
             Ok(item_value(&item))
         }),
-        "claimRunItem" => caught(|| match ex.core().claim_run_item(p_str(p, "runId"), p_str(p, "executorSessionId"))? {
-            Some(item) => Ok(item_value(&item)),
-            None => Ok(Value::Null),
+        "claimRunItem" => caught(|| {
+            match ex
+                .core()
+                .claim_run_item(p_str(p, "runId"), p_str(p, "executorSessionId"))?
+            {
+                Some(item) => Ok(item_value(&item)),
+                None => Ok(Value::Null),
+            }
         }),
         "reportRunItem" => caught(|| {
             let result = ex.core().report_run_item(
@@ -695,7 +771,8 @@ pub fn apply_op(ex: &mut Executor, op: &str, params: &Value) -> Value {
             Ok(report_value(&result))
         }),
         "removeRunItem" => caught(|| {
-            ex.core().remove_run_item(p_str(p, "runId"), p_str(p, "nodeId"))?;
+            ex.core()
+                .remove_run_item(p_str(p, "runId"), p_str(p, "nodeId"))?;
             Ok(json!({ "removed": p_str(p, "nodeId") }))
         }),
 
@@ -704,20 +781,29 @@ pub fn apply_op(ex: &mut Executor, op: &str, params: &Value) -> Value {
             let count = p_opt(p, "count").and_then(Value::as_i64).unwrap_or(1);
             let mut last = Value::Null;
             for _ in 0..count.max(0) {
-                match ex.core().record_item_nudge(p_str(p, "runId"), p_str(p, "nodeId"), FIXED_NUDGE_AT) {
+                match ex.core().record_item_nudge(
+                    p_str(p, "runId"),
+                    p_str(p, "nodeId"),
+                    FIXED_NUDGE_AT,
+                ) {
                     Ok(item) => last = item_value(&item),
                     Err(problem) => return problem_to_value(&problem),
                 }
             }
             last
         }
-        "stallCheck" => match ex.core().get_run_item(p_str(p, "runId"), p_str(p, "nodeId")) {
+        "stallCheck" => match ex
+            .core()
+            .get_run_item(p_str(p, "runId"), p_str(p, "nodeId"))
+        {
             Some(item) => {
                 json!({ "stalled": is_run_item_stalled(item.state, item.nudge_count) })
             }
             // The TS harness asserts non-null (`!`), so absence surfaces as
             // an UNKNOWN error result.
-            None => json!({ "error": { "code": "UNKNOWN", "message": "Cannot read properties of undefined" } }),
+            None => {
+                json!({ "error": { "code": "UNKNOWN", "message": "Cannot read properties of undefined" } })
+            }
         },
         "continuationCandidates" => {
             let pairs = ex.core().continuation_candidates(p_str(p, "sessionId"));
@@ -732,7 +818,12 @@ pub fn apply_op(ex: &mut Executor, op: &str, params: &Value) -> Value {
         "sweep" => {
             let sessions: Vec<String> = p_opt(p, "activeSessions")
                 .and_then(Value::as_array)
-                .map(|array| array.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .map(|array| {
+                    array
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
                 .unwrap_or_default();
             ex.active_leases().borrow_mut().mark_exclusive(&sessions);
             caught(|| {
@@ -746,7 +837,12 @@ pub fn apply_op(ex: &mut Executor, op: &str, params: &Value) -> Value {
         "reopen" => {
             let sessions: Vec<String> = p_opt(p, "activeSessionIds")
                 .and_then(Value::as_array)
-                .map(|array| array.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .map(|array| {
+                    array
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
                 .unwrap_or_default();
             if p_opt(p, "freshDb").and_then(Value::as_bool) == Some(true) {
                 let store = ex.active_store();
@@ -767,7 +863,10 @@ pub fn apply_op(ex: &mut Executor, op: &str, params: &Value) -> Value {
                 Some(id) => id,
                 None => store_ref.next_run_id(),
             };
-            let status = p_str(p, "status").parse().ok().unwrap_or(RunStatus::Pending);
+            let status = p_str(p, "status")
+                .parse()
+                .ok()
+                .unwrap_or(RunStatus::Pending);
             store_ref.insert_run(RunRow {
                 id: id.clone(),
                 title: p_opt_str(p, "title"),
@@ -784,22 +883,37 @@ pub fn apply_op(ex: &mut Executor, op: &str, params: &Value) -> Value {
             if let Some(items) = p_opt(p, "items").and_then(Value::as_array) {
                 for item in items {
                     let state = parse_item_state(
-                        item.get("state").and_then(Value::as_str).unwrap_or("pending"),
+                        item.get("state")
+                            .and_then(Value::as_str)
+                            .unwrap_or("pending"),
                     )
                     .unwrap_or(RunItemState::Pending);
                     let mut row = RunItemRow::new(
                         &id,
-                        item.get("nodeId").and_then(Value::as_str).unwrap_or_default(),
+                        item.get("nodeId")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
                         item.get("position").and_then(Value::as_i64).unwrap_or(0),
                         state,
                     );
                     row.attempts = item.get("attempts").and_then(Value::as_i64).unwrap_or(0);
                     row.nudge_count = item.get("nudgeCount").and_then(Value::as_i64).unwrap_or(0);
-                    row.executor_session_id =
-                        item.get("executorSessionId").and_then(Value::as_str).map(str::to_string);
-                    row.last_error = item.get("lastError").and_then(Value::as_str).map(str::to_string);
-                    row.started_at = item.get("startedAt").and_then(Value::as_str).map(str::to_string);
-                    row.finished_at = item.get("finishedAt").and_then(Value::as_str).map(str::to_string);
+                    row.executor_session_id = item
+                        .get("executorSessionId")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    row.last_error = item
+                        .get("lastError")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    row.started_at = item
+                        .get("startedAt")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    row.finished_at = item
+                        .get("finishedAt")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
                     store_ref.insert_run_item(row);
                 }
             }
@@ -808,7 +922,9 @@ pub fn apply_op(ex: &mut Executor, op: &str, params: &Value) -> Value {
 
         // ── pool workspace routing ──
         "resolveHome" => match &ex.fixture {
-            None => json!({ "error": { "code": "UNKNOWN", "message": "resolveHome requires setup.pool" } }),
+            None => {
+                json!({ "error": { "code": "UNKNOWN", "message": "resolveHome requires setup.pool" } })
+            }
             Some(_) => Value::String(ex.home_for(ex.resolve_cwd(p.get("cwd")).as_deref())),
         },
         "openRouted" => {
@@ -852,9 +968,12 @@ fn pairs_to_value(pairs: &[(RunRow, RunItemRow)]) -> Value {
 
 pub fn mask_value(value: &Value, keys: &HashSet<&str>) -> Value {
     match value {
-        Value::Array(entries) => {
-            Value::Array(entries.iter().map(|entry| mask_value(entry, keys)).collect())
-        }
+        Value::Array(entries) => Value::Array(
+            entries
+                .iter()
+                .map(|entry| mask_value(entry, keys))
+                .collect(),
+        ),
         Value::Object(map) => {
             let mut out = Map::new();
             for (key, entry) in map {
@@ -881,7 +1000,10 @@ pub fn get_path<'a>(root: Option<&'a Value>, path: Option<&str>) -> Option<&'a V
         match current {
             Some(Value::Object(map)) => current = map.get(segment),
             Some(Value::Array(array)) => {
-                current = segment.parse::<usize>().ok().and_then(|index| array.get(index))
+                current = segment
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|index| array.get(index))
             }
             _ => return None,
         }
@@ -916,10 +1038,12 @@ fn value_eq(a: &Value, b: &Value) -> bool {
         (Value::Array(xs), Value::Array(ys)) => {
             xs.len() == ys.len() && xs.iter().zip(ys.iter()).all(|(x, y)| value_eq(x, y))
         }
-        (Value::Object(left), Value::Object(right)) => left.len() == right.len()
-            && left.iter().all(|(key, value)| {
-                right.get(key).map_or(false, |other| value_eq(value, other))
-            }),
+        (Value::Object(left), Value::Object(right)) => {
+            left.len() == right.len()
+                && left.iter().all(|(key, value)| {
+                    right.get(key).map_or(false, |other| value_eq(value, other))
+                })
+        }
         _ => false,
     }
 }
@@ -927,7 +1051,9 @@ fn value_eq(a: &Value, b: &Value) -> bool {
 pub fn subset_match(actual: Option<&Value>, expected: &Value) -> bool {
     match expected {
         Value::Array(expected_entries) => match actual {
-            Some(Value::Array(actual_entries)) if actual_entries.len() == expected_entries.len() => {
+            Some(Value::Array(actual_entries))
+                if actual_entries.len() == expected_entries.len() =>
+            {
                 expected_entries
                     .iter()
                     .zip(actual_entries.iter())
@@ -936,9 +1062,9 @@ pub fn subset_match(actual: Option<&Value>, expected: &Value) -> bool {
             _ => false,
         },
         Value::Object(expected_map) => match actual {
-            Some(Value::Object(actual_map)) => expected_map.iter().all(|(key, value)| {
-                subset_match(actual_map.get(key), value)
-            }),
+            Some(Value::Object(actual_map)) => expected_map
+                .iter()
+                .all(|(key, value)| subset_match(actual_map.get(key), value)),
             _ => false,
         },
         scalar => deep_eq(actual, Some(scalar)),
@@ -949,14 +1075,19 @@ pub fn subset_match(actual: Option<&Value>, expected: &Value) -> bool {
 pub fn resolve_expected(value: &Value, vars: &BTreeMap<String, String>) -> Value {
     match value {
         Value::String(text) => match text.strip_prefix('$') {
-            Some(name) if !text.starts_with("$$") => {
-                vars.get(name).cloned().map(Value::String).unwrap_or_else(|| value.clone())
-            }
+            Some(name) if !text.starts_with("$$") => vars
+                .get(name)
+                .cloned()
+                .map(Value::String)
+                .unwrap_or_else(|| value.clone()),
             _ => value.clone(),
         },
-        Value::Array(entries) => {
-            Value::Array(entries.iter().map(|entry| resolve_expected(entry, vars)).collect())
-        }
+        Value::Array(entries) => Value::Array(
+            entries
+                .iter()
+                .map(|entry| resolve_expected(entry, vars))
+                .collect(),
+        ),
         Value::Object(map) => {
             let mut out = Map::new();
             for (key, entry) in map {
@@ -986,7 +1117,10 @@ pub struct ScenarioSummary {
 fn fail(failures: &mut Vec<String>, name: &str, index: usize, invariant: &Value, message: String) {
     failures.push(format!(
         "[{name}#{index}] {}: {message}",
-        invariant.get("expect").and_then(Value::as_str).unwrap_or("?"),
+        invariant
+            .get("expect")
+            .and_then(Value::as_str)
+            .unwrap_or("?"),
     ));
 }
 
@@ -1011,15 +1145,20 @@ pub fn run_scenario(doc: &Value) -> ScenarioSummary {
     // ── setup ──
     'setup: {
         if let Some(pool) = doc.pointer("/setup/pool") {
-            let global_dir_name =
-                pool.get("globalDirName").and_then(Value::as_str).unwrap_or("global");
+            let global_dir_name = pool
+                .get("globalDirName")
+                .and_then(Value::as_str)
+                .unwrap_or("global");
             let global_home = join(&root, global_dir_name);
             ex.vars.insert("global".into(), global_home.clone());
             let mut workspaces: Vec<(String, bool)> = Vec::new();
             if let Some(list) = pool.get("workspaces").and_then(Value::as_array) {
                 for workspace in list {
-                    let ws_name =
-                        workspace.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
+                    let ws_name = workspace
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
                     let omt = workspace.get("omt").and_then(Value::as_bool) == Some(true);
                     workspaces.push((ws_name.clone(), omt));
                     let dir = join(&root, &ws_name);
@@ -1040,7 +1179,10 @@ pub fn run_scenario(doc: &Value) -> ScenarioSummary {
             let first_routing = doc
                 .get("operations")
                 .and_then(Value::as_array)
-                .and_then(|ops| ops.iter().find(|op| op.get("op").and_then(Value::as_str) == Some("openRouted")));
+                .and_then(|ops| {
+                    ops.iter()
+                        .find(|op| op.get("op").and_then(Value::as_str) == Some("openRouted"))
+                });
             let Some(first_routing) = first_routing else {
                 failures.push("pool scenario without an openRouted operation".into());
                 break 'setup;
@@ -1056,7 +1198,12 @@ pub fn run_scenario(doc: &Value) -> ScenarioSummary {
             let sessions: Vec<String> = doc
                 .pointer("/setup/activeSessionIds")
                 .and_then(Value::as_array)
-                .map(|array| array.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .map(|array| {
+                    array
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
                 .unwrap_or_default();
             if let Err(problem) = ex.open_core(&home, &sessions) {
                 failures.push(format!("open failed: {problem}"));
@@ -1094,7 +1241,10 @@ pub fn run_scenario(doc: &Value) -> ScenarioSummary {
     if let Some(operations) = doc.get("operations").and_then(Value::as_array) {
         for operation in operations {
             let op_name = operation.get("op").and_then(Value::as_str).unwrap_or("");
-            let params = operation.get("params").cloned().unwrap_or_else(|| json!({}));
+            let params = operation
+                .get("params")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
             let result = apply_op(&mut ex, op_name, &params);
             ex.results.push(result);
             if let Some(label) = operation.get("label").and_then(Value::as_str) {
@@ -1110,32 +1260,50 @@ pub fn run_scenario(doc: &Value) -> ScenarioSummary {
     if let Some(invariants) = doc.get("invariants").and_then(Value::as_array) {
         for invariant in invariants {
             checks += 1;
-            let kind = invariant.get("expect").and_then(Value::as_str).unwrap_or("");
+            let kind = invariant
+                .get("expect")
+                .and_then(Value::as_str)
+                .unwrap_or("");
             match kind {
                 "fileContains" | "fileNotContains" => {
-                    let file = invariant.get("file").and_then(Value::as_str).unwrap_or_default();
+                    let file = invariant
+                        .get("file")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
                     let cached = file_cache.entry(file.to_string()).or_insert_with(|| {
                         let abs = join(&ex.active_home, file);
                         ex.read_virtual_file(&abs)
                     });
                     match cached {
                         Err(message) => {
-                            fail(&mut failures, &name, checks - 1, invariant, format!(
-                                "file \"{file}\" unreadable: {message}"
-                            ));
+                            fail(
+                                &mut failures,
+                                &name,
+                                checks - 1,
+                                invariant,
+                                format!("file \"{file}\" unreadable: {message}"),
+                            );
                         }
                         Ok(content) => {
                             let text = invariant.get("text").and_then(Value::as_str).unwrap_or("");
                             let has = content.contains(text);
                             if kind == "fileContains" && !has {
-                                fail(&mut failures, &name, checks - 1, invariant, format!(
-                                    "\"{text}\" not in {file}"
-                                ));
+                                fail(
+                                    &mut failures,
+                                    &name,
+                                    checks - 1,
+                                    invariant,
+                                    format!("\"{text}\" not in {file}"),
+                                );
                             }
                             if kind == "fileNotContains" && has {
-                                fail(&mut failures, &name, checks - 1, invariant, format!(
-                                    "\"{text}\" unexpectedly in {file}"
-                                ));
+                                fail(
+                                    &mut failures,
+                                    &name,
+                                    checks - 1,
+                                    invariant,
+                                    format!("\"{text}\" unexpectedly in {file}"),
+                                );
                             }
                         }
                     }
@@ -1154,11 +1322,17 @@ pub fn run_scenario(doc: &Value) -> ScenarioSummary {
                             .collect(),
                     );
                     if !value_eq(&observed, &expected) {
-                        fail(&mut failures, &name, checks - 1, invariant, format!(
-                            "item events {} != {}",
-                            stringify(&observed),
-                            stringify(&expected)
-                        ));
+                        fail(
+                            &mut failures,
+                            &name,
+                            checks - 1,
+                            invariant,
+                            format!(
+                                "item events {} != {}",
+                                stringify(&observed),
+                                stringify(&expected)
+                            ),
+                        );
                     }
                     continue;
                 }
@@ -1167,31 +1341,42 @@ pub fn run_scenario(doc: &Value) -> ScenarioSummary {
 
             // Actual resolution + masking.
             let actual_raw: Option<Value> = match invariant.get("op") {
-                Some(Value::Number(index)) => index.as_u64().and_then(|i| ex.results.get(i as usize)).cloned(),
+                Some(Value::Number(index)) => index
+                    .as_u64()
+                    .and_then(|i| ex.results.get(i as usize))
+                    .cloned(),
                 Some(Value::String(label)) => ex.aliases.get(label).cloned(),
                 _ => None,
             };
             let actual_masked = actual_raw.as_ref().map(|raw| mask_value(raw, &mask_keys));
-            let at = get_path(actual_masked.as_ref(), invariant.get("path").and_then(Value::as_str));
+            let at = get_path(
+                actual_masked.as_ref(),
+                invariant.get("path").and_then(Value::as_str),
+            );
 
             // Expected resolution: literal `value` wins; otherwise a
             // `valueFrom` reference points at another whole result with the
             // SAME path applied before comparison. Absent both → undefined
             // (only meaningful for defined/notDefined, which ignore it).
-            let needs_expected =
-                !matches!(kind, "defined" | "notDefined");
+            let needs_expected = !matches!(kind, "defined" | "notDefined");
             let expected_source: Option<Value> = if !needs_expected {
                 None
             } else if invariant.get("value").is_some() {
-                invariant.get("value").map(|value| resolve_expected(value, &ex.vars))
+                invariant
+                    .get("value")
+                    .map(|value| resolve_expected(value, &ex.vars))
             } else if let Some(from) = invariant.get("valueFrom") {
                 let source: Option<Value> = match from {
-                    Value::Number(index) => index.as_u64().and_then(|i| ex.results.get(i as usize)).cloned(),
+                    Value::Number(index) => index
+                        .as_u64()
+                        .and_then(|i| ex.results.get(i as usize))
+                        .cloned(),
                     Value::String(label) => ex.aliases.get(label).cloned(),
                     _ => None,
                 };
                 source.map(|source| {
-                    let picked = get_path(Some(&source), invariant.get("path").and_then(Value::as_str));
+                    let picked =
+                        get_path(Some(&source), invariant.get("path").and_then(Value::as_str));
                     picked.cloned().unwrap_or(Value::Null)
                 })
             } else {
@@ -1204,34 +1389,66 @@ pub fn run_scenario(doc: &Value) -> ScenarioSummary {
             match kind {
                 "equals" => {
                     let Some(expected) = &expected else {
-                        fail(&mut failures, &name, checks - 1, invariant,
-                            format!("missing value/valueFrom (actual: {})", at.map(stringify).unwrap_or_else(|| "undefined".into())));
+                        fail(
+                            &mut failures,
+                            &name,
+                            checks - 1,
+                            invariant,
+                            format!(
+                                "missing value/valueFrom (actual: {})",
+                                at.map(stringify).unwrap_or_else(|| "undefined".into())
+                            ),
+                        );
                         continue;
                     };
                     if !deep_eq(at, Some(expected)) {
-                        fail(&mut failures, &name, checks - 1, invariant, format!(
-                            "{} != {}",
-                            at.map(stringify).unwrap_or_else(|| "undefined".into()),
-                            stringify(&expected)
-                        ));
+                        fail(
+                            &mut failures,
+                            &name,
+                            checks - 1,
+                            invariant,
+                            format!(
+                                "{} != {}",
+                                at.map(stringify).unwrap_or_else(|| "undefined".into()),
+                                stringify(&expected)
+                            ),
+                        );
                     }
                 }
                 "matches" => {
                     let Some(expected) = &expected else {
-                        fail(&mut failures, &name, checks - 1, invariant, "missing value/valueFrom".into());
+                        fail(
+                            &mut failures,
+                            &name,
+                            checks - 1,
+                            invariant,
+                            "missing value/valueFrom".into(),
+                        );
                         continue;
                     };
                     if !subset_match(at, expected) {
-                        fail(&mut failures, &name, checks - 1, invariant, format!(
-                            "{} does not match {}",
-                            at.map(stringify).unwrap_or_else(|| "undefined".into()),
-                            stringify(&expected)
-                        ));
+                        fail(
+                            &mut failures,
+                            &name,
+                            checks - 1,
+                            invariant,
+                            format!(
+                                "{} does not match {}",
+                                at.map(stringify).unwrap_or_else(|| "undefined".into()),
+                                stringify(&expected)
+                            ),
+                        );
                     }
                 }
                 "contains" => {
                     let Some(expected) = &expected else {
-                        fail(&mut failures, &name, checks - 1, invariant, "missing value/valueFrom".into());
+                        fail(
+                            &mut failures,
+                            &name,
+                            checks - 1,
+                            invariant,
+                            "missing value/valueFrom".into(),
+                        );
                         continue;
                     };
                     let hit = match (at, expected) {
@@ -1244,16 +1461,28 @@ pub fn run_scenario(doc: &Value) -> ScenarioSummary {
                         _ => false,
                     };
                     if !hit {
-                        fail(&mut failures, &name, checks - 1, invariant, format!(
-                            "{} does not contain {}",
-                            at.map(stringify).unwrap_or_else(|| "undefined".into()),
-                            stringify(&expected)
-                        ));
+                        fail(
+                            &mut failures,
+                            &name,
+                            checks - 1,
+                            invariant,
+                            format!(
+                                "{} does not contain {}",
+                                at.map(stringify).unwrap_or_else(|| "undefined".into()),
+                                stringify(&expected)
+                            ),
+                        );
                     }
                 }
                 "length" => {
                     let Some(expected) = &expected else {
-                        fail(&mut failures, &name, checks - 1, invariant, "missing value/valueFrom".into());
+                        fail(
+                            &mut failures,
+                            &name,
+                            checks - 1,
+                            invariant,
+                            "missing value/valueFrom".into(),
+                        );
                         continue;
                     };
                     let ok = match (at, expected.as_u64()) {
@@ -1263,16 +1492,28 @@ pub fn run_scenario(doc: &Value) -> ScenarioSummary {
                         _ => false,
                     };
                     if !ok {
-                        fail(&mut failures, &name, checks - 1, invariant, format!(
-                            "length of {} != {}",
-                            at.map(stringify).unwrap_or_else(|| "undefined".into()),
-                            stringify(&expected)
-                        ));
+                        fail(
+                            &mut failures,
+                            &name,
+                            checks - 1,
+                            invariant,
+                            format!(
+                                "length of {} != {}",
+                                at.map(stringify).unwrap_or_else(|| "undefined".into()),
+                                stringify(&expected)
+                            ),
+                        );
                     }
                 }
                 "gte" => {
                     let Some(expected) = &expected else {
-                        fail(&mut failures, &name, checks - 1, invariant, "missing value/valueFrom".into());
+                        fail(
+                            &mut failures,
+                            &name,
+                            checks - 1,
+                            invariant,
+                            "missing value/valueFrom".into(),
+                        );
                         continue;
                     };
                     let ok = match (at.and_then(Value::as_f64), expected.as_f64()) {
@@ -1280,31 +1521,53 @@ pub fn run_scenario(doc: &Value) -> ScenarioSummary {
                         _ => false,
                     };
                     if !ok {
-                        fail(&mut failures, &name, checks - 1, invariant, format!(
-                            "{} < {}",
-                            at.map(stringify).unwrap_or_else(|| "undefined".into()),
-                            stringify(&expected)
-                        ));
+                        fail(
+                            &mut failures,
+                            &name,
+                            checks - 1,
+                            invariant,
+                            format!(
+                                "{} < {}",
+                                at.map(stringify).unwrap_or_else(|| "undefined".into()),
+                                stringify(&expected)
+                            ),
+                        );
                     }
                 }
                 "defined" => {
                     if at.is_none() {
-                        fail(&mut failures, &name, checks - 1, invariant,
-                            format!("{:?} is undefined", invariant.get("path")));
+                        fail(
+                            &mut failures,
+                            &name,
+                            checks - 1,
+                            invariant,
+                            format!("{:?} is undefined", invariant.get("path")),
+                        );
                     }
                 }
                 "notDefined" => {
                     if at.is_some() {
-                        fail(&mut failures, &name, checks - 1, invariant, format!(
-                            "{:?} is defined: {}",
-                            invariant.get("path"),
-                            at.map(stringify).unwrap_or_default()
-                        ));
+                        fail(
+                            &mut failures,
+                            &name,
+                            checks - 1,
+                            invariant,
+                            format!(
+                                "{:?} is defined: {}",
+                                invariant.get("path"),
+                                at.map(stringify).unwrap_or_default()
+                            ),
+                        );
                     }
                 }
                 other => {
-                    fail(&mut failures, &name, checks - 1, invariant,
-                        format!("unknown expect kind \"{other}\""));
+                    fail(
+                        &mut failures,
+                        &name,
+                        checks - 1,
+                        invariant,
+                        format!("unknown expect kind \"{other}\""),
+                    );
                 }
             }
         }
@@ -1314,13 +1577,30 @@ pub fn run_scenario(doc: &Value) -> ScenarioSummary {
     let debug_results = if ok {
         None
     } else {
-        Some(ex.results.iter().map(|result| mask_value(result, &mask_keys)).collect())
+        Some(
+            ex.results
+                .iter()
+                .map(|result| mask_value(result, &mask_keys))
+                .collect(),
+        )
     };
-    ScenarioSummary { ok, name, checks, failures, debug_results }
+    ScenarioSummary {
+        ok,
+        name,
+        checks,
+        failures,
+        debug_results,
+    }
 }
 
 fn sanitize(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }

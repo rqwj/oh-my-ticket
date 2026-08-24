@@ -144,6 +144,27 @@
         }
       },
       "additionalProperties": false
+    },
+    "U4SubdivisionDescriptors": {
+      "type": "object",
+      "description": "Subdivided codes introduced by U4's storage plane (additive; each carries a coarseFallback so older clients interpret unknown codes). Open map: any key matching ^[A-Z][A-Z0-9_]+$ may appear.",
+      "propertyNames": {
+        "pattern": "^[A-Z][A-Z0-9_]+$"
+      },
+      "properties": {
+        "REINDEX_REQUIRED": {
+          "type": "object",
+          "description": "Manual drift / ambiguous crash residue gate (U4/R19): observed on-disk content diverges from what the journaled plan wrote; nothing is overwritten — reindex first, then retry. Emitted by the recovery layer when a pending plan's target files were hand-edited while the writer was down, or when move source/target presence is ambiguous.",
+          "properties": {
+            "summary": { "const": "Observed on-disk content diverges from what the journaled plan wrote (manual drift or ambiguous crash residue); nothing was overwritten — run reindex and retry." },
+            "detailsShape": { "const": "{ requiresReindex: true, commandId?: string, from?: string, to?: string } — commandId identifies the pending journal plan; from/to appear for move-drift refusals." },
+            "coarseFallback": { "const": "CONFLICT" },
+            "stability": { "const": "stable" }
+          },
+          "required": ["summary", "detailsShape", "coarseFallback", "stability"]
+        }
+      },
+      "additionalProperties": false
     }
   }
 }

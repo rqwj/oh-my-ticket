@@ -163,7 +163,11 @@ impl OmtCore {
     /// the list becomes an exclusive far-future lease set at the port).
     pub fn open(home: &str, active_session_ids: &[String], deps: CoreDeps) -> Result<OmtCore> {
         deps.files.borrow_mut().mkdir_all("tickets")?;
-        let core = OmtCore { home: home.to_string(), deps, listeners: Vec::new() };
+        let core = OmtCore {
+            home: home.to_string(),
+            deps,
+            listeners: Vec::new(),
+        };
         let mut core = core;
         if core.db().schema_version().is_none() {
             let existing = core.deps.files.borrow().list_markdown_under_tickets();
@@ -173,7 +177,10 @@ impl OmtCore {
                 core.db_mut().mark_schema_version();
             }
         }
-        core.deps.leases.borrow_mut().mark_exclusive(active_session_ids);
+        core.deps
+            .leases
+            .borrow_mut()
+            .mark_exclusive(active_session_ids);
         core.janitor_sweep()?;
         Ok(core)
     }
@@ -239,9 +246,13 @@ impl OmtCore {
     pub fn create(&mut self, input: CreateInput) -> Result<NodeRow> {
         let title = input.title.trim().to_string();
         if title.is_empty() {
-            return Err(Problem::with_details(error::INVALID_INPUT, "title must not be empty", |d| {
-                d.insert("field".into(), "title".into());
-            }));
+            return Err(Problem::with_details(
+                error::INVALID_INPUT,
+                "title must not be empty",
+                |d| {
+                    d.insert("field".into(), "title".into());
+                },
+            ));
         }
         let node_type = parse_node_type(&input.node_type).ok_or_else(|| {
             Problem::with_details(
@@ -260,8 +271,7 @@ impl OmtCore {
                 None
             }
             Some(parent_id) => {
-                let parent =
-                    hierarchy::require_node(&self.db(), parent_id)?.clone();
+                let parent = hierarchy::require_node(&self.db(), parent_id)?.clone();
                 hierarchy::check_child_type(&parent, node_type)?;
                 Some(parent)
             }
@@ -283,8 +293,12 @@ impl OmtCore {
         }
 
         let now = self.now();
-        let path =
-            markdown_path_for(&node_type.to_string(), &id, &title, parent.as_ref().map(|p| p.path.as_str()));
+        let path = markdown_path_for(
+            &node_type.to_string(),
+            &id,
+            &title,
+            parent.as_ref().map(|p| p.path.as_str()),
+        );
         let node = NodeRow {
             id: id.clone(),
             node_type,
@@ -297,11 +311,16 @@ impl OmtCore {
             updated_at: now,
         };
 
-        let body = input.body.clone().unwrap_or_else(|| default_body(&node_type));
+        let body = input
+            .body
+            .clone()
+            .unwrap_or_else(|| default_body(&node_type));
         let empty_children = render_children_entries(&[]);
         let full_body = replace_children_block(&body, &empty_children);
-        let content =
-            serialize_node_file(frontmatter_lines(&node, parent.as_ref().map(|p| p.id.as_str())), &full_body);
+        let content = serialize_node_file(
+            frontmatter_lines(&node, parent.as_ref().map(|p| p.id.as_str())),
+            &full_body,
+        );
         self.deps.files.borrow_mut().write_file(&path, &content)?;
 
         self.db_mut().insert_node(node.clone());
@@ -309,7 +328,8 @@ impl OmtCore {
             let ord = self.db().children_of(&parent.id).len() as i64;
             self.db_mut().insert_edge(&parent.id, &id, ord);
         }
-        self.db_mut().index_node(&id, &node.title, &strip_children_block(&full_body));
+        self.db_mut()
+            .index_node(&id, &node.title, &strip_children_block(&full_body));
         if let Some(parent) = &parent {
             self.refresh_children_block(&parent.id)?;
         }
@@ -349,10 +369,14 @@ impl OmtCore {
         if let Some(raw_title) = &input.title {
             let trimmed = raw_title.trim().to_string();
             if trimmed.is_empty() {
-                return Err(Problem::with_details(error::INVALID_INPUT, "title must not be empty", |d| {
-                    d.insert("field".into(), "title".into());
-                    d.insert("nodeId".into(), input.id.clone().into());
-                }));
+                return Err(Problem::with_details(
+                    error::INVALID_INPUT,
+                    "title must not be empty",
+                    |d| {
+                        d.insert("field".into(), "title".into());
+                        d.insert("nodeId".into(), input.id.clone().into());
+                    },
+                ));
             }
             patch_title = Some(trimmed);
         }
@@ -400,8 +424,12 @@ impl OmtCore {
             frontmatter_lines(&updated, parent.as_ref().map(|p| p.id.as_str())),
             &body,
         );
-        self.deps.files.borrow_mut().write_file(&node.path, &content)?;
-        self.db_mut().index_node(&node.id, &updated.title, &strip_children_block(&body));
+        self.deps
+            .files
+            .borrow_mut()
+            .write_file(&node.path, &content)?;
+        self.db_mut()
+            .index_node(&node.id, &updated.title, &strip_children_block(&body));
 
         // A title change shows up in the parent's managed children list.
         if patch_title.is_some() {
@@ -472,12 +500,21 @@ impl OmtCore {
 
         let old_parent = self.db().parent_of(id);
         let old_path = node.path.clone();
-        let new_path = markdown_path_for(&node.node_type.to_string(), id, &node.title, Some(&new_parent.path));
+        let new_path = markdown_path_for(
+            &node.node_type.to_string(),
+            id,
+            &node.title,
+            Some(&new_parent.path),
+        );
         if old_path == new_path {
-            return Err(Problem::with_details(error::CONFLICT, "node is already at the target location", |d| {
-                d.insert("rule".into(), "already-at-target".into());
-                d.insert("nodeId".into(), id.into());
-            }));
+            return Err(Problem::with_details(
+                error::CONFLICT,
+                "node is already at the target location",
+                |d| {
+                    d.insert("rule".into(), "already-at-target".into());
+                    d.insert("nodeId".into(), id.into());
+                },
+            ));
         }
 
         let now = self.now();
@@ -487,7 +524,11 @@ impl OmtCore {
 
         // The move relocates the whole subtree: rewrite stored path prefixes.
         let subtree_ids: Vec<String> = std::iter::once(id.to_string())
-            .chain(hierarchy::descendants_of(&self.db(), id).into_iter().map(|n| n.id))
+            .chain(
+                hierarchy::descendants_of(&self.db(), id)
+                    .into_iter()
+                    .map(|n| n.id),
+            )
             .collect();
         for member_id in &subtree_ids {
             let member = self.db().get_node(member_id).cloned();
@@ -512,8 +553,12 @@ impl OmtCore {
 
         let moved = hierarchy::require_node(&self.db(), id)?.clone();
         let file = read_node_file(&mut *self.deps.files.borrow_mut(), &moved.path)?;
-        let content = serialize_node_file(frontmatter_lines(&moved, Some(new_parent_id)), &file.body);
-        self.deps.files.borrow_mut().write_file(&moved.path, &content)?;
+        let content =
+            serialize_node_file(frontmatter_lines(&moved, Some(new_parent_id)), &file.body);
+        self.deps
+            .files
+            .borrow_mut()
+            .write_file(&moved.path, &content)?;
 
         if let Some(old_parent) = &old_parent {
             self.refresh_children_block(&old_parent.id)?;
@@ -569,7 +614,10 @@ impl OmtCore {
         let ordered_edges = db.all_edges();
         let mut children_of: std::collections::BTreeMap<String, Vec<String>> = Default::default();
         for edge in &ordered_edges {
-            children_of.entry(edge.parent_id.clone()).or_default().push(edge.child_id.clone());
+            children_of
+                .entry(edge.parent_id.clone())
+                .or_default()
+                .push(edge.child_id.clone());
         }
         fn build(
             id: &str,
@@ -577,7 +625,10 @@ impl OmtCore {
             children_of: &std::collections::BTreeMap<String, Vec<String>>,
         ) -> TreeNodeRow {
             TreeNodeRow {
-                node: db.get_node(id).expect("edge targets an indexed node").clone(),
+                node: db
+                    .get_node(id)
+                    .expect("edge targets an indexed node")
+                    .clone(),
                 children: children_of
                     .get(id)
                     .map(|kids| kids.iter().map(|kid| build(kid, db, children_of)).collect())
@@ -629,7 +680,11 @@ impl OmtCore {
             };
             let attrs = file.attrs;
             let id_valid = attrs.id.as_deref().map(id_matches_pattern).unwrap_or(false);
-            let type_valid = attrs.node_type.as_deref().and_then(parse_node_type_opt).is_some();
+            let type_valid = attrs
+                .node_type
+                .as_deref()
+                .and_then(parse_node_type_opt)
+                .is_some();
             let id = match attrs.id.clone() {
                 Some(id) if id_valid && type_valid && !seen.contains(&id) => id,
                 _ => {
@@ -646,12 +701,16 @@ impl OmtCore {
                 .filter(|t| !t.is_empty())
                 .map(str::to_string)
                 .unwrap_or_else(|| id.clone());
-            let status =
-                attrs.status.as_deref().and_then(parse_node_status_opt).unwrap_or(NodeStatus::Open);
+            let status = attrs
+                .status
+                .as_deref()
+                .and_then(parse_node_status_opt)
+                .unwrap_or(NodeStatus::Open);
             let priority = attrs.priority.map(|p| p as i64).unwrap_or(0);
             let node = NodeRow {
                 id: id.clone(),
-                node_type: parse_node_type_opt(attrs.node_type.as_deref().unwrap_or_default()).unwrap(),
+                node_type: parse_node_type_opt(attrs.node_type.as_deref().unwrap_or_default())
+                    .unwrap(),
                 title,
                 status,
                 archived: attrs.archived == Some(true),
@@ -667,7 +726,10 @@ impl OmtCore {
                     .filter(|p| !p.is_empty())
                     .map(|p| (id.clone(), p.to_string())),
             );
-            bodies.insert(id.clone(), (node.title.clone(), strip_children_block(&file.body)));
+            bodies.insert(
+                id.clone(),
+                (node.title.clone(), strip_children_block(&file.body)),
+            );
             nodes.push(node);
         }
 
@@ -714,13 +776,22 @@ impl OmtCore {
             let block = render_children_entries(&entries);
             let file = read_node_file(&mut *self.deps.files.borrow_mut(), &node.path)?;
             let body = replace_children_block(&file.body, &block);
-            let parent_id =
-                edges.iter().find(|edge| edge.child_id == node.id).map(|edge| edge.parent_id.clone());
+            let parent_id = edges
+                .iter()
+                .find(|edge| edge.child_id == node.id)
+                .map(|edge| edge.parent_id.clone());
             let content = serialize_node_file(frontmatter_lines(node, parent_id.as_deref()), &body);
-            self.deps.files.borrow_mut().write_file(&node.path, &content)?;
+            self.deps
+                .files
+                .borrow_mut()
+                .write_file(&node.path, &content)?;
         }
 
-        Ok(ReindexResult { nodes: nodes.len(), edges: edges.len(), skipped })
+        Ok(ReindexResult {
+            nodes: nodes.len(),
+            edges: edges.len(),
+            skipped,
+        })
     }
 
     // ── runs: creation & queries (EPIC-0003) ────────────────────────────
@@ -741,7 +812,8 @@ impl OmtCore {
         }
 
         let config_json = merge_run_config(input.config.as_ref());
-        let concurrency = validate_concurrency(config_json.get("concurrency").unwrap_or(&Value::Null))?;
+        let concurrency =
+            validate_concurrency(config_json.get("concurrency").unwrap_or(&Value::Null))?;
         let config = RunConfigValue {
             stop_on_failure: config_json["stopOnFailure"].as_bool().unwrap_or(false),
             auto_continue: config_json["autoContinue"].as_bool().unwrap_or(true),
@@ -750,8 +822,12 @@ impl OmtCore {
         };
 
         let id = self.db_mut().next_run_id();
-        let title =
-            input.title.as_deref().map(str::trim).filter(|t| !t.is_empty()).map(str::to_string);
+        let title = input
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string);
         let run = RunRow {
             id: id.clone(),
             title,
@@ -762,8 +838,12 @@ impl OmtCore {
         };
         self.db_mut().insert_run(run.clone());
         for (position, node_id) in input.node_ids.iter().enumerate() {
-            self.db_mut()
-                .insert_run_item(RunItemRow::new(&id, node_id, position as i64, RunItemState::Pending));
+            self.db_mut().insert_run_item(RunItemRow::new(
+                &id,
+                node_id,
+                position as i64,
+                RunItemState::Pending,
+            ));
         }
         Ok(run)
     }
@@ -810,7 +890,10 @@ impl OmtCore {
             let message = if run.status == RunStatus::Interrupted {
                 format!("run {run_id} 处于 interrupted（需人工核对）；请先 resume 再加入成员")
             } else {
-                format!("run {run_id} 已终态（{}），不可加入成员；请另建 run", run.status)
+                format!(
+                    "run {run_id} 已终态（{}），不可加入成员；请另建 run",
+                    run.status
+                )
             };
             return Err(Problem::with_details(error::CONFLICT, message, |d| {
                 d.insert("rule".into(), "run-not-active".into());
@@ -840,13 +923,18 @@ impl OmtCore {
         let mut duplicates = Vec::new();
         let mut seen = std::collections::BTreeSet::new();
         for member in members {
-            if seen.contains(&member.node_id) || self.db().get_run_item(run_id, &member.node_id).is_some() {
+            if seen.contains(&member.node_id)
+                || self.db().get_run_item(run_id, &member.node_id).is_some()
+            {
                 duplicates.push(member.node_id.clone());
                 continue;
             }
             seen.insert(member.node_id.clone());
             self.require_run_member_node(&member.node_id)?;
-            let state_text = member.state.clone().unwrap_or_else(|| "pending".to_string());
+            let state_text = member
+                .state
+                .clone()
+                .unwrap_or_else(|| "pending".to_string());
             let state = parse_item_state(&state_text).ok_or_else(|| {
                 Problem::with_details(
                     error::INVALID_INPUT,
@@ -875,7 +963,12 @@ impl OmtCore {
         self.db()
             .run_items_for_node(
                 node_id,
-                &[RunStatus::Pending, RunStatus::Running, RunStatus::Paused, RunStatus::Interrupted],
+                &[
+                    RunStatus::Pending,
+                    RunStatus::Running,
+                    RunStatus::Paused,
+                    RunStatus::Interrupted,
+                ],
             )
             .into_iter()
             .filter_map(|(item, _)| {
@@ -914,7 +1007,11 @@ impl OmtCore {
     pub fn resume_run(&mut self, id: &str) -> Result<RunRow> {
         let run = self.require_run(id)?;
         if run.status != RunStatus::Paused && run.status != RunStatus::Interrupted {
-            return Err(run_status_gate(id, run.status, &[RunStatus::Paused, RunStatus::Interrupted]));
+            return Err(run_status_gate(
+                id,
+                run.status,
+                &[RunStatus::Paused, RunStatus::Interrupted],
+            ));
         }
         self.set_run_status(id, RunStatus::Running)?;
         self.require_run(id)
@@ -937,10 +1034,14 @@ impl OmtCore {
         options: TransitionOptions,
     ) -> Result<RunItemRow> {
         let to_state = parse_item_state(to).ok_or_else(|| {
-            Problem::with_details(error::INVALID_INPUT, format!("unknown run item state: {to}"), |d| {
-                d.insert("field".into(), "to".into());
-                d.insert("value".into(), to.into());
-            })
+            Problem::with_details(
+                error::INVALID_INPUT,
+                format!("unknown run item state: {to}"),
+                |d| {
+                    d.insert("field".into(), "to".into());
+                    d.insert("value".into(), to.into());
+                },
+            )
         })?;
         let run = self.require_run(run_id)?;
         let item = self
@@ -980,7 +1081,10 @@ impl OmtCore {
         if !item_transition_allowed(item.state, to_state) {
             return Err(Problem::with_details(
                 error::CONFLICT,
-                format!("illegal item transition for {node_id}: {} → {}", item.state, to_state),
+                format!(
+                    "illegal item transition for {node_id}: {} → {}",
+                    item.state, to_state
+                ),
                 |d| {
                     d.insert("rule".into(), "item-transition".into());
                     d.insert("runId".into(), run_id.into());
@@ -994,7 +1098,11 @@ impl OmtCore {
         let now = self.now();
         let entering_running = to_state == RunItemState::Running;
         let final_state = is_run_item_final(to_state);
-        let last_error = if to_state == RunItemState::Failed { options.error.clone() } else { None };
+        let last_error = if to_state == RunItemState::Failed {
+            options.error.clone()
+        } else {
+            None
+        };
         self.db_mut().update_run_item(
             run_id,
             node_id,
@@ -1041,9 +1149,13 @@ impl OmtCore {
                 },
             ));
         }
-        let item =
-            self.get_run_item(run_id, node_id).ok_or_else(|| not_found_run_item(run_id, node_id))?;
-        if !matches!(item.state, RunItemState::Failed | RunItemState::Interrupted | RunItemState::Pending) {
+        let item = self
+            .get_run_item(run_id, node_id)
+            .ok_or_else(|| not_found_run_item(run_id, node_id))?;
+        if !matches!(
+            item.state,
+            RunItemState::Failed | RunItemState::Interrupted | RunItemState::Pending
+        ) {
             return Err(retry_state_gate(run_id, node_id, item.state));
         }
         self.db_mut().update_run_item(
@@ -1080,7 +1192,10 @@ impl OmtCore {
         ) {
             return Err(Problem::with_details(
                 error::CONFLICT,
-                format!("run {run_id} is {}; replay requires an in-progress run", run.status),
+                format!(
+                    "run {run_id} is {}; replay requires an in-progress run",
+                    run.status
+                ),
                 |d| {
                     d.insert("rule".into(), "replay-run-gate".into());
                     d.insert("runId".into(), run_id.into());
@@ -1088,9 +1203,13 @@ impl OmtCore {
                 },
             ));
         }
-        let item =
-            self.get_run_item(run_id, node_id).ok_or_else(|| not_found_run_item(run_id, node_id))?;
-        if !matches!(item.state, RunItemState::Done | RunItemState::Blocked | RunItemState::Skipped) {
+        let item = self
+            .get_run_item(run_id, node_id)
+            .ok_or_else(|| not_found_run_item(run_id, node_id))?;
+        if !matches!(
+            item.state,
+            RunItemState::Done | RunItemState::Blocked | RunItemState::Skipped
+        ) {
             return Err(Problem::with_details(
                 error::CONFLICT,
                 format!(
@@ -1102,7 +1221,10 @@ impl OmtCore {
                     d.insert("runId".into(), run_id.into());
                     d.insert("nodeId".into(), node_id.into());
                     d.insert("itemState".into(), item.state.to_string().into());
-                    d.insert("required".into(), serde_json::json!(["done", "blocked", "skipped"]));
+                    d.insert(
+                        "required".into(),
+                        serde_json::json!(["done", "blocked", "skipped"]),
+                    );
                 },
             ));
         }
@@ -1154,7 +1276,8 @@ impl OmtCore {
 
         let now = self.now();
         let ClaimNextResult { claimed, skipped } =
-            self.db_mut().claim_next_run_item(run_id, executor_session_id, &now);
+            self.db_mut()
+                .claim_next_run_item(run_id, executor_session_id, &now);
         for item in &skipped {
             self.emit_item_event(self.require_run(run_id)?, item, RunItemState::Pending);
         }
@@ -1168,7 +1291,10 @@ impl OmtCore {
                 principal: executor_session_id.to_string(),
                 expires_at: crate::ports::FAR_FUTURE_MS,
             };
-            self.deps.leases.borrow_mut().issue(executor_session_id, grant);
+            self.deps
+                .leases
+                .borrow_mut()
+                .issue(executor_session_id, grant);
             // Ancestor activation is best-effort on the claim path: a failed
             // cosmetic status write must never fail or undo the claim.
             let activation = self.activate_ancestors(&claimed.node_id);
@@ -1186,7 +1312,10 @@ impl OmtCore {
     /// completion; callers filter by item state.
     pub fn executor_items(&self, session_id: &str) -> Vec<(RunRow, RunItemRow)> {
         let mut owned = Vec::new();
-        for run in self.db().list_runs_by_status(&[RunStatus::Running, RunStatus::Paused]) {
+        for run in self
+            .db()
+            .list_runs_by_status(&[RunStatus::Running, RunStatus::Paused])
+        {
             for item in self.db().list_run_items(&run.id) {
                 if item.executor_session_id.as_deref() == Some(session_id) {
                     owned.push((run.clone(), item));
@@ -1206,10 +1335,16 @@ impl OmtCore {
                 continue;
             }
             let items = self.db().list_run_items(&run.id);
-            if !items.iter().any(|item| item.executor_session_id.as_deref() == Some(session_id)) {
+            if !items
+                .iter()
+                .any(|item| item.executor_session_id.as_deref() == Some(session_id))
+            {
                 continue;
             }
-            if let Some(next) = items.iter().find(|item| item.state == RunItemState::Pending) {
+            if let Some(next) = items
+                .iter()
+                .find(|item| item.state == RunItemState::Pending)
+            {
                 candidates.push((run.clone(), next.clone()));
             }
         }
@@ -1218,10 +1353,16 @@ impl OmtCore {
 
     /// Record one continuation nudge (pure bookkeeping; budget/backoff
     /// policy lives in the hook; retryItem clears the fields).
-    pub fn record_item_nudge(&mut self, run_id: &str, node_id: &str, at: &str) -> Result<RunItemRow> {
+    pub fn record_item_nudge(
+        &mut self,
+        run_id: &str,
+        node_id: &str,
+        at: &str,
+    ) -> Result<RunItemRow> {
         self.require_run(run_id)?;
-        let item =
-            self.get_run_item(run_id, node_id).ok_or_else(|| not_found_run_item(run_id, node_id))?;
+        let item = self
+            .get_run_item(run_id, node_id)
+            .ok_or_else(|| not_found_run_item(run_id, node_id))?;
         self.db_mut().update_run_item(
             run_id,
             node_id,
@@ -1244,8 +1385,9 @@ impl OmtCore {
     /// never report). Afterwards the run may derive its terminal state.
     pub fn remove_run_item(&mut self, run_id: &str, node_id: &str) -> Result<()> {
         self.require_run(run_id)?;
-        let item =
-            self.get_run_item(run_id, node_id).ok_or_else(|| not_found_run_item(run_id, node_id))?;
+        let item = self
+            .get_run_item(run_id, node_id)
+            .ok_or_else(|| not_found_run_item(run_id, node_id))?;
         if is_run_item_in_flight(item.state) {
             let force_allowed = match self.get_node(node_id) {
                 Some(node) => node.archived,
@@ -1254,7 +1396,10 @@ impl OmtCore {
             if !force_allowed {
                 return Err(Problem::with_details(
                     error::CONFLICT,
-                    format!("item {node_id} is {} (in-flight); it cannot be removed", item.state),
+                    format!(
+                        "item {node_id} is {} (in-flight); it cannot be removed",
+                        item.state
+                    ),
                     |d| {
                         d.insert("rule".into(), "remove-in-flight".into());
                         d.insert("runId".into(), run_id.into());
@@ -1307,12 +1452,16 @@ impl OmtCore {
                 },
             ));
         }
-        let item =
-            self.get_run_item(run_id, node_id).ok_or_else(|| not_found_run_item(run_id, node_id))?;
+        let item = self
+            .get_run_item(run_id, node_id)
+            .ok_or_else(|| not_found_run_item(run_id, node_id))?;
         if !is_run_item_in_flight(item.state) {
             return Err(Problem::with_details(
                 error::CONFLICT,
-                format!("only in-flight items can report ({node_id} is {})", item.state),
+                format!(
+                    "only in-flight items can report ({node_id} is {})",
+                    item.state
+                ),
                 |d| {
                     d.insert("rule".into(), "report-state-gate".into());
                     d.insert("runId".into(), run_id.into());
@@ -1331,7 +1480,10 @@ impl OmtCore {
         if !executable {
             let quarantined =
                 self.transition_item(run_id, node_id, "skipped", TransitionOptions::default())?;
-            return Ok(ReportResult { item: quarantined, node });
+            return Ok(ReportResult {
+                item: quarantined,
+                node,
+            });
         }
 
         let note_text = note.map(str::trim).filter(|n| !n.is_empty());
@@ -1340,7 +1492,10 @@ impl OmtCore {
                 run_id,
                 node_id,
                 "failed",
-                TransitionOptions { error: note_text.map(str::to_string), ..TransitionOptions::default() },
+                TransitionOptions {
+                    error: note_text.map(str::to_string),
+                    ..TransitionOptions::default()
+                },
             )?;
             if let Some(note_text) = note_text {
                 self.update(UpdateInput {
@@ -1350,7 +1505,10 @@ impl OmtCore {
                 })?;
             }
             let node_after = hierarchy::require_node(&self.db(), node_id)?.clone();
-            return Ok(ReportResult { item: transitioned, node: node_after });
+            return Ok(ReportResult {
+                item: transitioned,
+                node: node_after,
+            });
         }
 
         let transitioned =
@@ -1362,7 +1520,10 @@ impl OmtCore {
             reported: true,
             ..UpdateInput::default()
         })?;
-        Ok(ReportResult { item: transitioned, node: updated })
+        Ok(ReportResult {
+            item: transitioned,
+            node: updated,
+        })
     }
 
     // ── passive observation (TICKET-0061) ───────────────────────────────
@@ -1389,13 +1550,14 @@ impl OmtCore {
         }
         let mut advanced = Vec::new();
         // Snapshot BEFORE mutating (the SQL scan materializes rows first).
-        let snapshot =
-            self.db().run_items_for_node(node_id, &[RunStatus::Running, RunStatus::Paused]);
+        let snapshot = self
+            .db()
+            .run_items_for_node(node_id, &[RunStatus::Running, RunStatus::Paused]);
         for (item, run_status) in snapshot {
             let in_flight = is_run_item_in_flight(item.state);
             // In-flight always advances; pending only while dispatching.
-            let advance =
-                in_flight || (item.state == RunItemState::Pending && run_status == RunStatus::Running);
+            let advance = in_flight
+                || (item.state == RunItemState::Pending && run_status == RunStatus::Running);
 
             if archived_change == Some(true) {
                 if advance {
@@ -1408,7 +1570,9 @@ impl OmtCore {
                 }
                 continue;
             }
-            let Some(change) = status_change else { continue };
+            let Some(change) = status_change else {
+                continue;
+            };
             match change {
                 NodeStatus::InProgress => {
                     // Dispatch only — a claimed (already running) item is
@@ -1440,7 +1604,11 @@ impl OmtCore {
                         item.executor_session_id.as_deref(),
                         auto_verify,
                     );
-                    let target = if gated { "awaiting_confirmation" } else { "done" };
+                    let target = if gated {
+                        "awaiting_confirmation"
+                    } else {
+                        "done"
+                    };
                     advanced.push(self.transition_item(
                         &item.run_id,
                         node_id,
@@ -1493,14 +1661,22 @@ impl OmtCore {
     /// store directly and emit NO item events.
     pub fn janitor_sweep(&mut self) -> Result<JanitorResult> {
         let now = self.now();
-        let candidates = self.db().list_runs_by_status(&[RunStatus::Running, RunStatus::Paused]);
+        let candidates = self
+            .db()
+            .list_runs_by_status(&[RunStatus::Running, RunStatus::Paused]);
         let snapshots: Vec<SweepRun> = candidates
             .iter()
-            .map(|run| SweepRun { run: run.clone(), items: self.db().list_run_items(&run.id) })
+            .map(|run| SweepRun {
+                run: run.clone(),
+                items: self.db().list_run_items(&run.id),
+            })
             .collect();
         let leases = self.deps.leases.clone();
-        let plan: SweepPlan =
-            plan_sweep(&snapshots, |session, attempt| leases.borrow().lease_alive(session, attempt), &now)?;
+        let plan: SweepPlan = plan_sweep(
+            &snapshots,
+            |session, attempt| leases.borrow().lease_alive(session, attempt),
+            &now,
+        )?;
 
         for (run_id, node_id) in &plan.demotions {
             self.db_mut().update_run_item(
@@ -1570,9 +1746,13 @@ impl OmtCore {
 
     /// Terminal derivation wrapper returning whether a terminal was derived.
     fn derive_run_terminal(&mut self, id: &str) -> bool {
-        let Some(run) = self.store_get_run(id) else { return false };
+        let Some(run) = self.store_get_run(id) else {
+            return false;
+        };
         let items = self.db().list_run_items(id);
-        let Some(terminal) = derive_terminal(run.status, &items) else { return false };
+        let Some(terminal) = derive_terminal(run.status, &items) else {
+            return false;
+        };
         self.set_run_status(id, terminal).is_ok()
     }
 
@@ -1625,7 +1805,10 @@ impl OmtCore {
         let body = replace_children_block(&file.body, &block);
         let parent_id = self.db().parent_of(id).map(|p| p.id);
         let content = serialize_node_file(frontmatter_lines(&node, parent_id.as_deref()), &body);
-        self.deps.files.borrow_mut().write_file(&node.path, &content)?;
+        self.deps
+            .files
+            .borrow_mut()
+            .write_file(&node.path, &content)?;
         Ok(())
     }
 }
@@ -1633,15 +1816,24 @@ impl OmtCore {
 // ── free helpers ────────────────────────────────────────────────────────
 
 fn run_status_gate(run_id: &str, current: RunStatus, required: &[RunStatus]) -> Problem {
-    Problem::with_details(error::CONFLICT, format!("run-status-gate violated for {run_id}"), |d| {
-        d.insert("rule".into(), "run-status-gate".into());
-        d.insert("runId".into(), run_id.into());
-        d.insert("current".into(), current.to_string().into());
-        d.insert(
-            "required".into(),
-            Value::Array(required.iter().map(|r| Value::String(r.to_string())).collect()),
-        );
-    })
+    Problem::with_details(
+        error::CONFLICT,
+        format!("run-status-gate violated for {run_id}"),
+        |d| {
+            d.insert("rule".into(), "run-status-gate".into());
+            d.insert("runId".into(), run_id.into());
+            d.insert("current".into(), current.to_string().into());
+            d.insert(
+                "required".into(),
+                Value::Array(
+                    required
+                        .iter()
+                        .map(|r| Value::String(r.to_string()))
+                        .collect(),
+                ),
+            );
+        },
+    )
 }
 
 fn retry_state_gate(run_id: &str, node_id: &str, item_state: RunItemState) -> Problem {
@@ -1653,7 +1845,10 @@ fn retry_state_gate(run_id: &str, node_id: &str, item_state: RunItemState) -> Pr
             d.insert("runId".into(), run_id.into());
             d.insert("nodeId".into(), node_id.into());
             d.insert("itemState".into(), item_state.to_string().into());
-            d.insert("required".into(), serde_json::json!(["failed", "interrupted", "pending"]));
+            d.insert(
+                "required".into(),
+                serde_json::json!(["failed", "interrupted", "pending"]),
+            );
         },
     )
 }
@@ -1704,7 +1899,13 @@ pub fn merge_run_config(overrides: Option<&Value>) -> serde_json::Map<String, Va
 pub fn default_body(node_type: &NodeType) -> String {
     let sections: Vec<&str> = match node_type {
         NodeType::Epic => {
-            vec!["## 总体目标", "## 范围", "## 非范围", "## 全局约束", "## 成功标准"]
+            vec![
+                "## 总体目标",
+                "## 范围",
+                "## 非范围",
+                "## 全局约束",
+                "## 成功标准",
+            ]
         }
         NodeType::Story | NodeType::Substory => vec![
             "## 能力结果",

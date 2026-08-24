@@ -13,6 +13,7 @@
 //! [`omt_domain::error::Problem`] shape; this crate implements the IO side and
 //! never duplicates domain decisions.
 
+pub mod backup;
 pub mod clock;
 pub mod fault;
 pub mod files;
@@ -22,6 +23,7 @@ pub mod journal;
 pub mod migrate;
 pub mod outbox;
 pub mod recovery;
+pub mod reindex;
 pub mod store;
 
 pub use clock::{FixedClock, MillisClock, SystemClock};
