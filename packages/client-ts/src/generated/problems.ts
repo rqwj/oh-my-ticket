@@ -2,7 +2,7 @@
 // Regenerate with `pnpm gen` at the repository root.
 
 /**
- * The v1 seed set of coarse codes, carried forward from the TypeScript core's OmtError taxonomy. U2's pre-freeze pass subdivides these additively (e.g. ARCHIVED_READONLY under CONFLICT, DUPLICATE_MEMBER under INVALID_INPUT); the runtime plane (U5) adds its connection-identity coarse codes UNAUTHORIZED / FORBIDDEN and lifecycle code BOOTSTRAP_TIMEOUT.
+ * The v1 seed set of coarse codes, carried forward from the TypeScript core's OmtError taxonomy. U2's pre-freeze pass subdivides these additively (e.g. ARCHIVED_READONLY under CONFLICT, DUPLICATE_MEMBER under INVALID_INPUT); the runtime plane (U5) adds its connection-identity coarse codes UNAUTHORIZED / FORBIDDEN, lifecycle code BOOTSTRAP_TIMEOUT, and the U5b resource-bound codes RATE_LIMITED / QUOTA_EXCEEDED.
  */
 export type SeedProblemCodes =
   | "CONFLICT"
@@ -14,7 +14,9 @@ export type SeedProblemCodes =
   | "SCHEMA_TOO_NEW"
   | "UNAUTHORIZED"
   | "FORBIDDEN"
-  | "BOOTSTRAP_TIMEOUT";
+  | "BOOTSTRAP_TIMEOUT"
+  | "RATE_LIMITED"
+  | "QUOTA_EXCEEDED";
 
 /**
  * One registry entry: what the code means, its details shape, and coarse fallback for unknown subdivided codes.
@@ -67,6 +69,8 @@ export interface SeedProblemRegistry {
   UNAUTHORIZED?: ProblemDescriptor8;
   FORBIDDEN?: ProblemDescriptor9;
   BOOTSTRAP_TIMEOUT?: ProblemDescriptor10;
+  RATE_LIMITED?: ProblemDescriptor11;
+  QUOTA_EXCEEDED?: ProblemDescriptor12;
 }
 /**
  * One registry entry: what the code means, its details shape, and coarse fallback for unknown subdivided codes.
@@ -299,6 +303,52 @@ export interface ProblemDescriptor10 {
   [k: string]: unknown;
 }
 /**
+ * One registry entry: what the code means, its details shape, and coarse fallback for unknown subdivided codes.
+ */
+
+/**
+ * One registry entry: what the code means, its details shape, and coarse fallback for unknown subdivided codes.
+ */
+export interface ProblemDescriptor11 {
+  summary: string;
+  /**
+   * Prose description of the Problem.details fields for this code.
+   */
+  detailsShape?: string;
+  /**
+   * Nearest coarse ancestor to interpret when this exact code is unknown to an older client; absent when the code is itself coarse.
+   */
+  coarseFallback?: string;
+  /**
+   * stable: the code will never change meaning. provisional: introduced as a subdivision and may still be folded back.
+   */
+  stability: "stable" | "provisional";
+  [k: string]: unknown;
+}
+/**
+ * One registry entry: what the code means, its details shape, and coarse fallback for unknown subdivided codes.
+ */
+
+/**
+ * One registry entry: what the code means, its details shape, and coarse fallback for unknown subdivided codes.
+ */
+export interface ProblemDescriptor12 {
+  summary: string;
+  /**
+   * Prose description of the Problem.details fields for this code.
+   */
+  detailsShape?: string;
+  /**
+   * Nearest coarse ancestor to interpret when this exact code is unknown to an older client; absent when the code is itself coarse.
+   */
+  coarseFallback?: string;
+  /**
+   * stable: the code will never change meaning. provisional: introduced as a subdivision and may still be folded back.
+   */
+  stability: "stable" | "provisional";
+  [k: string]: unknown;
+}
+/**
  * Subdivided codes introduced by U2's pre-freeze pass (additive; each carries a coarseFallback so older clients interpret unknown codes). Open map: any key matching ^[A-Z][A-Z0-9_]+$ may appear.
  */
 
@@ -372,6 +422,25 @@ export interface U4SubdivisionDescriptors {
   REINDEX_REQUIRED?: {
     summary: "Observed on-disk content diverges from what the journaled plan wrote (manual drift or ambiguous crash residue); nothing was overwritten — run reindex and retry.";
     detailsShape: "{ requiresReindex: true, commandId?: string, from?: string, to?: string } — commandId identifies the pending journal plan; from/to appear for move-drift refusals.";
+    coarseFallback: "CONFLICT";
+    stability: "stable";
+    [k: string]: unknown;
+  };
+}
+/**
+ * Runtime-plane codes introduced by U5/U5b (additive). Open map: any key matching ^[A-Z][A-Z0-9_]+$ may appear.
+ */
+
+/**
+ * Runtime-plane codes introduced by U5/U5b (additive). Open map: any key matching ^[A-Z][A-Z0-9_]+$ may appear.
+ */
+export interface U5SubdivisionDescriptors {
+  /**
+   * Client cancellation honored at a linearization-safe point (U5b): before db_committed the op aborts leaving its journal row pending-recovery (the next recovery rolls it forward); after db_committed the op completes and the cancel is ignored. details.rule=client-canceled, details.commandId, details.at names the safe point.
+   */
+  CANCELED?: {
+    summary: "The operation was canceled by the client before it could commit; any journaled residue rolls forward deterministically on the next recovery.";
+    detailsShape: "{ rule: 'client-canceled', commandId: string, at: 'before-journal' | 'after-prepared' | 'after-files-applied' }.";
     coarseFallback: "CONFLICT";
     stability: "stable";
     [k: string]: unknown;

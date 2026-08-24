@@ -153,13 +153,23 @@ export class Transport {
   /**
    * Send one JSON-RPC request and await its response. Rejects with
    * {@link OmtProtocolError} when the daemon answers with a Problem.
+   *
+   * `hooks.onIssued` receives the wire id as soon as the request line is
+   * written, enabling `$/cancelRequest` cancellation via {@link sendCancel}
+   * (U5c: the server honors cancellation only at linearization-safe points;
+   * after the op is durable the call completes normally).
    */
-  call(method: string, params: unknown = {}): Promise<unknown> {
+  call(
+    method: string,
+    params: unknown = {},
+    hooks?: { onIssued?: (id: number) => void },
+  ): Promise<unknown> {
     if (!this.isConnected) {
       return Promise.reject(new Error('transport not connected'))
     }
     const id = this.nextId++
     const line = JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n'
+    hooks?.onIssued?.(id)
     return new Promise((resolve, reject) => {
       const timer =
         this.requestTimeoutMs > 0
@@ -177,6 +187,27 @@ export class Transport {
         }
       })
     })
+  }
+
+  /**
+   * Send the JSON-RPC cancellation notification for an in-flight call id
+   * (U5c): `{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id"}}`.
+   * Fire-and-forget by protocol design — the response to the ORIGINAL
+   * request settles the promise (CANCELED problem or the completed result).
+   */
+  sendCancel(id: number): void {
+    if (!this.isConnected) return
+    try {
+      const line =
+        JSON.stringify({
+          jsonrpc: '2.0',
+          method: '$/cancelRequest',
+          params: { id },
+        }) + '\n'
+      this.socket.write(line)
+    } catch {
+      /* socket raced shutdown: nothing to cancel anyway */
+    }
   }
 
   /** Register an extra close handler (idempotent removal on unsubscribe). */

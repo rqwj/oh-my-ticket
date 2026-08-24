@@ -42,7 +42,7 @@ fn stale_bootstrap_lock_is_stolen_by_a_new_daemon() {
     // The stale marker was replaced by the winner's own lock body.
     let body = read_maybe(&lock_path).expect("winner rewrote the lock");
     assert!(
-        body.contains("2000000000") == false || body.contains("\"pid\":2000000000") == false,
+        !body.contains("2000000000") || !body.contains("\"pid\":2000000000"),
         "stale pid must not survive"
     );
     assert!(proc.is_alive(), "winner serves");
@@ -50,14 +50,13 @@ fn stale_bootstrap_lock_is_stolen_by_a_new_daemon() {
     proc.kill();
 }
 
-/// Restart after a hard kill: the BOOTSTRAP plane recovers (stale election
-/// lock + stale descriptor are stolen/steppable), but the HOME plane fails
-/// CLOSED per U4a's locked refusal matrix — `ownerKind:"daemon"` markers
-/// refuse ALWAYS (even stale/dead) so crashed daemons need EXPLICIT
-/// takeover (U6 tooling), never silent auto-steal. The replacement daemon
-/// must therefore exit(2) with an actionable DAEMON_OWNS_HOME error.
+/// Restart after a hard kill (U5b ownership ruling): the BOOTSTRAP plane
+/// recovers (stale election lock + stale descriptor are stolen/steppable),
+/// and the HOME plane auto-recovers ONLY the predecessor's own dead-pid
+/// `ownerKind:"daemon"` marker — a live daemon marker still refuses with
+/// DAEMON_OWNS_HOME, and ts-bridge markers require explicit takeover (U6).
 #[test]
-fn killed_daemons_home_marker_fails_closed_until_explicit_takeover() {
+fn killed_daemons_home_marker_auto_recovers_own_dead_pid() {
     let ctx = TestCtx::spawn();
 
     let mut first = DaemonProcess::spawn(&ctx, &["--home", ctx.home_str()]);
@@ -65,15 +64,24 @@ fn killed_daemons_home_marker_fails_closed_until_explicit_takeover() {
         .expect("first daemon publishes");
     first.kill(); // hard kill: leaves bootstrap.lock + descriptor.json + home.lock
 
-    // Bootstrap plane recovers: the abandoned election artifacts do not
-    // block a new contender from WINNING the election...
+    // Bootstrap plane recovers; the dead predecessor's OWN daemon marker is
+    // auto-recovered (ruling: daemon restart may recover only ownerKind
+    // "daemon" with a dead PID) and the replacement serves.
     let mut second = DaemonProcess::spawn(&ctx, &["--home", ctx.home_str()]);
+    let d2 = wait_for_descriptor(&ctx.runtime_dir, Duration::from_secs(20))
+        .expect("replacement daemon recovers its own dead marker and serves");
+    assert!(
+        d2.generation >= 2,
+        "generation increments across replacements"
+    );
+    assert!(second.is_alive(), "replacement serves");
 
-    // ...but the home open must FAIL CLOSED on the daemon-owned marker:
-    // exit code 2 + actionable problem code on stderr.
-    let info = second
+    // A SECOND writer while the replacement is LIVE still fails closed:
+    // exit code 2 + DAEMON_OWNS_HOME on stderr.
+    let mut contender = DaemonProcess::spawn(&ctx, &["--home", ctx.home_str()]);
+    let info = contender
         .wait_with_timeout(Duration::from_secs(20))
-        .expect("replacement daemon exits after the refused home open");
+        .expect("contender exits after the refused home open");
     assert_eq!(
         info.code,
         Some(2),
@@ -86,29 +94,18 @@ fn killed_daemons_home_marker_fails_closed_until_explicit_takeover() {
         info.stderr
     );
 
-    // No descriptor is published by the failed replacement.
+    // No descriptor is published by the failed contender.
     let published = common::Descriptor::read(&ctx.runtime_dir);
     match published {
         None => {}
         Some(d) => assert_ne!(
             d.pid,
-            std::process::id() as i64,
-            "a failed replacement must not publish its own descriptor"
+            contender.pid(),
+            "a failed contender must not publish its own descriptor"
         ),
     }
 
-    // Explicit-takeover path (U6 preview, manual marker removal per U4a's
-    // documented recovery): removing the abandoned marker re-enables
-    // ownership and the daemon then starts cleanly.
-    let _ = std::fs::remove_file(ctx.home.join("home.lock"));
-    let mut third = DaemonProcess::spawn(&ctx, &["--home", ctx.home_str()]);
-    let d3 = wait_for_descriptor(&ctx.runtime_dir, Duration::from_secs(20))
-        .expect("daemon starts after explicit takeover");
-    assert!(
-        d3.generation >= 2,
-        "generation increments across replacements"
-    );
-    third.kill();
+    second.kill();
 }
 
 /// Stale descriptor respawn path: with only a descriptor left behind by a

@@ -14,6 +14,28 @@ pub const FORBIDDEN: &str = "FORBIDDEN";
 /// budget and no lock could be won (HOME_LOCKED-style coarse refusal).
 pub const BOOTSTRAP_TIMEOUT: &str = "BOOTSTRAP_TIMEOUT";
 
+/// Alias so runtime modules speak one Problem shape.
+pub type ProblemShape = omt_storage::Problem;
+
+/// Registered limit-code builder (U5b): RATE_LIMITED carries
+/// `details.reason`, QUOTA_EXCEEDED carries `details.rule`; both merge the
+/// caller's structured extras (limit/observed) into details.
+pub fn limit_problem(
+    code: &'static str,
+    field: &'static str,
+    value: &str,
+    extra: serde_json::Value,
+) -> ProblemShape {
+    omt_storage::Problem::with_details(code, format!("{code}: {field}={value}"), |d| {
+        d.insert(field.into(), serde_json::Value::String(value.to_string()));
+        if let serde_json::Value::Object(map) = extra {
+            for (name, item) in map {
+                d.insert(name, item);
+            }
+        }
+    })
+}
+
 /// Entropy helpers: hex tokens from the OS CSPRNG.
 pub mod entropy {
     /// 32 random bytes as 64 lowercase hex chars (credential tokens,

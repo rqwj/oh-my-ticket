@@ -11,6 +11,7 @@
 //! exit closing fds (documented in README).
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 pub static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
@@ -19,6 +20,31 @@ pub static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 pub type WakeListener = Box<dyn FnOnce() + Send>;
 
 static WAKE: std::sync::Mutex<Option<WakeListener>> = std::sync::Mutex::new(None);
+
+/// Reusable wake handle for NON-signal sources (U5b idle watchdog): the
+/// last home actor exiting after the quiet period self-connects through
+/// this so a blocked accept() observes an empty homes registry and starts
+/// the clean shutdown path.
+pub type WakeFn = Arc<dyn Fn() + Send + Sync>;
+
+/// THE shared idle-wake slot: writers (set_idle_wake) and readers (home
+/// actors through idle_wake_handle clones) MUST observe the same instance.
+fn idle_slot() -> &'static std::sync::Arc<std::sync::Mutex<Option<WakeFn>>> {
+    static SLOT: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<Option<WakeFn>>>> =
+        std::sync::OnceLock::new();
+    SLOT.get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new(None)))
+}
+
+/// Register the idle-wake callback (called once during daemon startup,
+/// before any actor can finish).
+pub fn set_idle_wake(wake: WakeFn) {
+    *idle_slot().lock().expect("idle wake slot") = Some(wake);
+}
+
+/// Shared handle handed to home actors.
+pub fn idle_wake_handle() -> std::sync::Arc<std::sync::Mutex<Option<WakeFn>>> {
+    idle_slot().clone()
+}
 
 /// Install signal masking + watcher. Returns after arming; does not block.
 #[cfg(unix)]

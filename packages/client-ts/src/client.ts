@@ -73,12 +73,31 @@ export interface ClientOptions {
   requestTimeoutMs?: number
   /** Skip spawn when no live descriptor exists (connect-only mode). */
   noSpawn?: boolean
+  /**
+   * Reconnect policy (U5c). Enabled by default: on an unexpected close the
+   * client re-runs discover-or-spawn + handshake with CAPPED BACKOFF
+   * (`initialDelayMs` doubling up to `maxDelayMs`), then replays every
+   * active events() subscription from its last delivered cursor.
+   */
+  reconnect?: { initialDelayMs?: number; maxDelayMs?: number; enabled?: boolean }
 }
 
 export class OmtClient {
   private transport: Transport | null = null
   private handshakeResult: HandshakeOutcome | null = null
   private readonly options: ClientOptions
+  /** connect() arguments retained for automatic reconnection (U5c). */
+  private connectArgs: {
+    kind: ClientKind
+    scopes: RequestedScopes
+    name?: string
+  } | null = null
+  private closedByCaller = false
+  private reconnecting = false
+  private reconnectAttempt = 0
+  /** Active events() subscriptions replayed from their cursor after a
+   *  reconnect completes. */
+  private readonly resubscribers = new Set<() => void>()
 
   constructor(options: ClientOptions = {}) {
     this.options = options
@@ -179,6 +198,8 @@ export class OmtClient {
    */
   async connect(kind: ClientKind, scopes: RequestedScopes = {}, name?: string): Promise<HandshakeOutcome> {
     if (this.transport?.isConnected && this.handshakeResult) return this.handshakeResult
+    this.connectArgs = { kind, scopes, name }
+    this.closedByCaller = false
 
     const descriptor = await OmtClient.discoverOrSpawn(this.options)
     this.transport = await Transport.connect(descriptor.endpoint, {
@@ -191,6 +212,7 @@ export class OmtClient {
       onClose: () => {
         this.handshakeResult = null
         this.transport = null
+        this.scheduleReconnect()
       },
     })
     this.handshakeResult = (await this.transport.call('handshake/request', {
@@ -199,6 +221,56 @@ export class OmtClient {
       requestedScopes: scopes,
     })) as HandshakeOutcome
     return this.handshakeResult
+  }
+
+  /**
+   * U5c resilience: unexpected socket loss re-establishes the session with
+   * capped backoff (default 100ms → ×2 → 5s ceiling), then replays every
+   * active subscription from its LAST DELIVERED CURSOR — no gap, no dupes
+   * beyond the documented page/live boundary dedupe.
+   */
+  private scheduleReconnect(): void {
+    if (this.closedByCaller || this.reconnecting) return
+    if (this.options.reconnect?.enabled === false) return
+    if (!this.connectArgs) return
+    this.reconnecting = true
+    void (async () => {
+      const initial = this.options.reconnect?.initialDelayMs ?? 100
+      const max = this.options.reconnect?.maxDelayMs ?? 5_000
+      try {
+        while (!this.closedByCaller && !this.connected && this.connectArgs) {
+          const delay = Math.min(max, initial * 2 ** this.reconnectAttempt)
+          this.reconnectAttempt += 1
+          await sleep(delay)
+          try {
+            await this.connect(this.connectArgs.kind, this.connectArgs.scopes, this.connectArgs.name)
+            this.reconnectAttempt = 0
+            for (const resubscribe of [...this.resubscribers]) {
+              try {
+                resubscribe()
+              } catch {
+                /* a broken listener must not block the others */
+              }
+            }
+            break
+          } catch {
+            /* keep backing off */
+          }
+        }
+      } finally {
+        this.reconnecting = false
+      }
+    })()
+  }
+
+  /**
+   * Cancel one in-flight call (U5c): sends `$/cancelRequest` for the given
+   * wire id. The original promise settles with either a CANCELED problem or
+   * the completed result — cancellation lands only at linearization-safe
+   * points server-side.
+   */
+  cancel(callId: number): void {
+    this.transport?.sendCancel(callId)
   }
 
   /** Active credential after a successful {@link connect}. */
@@ -222,12 +294,16 @@ export class OmtClient {
    * casts the result to T. Rejects with {@link OmtProtocolError} carrying
    * problem code/details on failure (R5).
    */
-  async call<T = unknown>(method: string, params: Record<string, unknown> = {}): Promise<T> {
+  async call<T = unknown>(
+    method: string,
+    params: Record<string, unknown> = {},
+    hooks?: { onIssued?: (id: number) => void },
+  ): Promise<T> {
     if (!this.connected || !this.credential || !this.transport) {
       throw new Error('client not connected; call connect() first')
     }
     const authedParams = { ...params, credential: { token: this.credential.token } }
-    return (await this.transport.call(method, authedParams)) as T
+    return (await this.transport.call(method, authedParams, hooks)) as T
   }
 
   // ── events ───────────────────────────────────────────────────────────
@@ -256,6 +332,11 @@ export class OmtClient {
     const deliver = (envelope: EventEnvelope): void => {
       if (disposed) return
       if ((envelope.cursor ?? 0) <= (options.since ?? 0)) return
+      // Page/live boundary dedupe: a live notification may arrive while
+      // the backlog page containing the same cursor is still in flight
+      // (and vice versa). Cursors are strictly monotonic per home, so any
+      // envelope at or below the high-water mark was already delivered.
+      if ((envelope.cursor ?? 0) <= lastCursor) return
       lastCursor = Math.max(lastCursor, envelope.cursor)
       try {
         onEnvelope(envelope)
@@ -303,10 +384,18 @@ export class OmtClient {
 
     const previousNotificationHandler = this.notificationBridge
     this.notificationBridge = notificationHandler
+    // U5c: after an automatic reconnect, replaying resume() re-pages from
+    // lastCursor (no gap) AND re-attaches the live server subscription the
+    // dead connection used to hold.
+    const resubscribe = (): void => {
+      if (!disposed && this.transport !== null) void resume()
+    }
+    this.resubscribers.add(resubscribe)
     void resume()
 
     return () => {
       disposed = true
+      this.resubscribers.delete(resubscribe)
       if (this.notificationBridge === notificationHandler) {
         this.notificationBridge = previousNotificationHandler
       }
@@ -317,8 +406,11 @@ export class OmtClient {
   /** Single-notification bridge wired at connect(); see events(). */
   private notificationBridge: ((method: string, params: unknown) => void) | null = null
 
-  /** Tear down the connection (credentials die server-side with expiry). */
+  /** Tear down the connection (credentials die server-side with expiry).
+   *  Stops the automatic reconnect loop. */
   close(): void {
+    this.closedByCaller = true
+    this.resubscribers.clear()
     this.handshakeResult = null
     this.transport?.end()
     this.transport = null

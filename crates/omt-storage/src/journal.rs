@@ -30,6 +30,29 @@ pub const PHASE_FILES_APPLIED: &str = "files_applied";
 pub const PHASE_DB_COMMITTED: &str = "db_committed";
 pub const PHASE_ACKNOWLEDGED: &str = "acknowledged";
 
+/// Problem code returned when a caller cancellation was honored at a
+/// linearization-safe point (U5b; registered in schema/problems.schema.json).
+/// details.rule = "client-canceled", details.at names the safe point.
+pub const CANCELED_PROBLEM_CODE: &str = "CANCELED";
+
+/// Build the canonical cancellation problem for one aborted command.
+pub fn canceled_problem(command_id: &str, at: &str) -> Problem {
+    Problem::with_details(
+        CANCELED_PROBLEM_CODE,
+        format!("operation {command_id} canceled before commit"),
+        |d| {
+            d.insert("rule".into(), "client-canceled".into());
+            d.insert("commandId".into(), command_id.into());
+            d.insert("at".into(), at.into());
+        },
+    )
+}
+
+/// Never-cancel probe used by the plain [`Storage::execute`] path.
+pub fn no_cancel() -> impl Fn() -> bool + Send + Sync + Copy {
+    || false
+}
+
 // ── plan vocabulary ─────────────────────────────────────────────────────
 
 /// One file operation of a mutation plan. Content is ABSOLUTE (the final
@@ -144,6 +167,111 @@ where
     })
 }
 
+/// Serializable run snapshot crossing the journal JSON boundary (mirrors
+/// [`omt_domain::types::RunRow`], which stays Serialize-only by design).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RunDto {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub status: String,
+    /// RunConfigValue wire shape {stopOnFailure, autoContinue, autoVerify, concurrency}.
+    pub config: Value,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+}
+
+impl RunDto {
+    pub fn from_row(run: &omt_domain::types::RunRow) -> Self {
+        RunDto {
+            id: run.id.clone(),
+            title: run.title.clone(),
+            status: run.status.to_string(),
+            config: serde_json::json!({
+                "stopOnFailure": run.config.stop_on_failure,
+                "autoContinue": run.config.auto_continue,
+                "autoVerify": run.config.auto_verify,
+                "concurrency": run.config.concurrency,
+            }),
+            created_at: run.created_at.clone(),
+            finished_at: run.finished_at.clone(),
+        }
+    }
+
+    pub fn to_row(&self) -> Result<omt_domain::types::RunRow> {
+        Ok(omt_domain::types::RunRow {
+            id: self.id.clone(),
+            title: self.title.clone(),
+            status: parse(&self.status)?,
+            config: omt_domain::types::RunConfigValue {
+                stop_on_failure: self.config["stopOnFailure"].as_bool().unwrap_or(false),
+                auto_continue: self.config["autoContinue"].as_bool().unwrap_or(true),
+                auto_verify: self.config["autoVerify"].as_bool().unwrap_or(false),
+                concurrency: self.config["concurrency"].as_i64().unwrap_or(1),
+            },
+            created_at: self.created_at.clone(),
+            finished_at: self.finished_at.clone(),
+        })
+    }
+}
+
+/// Serializable run-item snapshot crossing the journal JSON boundary
+/// (mirrors [`omt_domain::types::RunItemRow`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ItemDto {
+    pub run_id: String,
+    pub node_id: String,
+    pub position: i64,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor_session_id: Option<String>,
+    pub attempts: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nudged_at: Option<String>,
+    pub nudge_count: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+}
+
+impl ItemDto {
+    pub fn from_row(item: &RunItemRow) -> Self {
+        ItemDto {
+            run_id: item.run_id.clone(),
+            node_id: item.node_id.clone(),
+            position: item.position,
+            state: item.state.to_string(),
+            executor_session_id: item.executor_session_id.clone(),
+            attempts: item.attempts,
+            last_error: item.last_error.clone(),
+            nudged_at: item.nudged_at.clone(),
+            nudge_count: item.nudge_count,
+            started_at: item.started_at.clone(),
+            finished_at: item.finished_at.clone(),
+        }
+    }
+
+    pub fn to_row(&self) -> Result<RunItemRow> {
+        Ok(RunItemRow {
+            run_id: self.run_id.clone(),
+            node_id: self.node_id.clone(),
+            position: self.position,
+            state: parse(&self.state)?,
+            executor_session_id: self.executor_session_id.clone(),
+            attempts: self.attempts,
+            last_error: self.last_error.clone(),
+            nudged_at: self.nudged_at.clone(),
+            nudge_count: self.nudge_count,
+            started_at: self.started_at.clone(),
+            finished_at: self.finished_at.clone(),
+        })
+    }
+}
+
 /// Explicit-set patch payload (`None` fields are skipped; dedicated clear
 /// flags make NULL writes distinguishable from no-ops).
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -161,6 +289,19 @@ pub struct NodePatch {
     pub set_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub set_updated_at: Option<String>,
+}
+
+/// Run-row patch mirroring [`store::update_run`] semantics on the wire:
+/// `clear_finished_at`/`clear_title` distinguish NULL writes from no-ops.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct RunPatch {
+    pub run_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub set_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub set_finished_at: Option<String>,
+    #[serde(default)]
+    pub clear_finished_at: bool,
 }
 
 /// Run-item patch mirroring [`store::ItemPatchValues`] on the wire.
@@ -226,6 +367,20 @@ pub enum DbChange {
     },
     CounterBump {
         prefix: String,
+    },
+    /// U5b run-plane vocabulary (additive): insert one run row. Applied in
+    /// the first pass so later ItemInsert changes satisfy the FK.
+    RunInsert {
+        run: RunDto,
+    },
+    /// U5b run-plane vocabulary: status/finished_at patch of one run.
+    RunPatch {
+        patch: RunPatch,
+    },
+    /// U5b run-plane vocabulary: insert one pending item of a new run
+    /// (requires its RunInsert earlier in the plan).
+    ItemInsert {
+        item: ItemDto,
     },
     ItemPatch {
         patch: ItemPatch,
@@ -459,6 +614,23 @@ impl Storage {
     /// A previously committed `command_id` returns its stored result without
     /// re-applying anything (retry-after-lost-ack idempotency, R9).
     pub fn execute(&mut self, mutation: &PreparedMutation) -> Result<Value> {
+        self.execute_cancellable(mutation, &no_cancel())
+    }
+
+    /// [`Self::execute`] with a client-cancellation probe (U5b). The probe
+    /// is honored ONLY at linearization-safe points:
+    /// - before the journal row exists: clean abort, nothing durable;
+    /// - after `prepared` / after `files_applied`: the op aborts and the
+    ///   caller sees [`CANCELED_PROBLEM_CODE`], while the journal row stays
+    ///   PENDING-RECOVERY — cancellation is exactly a crash at that instant
+    ///   and the next recovery rolls it forward deterministically (R7);
+    /// - after `db_committed`: the mutation completes; the cancel flag is
+    ///   ignored and the normal result returns.
+    pub fn execute_cancellable(
+        &mut self,
+        mutation: &PreparedMutation,
+        canceled: &dyn Fn() -> bool,
+    ) -> Result<Value> {
         // Idempotency fast path: same commandId must carry the same input
         // fingerprint; a reuse with different input fails closed.
         let existing = self.stored_result(&mutation.command_id)?;
@@ -478,12 +650,30 @@ impl Storage {
             });
         }
 
+        // Safe point 1: nothing durable exists yet — clean abort.
+        if canceled() {
+            return Err(canceled_problem(&mutation.command_id, "before-journal"));
+        }
+
         // Phase PREPARED — durable BEFORE any file is touched.
         self.journal_insert(mutation)?;
+
+        // Safe point 2: journal row stays pending-recovery (replay converges).
+        if canceled() {
+            return Err(canceled_problem(&mutation.command_id, "after-prepared"));
+        }
 
         // File plan application with per-phase kill points.
         self.apply_file_plan(mutation)?;
         self.journal_set_phase(&mutation.command_id, PHASE_FILES_APPLIED)?;
+
+        // Safe point 3: files applied but DB untouched — still recoverable.
+        if canceled() {
+            return Err(canceled_problem(
+                &mutation.command_id,
+                "after-files-applied",
+            ));
+        }
 
         // Finalize: ONE transaction committing node rows + operations +
         // outbox events + journal phase=db_committed.
@@ -683,23 +873,41 @@ pub(crate) fn finalize_mutation(
 }
 
 pub(crate) fn apply_db_changes(tx: &Connection, changes: &[DbChange]) -> Result<()> {
-    // Two-pass application: every NodeInsert lands before anything that can
-    // reference it (edges carry FK constraints), preserving relative order
-    // within each pass.
+    // Three-pass application: (1) every NodeInsert AND RunInsert lands
+    // before anything that can reference it (edges/run_items carry FK
+    // constraints), preserving relative order within the pass; (2) ItemInsert
+    // rows (FK → runs) before generic patches; (3) everything else in plan
+    // order.
     for change in changes
         .iter()
-        .filter(|c| matches!(c, DbChange::NodeInsert { .. }))
+        .filter(|c| matches!(c, DbChange::NodeInsert { .. } | DbChange::RunInsert { .. }))
     {
-        if let DbChange::NodeInsert { node } = change {
-            store::insert_node(tx, &node.to_row()?, 1)?;
+        match change {
+            DbChange::NodeInsert { node } => store::insert_node(tx, &node.to_row()?, 1)?,
+            DbChange::RunInsert { run } => store::insert_run(tx, &run.to_row()?)?,
+            _ => unreachable!("filtered into first pass"),
         }
     }
     for change in changes
         .iter()
-        .filter(|c| !matches!(c, DbChange::NodeInsert { .. }))
+        .filter(|c| matches!(c, DbChange::ItemInsert { .. }))
     {
+        if let DbChange::ItemInsert { item } = change {
+            store::insert_run_item(tx, &item.to_row()?)?;
+        }
+    }
+    for change in changes.iter().filter(|c| {
+        !matches!(
+            c,
+            DbChange::NodeInsert { .. } | DbChange::RunInsert { .. } | DbChange::ItemInsert { .. }
+        )
+    }) {
         match change {
-            DbChange::NodeInsert { .. } => unreachable!("filtered into first pass"),
+            DbChange::NodeInsert { .. }
+            | DbChange::RunInsert { .. }
+            | DbChange::ItemInsert { .. } => {
+                unreachable!("filtered into earlier passes")
+            }
             DbChange::NodePatch { patch } => {
                 let values = store::NodePatchValues {
                     title: patch.set_title.clone(),
@@ -732,6 +940,15 @@ pub(crate) fn apply_db_changes(tx: &Connection, changes: &[DbChange]) -> Result<
             }
             DbChange::CounterBump { prefix } => {
                 store::bump_counter(tx, prefix)?;
+            }
+            DbChange::RunPatch { patch } => {
+                let status = patch.set_status.as_deref().map(parse).transpose()?;
+                let finished_at: Option<Option<String>> = if patch.clear_finished_at {
+                    Some(None)
+                } else {
+                    patch.set_finished_at.clone().map(Some)
+                };
+                store::update_run(tx, &patch.run_id, status, finished_at, None)?;
             }
             DbChange::ItemPatch { patch } => {
                 let values = store::ItemPatchValues {
@@ -1187,6 +1404,78 @@ impl Storage {
             plan.changes.push(change);
         }
         Ok(plan)
+    }
+
+    /// RUN CREATE (U5b): insert the run row, its pending items, and the RUN
+    /// counter bump as ONE journaled mutation. Runs are DB-only (no file
+    /// ops); decision gates (duplicates, member types, archive) stay
+    /// upstream. Fingerprint pins [runId, every memberId] so command-id
+    /// reuse with different membership fails closed (R9).
+    pub fn plan_run_create(
+        &self,
+        command_id: &str,
+        run: &omt_domain::types::RunRow,
+        items: &[RunItemRow],
+        home_id: &str,
+    ) -> Result<PreparedMutation> {
+        let mut fingerprint: Vec<&str> = vec![&run.id];
+        let item_ids: Vec<String> = items.iter().map(|item| item.node_id.clone()).collect();
+        let item_refs: Vec<&str> = item_ids.iter().map(String::as_str).collect();
+        fingerprint.extend(item_refs);
+        let mut plan = PreparedMutation::new(
+            command_id.to_string(),
+            "run_create",
+            input_fingerprint(&fingerprint),
+        );
+        plan.push_change(DbChange::CounterBump {
+            prefix: "RUN".into(),
+        });
+        plan.push_change(DbChange::RunInsert {
+            run: RunDto::from_row(run),
+        });
+        for item in items {
+            plan.push_change(DbChange::ItemInsert {
+                item: ItemDto::from_row(item),
+            });
+        }
+        plan.push_event(
+            "run.changed",
+            serde_json::json!({
+                "kind": "run.changed",
+                "ref": { "homeId": home_id, "runId": run.id },
+            }),
+        );
+        plan.result = serde_json::to_value(RunDto::from_row(run)).unwrap_or(Value::Null);
+        Ok(plan)
+    }
+
+    /// Generic run-plane mutation builder (U5b): control transitions,
+    /// retry/remove, and report follow-ups (stop-on-failure pause, terminal
+    /// derivation) compose validated [`DbChange`] lists + stream events +
+    /// the result envelope into one journaled mutation. ALL decision logic
+    /// stays upstream; this owns only durable shape + idempotency.
+    pub fn plan_run_mutation(
+        &self,
+        command_id: &str,
+        op_kind: &str,
+        fingerprint_parts: &[&str],
+        changes: Vec<DbChange>,
+        events: Vec<(&str, Value)>,
+        result: Value,
+    ) -> PreparedMutation {
+        let mut plan = PreparedMutation::new(
+            command_id.to_string(),
+            op_kind.to_string(),
+            input_fingerprint(fingerprint_parts),
+        );
+        for change in changes {
+            plan.push_change(change);
+        }
+        for (event_type, payload) in events {
+            plan.push_event(event_type, payload);
+        }
+        plan.result = result;
+        plan
     }
 
     /// Render the managed children block of one node from live edges.

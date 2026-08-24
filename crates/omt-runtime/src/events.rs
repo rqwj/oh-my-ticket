@@ -88,11 +88,16 @@ pub fn backlog(
         .collect())
 }
 
-/// One live subscriber: a bounded line channel into its connection writer.
+/// One live subscriber: a bounded line channel into its connection writer,
+/// plus the resume cursor it registered from — the retention task keys
+/// `snapshot.resync` emission on the OLDEST live subscriber cursor so a
+/// prune is signaled exactly when a connected consumer would lose history.
 pub struct Subscriber {
     #[allow(dead_code)]
     pub id: String,
     pub sender: std::sync::mpsc::SyncSender<String>,
+    /// Cursor this subscriber resumed from (0 = full replay).
+    pub from_cursor: i64,
 }
 
 /// Per-home live subscription registry + broadcast watermark. The home
@@ -115,12 +120,34 @@ impl Hub {
     }
 
     pub fn subscribe(&self, sender: std::sync::mpsc::SyncSender<String>) -> String {
+        self.subscribe_with_cursor(0, sender)
+    }
+
+    /// Register a live subscription remembering its resume cursor.
+    pub fn subscribe_with_cursor(
+        &self,
+        from_cursor: i64,
+        sender: std::sync::mpsc::SyncSender<String>,
+    ) -> String {
         let id = crate::problem::entropy::short_id();
-        self.subscribers.lock().expect("hub").push(Subscriber {
+        let mut subscribers = self.subscribers.lock().expect("hub");
+        subscribers.push(Subscriber {
             id: id.clone(),
             sender,
+            from_cursor,
         });
         id
+    }
+
+    /// Oldest live subscriber cursor (None when nobody subscribes). The
+    /// retention task passes this as the protected consumer cursor.
+    pub fn oldest_subscriber_cursor(&self) -> Option<i64> {
+        self.subscribers
+            .lock()
+            .expect("hub")
+            .iter()
+            .map(|subscriber| subscriber.from_cursor)
+            .min()
     }
 
     #[allow(dead_code)] // explicit unsubscribe path (connection teardown is channel-drop today)
@@ -163,10 +190,11 @@ impl Hub {
     }
 }
 
-/// Retention wiring is deferred to U5b (limits/logging unit): today the
-/// daemon never prunes, so snapshot-resync payloads never carry
-/// prunedThroughSeq/consumerCursor. The schema fields exist additively so
-/// consumers can parse them when retention lands.
+/// Retention wiring (U5b, superseding the U5a deferral): the daemon-owned
+/// pruning task lives in `homes::run_retention_tick`, running
+/// `outbox::prune_and_signal` per open home each actor tick with the oldest
+/// live subscriber cursor as the protected consumer. This stub remains only
+/// as a documentation anchor.
 pub struct RetentionNote;
 
 impl RetentionNote {

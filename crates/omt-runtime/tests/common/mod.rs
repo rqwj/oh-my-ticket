@@ -37,6 +37,34 @@ impl DaemonProcess {
         }
     }
 
+    /// Spawn with extra environment variables (e.g. the deterministic
+    /// OMT_DELAY_BEFORE_METHOD slowdown hook).
+    pub fn spawn_with_env(
+        ctx: &TestCtx,
+        extra_args: &[&str],
+        envs: &[(&str, String)],
+    ) -> DaemonProcess {
+        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let stderr_path = ctx.dir.path().join(format!("daemon-{id}.stderr"));
+        let stderr_file = std::fs::File::create(&stderr_path).expect("create stderr capture");
+        let mut command = Command::new(bin_path());
+        command
+            .arg("--runtime-dir")
+            .arg(ctx.runtime_dir_str())
+            .args(extra_args)
+            .env("OMT_RUNTIME_DIR", ctx.runtime_dir_str())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr_file));
+        for (key, value) in envs {
+            command.env(key, value);
+        }
+        let child = command.spawn().expect("spawn omt-daemon");
+        DaemonProcess {
+            child: std::sync::Mutex::new(child),
+            stderr_path,
+        }
+    }
+
     pub fn pid(&self) -> i64 {
         self.child.lock().expect("child lock").id() as i64
     }
@@ -243,6 +271,11 @@ impl TestClient {
             next_id: 1,
             notifications: Vec::new(),
         })
+    }
+
+    /// Raw reader access for refusal-line assertions (no id to match).
+    pub fn reader_line(&mut self, buf: &mut String) -> std::io::Result<usize> {
+        self.reader.read_line(buf)
     }
 
     pub fn send_line(&mut self, line: &str) -> Result<(), RpcError> {

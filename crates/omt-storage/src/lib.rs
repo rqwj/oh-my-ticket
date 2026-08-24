@@ -30,8 +30,8 @@ pub use clock::{FixedClock, MillisClock, SystemClock};
 pub use fault::{FaultSchedule, FilePhase, Step};
 pub use journal::Storage as _StorageAlias;
 pub use journal::{
-    report_item_patch, DbChange, FileOp, ItemPatch, NodeDto, NodePatch, OpenConfig, OutboxEvent,
-    PreparedMutation, Storage,
+    canceled_problem, report_item_patch, DbChange, FileOp, ItemDto, ItemPatch, NodeDto, NodePatch,
+    OpenConfig, OutboxEvent, PreparedMutation, RunDto, RunPatch, Storage, CANCELED_PROBLEM_CODE,
 };
 pub use omt_domain::error::Problem;
 pub use omt_domain::Result;

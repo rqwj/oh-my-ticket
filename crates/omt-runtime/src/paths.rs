@@ -12,6 +12,9 @@
 //! - `descriptor.json`  — atomic generation descriptor
 //! - `bootstrap.lock`   — single-daemon election lock
 //! - `admin-grants.json`— out-of-band administrator principal list
+//! - `daemon.json`      — lifecycle configuration (U5b: idleQuietMs,
+//!   lockHeartbeatMs, limits overrides)
+//! - `logs/`            — rotated daemon log (`omt-daemon.log.N`, U5b)
 //! - `omt/daemon.sock`  — unix endpoint (windows: named pipe, see ipc.rs)
 
 use std::path::PathBuf;
@@ -19,6 +22,8 @@ use std::path::PathBuf;
 pub const DESCRIPTOR_FILE: &str = "descriptor.json";
 pub const BOOTSTRAP_LOCK_FILE: &str = "bootstrap.lock";
 pub const ADMIN_GRANTS_FILE: &str = "admin-grants.json";
+/// Lifecycle configuration file (U5b).
+pub const CONFIG_FILE: &str = "daemon.json";
 /// Socket lives one level below the runtime dir (packet-pinned layout).
 pub const SOCKET_REL: &str = "omt/daemon.sock";
 

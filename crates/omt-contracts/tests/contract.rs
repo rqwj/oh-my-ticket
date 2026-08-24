@@ -21,7 +21,7 @@ use omt_contracts::protocol::*;
 use omt_contracts::{
     ArchiveNodeParams, ClaimRunResult, CreateNodeParams, EventEnvelope, EventPayload, HomeId,
     Iso8601Time, JsonRpcResponse, NodeStatus, NodeType, NodeView, Problem, ProblemCode,
-    ProblemDetails, Progress, RunLink, RunItemState, RunStatus, SnapshotResyncEvent,
+    ProblemDetails, Progress, RunItemState, RunLink, RunStatus, SnapshotResyncEvent,
 };
 use serde_json::{json, Value};
 
@@ -48,7 +48,10 @@ fn load_docs() -> BTreeMap<String, Value> {
         let text = fs::read_to_string(&path).expect("schema file is UTF-8");
         let doc: Value = serde_json::from_str(&text).expect("schema file is valid JSON");
         docs.insert(
-            path.file_name().expect("file name").to_string_lossy().into_owned(),
+            path.file_name()
+                .expect("file name")
+                .to_string_lossy()
+                .into_owned(),
             doc,
         );
     }
@@ -168,7 +171,9 @@ fn valid_problem_passes_schema() {
 fn malformed_home_id_rejected_by_schema() {
     let reg = registry();
     let home_id = validator_for(&reg, "common.schema.json#/$defs/HomeId");
-    for bad in ["HOMEABC", "h_", "h_ABC123", "abc123", "h_upper!", "h_ abc12"] {
+    for bad in [
+        "HOMEABC", "h_", "h_ABC123", "abc123", "h_upper!", "h_ abc12",
+    ] {
         assert_invalid(&home_id, &json!(bad), &format!("malformed homeId {bad:?}"));
     }
     // The documented shape passes: h_ plus at least six lowercase alphanumerics.
@@ -178,7 +183,11 @@ fn malformed_home_id_rejected_by_schema() {
     let create = validator_for(&reg, "commands.schema.json#/$defs/CreateNodeParams");
     let mut bad_payload = sample_create_params();
     bad_payload["homeId"] = json!("NOT_QUALIFIED");
-    assert_invalid(&create, &bad_payload, "node/create with bare non-qualified id");
+    assert_invalid(
+        &create,
+        &bad_payload,
+        "node/create with bare non-qualified id",
+    );
 }
 
 #[test]
@@ -214,7 +223,11 @@ fn unknown_fields_tolerated_at_schema_level() {
     let create = validator_for(&reg, "commands.schema.json#/$defs/CreateNodeParams");
     let mut future_create = sample_create_params();
     future_create["idempotencyKey"] = json!("opaque-key");
-    assert_valid(&create, &future_create, "params with additive unknown field");
+    assert_valid(
+        &create,
+        &future_create,
+        "params with additive unknown field",
+    );
 }
 
 #[test]
@@ -227,7 +240,10 @@ fn unknown_fields_ignored_by_generated_structs() {
     // Re-serializing drops what the struct does not know — the owned shape.
     let round: Value = serde_json::to_value(&view).expect("serialize NodeView");
     assert_eq!(round["nodeId"], json!("TICKET-0001"));
-    assert!(round.get("futureField").is_none(), "unknowns are not adopted");
+    assert!(
+        round.get("futureField").is_none(),
+        "unknowns are not adopted"
+    );
 }
 
 // ── unsupported-major negotiation → UNSUPPORTED_PROTOCOL ──────────────────
@@ -274,7 +290,9 @@ fn unsupported_major_carries_problem_over_the_wire() {
     // Simulate the negotiation failure response a peer must produce for a
     // request advertising an unsupported MAJOR: a JSON-RPC error whose data is
     // a Problem carrying the stable code. Round-trips through generated types.
-    let code: ProblemCode = UNSUPPORTED_PROTOCOL_CODE.parse().expect("code matches pattern");
+    let code: ProblemCode = UNSUPPORTED_PROTOCOL_CODE
+        .parse()
+        .expect("code matches pattern");
     let response = JsonRpcResponse::Variant1 {
         id: omt_contracts::RequestId::Variant0(7),
         jsonrpc: "2.0".parse().expect("jsonrpc literal"),
@@ -358,7 +376,11 @@ fn node_view_round_trips_with_camel_case_wire_names() {
     let original: NodeView =
         serde_json::from_value(sample_node_view()).expect("sample NodeView parses");
     let serialized = serde_json::to_value(&original).expect("NodeView serializes");
-    assert_eq!(serialized, sample_node_view(), "camelCase wire form preserved");
+    assert_eq!(
+        serialized,
+        sample_node_view(),
+        "camelCase wire form preserved"
+    );
     let back: NodeView = serde_json::from_value(serialized).expect("re-parse");
     assert_eq!(original.status, back.status);
     assert_eq!(*back.revision, *original.revision);
@@ -399,8 +421,8 @@ fn event_envelope_round_trips_attention_payload() {
     let envelope = validator_for(&reg, "events.schema.json#/$defs/EventEnvelope");
     assert_valid(&envelope, &attention, "attention envelope validates");
 
-    let typed: EventEnvelope = serde_json::from_value(attention.clone())
-        .expect("envelope deserializes");
+    let typed: EventEnvelope =
+        serde_json::from_value(attention.clone()).expect("envelope deserializes");
     match &typed.payload {
         EventPayload::AttentionRaisedEvent(payload) => {
             assert_eq!(payload.action.as_str(), "review.awaiting_confirmation");
@@ -448,6 +470,9 @@ fn snapshot_resync_event_round_trips() {
         home_id: HOME.parse().unwrap(),
         kind: "snapshot.resync".parse().expect("kind literal"),
         reason: "retention expired".to_string(),
+        // U5 additive keying fields (optional on the wire).
+        pruned_through_seq: None,
+        consumer_cursor: None,
     });
     let envelope = EventEnvelope {
         cursor: omt_contracts::EventCursor::from(9u64),
@@ -544,14 +569,21 @@ fn handshake_round_trip_negotiates_shared_version() {
 
     let request = json!({
         "protocolVersion": PROTOCOL_VERSION,
-        "client": { "name": "@omt/client-ts", "version": "0.1.0" },
+        "client": { "kind": "cli", "name": "@omt/client-ts", "version": "0.1.0" },
+        "requestedScopes": { "actorNamespace": "cli:4242" },
         "capabilities": ["events.resume"]
     });
     assert_valid(&params, &request, "handshake request");
     assert_invalid(
         &params,
         &json!({ "protocolVersion": "1.0", "client": {} }),
-        "client name required",
+        "client kind+name required",
+    );
+    // U5b: kind is part of the principal identity (R22 parity classes).
+    assert_invalid(
+        &params,
+        &json!({ "protocolVersion": "1.0", "client": { "name": "no-kind" } }),
+        "client kind required",
     );
 
     let reply = json!({
@@ -567,11 +599,26 @@ fn handshake_round_trip_negotiates_shared_version() {
             "maxEventBatch": 500,
             "runConcurrency": 1
         },
-        "features": { "actionParityMatrix": true, "eventResume": true, "idempotencyKeys": false }
+        "features": { "actionParityMatrix": true, "eventResume": true, "idempotencyKeys": false },
+        "credential": {
+            "token": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "principalId": "cli:4242",
+            "actorNamespace": "cli:4242",
+            "homes": [HOME],
+            "operations": ["*"],
+            "expiresAt": "2026-08-25T00:00:00.000Z"
+        }
     });
     assert_valid(&result, &reply, "handshake result");
+    // The server-derived credential block is REQUIRED in every result
+    // ($defs/CredentialGrant, U5b): a reply without it is invalid.
+    let mut stripped = reply.clone();
+    stripped.as_object_mut().unwrap().remove("credential");
+    assert_invalid(&result, &stripped, "handshake result requires credential");
     let homes = reply["homes"].as_array().unwrap();
-    assert!(homes.iter().all(|h| h["homeId"].as_str().unwrap().starts_with("h_")));
+    assert!(homes
+        .iter()
+        .all(|h| h["homeId"].as_str().unwrap().starts_with("h_")));
 }
 
 // ── action-parity classification (R22) ────────────────────────────────────
@@ -631,7 +678,10 @@ fn parity_matrix_seed_covers_whole_vocabulary() {
         let action = entry["action"].as_str().expect("action name");
         let class = entry["classification"].as_str().expect("classification");
         assert!(
-            matches!(class, "agent_available" | "adapter_only" | "human_administrative"),
+            matches!(
+                class,
+                "agent_available" | "adapter_only" | "human_administrative"
+            ),
             "classification outside the R22 enum: {class}"
         );
         assert_eq!(entry["since"], "v1", "seed entries all land in v1");
@@ -764,7 +814,10 @@ fn public_result_views_carry_home_id() {
 
 #[test]
 fn node_type_enum_preserves_domain_vocabulary() {
-    assert!(NodeType::try_from("subticket").is_ok(), "subticket is a valid type");
+    assert!(
+        NodeType::try_from("subticket").is_ok(),
+        "subticket is a valid type"
+    );
     let summary = json!({
         "homeId": HOME, "nodeId": "X-1", "type": "mystery",
         "title": "t", "status": "open", "archived": false, "priority": 0

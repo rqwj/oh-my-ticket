@@ -100,7 +100,7 @@ fn quarantine_snapshot_fields_are_exact() {
 #[test]
 fn execute_matches_dry_run_and_reruns_are_stable() {
     let clock: Arc<FixedClock> = fixed_clock();
-    let (_dir, home, mut storage) = seed_home(&clock);
+    let (_dir, home, storage) = seed_home(&clock);
     let any_clock: Arc<dyn MillisClock> = clock.clone();
 
     let missing_path = ticket_path();

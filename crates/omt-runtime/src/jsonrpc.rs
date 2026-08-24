@@ -18,6 +18,18 @@ pub struct Request {
     pub params: Value,
 }
 
+/// JSON-RPC cancellation notification method (spec: `/cancelRequest`).
+pub const CANCEL_METHOD: &str = "$/cancelRequest";
+
+/// One inbound line: a request expecting a response, or a server-visible
+/// notification (only cancellation is meaningful; everything else is
+/// ignored — the daemon pushes notifications but accepts none besides).
+#[derive(Debug)]
+pub enum Incoming {
+    Request(Request),
+    Notification { method: String, params: Value },
+}
+
 impl Request {
     /// Parse one line as a JSON-RPC request (id present). Returns:
     /// - Ok(Some(req)) — a request expecting a response
@@ -44,6 +56,46 @@ impl Request {
             return Ok(None);
         }
         Ok(Some(Request { id, method, params }))
+    }
+}
+
+/// Parse one line into its incoming shape (U5b): requests keep the
+/// [`Request::parse`] semantics; notifications surface as
+/// [`Incoming::Notification`] so cancellation can be honored mid-flight.
+pub fn parse_message(line: &str) -> Result<Option<Incoming>, (i64, String)> {
+    let value: Value = match serde_json::from_str(line) {
+        Ok(value) => value,
+        Err(err) => return Err((CODE_PARSE_ERROR, format!("parse error: {err}"))),
+    };
+    if value.get("jsonrpc").and_then(|v| v.as_str()) != Some("2.0") {
+        return Err((CODE_INVALID_REQUEST, "jsonrpc must be \"2.0\"".into()));
+    }
+    let method = match value.get("method").and_then(|v| v.as_str()) {
+        Some(method) => method.to_string(),
+        None => return Err((CODE_INVALID_REQUEST, "method missing".into())),
+    };
+    let params = value.get("params").cloned().unwrap_or(Value::Null);
+    let has_id = match value.get("id") {
+        None | Some(Value::Null) => false,
+        Some(_) => true,
+    };
+    if !has_id {
+        return Ok(Some(Incoming::Notification { method, params }));
+    }
+    Ok(Some(Incoming::Request(Request {
+        id: value.get("id").cloned().unwrap_or(Value::Null),
+        method,
+        params,
+    })))
+}
+
+/// Extract the target request id from a $/cancelRequest notification.
+pub fn cancel_target(params: &Value) -> Option<Value> {
+    let id = params.get("id")?;
+    if id.is_null() {
+        None
+    } else {
+        Some(id.clone())
     }
 }
 

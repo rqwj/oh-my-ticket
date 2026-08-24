@@ -14,6 +14,8 @@ export const SEED_PROBLEM_CODES = [
   'UNAUTHORIZED',
   'FORBIDDEN',
   'BOOTSTRAP_TIMEOUT',
+  'RATE_LIMITED',
+  'QUOTA_EXCEEDED',
 ] as const
 
 export type SeedProblemCode = (typeof SEED_PROBLEM_CODES)[number]

@@ -1,9 +1,16 @@
-# omt-runtime / omt-daemon (plan U5a)
+# omt-runtime / omt-daemon / omt (plan U5a–U5c)
 
 The runnable OMT runtime: a single-writer local daemon speaking JSON-RPC 2.0
-over OS-local IPC. This unit delivers the daemon skeleton plus a working
-dispatch for every command in `schema/commands.schema.json`; CLI/MCP/desktop
-consumers land in later units (U5b–U9).
+over OS-local IPC, plus the `omt` operator CLI (second binary of this crate).
+U5a delivered the daemon skeleton and dispatch; U5b added resource limits,
+lifecycle configuration, rotating logs, daemon-owned retention, run-plane
+journal vocabulary, and cancellation; U5c added this CLI and the TypeScript
+client's reconnect/cancel polish.
+
+## Bins
+
+- `omt-daemon` — the single-writer runtime (`src/server.rs`).
+- `omt` — the operator CLI (`src/cli/`), see below.
 
 ## Endpoint and discovery
 
@@ -13,11 +20,6 @@ Per-user runtime directory resolution (`src/paths.rs`):
 2. `OMT_RUNTIME_DIR` environment variable (tests/sandboxes),
 3. otherwise `~/.omt/run/`.
 
-**Choice note:** the existing TypeScript host has no runtime-directory
-convention (`src/host` resolves only ticket homes), so the daemon pins its
-files beside the global home root instead of a platform temp dir. Every
-daemon-owned file stays under one user-visible location.
-
 Layout inside `<runtime-dir>`:
 
 | File | Purpose |
@@ -25,6 +27,9 @@ Layout inside `<runtime-dir>`:
 | `descriptor.json` | Atomic generation descriptor `{schemaVersion:1, endpoint, generation, pid, bootToken, startedAt}`; published tmp+rename |
 | `bootstrap.lock` | Single-daemon election lock (O_EXCL create, 2 s heartbeat, 10 s staleness with injectable clock) |
 | `admin-grants.json` | Out-of-band administrator principal list `{"principalIds":[...]}`, re-read fresh on every check |
+| `daemon.json` | Lifecycle + limits configuration (see below); absent file means compiled defaults |
+| `logs/omt-daemon.log(.N)` | Size-capped rotating daemon log (`maxFiles × maxBytes` bound total volume) |
+| `cli-credential.json` | Persisted CLI enrollment (0600) so leases fence consistently across invocations |
 | `omt/daemon.sock` | Unix domain socket endpoint (windows: named pipe `\\.\pipe\omt\<hash>\omt-daemon.pipe`, compiled per-target) |
 
 Descriptor staleness = PID liveness **and** a connect probe against the
@@ -32,12 +37,76 @@ endpoint; each replacement publishes `generation = previous + 1`. Startup
 performs pending-journal recovery while opening homes **before** publishing
 the descriptor, so readiness implies recovered.
 
-## Framing (pinned)
+## Lifecycle configuration (`daemon.json`, U5b)
 
-**Newline-delimited JSON**: exactly one JSON-RPC 2.0 message object per
-line, `\n` terminated, UTF-8, no batch arrays, no content-length headers.
-Payloads above 8 MiB are refused. The server pushes `omt/event`
-notifications interleaved with responses over the same ordered connection.
+Precedence: compiled defaults < config file; unknown keys or ill-typed
+values fail startup closed with `INVALID_INPUT` naming the field.
+
+```json
+{
+  "idleQuietMs": 1800000,
+  "lockHeartbeatMs": 10000,
+  "log": { "maxBytes": 5242880, "maxFiles": 3 },
+  "limits": { "maxOpenHomes": 8, "maxRetainedEvents": 100000 }
+}
+```
+
+- `idleQuietMs` — quiet-period idle watchdog (default 30 min). After this
+  much silence a home actor drains, releases its lock, and exits; the last
+  exiting actor wakes the accept loop so the process shuts down cleanly.
+  `0` disables the watchdog.
+- `lockHeartbeatMs` — per-home owner-lock heartbeat cadence.
+- `log.maxBytes` × `log.maxFiles` — rotation caps; total on-disk log volume
+  stays under their product by construction (oldest generation deleted at
+  rollover). Every logged line passes secret redaction before touching disk.
+- `limits` — overrides for the R21 bounds advertised in the handshake
+  (`Limits` in `schema/capabilities.schema.json`).
+
+## Resource limits (R21, U5b)
+
+Every externally influenced quantity is bounded (`src/limits.rs`) and each
+bound degrades FAIRLY — cheap checks before expensive ones — returning a
+registered Problem code:
+
+- `RATE_LIMITED` (transient capacity): concurrent connections at cap
+  (refused pre-protocol), per-home queue at depth (`try_send`, O(1)).
+- `QUOTA_EXCEEDED` (durable resource): opened-homes count, idempotency-table
+  entries at retention cap (committed replays always stay allowed).
+- `INVALID_INPUT` (caller mistakes): payload bytes over `maxPayloadBytes`,
+  search term over `maxSearchTermBytes`, event page over `maxEventBatch`.
+
+The negative matrix lives in `tests/limits_matrix.rs`; it asserts both each
+bound tripping and the fair order along the request path.
+
+## Home ownership, serialization, cancellation
+
+Each home opens under the daemon owner lock
+(`OpenConfig { acquire_lock: true, owner_kind: Daemon }`) with journal
+recovery on open, then all of its work funnels through one actor thread
+(mpsc queue): mutations and reads serialize, WAL snapshots serve reads, and
+the lock heartbeats between jobs.
+
+**Owner markers (binding rulings):** a restart may auto-recover ONLY its own
+homes — a `home.lock` whose `ownerKind:"daemon"` carries a DEAD pid (kernel
+flock probed first) — while any ts-bridge marker requires explicit takeover
+(U6) and a live daemon marker refuses second writers with
+`DAEMON_OWNS_HOME`.
+
+**Cancellation (U5b):** `$/cancelRequest` flips an in-flight probe honored
+ONLY at linearization-safe points in `Storage::execute_cancellable`: before
+the journal row exists → clean abort; after `prepared` /
+`files_applied` → the op aborts with `CANCELED` while its journal row stays
+pending-recovery (identical to a crash; recovery rolls it forward); after
+`db_committed` → the cancel is ignored and the op completes.
+
+## Retention (R11/F4, U5b)
+
+The daemon owns pruning: each home actor tick runs
+`outbox::prune_and_signal` to `maxRetainedEvents`, keying the protected
+consumer cursor on the OLDEST LIVE SUBSCRIBER cursor. When retained history
+no longer covers that consumer, a keyed `snapshot.resync`
+(`prunedThroughSeq`, `consumerCursor`) fans out through the normal publish
+path.
 
 ## Handshake and credentials
 
@@ -57,38 +126,48 @@ The server derives a credential — token (32 random bytes hex),
 principalId `<kind>:<pid>`, actorNamespace (`<kind>:<pid>` unless the
 requested namespace equals it or nests under `<kind>:<pid>/…`; a client can
 never mint another principal's namespace), homes ∩ open homes, operations
-(default `*`), expiresAt now+12h. Every subsequent request carries
-`params.credential.token`. Credentials live only in memory and die with the
-process generation. No credential appears in argv, env, logs, or error text
-(`problem::redact` scrubs 64-hex runs from anything crossing the wire).
+(default `*`), expiresAt now+12h — formally registered as
+`$defs/CredentialGrant` in `schema/capabilities.schema.json`. Every
+subsequent request carries `params.credential.token`. Credentials live only
+in memory and die with the process generation. No credential appears in
+argv, env, logs, or error text (`problem::redact` scrubs 64-hex runs from
+anything crossing the wire or the log).
 
 Parity enforcement (`schema/parity.schema.json`): agent_available is the
 default; adapter_only (`node/execute`, `ui/*`) requires a dsh/desktop
 principal; human_administrative (`home/reindex`) requires the principal id
 to be listed in `admin-grants.json`.
 
-## Home ownership and serialization
+## The `omt` CLI (U5c)
 
-Each home opens under the daemon owner lock
-(`OpenConfig { acquire_lock: true, owner_kind: Daemon }`) with journal
-recovery on open, then all of its work funnels through one actor thread
-(mpsc queue): mutations and reads serialize, WAL snapshots serve reads, and
-the lock heartbeats between jobs. SIGTERM stops accepting, drains every
-queue, releases locks, removes our descriptor, exits 0.
+Online verbs connect exactly like the TypeScript client (descriptor
+discovery → liveness probe → handshake/enrollment, kind `cli`,
+actorNamespace `cli:<pid>` by default):
+
+```
+list · show · create · update · move · archive
+run-create · run-get · run-list · run-control · run-claim · run-report
+daemon-start · daemon-stop · daemon-status
+```
+
+Offline maintenance verbs take exclusive ownership themselves
+(`OwnerKind::Daemon` marker + kernel flock, released afterwards) and REFUSE
+while a live daemon serves the runtime dir (`HOME_LOCKED` with stop-the-
+daemon guidance):
+
+```
+reindex <home-path>     # quarantine-preserving index rebuild
+doctor  <home-path>     # local writer cohorts: ts-bridge live/stale markers,
+                        # orphan recovery dirs, too-new schema; never steals
+```
+
+Contract: human summary on stdout (pretty JSON; `--json` for compact),
+Problem code/details on stderr, exit codes `0` ok · `2` usage · `3` problem
+· `130` canceled. Ctrl-C aborts the in-flight call (socket shutdown breaks
+the blocked read) and exits 130.
 
 ## Deviations (deliberate, revisited by later units)
 
 - **Windows transport** compiles as a skeleton (pipe-name derivation +
   cfg-gated stubs); peer credentials via `GetNamedPipeClientProcessId` land
   with the windows release leg (U10). All suites here run on unix.
-- **Run-plane writes** (`run/create`, `run/control`, `run/claim`,
-  `run/report`) commit through immediate single transactions gated by
-  domain decisions; the U4a phased-journal vocabulary currently covers node
-  files only. Journal-backed run rows are an additive U4/U5b follow-up;
-  node writes (`node/create|update|move|archive|execute`, report file
-  patches) already flow through the journal.
-- **Event retention** never prunes in U5a, so `snapshot.resync`
-  `prunedThroughSeq`/`consumerCursor` (added to `events.schema.json`
-  additively this unit) stay optional until retention ships.
-- **Idle shutdown** after a quiet period is deferred to U5b lifecycle
-  configuration; SIGTERM drain is implemented and tested.

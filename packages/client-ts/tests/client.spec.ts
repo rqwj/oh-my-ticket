@@ -1,15 +1,17 @@
 /**
- * U5a integration smoke: the TypeScript client library drives a REAL
+ * U5a/U5c integration smoke: the TypeScript client library drives a REAL
  * omt-daemon end-to-end — discovery/spawn, handshake enrollment, typed
- * calls over newline-delimited JSON-RPC, live event subscription, and
- * idempotency-key replay semantics.
+ * calls over newline-delimited JSON-RPC, live event subscription,
+ * idempotency-key replay semantics, and (U5c) automatic reconnection with
+ * capped backoff plus cursor-exact event resubscription after the daemon
+ * is killed with SIGKILL.
  *
  * Skips when the daemon binary has not been built yet
  * (`cargo build -p omt-runtime` produces target/debug/omt-daemon).
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { execSync } from 'node:child_process'
-import { existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { OmtClient } from '../src/client.js'
@@ -149,4 +151,122 @@ describe.skipIf(!haveDaemon)('OmtClient against a live omt-daemon', () => {
     await writer.close()
     await client.close()
   }, 30_000)
+
+  /**
+   * U5c resilience contract: kill -9 the daemon mid-subscription; the
+   * client must respawn it through discover-or-spawn, re-handshake with
+   * capped backoff, and replay the subscription from its LAST DELIVERED
+   * CURSOR — every event committed after the crash arrives exactly once
+   * and contiguously (no gap, no duplicate range).
+   */
+  it('resumes a subscription without cursor gap after the daemon is killed -9', async () => {
+    // Dedicated home + runtime dir: the kill/respawn cycle must not see
+    // the other tests' event history, so cursors are fully deterministic.
+    const rt2 = join(workDir, 'rt-reconnect')
+    const home2 = join(workDir, 'home-reconnect')
+    mkdirSync(rt2, { recursive: true })
+    mkdirSync(home2, { recursive: true })
+    const subscriber = new OmtClient({
+      runtimeDir: rt2,
+      daemonPath: DAEMON,
+      daemonArgs: ['--home', home2],
+      requestTimeoutMs: 15_000,
+      reconnect: { initialDelayMs: 50, maxDelayMs: 1_000 },
+    })
+    const handshake = await subscriber.connect('cli')
+    const homeId = handshake.homes[0]!.homeId
+
+    const received: Array<{ cursor: number; type: string }> = []
+    const dispose = subscriber.events(homeId, (envelope) => {
+      received.push({ cursor: envelope.cursor, type: envelope.type })
+    })
+
+    // Phase 1 — exactly ONE committed event while connected.
+    const writer = new OmtClient({
+      runtimeDir: rt2,
+      daemonPath: DAEMON,
+      daemonArgs: ['--home', home2],
+      requestTimeoutMs: 15_000,
+      reconnect: { enabled: false },
+    })
+    await writer.connect('cli')
+    await writer.call('node/create', { homeId, type: 'epic', title: 'pre-kill' })
+    await waitFor(() => received.length >= 1, 'first event delivered pre-kill')
+    const maxPreKill = Math.max(...received.map((e) => e.cursor))
+    expect(received.map((e) => e.cursor)).toEqual([maxPreKill])
+    await writer.close()
+
+    // Crash: SIGKILL leaves the descriptor AND the daemon owner marker
+    // behind (dead pid) — exactly the state auto-recovery exists for.
+    const descriptor = JSON.parse(
+      readFileSync(join(rt2, 'descriptor.json'), 'utf8'),
+    ) as { pid: number; generation: number }
+    const tokenBeforeKill = subscriber.credential!.token
+    process.kill(descriptor.pid, 'SIGKILL')
+
+    // The subscriber's automatic reconnect must land on a genuinely NEW
+    // session: `connected` alone can read stale-true for a few event-loop
+    // turns (a dead UDS peer is invisible until the close event lands), so
+    // require connected AND a fresh handshake token — proof the reconnect
+    // loop completed discover-or-spawn + handshake against the new daemon.
+    await waitFor(
+      () => subscriber.connected && subscriber.credential!.token !== tokenBeforeKill,
+      'subscriber reconnected with a fresh handshake after SIGKILL',
+      30_000,
+    )
+
+    // Respawn proof: the serving generation is strictly newer than the
+    // killed one (a different process owns the home now). Exact generation
+    // numbers are intentionally not pinned — a lost respawn race may burn
+    // one.
+    let respawnedGeneration = 0
+    await waitFor(
+      () => {
+        const current = OmtClient.readDescriptor(rt2)
+        if (current && current.generation > descriptor.generation) {
+          respawnedGeneration = current.generation
+        }
+        return respawnedGeneration > 0
+      },
+      'respawned daemon of a newer generation',
+    )
+
+    // Phase 2 — TWO events committed only after reconnection. If resume
+    // started anywhere but lastCursor these are lost; from 0 they'd dupe.
+    const writer2 = new OmtClient({
+      runtimeDir: rt2,
+      daemonPath: DAEMON,
+      daemonArgs: ['--home', home2],
+      requestTimeoutMs: 15_000,
+      reconnect: { enabled: false },
+    })
+    await writer2.connect('cli')
+    await writer2.call('node/create', { homeId, type: 'epic', title: 'post-crash-a' })
+    await writer2.call('node/create', { homeId, type: 'epic', title: 'post-crash-b' })
+
+    // Both post-crash events arrive, contiguous after the pre-kill cursor.
+    await waitFor(() => received.length >= 3, 'post-crash events delivered after resume')
+
+    const cursors = received.map((e) => e.cursor)
+    expect([...cursors].sort((a, b) => a - b)).toEqual(cursors) // strictly ordered
+    expect(new Set(cursors).size).toBe(cursors.length) // no duplicates
+    const post = cursors.filter((c) => c > maxPreKill)
+    expect(post).toEqual([maxPreKill + 1, maxPreKill + 2]) // no gap, exactly-once
+
+    // The respawned generation is a different process than the killed one.
+    expect(respawnedGeneration).toBeGreaterThan(descriptor.generation)
+
+    dispose()
+    await writer2.close()
+    await subscriber.close()
+  }, 60_000)
 })
+
+/** Poll until `condition` holds; polls every 50ms up to `timeoutMs`. */
+async function waitFor(condition: () => boolean, what: string, timeoutMs = 20_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`)
+    await new Promise((resolve) => setTimeout(resolve, 50))
+  }
+}

@@ -15,16 +15,18 @@ use omt_contracts::{NodeStatus, NodeType, RunItemState, RunStatus};
 use omt_domain::error;
 use omt_domain::types::{NodeRow, RunItemRow};
 use omt_storage::clock::{iso_from_ms, MillisClock};
-use omt_storage::journal::{report_item_patch, FileOp};
+use omt_storage::journal::{report_item_patch, DbChange, FileOp, RunPatch};
 use omt_storage::store;
 use omt_storage::{Problem, Result, Storage};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Mutex, OnceLock};
 
 use crate::auth::{self, Credential};
 use crate::events::Hub;
+use crate::limits::Limits;
 
 // ── parity matrix ───────────────────────────────────────────────────────
 
@@ -79,12 +81,19 @@ pub struct Ctx<'a> {
     pub storage: &'a mut Storage,
     pub hub: &'a std::sync::Arc<Hub>,
     pub auth: &'a Credential,
+    /// Resource bounds (R21) enforced inside dispatch.
+    pub limits: &'a Limits,
+    /// Client-cancellation probe honored at the storage layer's
+    /// linearization-safe points only (U5b).
+    pub cancel: &'a AtomicBool,
     /// Production clock; deterministic injection rides the lock/journal
     /// layers (tests drive FixedClock there).
     clock: SystemClockBox,
     /// Connection writer channel when the caller asked for a live event
     /// subscription (events/resume registers it race-free on the actor).
     pub subscribe: Option<SyncSender<String>>,
+    /// Cursor the live subscription resumes from (retention keying).
+    pub subscribe_from_cursor: Option<i64>,
 }
 
 struct SystemClockBox;
@@ -126,6 +135,35 @@ pub fn dispatch(
     params: Value,
     auth_credential: &Credential,
     subscribe: Option<SyncSender<String>>,
+) -> Result<Value> {
+    dispatch_cancellable(
+        storage,
+        hub,
+        method,
+        params,
+        auth_credential,
+        subscribe,
+        None,
+        &AtomicBool::new(false),
+        &Limits::default(),
+    )
+}
+
+/// Full-fidelity entry (U5b): cancellation probe + resource limits +
+/// subscription resume cursor. Cancellation is honored ONLY at the storage
+/// layer's linearization-safe points; a canceled pre-commit op leaves its
+/// journal row pending-recovery and rolls forward on the next recovery.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_cancellable(
+    storage: &mut Storage,
+    hub: &std::sync::Arc<Hub>,
+    method: &str,
+    params: Value,
+    auth_credential: &Credential,
+    subscribe: Option<SyncSender<String>>,
+    subscribe_from_cursor: Option<i64>,
+    cancel: &AtomicBool,
+    limits: &Limits,
 ) -> Result<Value> {
     // Parity gate (R22): every business method crosses the matrix before
     // touching a home.
@@ -171,8 +209,11 @@ pub fn dispatch(
         storage,
         hub,
         auth: auth_credential,
+        limits,
+        cancel,
         clock: SystemClockBox,
         subscribe,
+        subscribe_from_cursor,
     };
 
     let outcome = match method {
@@ -245,6 +286,25 @@ fn invalid_input(field: &str, message: &str) -> Problem {
     })
 }
 
+/// INVALID_INPUT whose structured details come from a limits check
+/// (field/maxLength/observed or field/limit/observed).
+fn invalid_input_details(field: &str, mut details: Value) -> Problem {
+    if let Some(map) = details.as_object_mut() {
+        map.insert("field".into(), json!(field));
+    }
+    Problem::with_details(
+        error::INVALID_INPUT,
+        format!("{field}: resource bound exceeded"),
+        |d| {
+            if let Some(map) = details.as_object() {
+                for (key, value) in map {
+                    d.insert(key.clone(), value.clone());
+                }
+            }
+        },
+    )
+}
+
 fn not_found_home(home_id: &str) -> Problem {
     Problem::with_details(error::NOT_FOUND, format!("unknown home: {home_id}"), |d| {
         d.insert("kind".into(), "home".into());
@@ -264,6 +324,32 @@ fn command_id(params: &Value) -> String {
         Some(id) if !id.is_empty() => id.to_string(),
         _ => crate::problem::entropy::short_id(),
     }
+}
+
+/// Idempotency-table quota (R21/U5b): enforced only for NEW commands —
+/// a committed commandId replaying its stored result is ALWAYS allowed,
+/// regardless of table pressure. Called by every client-initiated journaled
+/// handler right after its idempotency probe; internal cascade commands
+/// (ancestor activation) skip the gate.
+fn check_idempotency_room(ctx: &Ctx, command: &str) -> Result<()> {
+    if stored_operation(ctx.storage.conn(), command)?.is_some() {
+        return Ok(());
+    }
+    let rows: i64 = ctx
+        .storage
+        .conn()
+        .query_row("SELECT COUNT(*) FROM operations", [], |row| row.get(0))
+        .map_err(store_sql("operations count"))?;
+    if let Err(details) = ctx.limits.check_idempotency_capacity(rows) {
+        let map = details.as_object().cloned().unwrap_or_default();
+        let rule = map
+            .get("rule")
+            .and_then(|v| v.as_str())
+            .unwrap_or("idempotency-table")
+            .to_string();
+        return Err(crate::limits::quota_exceeded(&rule, Value::Object(map)));
+    }
+    Ok(())
 }
 
 fn conflict_rule(rule: &str, message: impl Into<String>, details: Value) -> Problem {
@@ -367,6 +453,10 @@ fn node_create(ctx: &mut Ctx, params: &Value) -> Result<Value> {
             json!({ "commandId": command }),
         ));
     }
+    // New command: enforce the idempotency-table quota (committed replays
+    // returned above).
+    check_idempotency_room(ctx, &command)?;
+
     let node_type_text = require_str(params, "type")?;
     let node_type: NodeType = node_type_text.parse().map_err(|_| {
         Problem::with_details(
@@ -574,6 +664,11 @@ fn node_list(ctx: &mut Ctx, params: &Value) -> Result<Value> {
     };
     let archived = filter.get("archived").and_then(|v| v.as_bool());
     let query = filter.get("query").and_then(|v| v.as_str()).map(str::trim);
+    if let Some(term) = query.filter(|q| !q.is_empty()) {
+        if let Err(details) = ctx.limits.check_search_term(term) {
+            return Err(invalid_input_details("filter.query", details));
+        }
+    }
 
     let nodes: Vec<NodeRow> = if let Some(query) = query.filter(|q| !q.is_empty()) {
         let conn = ctx.storage.conn();
@@ -645,6 +740,9 @@ fn node_search(ctx: &mut Ctx, params: &Value) -> Result<Value> {
         .unwrap_or_default()
         .trim()
         .to_string();
+    if let Err(details) = ctx.limits.check_search_term(&query) {
+        return Err(invalid_input_details("query", details));
+    }
     let limit = opt_i64(params, "limit")?.unwrap_or(20).clamp(1, 100) as usize;
     let conn = ctx.storage.conn();
     let ids: Vec<String> = if query.is_empty() {
@@ -684,6 +782,7 @@ fn node_update(ctx: &mut Ctx, params: &Value) -> Result<Value> {
             "body and append are mutually exclusive",
         ));
     }
+    check_idempotency_room(ctx, &command_id(params))?;
     // Optimistic concurrency gate BEFORE planning (R9).
     if let Some(expected) = opt_i64(params, "expectedRevision")? {
         let current = store::current_revision(ctx.storage.conn(), &id)?;
@@ -1210,6 +1309,7 @@ fn node_move(ctx: &mut Ctx, params: &Value) -> Result<Value> {
     omt_domain::hierarchy::check_self_parent(id, new_parent_id)?;
     omt_domain::hierarchy::check_child_type(&new_parent, node.node_type)?;
     check_descendant_cycle(conn, id, new_parent_id)?;
+    check_idempotency_room(ctx, &command_id(params))?;
 
     let old_parent = store::parent_of(conn, id)?;
     let old_path = node.path.clone();
@@ -1302,6 +1402,7 @@ fn node_archive(ctx: &mut Ctx, params: &Value) -> Result<Value> {
     let id = require_str(params, "nodeId")?.to_string();
     let changes = json!({ "archived": true });
     let command = command_id(params);
+    check_idempotency_room(ctx, &command)?;
     apply_update_and_activate(
         ctx,
         &id,
@@ -1329,6 +1430,7 @@ fn node_execute(ctx: &mut Ctx, params: &Value) -> Result<Value> {
             },
         ));
     }
+    check_idempotency_room(ctx, &command_id(params))?;
     let binding_key = format!("exec:{id}");
     let binding = json!({
         "principalId": ctx.auth.principal_id,
@@ -1516,31 +1618,19 @@ fn run_create(ctx: &mut Ctx, params: &Value) -> Result<Value> {
         finished_at: None,
     };
 
-    let home_id_ref = home_id.clone();
-    let run_id_items = run_id.clone();
-    store::in_transaction(conn, move |tx| {
-        store::bump_counter(tx, "RUN")?;
-        store::insert_run(tx, &run)?;
-        for (position, node_id) in node_ids.iter().enumerate() {
-            store::insert_run_item(
-                tx,
-                &RunItemRow::new(
-                    &run_id_items,
-                    node_id,
-                    position as i64,
-                    RunItemState::Pending,
-                ),
-            )?;
-        }
-        omt_storage::outbox::append(
-            tx,
-            &home_id_ref,
-            "run.changed",
-            &json!({ "kind": "run.changed", "ref": { "homeId": home_id_ref, "runId": run_id_items } }),
-            &now,
-        )?;
-        Ok(())
-    })?;
+    // U5b: run creation flows through the SAME phased journal as node ops
+    // (RunInsert + ItemInsert vocabulary) — crash-safe and idempotent.
+    let items: Vec<RunItemRow> = node_ids
+        .iter()
+        .enumerate()
+        .map(|(position, node_id)| {
+            RunItemRow::new(&run_id, node_id, position as i64, RunItemState::Pending)
+        })
+        .collect();
+    let mutation = ctx
+        .storage
+        .plan_run_create(&command_id(params), &run, &items, &home_id)?;
+    execute_journaled(ctx, &mutation)?;
 
     run_view_full(ctx, &home_id, &run_id)
 }
@@ -1619,6 +1709,35 @@ fn set_run_status_tx(
     Ok(())
 }
 
+/// finished_at semantics of a run status change (mirrors set_run_status_tx):
+/// terminal statuses stamp `now`; running/paused leave the column alone.
+fn run_finished_at_change(to: RunStatus, now: &str) -> (Option<String>, bool) {
+    match to {
+        RunStatus::Completed
+        | RunStatus::CompletedWithFailures
+        | RunStatus::Canceled
+        | RunStatus::Interrupted => (Some(now.to_string()), false),
+        RunStatus::Pending | RunStatus::Running | RunStatus::Paused => (None, false),
+    }
+}
+
+fn run_patch(run_id: &str, to: RunStatus, now: &str) -> RunPatch {
+    let (set_finished_at, clear_finished_at) = run_finished_at_change(to, now);
+    RunPatch {
+        run_id: run_id.to_string(),
+        set_status: Some(to.to_string()),
+        set_finished_at,
+        clear_finished_at,
+    }
+}
+
+fn run_changed_event(home_id: &str, run_id: &str) -> (&'static str, Value) {
+    (
+        "run.changed",
+        json!({ "kind": "run.changed", "ref": { "homeId": home_id, "runId": run_id } }),
+    )
+}
+
 fn run_control(ctx: &mut Ctx, params: &Value) -> Result<Value> {
     let home_id = ctx.home_id()?.to_string();
     let run_id = require_str(params, "runId")?.to_string();
@@ -1626,28 +1745,55 @@ fn run_control(ctx: &mut Ctx, params: &Value) -> Result<Value> {
     let action: omt_contracts::RunControlAction = action_text
         .parse()
         .map_err(|_| invalid_input("action", "unknown control action"))?;
+    check_idempotency_room(ctx, &command_id(params))?;
     let conn = ctx.storage.conn();
     let run = store::get_run(conn, &run_id)?.ok_or_else(|| error::not_found_run(&run_id))?;
     let now = ctx.now_iso();
+    let command = command_id(params);
 
+    // U5b: every control transition is ONE journaled mutation
+    // (RunPatch vocabulary + stream events), so crash convergence and
+    // idempotent replay match the node plane exactly.
     match action {
         omt_contracts::RunControlAction::Start => {
             if run.status != RunStatus::Pending {
                 return Err(status_gate(&run_id, run.status, &[RunStatus::Pending]));
             }
-            store::in_transaction(conn, |tx| {
-                set_run_status_tx(tx, &home_id, &run_id, RunStatus::Running, &ctx.clock, &run)?;
-                derive_terminal_tx(tx, &home_id, &run_id, &ctx.clock)?;
-                Ok(())
-            })?;
+            let items = store::list_run_items(conn, &run_id)?;
+            let mut changes = vec![DbChange::RunPatch {
+                patch: run_patch(&run_id, RunStatus::Running, &now),
+            }];
+            // Terminal derivation after start (e.g. zero-item runs).
+            if let Some(terminal) = omt_domain::runs::derive_terminal(RunStatus::Running, &items) {
+                changes.push(DbChange::RunPatch {
+                    patch: run_patch(&run_id, terminal, &now),
+                });
+            }
+            let mutation = ctx.storage.plan_run_mutation(
+                &command,
+                "run_control",
+                &[&run_id, action_text],
+                changes,
+                vec![run_changed_event(&home_id, &run_id)],
+                json!({ "runId": run_id, "status": "running" }),
+            );
+            execute_journaled(ctx, &mutation)?;
         }
         omt_contracts::RunControlAction::Pause => {
             if run.status != RunStatus::Running {
                 return Err(status_gate(&run_id, run.status, &[RunStatus::Running]));
             }
-            store::in_transaction(conn, |tx| {
-                set_run_status_tx(tx, &home_id, &run_id, RunStatus::Paused, &ctx.clock, &run)
-            })?;
+            let mutation = ctx.storage.plan_run_mutation(
+                &command,
+                "run_control",
+                &[&run_id, action_text],
+                vec![DbChange::RunPatch {
+                    patch: run_patch(&run_id, RunStatus::Paused, &now),
+                }],
+                vec![run_changed_event(&home_id, &run_id)],
+                json!({ "runId": run_id, "status": "paused" }),
+            );
+            execute_journaled(ctx, &mutation)?;
         }
         omt_contracts::RunControlAction::Resume => {
             if !matches!(run.status, RunStatus::Paused | RunStatus::Interrupted) {
@@ -1657,25 +1803,49 @@ fn run_control(ctx: &mut Ctx, params: &Value) -> Result<Value> {
                     &[RunStatus::Paused, RunStatus::Interrupted],
                 ));
             }
-            store::in_transaction(conn, |tx| {
-                set_run_status_tx(tx, &home_id, &run_id, RunStatus::Running, &ctx.clock, &run)
-            })?;
+            let mutation = ctx.storage.plan_run_mutation(
+                &command,
+                "run_control",
+                &[&run_id, action_text],
+                vec![DbChange::RunPatch {
+                    patch: run_patch(&run_id, RunStatus::Running, &now),
+                }],
+                vec![run_changed_event(&home_id, &run_id)],
+                json!({ "runId": run_id, "status": "running" }),
+            );
+            execute_journaled(ctx, &mutation)?;
         }
         omt_contracts::RunControlAction::Cancel => {
-            store::in_transaction(conn, |tx| {
-                set_run_status_tx(tx, &home_id, &run_id, RunStatus::Canceled, &ctx.clock, &run)
-            })?;
+            let mutation = ctx.storage.plan_run_mutation(
+                &command,
+                "run_control",
+                &[&run_id, action_text],
+                vec![DbChange::RunPatch {
+                    patch: run_patch(&run_id, RunStatus::Canceled, &now),
+                }],
+                vec![run_changed_event(&home_id, &run_id)],
+                json!({ "runId": run_id, "status": "canceled" }),
+            );
+            execute_journaled(ctx, &mutation)?;
         }
         omt_contracts::RunControlAction::Retry => {
             let node_id = require_str(params, "nodeId")?;
-            retry_item(ctx, &run_id, node_id, &run, &now)?;
+            retry_item(ctx, &run_id, node_id, &run, &now, &command)?;
         }
         omt_contracts::RunControlAction::Remove => {
             let node_id = require_str(params, "nodeId")?;
-            remove_item(ctx, &run_id, node_id)?;
+            remove_item(ctx, &run_id, node_id, &command)?;
         }
     }
     run_view_full(ctx, &home_id, &run_id)
+}
+
+/// Execute one prepared run-plane mutation through the phased journal with
+/// the connection's cancellation probe (linearization-safe abort points).
+fn execute_journaled(ctx: &mut Ctx, mutation: &omt_storage::PreparedMutation) -> Result<Value> {
+    let cancel: &AtomicBool = ctx.cancel;
+    let probe = move || cancel.load(AtomicOrdering::SeqCst);
+    ctx.storage.execute_cancellable(mutation, &probe)
 }
 
 fn status_gate(run_id: &str, current: RunStatus, required: &[RunStatus]) -> Problem {
@@ -1690,12 +1860,14 @@ fn status_gate(run_id: &str, current: RunStatus, required: &[RunStatus]) -> Prob
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn retry_item(
     ctx: &mut Ctx,
     run_id: &str,
     node_id: &str,
     run: &omt_domain::types::RunRow,
     now: &str,
+    command: &str,
 ) -> Result<()> {
     let conn = ctx.storage.conn();
     if matches!(run.status, RunStatus::Canceled | RunStatus::Completed) {
@@ -1727,50 +1899,31 @@ fn retry_item(
     }
     let home_id = ctx.home_id()?.to_string();
     let was_terminal_failure = run.status == RunStatus::CompletedWithFailures;
-    let home_id_ref = home_id.clone();
-    store::in_transaction(conn, move |tx| {
-        store::update_run_item(
-            tx,
-            run_id,
-            node_id,
-            &store::ItemPatchValues {
-                state: Some(RunItemState::Pending),
-                position: None,
-                executor_session_id: None,
-                clear_executor: true,
-                attempts: Some(item.attempts + 1),
-                last_error: None,
-                clear_last_error: false, // kept across retries
-                nudged_at: None,
-                nudge_count: Some(0),
-                started_at: None,
-                preserve_started_at: false,
-                finished_at: None,
-                clear_finished_at: true,
-            },
-        )?;
-        append_item_event_tx(
-            tx,
-            &home_id_ref,
-            run_id,
-            node_id,
-            RunItemState::Pending,
-            now,
-        )?;
-        if was_terminal_failure {
-            let refreshed =
-                store::get_run(tx, run_id)?.ok_or_else(|| error::not_found_run(run_id))?;
-            set_run_status_tx(
-                tx,
-                &home_id_ref,
-                run_id,
-                RunStatus::Running,
-                &SYSTEM_CLOCK,
-                &refreshed,
-            )?;
-        }
-        Ok(())
-    })?;
+    let patch = report_retry_patch(&item);
+    let mut changes = vec![DbChange::ItemPatch { patch }];
+    if was_terminal_failure {
+        changes.push(DbChange::RunPatch {
+            patch: run_patch(run_id, RunStatus::Running, now),
+        });
+    }
+    let events = vec![(
+        "run.item_changed",
+        json!({
+            "kind": "run.item_changed",
+            "ref": { "homeId": home_id, "runId": run_id, "nodeId": node_id },
+            "state": "pending",
+        }),
+    )];
+    let fingerprint = format!("retry:{run_id}:{node_id}");
+    let mutation = ctx.storage.plan_run_mutation(
+        command,
+        "run_control",
+        &[&fingerprint],
+        changes,
+        events,
+        json!({ "runId": run_id, "nodeId": node_id, "state": "pending" }),
+    );
+    execute_journaled(ctx, &mutation)?;
     leases()
         .lock()
         .expect("leases")
@@ -1778,7 +1931,28 @@ fn retry_item(
     Ok(())
 }
 
-fn remove_item(ctx: &mut Ctx, run_id: &str, node_id: &str) -> Result<()> {
+/// Retry patch (decision-identical to the TS flow): back to pending with
+/// bumped attempts, executor cleared, last_error kept across retries.
+fn report_retry_patch(item: &RunItemRow) -> omt_storage::ItemPatch {
+    omt_storage::journal::ItemPatch {
+        run_id: item.run_id.clone(),
+        node_id: item.node_id.clone(),
+        set_state: Some("pending".to_string()),
+        set_executor_session_id: None,
+        clear_executor_session_id: true,
+        set_attempts: Some(item.attempts + 1),
+        set_last_error: None,
+        clear_last_error: false,
+        set_nudged_at: None,
+        set_nudge_count: Some(0),
+        set_started_at_preserve: None,
+        set_started_at: None,
+        set_finished_at: None,
+        clear_finished_at: true,
+    }
+}
+
+fn remove_item(ctx: &mut Ctx, run_id: &str, node_id: &str, command: &str) -> Result<()> {
     let conn = ctx.storage.conn();
     let item = store::get_run_item(conn, run_id, node_id)?
         .ok_or_else(|| error::not_found_run_item(run_id, node_id))?;
@@ -1803,11 +1977,43 @@ fn remove_item(ctx: &mut Ctx, run_id: &str, node_id: &str) -> Result<()> {
         }
     }
     let home_id = ctx.home_id()?.to_string();
-    store::in_transaction(conn, |tx| {
-        store::delete_run_item(tx, run_id, node_id)?;
-        derive_terminal_tx(tx, &home_id, run_id, &ctx.clock)?;
-        Ok(())
-    })?;
+    // Simulate post-removal items for terminal derivation (decision stays
+    // upstream; the journal carries the mechanical RunPatch).
+    let items_after: Vec<RunItemRow> = store::list_run_items(conn, run_id)?
+        .into_iter()
+        .filter(|it| it.node_id != node_id)
+        .collect();
+    let mut changes = vec![DbChange::ItemDelete {
+        run_id: run_id.to_string(),
+        node_id: node_id.to_string(),
+    }];
+    let run_status = store::get_run(conn, run_id)?
+        .ok_or_else(|| error::not_found_run(run_id))?
+        .status;
+    if let Some(terminal) = omt_domain::runs::derive_terminal(run_status, &items_after) {
+        let now_iso = ctx.now_iso();
+        changes.push(DbChange::RunPatch {
+            patch: run_patch(run_id, terminal, &now_iso),
+        });
+    }
+    let events = vec![(
+        "run.item_changed",
+        json!({
+            "kind": "run.item_changed",
+            "ref": { "homeId": home_id, "runId": run_id, "nodeId": node_id },
+            "state": "removed",
+        }),
+    )];
+    let fingerprint = format!("remove:{run_id}:{node_id}");
+    let mutation = ctx.storage.plan_run_mutation(
+        command,
+        "run_control",
+        &[&fingerprint],
+        changes,
+        events,
+        json!({ "runId": run_id, "nodeId": node_id, "removed": true }),
+    );
+    execute_journaled(ctx, &mutation)?;
     leases()
         .lock()
         .expect("leases")
@@ -2037,7 +2243,10 @@ fn run_report(ctx: &mut Ctx, params: &Value) -> Result<Value> {
         .filter(|n| !n.is_empty());
 
     let conn = ctx.storage.conn();
-    let _run = store::get_run(conn, &run_id)?.ok_or_else(|| error::not_found_run(&run_id))?;
+    check_idempotency_room(ctx, &command_id(params))?;
+    let run_for_gate =
+        store::get_run(conn, &run_id)?.ok_or_else(|| error::not_found_run(&run_id))?;
+    drop(run_for_gate);
     let node = require_node(conn, &node_id)?;
     let item = store::get_run_item(conn, &run_id, &node_id)?
         .ok_or_else(|| error::not_found_run_item(&run_id, &node_id))?;
@@ -2099,15 +2308,54 @@ fn run_report(ctx: &mut Ctx, params: &Value) -> Result<Value> {
         _ => None,
     };
 
+    // U5b: the report AND its follow-ups (stop-on-failure pause, terminal
+    // derivation) form ONE journaled mutation — a crash anywhere converges
+    // to exactly one of: nothing (pre-commit replay) or everything.
+    let run_before = store::get_run(conn, &run_id)?.ok_or_else(|| error::not_found_run(&run_id))?;
     let now = ctx.now_iso();
+    let final_state_text = if failed { "failed" } else { outcome_text };
     let patch = report_item_patch(
         &item,
-        if failed { "failed" } else { outcome_text },
+        final_state_text,
         now.clone(),
         failed.then(|| note.unwrap_or_default().to_string()),
     );
+
+    let stop_hit =
+        failed && run_before.config.stop_on_failure && run_before.status == RunStatus::Running;
+    let mut extra_changes: Vec<DbChange> = Vec::new();
+    if stop_hit {
+        extra_changes.push(DbChange::RunPatch {
+            patch: run_patch(&run_id, RunStatus::Paused, &now),
+        });
+    }
+    // Terminal derivation over SIMULATED post-report item states (decision
+    // upstream; journal mechanical).
+    let simulated_items: Vec<RunItemRow> = store::list_run_items(conn, &run_id)?
+        .into_iter()
+        .map(|mut it| {
+            if it.node_id == node_id {
+                it.state = final_state_text.parse().expect("final state");
+            }
+            it
+        })
+        .collect();
+    let effective_status = if stop_hit {
+        RunStatus::Paused
+    } else {
+        run_before.status
+    };
+    if let Some(terminal) = omt_domain::runs::derive_terminal(effective_status, &simulated_items) {
+        if terminal != effective_status {
+            extra_changes.push(DbChange::RunPatch {
+                patch: run_patch(&run_id, terminal, &now),
+            });
+        }
+    }
+
     let parent = store::parent_of(conn, &node_id)?;
     let command = command_id(params);
+    check_idempotency_room(ctx, &command)?;
     let mut mutation = ctx.storage.plan_report(
         &command,
         &node,
@@ -2119,43 +2367,25 @@ fn run_report(ctx: &mut Ctx, params: &Value) -> Result<Value> {
             note.map(str::to_string)
         },
         patch,
-        vec![],
+        extra_changes,
     )?;
     mutation.push_event(
         "run.item_changed",
         json!({
             "kind": "run.item_changed",
             "ref": { "homeId": home_id, "runId": run_id, "nodeId": node_id },
-            "state": if failed { "failed" } else { outcome_text },
+            "state": final_state_text,
         }),
     );
-    ctx.storage.execute(&mutation)?;
+    execute_journaled(ctx, &mutation)?;
     leases()
         .lock()
         .expect("leases")
         .remove(&(run_id.clone(), node_id.clone()));
 
-    // Stop-on-failure + terminal derivation mirror the TS report flow.
+    // Response renders from the post-execute state; replays re-render from
+    // the converged state identically.
     let conn = ctx.storage.conn();
-    let run_after = store::get_run(conn, &run_id)?.ok_or_else(|| error::not_found_run(&run_id))?;
-    let stop_hit =
-        failed && run_after.config.stop_on_failure && run_after.status == RunStatus::Running;
-    let home_id_ref = home_id.clone();
-    let run_id_tx = run_id.clone();
-    store::in_transaction(conn, move |tx| {
-        if stop_hit {
-            set_run_status_tx(
-                tx,
-                &home_id_ref,
-                &run_id_tx,
-                RunStatus::Paused,
-                &SYSTEM_CLOCK,
-                &run_after,
-            )?;
-        }
-        derive_terminal_tx(tx, &home_id_ref, &run_id_tx, &SYSTEM_CLOCK)?;
-        Ok(())
-    })?;
 
     let final_run = store::get_run(conn, &run_id)?.ok_or_else(|| error::not_found_run(&run_id))?;
     let final_item = store::get_run_item(conn, &run_id, &node_id)?
@@ -2177,21 +2407,44 @@ pub const MAX_EVENT_BATCH: i64 = 1000;
 fn events_resume(ctx: &mut Ctx, params: &Value) -> Result<Value> {
     let home_id = ctx.home_id()?.to_string();
     let cursor = opt_i64(params, "cursor")?.unwrap_or(0).max(0);
-    let limit = opt_i64(params, "limit")?
-        .unwrap_or(500)
-        .clamp(1, MAX_EVENT_BATCH) as usize;
-    let batch = crate::events::backlog(ctx.storage.conn(), &home_id, cursor, limit)?;
+    let requested_limit = opt_i64(params, "limit")?.unwrap_or(500);
+    // Event-page bound (R21): reject above the advertised batch ceiling.
+    if let Err(details) = ctx.limits.check_event_page(requested_limit) {
+        return Err(invalid_input_details("limit", details));
+    }
+    let limit = requested_limit.clamp(1, MAX_EVENT_BATCH.max(1)) as usize;
+    let conn = ctx.storage.conn();
+    // Gap detection (AE5): when retention already evicted past this
+    // consumer's cursor, replay would be lossy — flag resync so the client
+    // rebuilds from a snapshot instead of trusting the page.
+    let oldest: i64 = conn
+        .query_row("SELECT COALESCE(MIN(seq), 0) FROM events", [], |row| {
+            row.get(0)
+        })
+        .unwrap_or(0);
+    // Gap rule: history below the consumer's cursor is gone. cursor==0
+    // ("I have nothing") also resyncs when seq 1 itself was evicted — the
+    // page cannot make a consumer whole in either case.
+    let gap = if cursor == 0 {
+        oldest > 1
+    } else {
+        oldest > 1 && cursor < oldest - 1
+    };
+    let batch = crate::events::backlog(conn, &home_id, cursor, limit)?;
     // Register the live subscription AFTER the backlog read, ON THE ACTOR:
     // commits cannot interleave with the actor, so nothing falls into the
     // gap between backlog page and subscription. An envelope may arrive
-    // twice (page boundary vs live push); clients dedupe by cursor.
+    // twice (page boundary vs live push); clients dedupe by cursor. The
+    // registration carries the resume cursor so the daemon-owned retention
+    // task can key snapshot.resync on the oldest live consumer.
     if let Some(sender) = ctx.subscribe.take() {
-        ctx.hub.subscribe(sender);
+        let from_cursor = ctx.subscribe_from_cursor.unwrap_or(cursor);
+        ctx.hub.subscribe_with_cursor(from_cursor, sender);
     }
     let new_cursor = batch.last().map(|e| e.cursor).unwrap_or(cursor);
     Ok(json!({
         "cursor": new_cursor,
-        "resync": false,
+        "resync": gap,
         "events": batch.iter().map(|e| e.value.clone()).collect::<Vec<_>>(),
     }))
 }

@@ -55,9 +55,11 @@
     "SCHEMA_TOO_NEW",
     "UNAUTHORIZED",
     "FORBIDDEN",
-    "BOOTSTRAP_TIMEOUT"
+    "BOOTSTRAP_TIMEOUT",
+    "RATE_LIMITED",
+    "QUOTA_EXCEEDED"
    ],
-   "description": "The v1 seed set of coarse codes, carried forward from the TypeScript core's OmtError taxonomy. U2's pre-freeze pass subdivides these additively (e.g. ARCHIVED_READONLY under CONFLICT, DUPLICATE_MEMBER under INVALID_INPUT); the runtime plane (U5) adds its connection-identity coarse codes UNAUTHORIZED / FORBIDDEN and lifecycle code BOOTSTRAP_TIMEOUT."
+   "description": "The v1 seed set of coarse codes, carried forward from the TypeScript core's OmtError taxonomy. U2's pre-freeze pass subdivides these additively (e.g. ARCHIVED_READONLY under CONFLICT, DUPLICATE_MEMBER under INVALID_INPUT); the runtime plane (U5) adds its connection-identity coarse codes UNAUTHORIZED / FORBIDDEN, lifecycle code BOOTSTRAP_TIMEOUT, and the U5b resource-bound codes RATE_LIMITED / QUOTA_EXCEEDED."
   },
   "SeedProblemRegistry": {
    "type": "object",
@@ -102,6 +104,14 @@
     "BOOTSTRAP_TIMEOUT": {
      "$ref": "#/$defs/ProblemDescriptor",
      "description": "Daemon election gave up: no live daemon appeared within the loser descriptor-poll budget and the bootstrap lock could not be won (HOME_LOCKED-style coarse refusal; details.runtimeDir)."
+    },
+    "RATE_LIMITED": {
+     "$ref": "#/$defs/ProblemDescriptor",
+     "description": "Transient capacity bound tripped (U5b/R21): too many concurrent connections or a per-home queue at depth. The request was never started; retrying after backoff can succeed (details.reason in concurrent-connections | home-queue-depth, with limit/observed where applicable)."
+    },
+    "QUOTA_EXCEEDED": {
+     "$ref": "#/$defs/ProblemDescriptor",
+     "description": "Durable-resource quota exhausted (U5b/R21): e.g. opened-homes count or the idempotent-operation registry at its retention cap. The bound protects the host; details names rule + limit (details.rule in open-homes | idempotency-table)."
     }
    },
    "additionalProperties": false
@@ -256,6 +266,40 @@
       },
       "detailsShape": {
        "const": "{ requiresReindex: true, commandId?: string, from?: string, to?: string } \u2014 commandId identifies the pending journal plan; from/to appear for move-drift refusals."
+      },
+      "coarseFallback": {
+       "const": "CONFLICT"
+      },
+      "stability": {
+       "const": "stable"
+      }
+     },
+     "required": [
+      "summary",
+      "detailsShape",
+      "coarseFallback",
+      "stability"
+     ]
+    }
+   },
+   "additionalProperties": false
+  },
+  "U5SubdivisionDescriptors": {
+   "type": "object",
+   "description": "Runtime-plane codes introduced by U5/U5b (additive). Open map: any key matching ^[A-Z][A-Z0-9_]+$ may appear.",
+   "propertyNames": {
+    "pattern": "^[A-Z][A-Z0-9_]+$"
+   },
+   "properties": {
+    "CANCELED": {
+     "type": "object",
+     "description": "Client cancellation honored at a linearization-safe point (U5b): before db_committed the op aborts leaving its journal row pending-recovery (the next recovery rolls it forward); after db_committed the op completes and the cancel is ignored. details.rule=client-canceled, details.commandId, details.at names the safe point.",
+     "properties": {
+      "summary": {
+       "const": "The operation was canceled by the client before it could commit; any journaled residue rolls forward deterministically on the next recovery."
+      },
+      "detailsShape": {
+       "const": "{ rule: 'client-canceled', commandId: string, at: 'before-journal' | 'after-prepared' | 'after-files-applied' }."
       },
       "coarseFallback": {
        "const": "CONFLICT"

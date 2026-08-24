@@ -4,11 +4,37 @@
 import type { HomeInfo } from './common.js'
 
 /**
- * Self-description of the connecting client; informational only.
+ * Self-description of the connecting client. kind selects the principal class used for parity enforcement (R22); name is informational.
  */
 export interface ClientInfo {
+  /**
+   * Principal class of the connecting client. adapter_only actions require dsh/desktop; cli/desktop/mcp/external map to their documented parity classes.
+   */
+  kind: "dsh" | "cli" | "desktop" | "mcp" | "external";
   name: string;
   version?: string;
+  [k: string]: unknown;
+}
+/**
+ * Optional scope request of method handshake/request. The server derives every credential field; a client can never mint another principal's namespace or widen beyond open homes (R12).
+ */
+
+/**
+ * Optional scope request of method handshake/request. The server derives every credential field; a client can never mint another principal's namespace or widen beyond open homes (R12).
+ */
+export interface RequestedScopes {
+  /**
+   * Requested delegated actor namespace. Honored ONLY when equal to the server-assigned base (<kind>:<pid>) or nested under it (<base>/<suffix>).
+   */
+  actorNamespace?: string;
+  /**
+   * Requested home scope; intersected with currently-open homes. Absent/empty means all open homes.
+   */
+  homes?: string[];
+  /**
+   * Requested operation families ('node', 'run', 'events', 'ui', 'home') or '*'. Empty/absent defaults to '*'.
+   */
+  operations?: string[];
   [k: string]: unknown;
 }
 /**
@@ -28,14 +54,15 @@ export interface HandshakeParams {
    * Optional feature tokens the client understands (open vocabulary, e.g. "events.resume", "attention.payload.v1").
    */
   capabilities?: string[];
+  requestedScopes?: RequestedScopes;
   [k: string]: unknown;
 }
 /**
- * Bounded-resource limits enforced by this daemon (R21 seed); clients must not exceed them.
+ * Bounded-resource limits enforced by this daemon (R21); clients must not exceed them. Exceeding a transient-capacity bound degrades with RATE_LIMITED; exceeding a durable-resource quota degrades with QUOTA_EXCEEDED (U5b).
  */
 
 /**
- * Bounded-resource limits enforced by this daemon (R21 seed); clients must not exceed them.
+ * Bounded-resource limits enforced by this daemon (R21); clients must not exceed them. Exceeding a transient-capacity bound degrades with RATE_LIMITED; exceeding a durable-resource quota degrades with QUOTA_EXCEEDED (U5b).
  */
 export interface Limits {
   maxPayloadBytes: number;
@@ -43,11 +70,38 @@ export interface Limits {
    * Upper bound of any limit/page parameter.
    */
   maxListLimit: number;
+  /**
+   * Upper bound of one events/resume page.
+   */
   maxEventBatch: number;
   /**
    * Advertised run concurrency; values above it are rejected (plan: fixed at 1).
    */
   runConcurrency: number;
+  /**
+   * Additive U5b: maximum simultaneously opened homes per daemon process.
+   */
+  maxOpenHomes?: number;
+  /**
+   * Additive U5b: maximum live client connections; excess connects degrade with RATE_LIMITED.
+   */
+  maxConcurrentConnections?: number;
+  /**
+   * Additive U5b: maximum queued jobs per home actor; overflow degrades with RATE_LIMITED.
+   */
+  maxHomeQueueDepth?: number;
+  /**
+   * Additive U5b: maximum UTF-8 byte length of a search term; longer terms fail with INVALID_INPUT.
+   */
+  maxSearchTermBytes?: number;
+  /**
+   * Additive U5b: retained idempotent-operation registry rows; exhausting it degrades with QUOTA_EXCEEDED until retention prunes acknowledged rows.
+   */
+  maxIdempotencyEntries?: number;
+  /**
+   * Additive U5b: per-home outbox retention ceiling owned by the daemon; pruning emits a keyed snapshot.resync event.
+   */
+  maxRetainedEvents?: number;
   [k: string]: unknown;
 }
 /**
@@ -73,6 +127,40 @@ export interface Features {
   [k: string]: boolean;
 }
 /**
+ * Server-derived scoped credential issued by handshake/request (R12/KTD9, formally registered U5b). The token is a 128-bit hex secret that exists ONLY in this response and the daemon's in-memory registry; it never appears in argv/env/logs/errors (secret redaction). Nothing client-supplied can mint or widen a grant.
+ */
+
+/**
+ * Server-derived scoped credential issued by handshake/request (R12/KTD9, formally registered U5b). The token is a 128-bit hex secret that exists ONLY in this response and the daemon's in-memory registry; it never appears in argv/env/logs/errors (secret redaction). Nothing client-supplied can mint or widen a grant.
+ */
+export interface CredentialGrant {
+  /**
+   * Opaque bearer secret presented as params.credential.token on every subsequent request. Short-lived: dies at expiresAt or with the daemon generation.
+   */
+  token: string;
+  /**
+   * Server-assigned connection principal '<kind>:<pid>'. Administrator capability keys on this id via the out-of-band admin-grants file.
+   */
+  principalId: string;
+  /**
+   * Delegated actor namespace for run claims/reports: the server-assigned base (<kind>:<pid>) unless an equal-or-nested scope was requested.
+   */
+  actorNamespace: string;
+  /**
+   * Granted home ids (requested scope intersected with open homes).
+   */
+  homes: string[];
+  /**
+   * Granted operation families or '*'.
+   */
+  operations: string[];
+  /**
+   * UTC timestamp in ISO 8601 / RFC 3339 form.
+   */
+  expiresAt: string;
+  [k: string]: unknown;
+}
+/**
  * Result of method handshake/request.
  */
 
@@ -95,6 +183,7 @@ export interface HandshakeResult {
   homes: HomeInfo[];
   limits: Limits;
   features: Features;
+  credential: CredentialGrant;
   [k: string]: unknown;
 }
 /**
