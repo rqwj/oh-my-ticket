@@ -4,8 +4,9 @@
  * (HIERARCHY), id allocation, stable directory names, managed children
  * blocks, and full reindex from disk (files are the content authority).
  */
-import { readFile } from 'node:fs/promises'
+import { mkdir, readFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
+import { acquireHomeLock, type HomeLockHandle } from './home-lock.ts'
 import { OmtFiles } from './files.ts'
 import {
   defaultBody,
@@ -240,6 +241,8 @@ export class OmtCore {
     readonly home: string,
     private readonly store: OmtStore,
     private readonly files: OmtFiles,
+    /** Per-home writer lock held for this core's lifetime (U2b / R2). */
+    private readonly lock: HomeLockHandle,
   ) {}
 
   /**
@@ -265,32 +268,51 @@ export class OmtCore {
   }
 
   /**
-   * Open the OMT home: create directories, open the database, and reindex
-   * when the database is fresh but markdown files already exist on disk.
-   * Finally run the startup janitor (decision 12): running runs/items left
-   * over from a previous process have no live executor here and are demoted
-   * to interrupted (resumable via resume + row-level retry).
+   * Open the OMT home: acquire the per-home owner lock (U2b / R2 — one
+   * writer per opened home; refuses daemon markers and live conflicting
+   * writers, steals stale locks), then create directories, open the
+   * database, and reindex when the database is fresh but markdown files
+   * already exist on disk. Finally run the startup janitor (decision 12):
+   * running runs/items left over from a previous process have no live
+   * executor here and are demoted to interrupted (resumable via resume +
+   * row-level retry). A failed open releases the lock again.
    */
   static async open(home: string, options: OpenOptions = {}): Promise<OmtCore> {
-    const files = new OmtFiles(home)
-    await files.ensureDirs()
-    const store = await OmtStore.open(join(home, DB_FILE))
-    const core = new OmtCore(home, store, files)
-    if (store.schemaVersion === undefined) {
-      const existing = await files.listNodeFiles()
-      if (existing.length > 0) {
-        await core.reindex()
-      } else {
-        store.markSchemaVersion()
+    // The lock file lives inside the home; acquireHomeLock creates the
+    // directory before its exclusive create.
+    const lock = await acquireHomeLock(home)
+    try {
+      const files = new OmtFiles(home)
+      await files.ensureDirs()
+      const store = await OmtStore.open(join(home, DB_FILE))
+      const core = new OmtCore(home, store, files, lock)
+      if (store.schemaVersion === undefined) {
+        const existing = await files.listNodeFiles()
+        if (existing.length > 0) {
+          await core.reindex()
+        } else {
+          store.markSchemaVersion()
+        }
       }
+      const active = new Set(options.activeSessionIds ?? [])
+      core.janitorSweep(sessionId => active.has(sessionId))
+      return core
+    } catch (error) {
+      // Reindex/store/janitor failures must not keep the home locked.
+      await lock.release().catch(() => {})
+      throw error
     }
-    const active = new Set(options.activeSessionIds ?? [])
-    core.janitorSweep(sessionId => active.has(sessionId))
-    return core
   }
 
-  close(): void {
+  /**
+   * Close the database and release the per-home owner lock. Idempotent on
+   * the lock side; the returned promise resolves once the lock is handed
+   * back, so `await pool.closeAll()` is a safe handoff point for a second
+   * writer.
+   */
+  async close(): Promise<void> {
     this.store.close()
+    await this.lock.release().catch(() => {})
   }
 
   // ── create ───────────────────────────────────────────────────────────

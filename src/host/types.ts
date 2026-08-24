@@ -216,6 +216,8 @@ export type ProblemCode =
   | 'ARCHIVED_READONLY'   // → CONFLICT: the node is archived and read-only
   | 'DUPLICATE_MEMBER'    // → INVALID_INPUT: a run member list repeats a node
   | 'INVALID_CONCURRENCY' // → INVALID_INPUT: run concurrency is not a positive integer
+  | 'HOME_LOCKED'         // → CONFLICT: another live writer owns the home (owner lock, U2b/R2)
+  | 'DAEMON_OWNS_HOME'    // → CONFLICT: a daemon owner marker is present; TS writers always refuse
 
 /** Structured, assertion-ready details carried alongside a problem code (R5). */
 export type ProblemDetails = Record<string, unknown>

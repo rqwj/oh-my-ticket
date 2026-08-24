@@ -67,19 +67,22 @@ describe('/omt recent endpoint', () => {
   let core: OmtCore
   let handler: (endpoint: string, payload: unknown, signal: AbortSignal) => Promise<any>
   let registry: RecentRegistry
+  let pool: OmtCorePool
 
   beforeEach(async () => {
     home = await mkdtemp(join(tmpdir(), 'omt-recent-test-'))
-    core = await OmtCore.open(home)
+    // Single opener per home (U2b owner lock): the seeding core IS the
+    // pool's cached core.
+    pool = new OmtCorePool(home)
+    core = await pool.coreForHome(home)
     registry = new RecentRegistry()
-    const pool = new OmtCorePool(home)
     registerOmtRpc({ connection: { rpc: { handle: (_c: string, h: any) => { handler = h } } } } as never, pool, registry)
     await core.create({ type: 'epic', title: '用户体系', id: 'EPIC-0001' })
     await core.create({ type: 'epic', title: '通知系统', id: 'EPIC-0002' })
   })
 
   afterEach(async () => {
-    core.close()
+    await pool.closeAll()
     await rm(home, { recursive: true, force: true })
   })
 

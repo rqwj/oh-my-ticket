@@ -90,6 +90,13 @@ export class OmtCorePool {
     let core = this.cores.get(home)
     if (core === undefined) {
       core = OmtCore.open(home, { activeSessionIds: this.options.activeSessionIds?.() })
+      // A failed open (e.g. HOME_LOCKED by another pool/core, U2b) must not
+      // poison the cache: evict on rejection so a later attempt can succeed
+      // once the conflicting writer disposes.
+      const pending = core
+      void pending.catch(() => {
+        if (this.cores.get(home) === pending) this.cores.delete(home)
+      })
       const onCoreOpened = this.options.onCoreOpened
       if (onCoreOpened !== undefined) {
         // Rejection is owned by the awaited promise above (callers see it);

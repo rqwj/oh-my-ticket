@@ -228,11 +228,11 @@ export interface SubdividedProblemRegistry {
   [k: string]: ProblemDescriptor;
 }
 /**
- * The subdivision entries frozen with the behavioral corpus (U2). Each property pins the exact descriptor instance registered for that code.
+ * The subdivision entries frozen with the behavioral corpus (U2, incl. the U2b owner-lock codes for R2 cross-language home ownership). Each property pins the exact descriptor instance registered for that code.
  */
 
 /**
- * The subdivision entries frozen with the behavioral corpus (U2). Each property pins the exact descriptor instance registered for that code.
+ * The subdivision entries frozen with the behavioral corpus (U2, incl. the U2b owner-lock codes for R2 cross-language home ownership). Each property pins the exact descriptor instance registered for that code.
  */
 export interface U2SubdivisionDescriptors {
   ARCHIVED_READONLY?: {
@@ -254,6 +254,26 @@ export interface U2SubdivisionDescriptors {
     detailsShape: "{ value: number | string } — the rejected value.";
     coarseFallback: "INVALID_INPUT";
     stability: "provisional";
+    [k: string]: unknown;
+  };
+  /**
+   * Owner-lock refusal (U2b/R2): one writer per opened home; lock file <home>/home.lock (e.g. ~/.omt/home.lock), JSON body {schemaVersion, ownerKind, pid, hostname?, acquiredAt, heartbeatAt, token}. Stale holders (>30 s silent) are stolen; unknown/future schemaVersion fails closed and is never stolen. Documented residual: the marker-check-to-write window stays TOCTOU-racy until the daemon adds a kernel flock on the same path (plan U5).
+   */
+  HOME_LOCKED?: {
+    summary: "Another live writer already owns this home (per-home owner lock); only one writer may hold a home.";
+    detailsShape: "{ pid: number | null, acquiredAt: string | null, schemaVersion?: number } — holder identity recorded in the owner lock; pid/acquiredAt are null when the lock body carries no readable identity; schemaVersion appears on incompatible-format refusals.";
+    coarseFallback: "CONFLICT";
+    stability: "stable";
+    [k: string]: unknown;
+  };
+  /**
+   * Daemon-marker refusal (U2b/R2/F5): ownerKind "daemon" in <home>/home.lock always refuses TypeScript writers — even when stale — and blocks second-daemon takeover while present. Stable because takeover tooling (U6) and the daemon (U5) branch on it across languages.
+   */
+  DAEMON_OWNS_HOME?: {
+    summary: "The home carries a daemon owner marker (ownerKind 'daemon'); TypeScript writers always refuse, and no second daemon may take over while it is held.";
+    detailsShape: "{ owner: object } — the full parsed owner-lock body (schemaVersion, ownerKind, pid, hostname?, acquiredAt, heartbeatAt, token).";
+    coarseFallback: "CONFLICT";
+    stability: "stable";
     [k: string]: unknown;
   };
 }

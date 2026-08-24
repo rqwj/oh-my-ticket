@@ -16,12 +16,16 @@ type Handler = (endpoint: string, payload: unknown, signal: AbortSignal) => Prom
 
 let home: string
 let core: OmtCore
+let pool: OmtCorePool
 let handler: Handler
 let capturedAuthority: string | undefined
 
 beforeEach(async () => {
   home = await mkdtemp(join(tmpdir(), 'omt-rpc-test-'))
-  core = await OmtCore.open(home)
+  // Single opener per home (U2b owner lock): the seeding core IS the pool's
+  // cached core, so RPC handlers reuse it instead of opening a second one.
+  pool = new OmtCorePool(home)
+  core = await pool.coreForHome(home)
   const stubCtx = {
     connection: {
       rpc: {
@@ -32,7 +36,7 @@ beforeEach(async () => {
       },
     },
   }
-  registerOmtRpc(stubCtx as never, new OmtCorePool(home))
+  registerOmtRpc(stubCtx as never, pool)
 
   const epic = await core.create({ type: 'epic', title: '用户体系' })
   const story = await core.create({ type: 'story', title: '登录', parentId: epic.id })
@@ -40,7 +44,7 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
-  core.close()
+  await pool.closeAll()
   await rm(home, { recursive: true, force: true })
 })
 

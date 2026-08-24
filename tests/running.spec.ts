@@ -46,20 +46,23 @@ describe('RunningRegistry', () => {
 describe('/omt execute endpoint', () => {
   let home: string
   let core: OmtCore
+  let pool: OmtCorePool
   let handler: (endpoint: string, payload: unknown, signal: AbortSignal) => Promise<any>
   let running: RunningRegistry
 
   beforeEach(async () => {
     home = await mkdtemp(join(tmpdir(), 'omt-running-test-'))
-    core = await OmtCore.open(home)
+    // Single opener per home (U2b owner lock): the seeding core IS the
+    // pool's cached core.
+    pool = new OmtCorePool(home)
+    core = await pool.coreForHome(home)
     running = new RunningRegistry()
-    const pool = new OmtCorePool(home)
     registerOmtRpc({ connection: { rpc: { handle: (_c: string, h: any) => { handler = h } } } } as never, pool, new RecentRegistry(), undefined, running)
     await core.create({ type: 'epic', title: '用户体系', id: 'EPIC-0001' })
   })
 
   afterEach(async () => {
-    core.close()
+    await pool.closeAll()
     await rm(home, { recursive: true, force: true })
   })
 
@@ -87,8 +90,8 @@ describe('/omt execute endpoint', () => {
 
   it('execute snapshots the session lineage into the running mark (TICKET-0066)', async () => {
     // Re-register with an agents registry whose session header carries the
-    // subagent lineage (parentSession + origin).
-    const extraPool = new OmtCorePool(home)
+    // subagent lineage (parentSession + origin). Same pool: one writer per
+    // home (U2b owner lock); only the agents registry changes.
     const withAgents = {
       connection: { rpc: { handle: (_c: string, h: any) => { handler = h } } },
       agents: {
@@ -97,7 +100,7 @@ describe('/omt execute endpoint', () => {
           : undefined),
       },
     }
-    registerOmtRpc(withAgents as never, extraPool, new RecentRegistry(), undefined, running)
+    registerOmtRpc(withAgents as never, pool, new RecentRegistry(), undefined, running)
 
     const result = await handler('execute', { id: 'EPIC-0001', sessionId: 'child-1' }, new AbortController().signal)
     expect(result.ok).toBe(true)
@@ -107,6 +110,5 @@ describe('/omt execute endpoint', () => {
       parentSessionId: 'parent-1',
       isSubagent: true,
     })
-    await extraPool.closeAll()
   })
 })

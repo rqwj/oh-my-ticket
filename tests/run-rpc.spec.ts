@@ -50,7 +50,6 @@ async function storyFixture(count: number) {
 
 beforeEach(async () => {
   home = await mkdtemp(join(tmpdir(), 'omt-run-rpc-test-'))
-  core = await OmtCore.open(home)
   hub = new ChangeHub()
   running = new RunningRegistry()
   events = []
@@ -83,13 +82,13 @@ beforeEach(async () => {
   // bumps.
   pool = new OmtCorePool(home, { onCoreOpened: opened => { bridgeRunEvents(opened, hub) } })
   registerOmtRpc(stubCtx as never, pool, undefined, hub, running)
-  // Open the pool core up front: its startup janitor assumes no live
+  // Single opener per home (U2b owner lock): the fixture core IS the pool's
+  // cached core. Open it up front: its startup janitor assumes no live
   // sessions, so fixtures with running items must be created afterwards.
-  await pcore()
+  core = await pcore()
 })
 
 afterEach(async () => {
-  core.close()
   await pool.closeAll()
   await rm(home, { recursive: true, force: true })
 })

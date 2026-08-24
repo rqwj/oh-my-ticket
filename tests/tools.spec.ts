@@ -14,17 +14,21 @@ import { renderToolText, stubToolCtx, type RegisteredTool } from './mocks/regist
 
 let home: string
 let core: OmtCore
+let pool: OmtCorePool
 let tools: Map<string, RegisteredTool>
 
 beforeEach(async () => {
   home = await mkdtemp(join(tmpdir(), 'omt-tools-test-'))
-  core = await OmtCore.open(home)
+  // Single opener per home (U2b owner lock): seed through the pool's own
+  // core instead of holding a second bare core on the same directory.
+  pool = new OmtCorePool(home)
+  core = await pool.coreForHome(home)
   tools = new Map()
-  registerOmtTools(stubToolCtx(tools) as never, new OmtCorePool(home))
+  registerOmtTools(stubToolCtx(tools) as never, pool)
 })
 
 afterEach(async () => {
-  core.close()
+  await pool.closeAll()
   await rm(home, { recursive: true, force: true })
 })
 
