@@ -1,17 +1,15 @@
 /**
  * Running-state tests (TICKET-0025): registry start/stop, the execute
  * endpoint (in_progress + running mark + get carrying running info), and
- * stop-on-done.
+ * stop-on-done. U7a: endpoint cases run against a REAL omt-daemon via the
+ * runtime fixture.
  */
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { OmtCore } from '../src/host/core.ts'
-import { OmtCorePool } from '../src/host/pool.ts'
 import { RecentRegistry } from '../src/host/recent.ts'
 import { RunningRegistry } from '../src/host/running.ts'
 import { registerOmtRpc } from '../src/host/rpc.ts'
+import type { OmtService } from '../src/host/service.ts'
+import { createRuntimeFixture, type RuntimeFixture } from './mocks/runtime-fixture.ts'
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -44,54 +42,51 @@ describe('RunningRegistry', () => {
 })
 
 describe('/omt execute endpoint', () => {
-  let home: string
-  let core: OmtCore
-  let pool: OmtCorePool
+  let fixture: RuntimeFixture
+  let service: OmtService
+  let epicId: string
   let handler: (endpoint: string, payload: unknown, signal: AbortSignal) => Promise<any>
   let running: RunningRegistry
 
   beforeEach(async () => {
-    home = await mkdtemp(join(tmpdir(), 'omt-running-test-'))
-    // Single opener per home (U2b owner lock): the seeding core IS the
-    // pool's cached core.
-    pool = new OmtCorePool(home)
-    core = await pool.coreForHome(home)
+    fixture = await createRuntimeFixture({ label: 'running' })
+    service = fixture.service
     running = new RunningRegistry()
-    registerOmtRpc({ connection: { rpc: { handle: (_c: string, h: any) => { handler = h } } } } as never, pool, new RecentRegistry(), undefined, running)
-    await core.create({ type: 'epic', title: '用户体系', id: 'EPIC-0001' })
+    registerOmtRpc({ connection: { rpc: { handle: (_c: string, h: any) => { handler = h } } } } as never, service, new RecentRegistry(), undefined, running)
+    // Daemon allocates ids (no caller-supplied id over the protocol).
+    epicId = (await service.createNode(fixture.globalHome, { type: 'epic', title: '用户体系' })).id
   })
 
   afterEach(async () => {
-    await pool.closeAll()
-    await rm(home, { recursive: true, force: true })
+    await fixture.stop()
   })
 
   it('execute sets in_progress and records the session; get reports it', async () => {
-    const result = await handler('execute', { id: 'EPIC-0001', sessionId: 's1' }, new AbortController().signal)
+    const result = await handler('execute', { id: epicId, sessionId: 's1' }, new AbortController().signal)
     expect(result.ok).toBe(true)
     expect(result.value.status).toBe('in_progress')
 
-    const detail = await handler('get', { id: 'EPIC-0001' }, new AbortController().signal)
+    const detail = await handler('get', { id: epicId }, new AbortController().signal)
     expect(detail.value.running).toMatchObject({ sessionId: 's1' })
   })
 
   it('manual in_progress via update does NOT mark running (TICKET-0028)', async () => {
-    await handler('update', { id: 'EPIC-0001', status: 'in_progress', sessionId: 's1' }, new AbortController().signal)
-    const detail = await handler('get', { id: 'EPIC-0001' }, new AbortController().signal)
+    await handler('update', { id: epicId, status: 'in_progress', sessionId: 's1' }, new AbortController().signal)
+    const detail = await handler('get', { id: epicId }, new AbortController().signal)
     expect(detail.value.running).toBeUndefined()
   })
 
   it('done clears the running mark', async () => {
-    await handler('execute', { id: 'EPIC-0001', sessionId: 's1' }, new AbortController().signal)
-    await handler('update', { id: 'EPIC-0001', status: 'done' }, new AbortController().signal)
-    const detail = await handler('get', { id: 'EPIC-0001' }, new AbortController().signal)
+    await handler('execute', { id: epicId, sessionId: 's1' }, new AbortController().signal)
+    await handler('update', { id: epicId, status: 'done' }, new AbortController().signal)
+    const detail = await handler('get', { id: epicId }, new AbortController().signal)
     expect(detail.value.running).toBeUndefined()
   })
 
   it('execute snapshots the session lineage into the running mark (TICKET-0066)', async () => {
     // Re-register with an agents registry whose session header carries the
-    // subagent lineage (parentSession + origin). Same pool: one writer per
-    // home (U2b owner lock); only the agents registry changes.
+    // subagent lineage (parentSession + origin). Same service: only the
+    // agents registry changes.
     const withAgents = {
       connection: { rpc: { handle: (_c: string, h: any) => { handler = h } } },
       agents: {
@@ -100,11 +95,11 @@ describe('/omt execute endpoint', () => {
           : undefined),
       },
     }
-    registerOmtRpc(withAgents as never, pool, new RecentRegistry(), undefined, running)
+    registerOmtRpc(withAgents as never, service, new RecentRegistry(), undefined, running)
 
-    const result = await handler('execute', { id: 'EPIC-0001', sessionId: 'child-1' }, new AbortController().signal)
+    const result = await handler('execute', { id: epicId, sessionId: 'child-1' }, new AbortController().signal)
     expect(result.ok).toBe(true)
-    const detail = await handler('get', { id: 'EPIC-0001' }, new AbortController().signal)
+    const detail = await handler('get', { id: epicId }, new AbortController().signal)
     expect(detail.value.running).toMatchObject({
       sessionId: 'child-1',
       parentSessionId: 'parent-1',

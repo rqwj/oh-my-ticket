@@ -12,21 +12,23 @@
  *
  * Nudge budget: one pending item is nudged at most NUDGE_BUDGET times with
  * exponential backoff (interval = base × 2^(count-1), first nudge
- * immediate); bookkeeping rides run_items.nudged_at/nudge_count (durable, so
- * the budget survives host restarts). Exhaustion leaves the item pending and
- * reads as stalled (isRunItemStalled) — a human retries it via
- * omt_run_control retry, which clears the budget. The budget is also the
- * loop guard: a nudge-driven turn that idles without progress hits the
- * backoff, then the ceiling, then silence.
+ * immediate). U7a: this daemon build exposes no nudge-record RPC, so the
+ * durable bookkeeping (run_items.nudged_at/nudge_count) is replaced by an
+ * ADAPTER-SIDE ledger inside OmtService — in-memory, so a host restart
+ * resets budgets (documented deviation; a nudge-record protocol command is
+ * an open U7b item). Exhaustion leaves the item pending and reads as
+ * stalled (isRunItemStalled) — a human retries it via omt_run_control
+ * retry, which clears both the daemon row and the adapter ledger. The
+ * budget is also the loop guard: a nudge-driven turn that idles without
+ * progress hits the backoff, then the ceiling, then silence.
  *
  * Backoff timers are unref'd (never hold the process open) and cleared on
  * plugin dispose; a firing timer revalidates everything (agent still idle,
  * run still running, item still pending) before nudging.
  */
 import type { Context } from '@deepseek-ai/cordis'
-import type { OmtCore } from './core.ts'
 import { safeFollowup } from './messages.ts'
-import type { OmtCorePool } from './pool.ts'
+import type { HomeRef, OmtService } from './service.ts'
 import type { RunningRegistry } from './running.ts'
 import { NUDGE_BUDGET, type OmtRun, type OmtRunItem } from './types.ts'
 
@@ -66,7 +68,7 @@ export type NudgeDecision =
  * requires base × 2^(k-1) ms since the last one; at NUDGE_BUDGET the item
  * is stalled (no more nudges until retry resets the budget).
  */
-function nudgeDecision(
+export function nudgeDecision(
   item: Pick<OmtRunItem, 'nudge_count' | 'nudged_at'>,
   nowMs: number,
   baseMs: number,
@@ -88,7 +90,7 @@ function nudgeLine(run: OmtRun, item: OmtRunItem): string {
 }
 
 /** Register the idle hook. Timers are cleaned up via the cordis effect lifecycle. */
-export function registerOmtIdleHook(ctx: Context, pool: OmtCorePool, running: RunningRegistry, options: IdleHookOptions = {}): void {
+export function registerOmtIdleHook(ctx: Context, service: OmtService, running: RunningRegistry, options: IdleHookOptions = {}): void {
   const baseMs = options.backoffBaseMs ?? DEFAULT_BACKOFF_BASE_MS
   const now = options.now ?? (() => Date.now())
   const setTimer = options.setTimer ?? ((fn: () => void, ms: number) => setTimeout(fn, ms))
@@ -107,9 +109,8 @@ export function registerOmtIdleHook(ctx: Context, pool: OmtCorePool, running: Ru
     safeFollowup(agent, text, warn)
   }
 
-  const recordNudge = (core: OmtCore, runId: string, nodeId: string): void => {
-    core.recordItemNudge(runId, nodeId, new Date(now()).toISOString())
-  }
+  const recordNudge = async (home: HomeRef, runId: string, nodeId: string): Promise<OmtRunItem> =>
+    service.recordItemNudge(home, runId, nodeId, new Date(now()).toISOString())
 
   const armBackoff = (agent: AgentLike, runId: string, nodeId: string, waitMs: number): void => {
     const key = `${runId}:${nodeId}`
@@ -129,14 +130,14 @@ export function registerOmtIdleHook(ctx: Context, pool: OmtCorePool, running: Ru
    * backoff timer or records the nudge, returning the nudge line when one
    * is due. Delivery is the caller's choice (merged vs direct followup).
    */
-  const applyNudgeDecision = (agent: AgentLike, core: OmtCore, run: OmtRun, item: OmtRunItem): string | undefined => {
+  const applyNudgeDecision = async (agent: AgentLike, home: HomeRef, run: OmtRun, item: OmtRunItem): Promise<string | undefined> => {
     const decision = nudgeDecision(item, now(), baseMs)
     if (decision.kind === 'stalled') return undefined
     if (decision.kind === 'backoff') {
       armBackoff(agent, run.id, item.node_id, decision.waitMs)
       return undefined
     }
-    recordNudge(core, run.id, item.node_id)
+    await recordNudge(home, run.id, item.node_id)
     return nudgeLine(run, item)
   }
 
@@ -144,12 +145,17 @@ export function registerOmtIdleHook(ctx: Context, pool: OmtCorePool, running: Ru
   const onBackoffTimer = async (agent: AgentLike, runId: string, nodeId: string): Promise<void> => {
     // Not idle anymore → drop; the next idle event re-evaluates from scratch.
     if (agent.status !== 'idle') return
-    const core = await pool.coreFor(agent.session.header.cwd)
-    const run = core.getRun(runId)
-    if (run === undefined || run.status !== 'running' || !run.config.autoContinue) return
-    const item = core.getRunItem(runId, nodeId)
+    const home = await service.homeFor(agent.session.header.cwd)
+    let run: OmtRun | undefined
+    try {
+      run = (await service.fetchRun(home, runId)).run
+    } catch {
+      return
+    }
+    if (run.status !== 'running' || !run.config.autoContinue) return
+    const item = (await service.fetchRun(home, runId)).items.find(entry => entry.node_id === nodeId)
     if (item === undefined || item.state !== 'pending') return
-    const text = applyNudgeDecision(agent, core, run, item)
+    const text = await applyNudgeDecision(agent, home, run, item)
     if (text !== undefined) followup(agent, text)
   }
 
@@ -173,9 +179,9 @@ export function registerOmtIdleHook(ctx: Context, pool: OmtCorePool, running: Ru
 
     // 2. run 续跑 nudge — running runs only (paused excluded inside
     // continuationCandidates), autoContinue honored, budget enforced.
-    const core = await pool.coreFor(agent.session.header.cwd)
-    for (const { run, item } of core.continuationCandidates(sessionId)) {
-      const text = applyNudgeDecision(agent, core, run, item)
+    const home = await service.homeFor(agent.session.header.cwd)
+    for (const { run, item } of await service.continuationCandidates(sessionId, agent.session.header.cwd)) {
+      const text = await applyNudgeDecision(agent, home, run, item)
       if (text !== undefined) lines.push(text)
     }
 

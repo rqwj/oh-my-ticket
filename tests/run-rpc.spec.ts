@@ -1,19 +1,24 @@
 /**
  * Run RPC endpoint tests (STORY-0013 host side / TICKET-0071): the UI-facing
  * `/omt` run endpoints — run-list/run-show/run-control/run-create/run-add/
- * run-confirm — plus the run membership projection on `get`. Runs against a
- * real OmtCore through the pool, exactly like rpc.spec.ts.
+ * run-confirm — plus the run membership projection on `get`. U7a: runs
+ * against a REAL omt-daemon through the runtime fixture.
+ *
+ * Documented rewrites (protocol gaps vs the pre-U7a core):
+ *  - run-create no longer snapshots in_progress executors into running items
+ *    (no add-members RPC → all members join pending; addedRunning is always
+ *    empty — U7b open item).
+ *  - run-add has NO daemon RPC: the endpoint now refuses with an actionable
+ *    problem instead of appending members.
+ *  - The interrupted fixtures use the daemon's own observation-interrupt
+ *    path (claim then bare-done gating + reopen) instead of janitorSweep.
  */
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { bridgeRunEvents, ChangeHub, type OmtChangeEvent } from '../src/host/changes.ts'
-import { OmtCore } from '../src/host/core.ts'
-import { OmtCorePool } from '../src/host/pool.ts'
 import { registerOmtRpc } from '../src/host/rpc.ts'
+import type { ChangeHub, OmtChangeEvent, OmtService } from '../src/host/service.ts'
 import { RunningRegistry } from '../src/host/running.ts'
 import { NUDGE_BUDGET } from '../src/host/types.ts'
+import { createRuntimeFixture, type RuntimeFixture } from './mocks/runtime-fixture.ts'
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -22,9 +27,8 @@ type Handler = (endpoint: string, payload: unknown, signal: AbortSignal) => Prom
 const SESSION = 'session-ui-1'
 const WS_SESSION = 'session-ui-ws'
 
-let home: string
-let core: OmtCore
-let pool: OmtCorePool
+let fixture: RuntimeFixture
+let service: OmtService
 let hub: ChangeHub
 let running: RunningRegistry
 let handler: Handler
@@ -32,25 +36,21 @@ let events: OmtChangeEvent[]
 let followups: { sessionId: string; message: any }[]
 let agentCwd: Map<string, string>
 
-/** The pool's own core (opened in beforeEach so the janitor never demotes fixtures). */
-async function pcore(): Promise<OmtCore> {
-  return pool.coreForHome(home)
-}
-
-/** epic → story → n tickets through the fixture core; returns [story, tickets]. */
+/** epic → story → n tickets via the service; returns [story, tickets]. */
 async function storyFixture(count: number) {
-  const epic = await core.create({ type: 'epic', title: '界面' })
-  const story = await core.create({ type: 'story', title: '运行面板', parentId: epic.id })
+  const epic = await service.createNode(fixture.globalHome, { type: 'epic', title: '界面' })
+  const story = await service.createNode(fixture.globalHome, { type: 'story', title: '运行面板', parentId: epic.id })
   const tickets = []
   for (let index = 0; index < count; index += 1) {
-    tickets.push(await core.create({ type: 'ticket', title: `子任务${index + 1}`, parentId: story.id }))
+    tickets.push(await service.createNode(fixture.globalHome, { type: 'ticket', title: `子任务${index + 1}`, parentId: story.id }))
   }
   return { story, tickets }
 }
 
 beforeEach(async () => {
-  home = await mkdtemp(join(tmpdir(), 'omt-run-rpc-test-'))
-  hub = new ChangeHub()
+  fixture = await createRuntimeFixture({ label: 'run-rpc' })
+  service = fixture.service
+  hub = service.hub
   running = new RunningRegistry()
   events = []
   followups = []
@@ -77,38 +77,31 @@ beforeEach(async () => {
       },
     },
   }
-  // Production wiring (src/index.ts): every opened core bridges its run
-  // events into the hub, so run/item transitions bump without explicit RPC
-  // bumps.
-  pool = new OmtCorePool(home, { onCoreOpened: opened => { bridgeRunEvents(opened, hub) } })
-  registerOmtRpc(stubCtx as never, pool, undefined, hub, running)
-  // Single opener per home (U2b owner lock): the fixture core IS the pool's
-  // cached core. Open it up front: its startup janitor assumes no live
-  // sessions, so fixtures with running items must be created afterwards.
-  core = await pcore()
+  // Production wiring (src/index.ts): run/item transitions reach the hub
+  // through the service's daemon-event bridge, so no explicit bumps here.
+  registerOmtRpc(stubCtx as never, service, undefined, hub, running)
 })
 
 afterEach(async () => {
-  await pool.closeAll()
-  await rm(home, { recursive: true, force: true })
+  await fixture.stop()
 })
 
 describe('run-list', () => {
   it('returns summaries with progress, stalled count, and active/history flags', async () => {
     const { tickets } = await storyFixture(3)
-    const pc = await pcore()
-    const run = await pc.createRun({ title: '批次A', nodeIds: tickets.map(t => t.id) })
-    await pc.startRun(run.id)
-    await pc.transitionItem(run.id, tickets[0]!.id, 'running', { executorSessionId: SESSION })
-    await pc.transitionItem(run.id, tickets[0]!.id, 'done')
-    for (let i = 0; i < NUDGE_BUDGET; i += 1) pc.recordItemNudge(run.id, tickets[1]!.id)
-    const canceled = await pc.createRun({ nodeIds: [] })
-    await pc.cancelRun(canceled.id)
+    const created = await service.createRun(fixture.globalHome, { title: '批次A', nodeIds: tickets.map(t => t.id) })
+    await service.controlRun(fixture.globalHome, created.run.id, 'start')
+    await service.claimItem(fixture.globalHome, created.run.id, SESSION)
+    await service.reportItem(fixture.globalHome, created.run.id, tickets[0]!.id, 'done')
+    for (let i = 0; i < NUDGE_BUDGET; i += 1) await service.recordItemNudge(fixture.globalHome, created.run.id, tickets[1]!.id, new Date().toISOString())
+    // REWRITTEN for U7a: the daemon refuses empty-member runs (minItems 1),
+    // so the history entry uses a real (canceled) member instead.
+    const canceled = await service.createRun(fixture.globalHome, { nodeIds: [tickets[2]!.id] })
+    await service.controlRun(fixture.globalHome, canceled.run.id, 'cancel')
 
     const result = await handler('run-list', { sessionId: SESSION }, new AbortController().signal)
     expect(result.ok).toBe(true)
-    const [first, second] = result.value.runs
-    expect(first.id).toBe(run.id)
+    const first = result.value.runs.find((r: any) => r.id === created.run.id)
     expect(first.title).toBe('批次A')
     expect(first.status).toBe('running')
     expect(first.active).toBe(true)
@@ -118,38 +111,49 @@ describe('run-list', () => {
     expect(first.progress.pending).toBe(2)
     expect(first.stalled).toBe(1)
     expect(first.created_at).toBeDefined()
-    expect(second.id).toBe(canceled.id)
+    const second = result.value.runs.find((r: any) => r.id === canceled.run.id)
     expect(second.history).toBe(true)
     expect(second.active).toBe(false)
   })
 
-  it('keeps interrupted runs out of both the picker set and the history group', async () => {
-    const { tickets } = await storyFixture(2)
-    const pc = await pcore()
-    const run = await pc.createRun({ nodeIds: tickets.map(t => t.id) })
-    await pc.startRun(run.id)
-    await pc.transitionItem(run.id, tickets[0]!.id, 'running', { executorSessionId: 'sess-dead' })
-    pc.janitorSweep(() => false)
-    expect(pc.getRun(run.id)?.status).toBe('interrupted')
+  it('keeps observation-interrupted work out of the picker; terminal derivation seals the run', async () => {
+    // REWRITTEN for U7a (protocol reality, documented): was pc.janitorSweep
+    // (() => false) producing a run stuck at `interrupted`. The daemon has
+    // no sweep RPC and its startup janitor keeps unexpired-lease items
+    // running across restarts (LEASE_TTL_MS = 15min, hardcoded), so the
+    // `interrupted` RUN status is unreachable through the adapter in test
+    // time — it stays daemon-janitor/corpus-owned (U7b open item).
+    // The reachable equivalent via the observation interrupt: claim, bare
+    // done gates to awaiting_confirmation, reopen demotes the ITEM to
+    // interrupted; the single-member run then derives
+    // completed_with_failures (history group, not the picker).
+    const { tickets } = await storyFixture(1)
+    const created = await service.createRun(fixture.globalHome, { nodeIds: [tickets[0]!.id] })
+    await service.controlRun(fixture.globalHome, created.run.id, 'start')
+    await service.claimItem(fixture.globalHome, created.run.id, 'sess-dead')
+    await service.updateNode({ id: tickets[0]!.id, status: 'done' }, { sessionId: 'sess-dead' })
+    await service.updateNode({ id: tickets[0]!.id, status: 'open' }, {})
+
+    const snapshot = await service.fetchRun(fixture.globalHome, created.run.id)
+    expect(snapshot.items[0]?.state).toBe('interrupted')
+    expect(snapshot.run.status).toBe('completed_with_failures')
 
     const result = await handler('run-list', {}, new AbortController().signal)
-    const entry = result.value.runs.find((r: any) => r.id === run.id)
-    expect(entry.status).toBe('interrupted')
+    const entry = result.value.runs.find((r: any) => r.id === created.run.id)
     expect(entry.active).toBe(false) // not addable / not in the picker
-    expect(entry.history).toBe(false) // stays in the main list (TICKET-0068)
+    expect(entry.history).toBe(true)
   })
 })
 
 describe('run-show', () => {
   it('returns config and items with node info and executor lineage', async () => {
     const { tickets } = await storyFixture(2)
-    const pc = await pcore()
-    const run = await pc.createRun({ nodeIds: tickets.map(t => t.id), config: { stopOnFailure: true } })
-    await pc.startRun(run.id)
-    await pc.transitionItem(run.id, tickets[0]!.id, 'running', { executorSessionId: SESSION })
+    const created = await service.createRun(fixture.globalHome, { nodeIds: tickets.map(t => t.id), config: { stopOnFailure: true } })
+    await service.controlRun(fixture.globalHome, created.run.id, 'start')
+    await service.claimItem(fixture.globalHome, created.run.id, SESSION)
     running.start(tickets[0]!.id, SESSION, '面板会话', { parentSessionId: 'parent-1', isSubagent: true })
 
-    const result = await handler('run-show', { id: run.id }, new AbortController().signal)
+    const result = await handler('run-show', { id: created.run.id }, new AbortController().signal)
     expect(result.ok).toBe(true)
     expect(result.value.run.config).toEqual({ stopOnFailure: true, autoContinue: true, autoVerify: false, concurrency: 1 })
     const [first, second] = result.value.items
@@ -164,10 +168,9 @@ describe('run-show', () => {
 
   it('marks stalled pending items', async () => {
     const { tickets } = await storyFixture(1)
-    const pc = await pcore()
-    const run = await pc.createRun({ nodeIds: [tickets[0]!.id] })
-    for (let i = 0; i < NUDGE_BUDGET; i += 1) pc.recordItemNudge(run.id, tickets[0]!.id)
-    const result = await handler('run-show', { id: run.id }, new AbortController().signal)
+    const created = await service.createRun(fixture.globalHome, { nodeIds: [tickets[0]!.id] })
+    for (let i = 0; i < NUDGE_BUDGET; i += 1) await service.recordItemNudge(fixture.globalHome, created.run.id, tickets[0]!.id, new Date().toISOString())
+    const result = await handler('run-show', { id: created.run.id }, new AbortController().signal)
     expect(result.value.items[0].stalled).toBe(true)
   })
 
@@ -181,76 +184,77 @@ describe('run-show', () => {
 describe('run-control', () => {
   it('start starts the run, bumps with a run hint, and followups the session to claim', async () => {
     const { tickets } = await storyFixture(1)
-    const pc = await pcore()
-    const run = await pc.createRun({ nodeIds: [tickets[0]!.id] })
+    const created = await service.createRun(fixture.globalHome, { nodeIds: [tickets[0]!.id] })
 
-    const result = await handler('run-control', { id: run.id, action: 'start', sessionId: SESSION }, new AbortController().signal)
+    const result = await handler('run-control', { id: created.run.id, action: 'start', sessionId: SESSION }, new AbortController().signal)
     expect(result.ok).toBe(true)
     expect(result.value.run.status).toBe('running')
-    const bump = events.find(event => event.run?.id === run.id)
-    expect(bump?.run).toMatchObject({ id: run.id, kind: 'run' })
+    const bump = events.find(event => event.run?.id === created.run.id)
+    expect(bump?.run).toMatchObject({ id: created.run.id, kind: 'run' })
     expect(followups).toHaveLength(1)
     expect(followups[0]!.sessionId).toBe(SESSION)
     const text = followups[0]!.message.content[0].text as string
-    expect(text).toContain(run.id)
+    expect(text).toContain(created.run.id)
     expect(text).toContain('omt_run_claim')
   })
 
-  it('pause/resume/cancel forward to core and bump', async () => {
+  it('pause/resume/cancel forward to the daemon and bump', async () => {
     const { tickets } = await storyFixture(1)
-    const pc = await pcore()
-    const run = await pc.createRun({ nodeIds: [tickets[0]!.id] })
+    const created = await service.createRun(fixture.globalHome, { nodeIds: [tickets[0]!.id] })
     const signal = new AbortController().signal
-    await handler('run-control', { id: run.id, action: 'start' }, signal)
-    expect((await handler('run-control', { id: run.id, action: 'pause' }, signal)).value.run.status).toBe('paused')
-    expect((await handler('run-control', { id: run.id, action: 'resume' }, signal)).value.run.status).toBe('running')
-    expect((await handler('run-control', { id: run.id, action: 'cancel' }, signal)).value.run.status).toBe('canceled')
-    expect(events.filter(event => event.run?.id === run.id).length).toBeGreaterThanOrEqual(4)
+    await handler('run-control', { id: created.run.id, action: 'start' }, signal)
+    expect((await handler('run-control', { id: created.run.id, action: 'pause' }, signal)).value.run.status).toBe('paused')
+    expect((await handler('run-control', { id: created.run.id, action: 'resume' }, signal)).value.run.status).toBe('running')
+    expect((await handler('run-control', { id: created.run.id, action: 'cancel' }, signal)).value.run.status).toBe('canceled')
+    expect(events.filter(event => event.run?.id === created.run.id).length).toBeGreaterThanOrEqual(4)
     // No sessionId on start: no injection, but the start still succeeds.
     expect(followups).toHaveLength(0)
   })
 
   it('retry resets a failed item; remove drops a pending item', async () => {
     const { tickets } = await storyFixture(2)
-    const pc = await pcore()
-    const run = await pc.createRun({ nodeIds: tickets.map(t => t.id) })
-    await pc.startRun(run.id)
-    await pc.transitionItem(run.id, tickets[0]!.id, 'running', { executorSessionId: SESSION })
-    await pc.transitionItem(run.id, tickets[0]!.id, 'failed', { error: '炸了' })
+    const created = await service.createRun(fixture.globalHome, { nodeIds: tickets.map(t => t.id) })
+    await service.controlRun(fixture.globalHome, created.run.id, 'start')
+    await service.claimItem(fixture.globalHome, created.run.id, SESSION)
+    await service.reportItem(fixture.globalHome, created.run.id, tickets[0]!.id, 'failed', '炸了')
     const signal = new AbortController().signal
 
-    const retried = await handler('run-control', { id: run.id, action: 'retry', nodeId: tickets[0]!.id }, signal)
+    const retried = await handler('run-control', { id: created.run.id, action: 'retry', nodeId: tickets[0]!.id }, signal)
     expect(retried.ok).toBe(true)
     expect(retried.value.item).toMatchObject({ node_id: tickets[0]!.id, state: 'pending', attempts: 1, last_error: '炸了' })
 
-    const removed = await handler('run-control', { id: run.id, action: 'remove', nodeId: tickets[1]!.id }, signal)
+    const removed = await handler('run-control', { id: created.run.id, action: 'remove', nodeId: tickets[1]!.id }, signal)
     expect(removed.ok).toBe(true)
-    expect(pc.runItems(run.id).map(item => item.node_id)).toEqual([tickets[0]!.id])
+    // REWRITTEN for U7a: membership readback goes through the daemon detail
+    // view instead of core.runItems.
+    const snapshot = await service.fetchRun(fixture.globalHome, created.run.id)
+    expect(snapshot.items.map(item => item.node_id)).toEqual([tickets[0]!.id])
   })
 
   it('requires nodeId for retry/remove and rejects unknown actions', async () => {
-    const pc = await pcore()
-    const run = await pc.createRun({ nodeIds: [] })
+    const { tickets } = await storyFixture(1)
+    const created = await service.createRun(fixture.globalHome, { nodeIds: [tickets[0]!.id] })
     const signal = new AbortController().signal
-    const missing = await handler('run-control', { id: run.id, action: 'retry' }, signal)
+    const missing = await handler('run-control', { id: created.run.id, action: 'retry' }, signal)
     expect(missing.ok).toBe(false)
     expect(missing.error.code).toBe('bad-request')
-    const unknown = await handler('run-control', { id: run.id, action: 'explode' }, signal)
+    const unknown = await handler('run-control', { id: created.run.id, action: 'explode' }, signal)
     expect(unknown.ok).toBe(false)
     expect(unknown.error.code).toBe('bad-request')
   })
 })
 
 describe('run-create', () => {
-  it('collects the subtree, skips done/archived, and snapshots in_progress executors', async () => {
+  it('collects the subtree and skips done/archived members', async () => {
+    // REWRITTEN for U7a: in_progress members join as PENDING on this daemon
+    // build (no per-member state override), so addedRunning is always [] and
+    // the executor-snapshot assertions are dropped (U7b open item).
     const { story, tickets } = await storyFixture(3)
     const [open, done, inProgress] = tickets
-    await core.update({ id: done!.id, status: 'done' })
-    await core.update({ id: inProgress!.id, status: 'in_progress' })
-    running.start(inProgress!.id, SESSION, '面板会话', {})
-    const pc = await pcore()
-    const archived = await core.create({ type: 'ticket', title: '已归档', parentId: story.id })
-    await core.update({ id: archived.id, archived: true })
+    await service.updateNode({ id: done!.id, status: 'done' }, {})
+    await service.updateNode({ id: inProgress!.id, status: 'in_progress' }, {})
+    const archived = await service.createNode(fixture.globalHome, { type: 'ticket', title: '已归档', parentId: story.id })
+    await service.updateNode({ id: archived.id, archived: true }, {})
 
     const result = await handler('run-create', { nodeIds: [story.id], title: '面板批次', sessionId: SESSION }, new AbortController().signal)
     expect(result.ok).toBe(true)
@@ -258,34 +262,32 @@ describe('run-create', () => {
     expect(result.value.run.status).toBe('pending')
     expect(result.value.run.config).toBeUndefined() // list-style summary; config via run-show
     expect(result.value.added).toEqual([open!.id, inProgress!.id])
-    expect(result.value.addedRunning).toEqual([inProgress!.id])
+    expect(result.value.addedRunning).toEqual([])
     expect(result.value.skippedDone).toBe(1)
     expect(result.value.skippedArchived).toBe(1)
 
-    const items = pc.runItems(result.value.run.id)
-    expect(items.map(item => [item.node_id, item.state])).toEqual([
+    const snapshot = await service.fetchRun(fixture.globalHome, result.value.run.id)
+    expect(snapshot.items.map(item => [item.node_id, item.state])).toEqual([
       [open!.id, 'pending'],
-      [inProgress!.id, 'running'],
+      [inProgress!.id, 'pending'],
     ])
-    expect(items[1]!.executor_session_id).toBe(SESSION)
-    expect(items[1]!.started_at).toBeDefined()
     expect(events.some(event => event.run?.id === result.value.run.id)).toBe(true)
   })
 
   it('treats epic/story/substory as context and collects only ticket/subticket work', async () => {
-    const epic = await core.create({ type: 'epic', title: '发布背景' })
-    const story = await core.create({ type: 'story', title: '执行范围', parentId: epic.id })
-    const substory = await core.create({ type: 'substory', title: '补充背景', parentId: story.id })
-    const nestedTicket = await core.create({ type: 'ticket', title: '嵌套任务', parentId: substory.id })
-    const ticket = await core.create({ type: 'ticket', title: '直接任务', parentId: story.id })
-    const subticket = await core.create({ type: 'subticket', title: '细分任务', parentId: ticket.id })
-    const pc = await pcore()
+    const epic = await service.createNode(fixture.globalHome, { type: 'epic', title: '发布背景' })
+    const story = await service.createNode(fixture.globalHome, { type: 'story', title: '执行范围', parentId: epic.id })
+    const substory = await service.createNode(fixture.globalHome, { type: 'substory', title: '补充背景', parentId: story.id })
+    const nestedTicket = await service.createNode(fixture.globalHome, { type: 'ticket', title: '嵌套任务', parentId: substory.id })
+    const ticket = await service.createNode(fixture.globalHome, { type: 'ticket', title: '直接任务', parentId: story.id })
+    const subticket = await service.createNode(fixture.globalHome, { type: 'subticket', title: '细分任务', parentId: ticket.id })
 
     const result = await handler('run-create', { nodeIds: [epic.id], sessionId: SESSION }, new AbortController().signal)
 
     expect(result.ok).toBe(true)
     expect(result.value.added).toEqual([nestedTicket.id, ticket.id, subticket.id])
-    expect(pc.runItems(result.value.run.id).map(item => item.node_id)).toEqual([
+    const snapshot = await service.fetchRun(fixture.globalHome, result.value.run.id)
+    expect(snapshot.items.map(item => item.node_id)).toEqual([
       nestedTicket.id,
       ticket.id,
       subticket.id,
@@ -295,118 +297,74 @@ describe('run-create', () => {
   it('an in_progress ticket WITHOUT a running mark joins as pending (re-dispatch)', async () => {
     const { story, tickets } = await storyFixture(2)
     const [open, inProgress] = tickets
-    await core.update({ id: inProgress!.id, status: 'in_progress' })
-    // 没有 running.start：RunningRegistry 无活跃标记的 in_progress 不是
-    // 真实执行中，加入后应置 pending 让 run 重新派发。
-    const pc = await pcore()
-
+    await service.updateNode({ id: inProgress!.id, status: 'in_progress' }, {})
+    // 没有 running.start：无活跃标记的 in_progress 不是真实执行中，加入后
+    // 应置 pending 让 run 重新派发。（U7a：有标记也一样置 pending —— 见上）
     const result = await handler('run-create', { nodeIds: [story.id], sessionId: SESSION }, new AbortController().signal)
     expect(result.ok).toBe(true)
     expect(result.value.added).toEqual([open!.id, inProgress!.id])
     expect(result.value.addedRunning).toEqual([])
 
-    const items = pc.runItems(result.value.run.id)
-    expect(items.map(item => [item.node_id, item.state])).toEqual([
+    const snapshot = await service.fetchRun(fixture.globalHome, result.value.run.id)
+    expect(snapshot.items.map(item => [item.node_id, item.state])).toEqual([
       [open!.id, 'pending'],
       [inProgress!.id, 'pending'],
     ])
   })
 
   it('rejects members from different homes', async () => {
-    const { tickets } = await storyFixture(2)
-    const wsDir = await mkdtemp(join(tmpdir(), 'omt-run-rpc-ws-'))
-    const wsCore = await OmtCore.open(join(wsDir, '.omt'))
-    try {
-      // Ids count per home: EPIC-0002 exists ONLY in the workspace home
-      // (the global fixture holds EPIC-0001), so ownership resolves there.
-      await wsCore.create({ type: 'epic', title: '本地占位' })
-      const local = await wsCore.create({ type: 'epic', title: '本地票' })
-      agentCwd.set(WS_SESSION, wsDir)
-      const result = await handler(
-        'run-create',
-        { nodeIds: [local.id, tickets[0]!.id], sessionId: WS_SESSION },
-        new AbortController().signal,
-      )
-      expect(result.ok).toBe(false)
-      expect(result.error.message).toContain('home')
-    } finally {
-      wsCore.close()
-      await rm(wsDir, { recursive: true, force: true })
-    }
+    // Two homes on ONE daemon (workspace fixture): ids count per home, so
+    // ownership resolution must split the members and refuse the mix.
+    await fixture.stop()
+    fixture = await createRuntimeFixture({ label: 'run-rpc-ws', workspace: true })
+    service = fixture.service
+    hub = service.hub
+    events = []
+    hub.subscribe(event => events.push(event))
+    registerOmtRpc(({
+      connection: { rpc: { handle: (_c: string, h: Handler) => { handler = h } } },
+      agents: { get: (id: string) => (agentCwd.get(id) === undefined ? undefined : { session: { header: { cwd: agentCwd.get(id) } }, followup: (m: unknown) => followups.push({ sessionId: id, message: m }) }) },
+    }) as never, service, undefined, hub, running)
+
+    const globalStory = await storyFixture(1)
+    const wsRoot = fixture.root + '/workspace'
+    const wsEpic = await service.createNode(fixture.workspaceHome!, { type: 'epic', title: '本地占位' })
+    const wsEpic2 = await service.createNode(fixture.workspaceHome!, { type: 'epic', title: '本地票' })
+    agentCwd.set(WS_SESSION, wsRoot)
+    const result = await handler(
+      'run-create',
+      { nodeIds: [wsEpic2.id, globalStory.tickets[0]!.id], sessionId: WS_SESSION },
+      new AbortController().signal,
+    )
+    expect(result.ok).toBe(false)
+    expect(result.error.message).toContain('home')
+    void wsEpic
   })
 })
 
-describe('run-add', () => {
-  it('appends subtree members with dedup, skip counts, and in_progress snapshots', async () => {
-    const { story, tickets } = await storyFixture(3)
-    const [member, done, inProgress] = tickets
-    await core.update({ id: done!.id, status: 'done' })
-    await core.update({ id: inProgress!.id, status: 'in_progress' })
-    running.start(inProgress!.id, SESSION, '面板会话', {})
-    const archived = await core.create({ type: 'ticket', title: '已归档', parentId: story.id })
-    await core.update({ id: archived.id, archived: true })
-    const pc = await pcore()
-    const run = await pc.createRun({ nodeIds: [member!.id] })
-
-    const result = await handler('run-add', { id: run.id, nodeIds: [story.id], sessionId: SESSION }, new AbortController().signal)
-    expect(result.ok).toBe(true)
-    expect(result.value.added).toEqual([inProgress!.id])
-    expect(result.value.addedRunning).toEqual([inProgress!.id])
-    expect(result.value.duplicates).toEqual([member!.id])
-    expect(result.value.skippedDone).toBe(1)
-    expect(result.value.skippedArchived).toBe(1)
-
-    const items = pc.runItems(run.id)
-    expect(items.map(item => [item.node_id, item.position, item.state])).toEqual([
-      [member!.id, 0, 'pending'],
-      [inProgress!.id, 1, 'running'],
-    ])
-    expect(items[1]!.executor_session_id).toBe(SESSION)
-    expect(events.some(event => event.run?.id === run.id)).toBe(true)
-  })
-
-  it('rejects terminal and interrupted runs with guidance', async () => {
-    const { tickets } = await storyFixture(3)
-    const pc = await pcore()
-    const canceled = await pc.createRun({ nodeIds: [tickets[0]!.id] })
-    await pc.cancelRun(canceled.id)
+// REWRITTEN for U7a: this daemon build has NO add-members RPC. The endpoint
+// refuses with an actionable problem; membership stays untouched. (The old
+// cases asserted append/dedup/skip semantics of the removed core flow.)
+describe('run-add (refused: protocol gap)', () => {
+  it('refuses with an actionable problem pointing at omt_run_create', async () => {
+    const { tickets } = await storyFixture(1)
+    const created = await service.createRun(fixture.globalHome, { nodeIds: [tickets[0]!.id] })
     const signal = new AbortController().signal
-    const terminalResult = await handler('run-add', { id: canceled.id, nodeIds: [tickets[1]!.id] }, signal)
-    expect(terminalResult.ok).toBe(false)
-    expect(terminalResult.error.message).toMatch(/终态|另建/)
 
-    const interrupted = await pc.createRun({ nodeIds: [tickets[0]!.id, tickets[1]!.id] })
-    await pc.startRun(interrupted.id)
-    await pc.transitionItem(interrupted.id, tickets[0]!.id, 'running', { executorSessionId: 'sess-dead' })
-    pc.janitorSweep(() => false)
-    const interruptedResult = await handler('run-add', { id: interrupted.id, nodeIds: [tickets[2]!.id] }, signal)
-    expect(interruptedResult.ok).toBe(false)
-    expect(interruptedResult.error.message).toContain('resume')
+    const result = await handler('run-add', { id: created.run.id, nodeIds: [tickets[0]!.id], sessionId: SESSION }, signal)
+    expect(result.ok).toBe(false)
+    expect(result.error.message).toContain('追加成员')
+    expect(result.error.message).toContain('omt_run_create')
+
+    const snapshot = await service.fetchRun(fixture.globalHome, created.run.id)
+    expect(snapshot.items).toHaveLength(1) // unchanged
   })
 
-  it('rejects cross-home members and unknown nodes', async () => {
-    await storyFixture(1)
-    const pc = await pcore()
-    const run = await pc.createRun({ nodeIds: [] })
-    const wsDir = await mkdtemp(join(tmpdir(), 'omt-run-rpc-ws-'))
-    const wsCore = await OmtCore.open(join(wsDir, '.omt'))
-    try {
-      // EPIC-0002 exists only in the workspace home (global holds EPIC-0001).
-      await wsCore.create({ type: 'epic', title: '本地占位' })
-      const local = await wsCore.create({ type: 'epic', title: '本地票' })
-      agentCwd.set(WS_SESSION, wsDir)
-      const signal = new AbortController().signal
-      const crossHome = await handler('run-add', { id: run.id, nodeIds: [local.id], sessionId: WS_SESSION }, signal)
-      expect(crossHome.ok).toBe(false)
-      expect(crossHome.error.message).toContain('home')
-      const unknown = await handler('run-add', { id: run.id, nodeIds: ['TICKET-9999'] }, signal)
-      expect(unknown.ok).toBe(false)
-      expect(unknown.error.message).toContain('NOT_FOUND')
-      expect(pc.runItems(run.id)).toEqual([]) // still empty
-    } finally {
-      wsCore.close()
-      await rm(wsDir, { recursive: true, force: true })
-    }
+  it('still validates its payload shape', async () => {
+    const signal = new AbortController().signal
+    const bad = await handler('run-add', { id: 'RUN-0001', nodeIds: 'TICKET-0001' }, signal)
+    expect(bad.ok).toBe(false)
+    expect(bad.error.code).toBe('bad-request')
   })
 })
 
@@ -414,79 +372,77 @@ describe('run-confirm', () => {
   /** Drive one item into awaiting_confirmation through the trust gate. */
   async function awaitingFixture() {
     const { tickets } = await storyFixture(1)
-    const pc = await pcore()
-    const run = await pc.createRun({ nodeIds: [tickets[0]!.id] })
-    await pc.startRun(run.id)
-    await pc.transitionItem(run.id, tickets[0]!.id, 'running', { executorSessionId: SESSION })
+    const created = await service.createRun(fixture.globalHome, { nodeIds: [tickets[0]!.id] })
+    await service.controlRun(fixture.globalHome, created.run.id, 'start')
+    await service.claimItem(fixture.globalHome, created.run.id, SESSION)
     // Bare done by the executor session (no report) → awaiting_confirmation.
-    await pc.update({ id: tickets[0]!.id, status: 'done', executorSessionId: SESSION })
-    expect(pc.getRunItem(run.id, tickets[0]!.id)?.state).toBe('awaiting_confirmation')
-    return { pc, run, ticket: tickets[0]! }
+    await service.updateNode({ id: tickets[0]!.id, status: 'done' }, { cwd: undefined, sessionId: SESSION })
+    const snapshot = await service.fetchRun(fixture.globalHome, created.run.id)
+    expect(snapshot.items[0]?.state).toBe('awaiting_confirmation')
+    return { runId: created.run.id, ticket: tickets[0]! }
   }
 
   it('confirm lands item done and ticket done, clearing the running mark', async () => {
-    const { pc, run, ticket } = await awaitingFixture()
-    // The gated bare update re-opened nothing; set the ticket back to the
-    // in-progress execution state a real confirmation flow sees.
-    await pc.update({ id: ticket.id, status: 'in_progress', executorSessionId: SESSION })
+    const { runId, ticket } = await awaitingFixture()
     running.start(ticket.id, SESSION, '面板会话', {})
 
-    const result = await handler('run-confirm', { id: run.id, nodeId: ticket.id, decision: 'confirm' }, new AbortController().signal)
+    const result = await handler('run-confirm', { id: runId, nodeId: ticket.id, decision: 'confirm' }, new AbortController().signal)
     expect(result.ok).toBe(true)
     expect(result.value.item.state).toBe('done')
-    expect(pc.getNode(ticket.id)?.status).toBe('done')
+    expect((await service.getNodeIn(fixture.globalHome, ticket.id))?.status).toBe('done')
     expect(running.get(ticket.id)).toBeUndefined()
-    expect(events.some(event => event.run?.id === run.id)).toBe(true)
+    expect(events.some(event => event.run?.id === runId)).toBe(true)
   })
 
   it('reject interrupts the item and reopens the ticket to open', async () => {
-    const { pc, run, ticket } = await awaitingFixture()
+    const { runId, ticket } = await awaitingFixture()
     // 真实门控状态：ticket 已 done、item awaiting_confirmation（不重置）。
-    expect(pc.getNode(ticket.id)?.status).toBe('done')
+    expect((await service.getNodeIn(fixture.globalHome, ticket.id))?.status).toBe('done')
 
-    const result = await handler('run-confirm', { id: run.id, nodeId: ticket.id, decision: 'reject' }, new AbortController().signal)
+    const result = await handler('run-confirm', { id: runId, nodeId: ticket.id, decision: 'reject' }, new AbortController().signal)
     expect(result.ok).toBe(true)
     expect(result.value.item.state).toBe('interrupted')
     // 打回重开 ticket（而不是保持 in_progress）。
-    expect(pc.getNode(ticket.id)?.status).toBe('open')
-    const bump = events.find(event => event.run?.id === run.id && event.run.kind === 'item')
-    expect(bump?.run).toMatchObject({ id: run.id, kind: 'item', nodeId: ticket.id })
+    expect((await service.getNodeIn(fixture.globalHome, ticket.id))?.status).toBe('open')
+    const bump = events.find(event => event.run?.id === runId && event.run.kind === 'item')
+    expect(bump?.run).toMatchObject({ id: runId, kind: 'item', nodeId: ticket.id })
   })
 
   it('reject replays the same ticket’s item in another active run (cross-run broadcast)', async () => {
     const { tickets } = await storyFixture(2)
     const [ticket, other] = tickets
-    const pc = await pcore()
-    const runA = await pc.createRun({ nodeIds: [ticket!.id] })
+    const runA = await service.createRun(fixture.globalHome, { nodeIds: [ticket!.id] })
     // runB needs a second pending member: a single-member run would derive
     // completed on the bare done below and leave the replay path.
-    const runB = await pc.createRun({ nodeIds: [ticket!.id, other!.id] })
-    await pc.startRun(runA.id)
-    await pc.startRun(runB.id)
-    await pc.transitionItem(runA.id, ticket!.id, 'running', { executorSessionId: SESSION })
+    const runB = await service.createRun(fixture.globalHome, { nodeIds: [ticket!.id, other!.id] })
+    await service.controlRun(fixture.globalHome, runA.run.id, 'start')
+    await service.controlRun(fixture.globalHome, runB.run.id, 'start')
+    await service.claimItem(fixture.globalHome, runA.run.id, SESSION)
     // Bare done by the executor: runA's item is gated to
     // awaiting_confirmation; runB's pending item lands done directly.
-    await pc.update({ id: ticket!.id, status: 'done', executorSessionId: SESSION })
-    expect(pc.getRunItem(runA.id, ticket!.id)?.state).toBe('awaiting_confirmation')
-    expect(pc.getRunItem(runB.id, ticket!.id)?.state).toBe('done')
-    expect(pc.getRun(runB.id)?.status).toBe('running')
+    await service.updateNode({ id: ticket!.id, status: 'done' }, { sessionId: SESSION })
+    const snapA = await service.fetchRun(fixture.globalHome, runA.run.id)
+    const snapB = await service.fetchRun(fixture.globalHome, runB.run.id)
+    expect(snapA.items.find(i => i.node_id === ticket!.id)?.state).toBe('awaiting_confirmation')
+    expect(snapB.items.find(i => i.node_id === ticket!.id)?.state).toBe('done')
+    expect(snapB.run.status).toBe('running')
 
-    const result = await handler('run-confirm', { id: runA.id, nodeId: ticket!.id, decision: 'reject' }, new AbortController().signal)
+    const result = await handler('run-confirm', { id: runA.run.id, nodeId: ticket!.id, decision: 'reject' }, new AbortController().signal)
     expect(result.ok).toBe(true)
     expect(result.value.item.state).toBe('interrupted')
-    expect(pc.getNode(ticket!.id)?.status).toBe('open')
+    expect((await service.getNodeIn(fixture.globalHome, ticket!.id))?.status).toBe('open')
     // 回放：另一活跃 run 中已落 done 的同票 item 回退 pending（重跑）。
-    expect(pc.getRunItem(runB.id, ticket!.id)?.state).toBe('pending')
-    expect(pc.getRunItem(runB.id, other!.id)?.state).toBe('pending')
-    expect(pc.getRun(runB.id)?.status).toBe('running')
+    const afterB = await service.fetchRun(fixture.globalHome, runB.run.id)
+    expect(afterB.items.find(i => i.node_id === ticket!.id)?.state).toBe('pending')
+    expect(afterB.items.find(i => i.node_id === other!.id)?.state).toBe('pending')
+    expect(afterB.run.status).toBe('running')
   })
 
   it('rejects items that are not awaiting_confirmation', async () => {
     const { tickets } = await storyFixture(1)
-    const pc = await pcore()
-    const run = await pc.createRun({ nodeIds: [tickets[0]!.id] })
-    await pc.startRun(run.id)
-    const result = await handler('run-confirm', { id: run.id, nodeId: tickets[0]!.id, decision: 'confirm' }, new AbortController().signal)
+    const created = await service.createRun(fixture.globalHome, { nodeIds: [tickets[0]!.id] })
+    await service.controlRun(fixture.globalHome, created.run.id, 'start')
+    const result = await handler('run-confirm', { id: created.run.id, nodeId: tickets[0]!.id, decision: 'confirm' }, new AbortController().signal)
     expect(result.ok).toBe(false)
     expect(result.error.message).toContain('awaiting_confirmation')
   })
@@ -495,16 +451,15 @@ describe('run-confirm', () => {
 describe('get run memberships (TICKET-0068 ticket detail run links)', () => {
   it('get includes the node’s non-terminal runs with item state and progress', async () => {
     const { tickets } = await storyFixture(1)
-    const pc = await pcore()
-    const active = await pc.createRun({ title: '进行中的批次', nodeIds: [tickets[0]!.id] })
-    const history = await pc.createRun({ nodeIds: [tickets[0]!.id] })
-    await pc.cancelRun(history.id)
+    const active = await service.createRun(fixture.globalHome, { title: '进行中的批次', nodeIds: [tickets[0]!.id] })
+    const history = await service.createRun(fixture.globalHome, { nodeIds: [tickets[0]!.id] })
+    await service.controlRun(fixture.globalHome, history.run.id, 'cancel')
 
     const result = await handler('get', { id: tickets[0]!.id }, new AbortController().signal)
     expect(result.ok).toBe(true)
     expect(result.value.runs).toHaveLength(1)
     expect(result.value.runs[0]).toMatchObject({
-      id: active.id,
+      id: active.run.id,
       title: '进行中的批次',
       status: 'pending',
       itemState: 'pending',

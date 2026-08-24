@@ -1,31 +1,26 @@
 /**
- * RPC layer tests: the `/omt` channel handler against a real OmtCore —
- * endpoint payloads (zod-validated), result envelopes, and error folding.
+ * RPC layer tests: the `/omt` channel handler against a REAL omt-daemon
+ * (U7a) — endpoint payloads (zod-validated), result envelopes, and error
+ * folding. Filter persistence assertions moved from the adapter-side
+ * `ui-filters.json` file to daemon-owned storage (documented rewrite).
  */
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { OmtCore } from '../src/host/core.ts'
-import { OmtCorePool } from '../src/host/pool.ts'
 import { registerOmtRpc } from '../src/host/rpc.ts'
+import type { OmtService } from '../src/host/service.ts'
+import { createRuntimeFixture, type RuntimeFixture } from './mocks/runtime-fixture.ts'
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
 type Handler = (endpoint: string, payload: unknown, signal: AbortSignal) => Promise<any>
 
-let home: string
-let core: OmtCore
-let pool: OmtCorePool
+let fixture: RuntimeFixture
+let service: OmtService
 let handler: Handler
 let capturedAuthority: string | undefined
 
 beforeEach(async () => {
-  home = await mkdtemp(join(tmpdir(), 'omt-rpc-test-'))
-  // Single opener per home (U2b owner lock): the seeding core IS the pool's
-  // cached core, so RPC handlers reuse it instead of opening a second one.
-  pool = new OmtCorePool(home)
-  core = await pool.coreForHome(home)
+  fixture = await createRuntimeFixture({ label: 'rpc' })
+  service = fixture.service
   const stubCtx = {
     connection: {
       rpc: {
@@ -36,16 +31,15 @@ beforeEach(async () => {
       },
     },
   }
-  registerOmtRpc(stubCtx as never, pool)
+  registerOmtRpc(stubCtx as never, service)
 
-  const epic = await core.create({ type: 'epic', title: '用户体系' })
-  const story = await core.create({ type: 'story', title: '登录', parentId: epic.id })
-  await core.create({ type: 'ticket', title: '登录接口', parentId: story.id, body: '支持 OAuth 授权码模式' })
+  const epic = await service.createNode(fixture.globalHome, { type: 'epic', title: '用户体系' })
+  const story = await service.createNode(fixture.globalHome, { type: 'story', title: '登录', parentId: epic.id })
+  await service.createNode(fixture.globalHome, { type: 'ticket', title: '登录接口', parentId: story.id, body: '支持 OAuth 授权码模式' })
 })
 
 afterEach(async () => {
-  await pool.closeAll()
-  await rm(home, { recursive: true, force: true })
+  await fixture.stop()
 })
 
 it('registers the channel with loopback authority', () => {
@@ -99,7 +93,11 @@ it('rejects invalid payloads and unknown endpoints', async () => {
   expect(unknown.error.code).toBe('bad-request')
 })
 
-it('filters-get defaults and filters-set persists to <home>/ui-filters.json (STORY-0023)', async () => {
+// REWRITTEN for U7a: was persisted to <home>/ui-filters.json (disk read
+// asserted); the bag now lives in daemon storage (ui/filters-get|set), so
+// persistence is proven by a FRESH service over the same runtime seeing the
+// saved values instead of a file read.
+it('filters-get defaults and filters-set persists via the daemon (STORY-0023)', async () => {
   const signal = new AbortController().signal
   const fresh = await handler('filters-get', {}, signal)
   expect(fresh.ok).toBe(true)
@@ -118,20 +116,32 @@ it('filters-get defaults and filters-set persists to <home>/ui-filters.json (STO
   const reloaded = await handler('filters-get', {}, signal)
   expect(reloaded.value).toEqual(saved.value)
 
-  const { readFile } = await import('node:fs/promises')
-  const onDisk = JSON.parse(await readFile(join(home, 'ui-filters.json'), 'utf8'))
-  expect(onDisk.query).toBe('登录')
-  expect(onDisk.sortOrder).toBe('priority-desc')
+  // Persistence is server-side: a brand-new client on the same daemon
+  // observes the saved bag (the old assertion read ui-filters.json).
+  const { OmtService } = await import('../src/host/service.ts')
+  const freshService = new OmtService({ runtimeDir: fixture.runtimeDir, name: 'rpc-persist-probe' })
+  try {
+    await freshService.ready()
+    const probe = await freshService.filtersGet(fixture.globalHome, 'ui')
+    expect(probe.query).toBe('登录')
+    expect(probe.sortOrder).toBe('priority-desc')
+  } finally {
+    await freshService.close()
+  }
 })
 
-it('filters-set rejects unknown fields and invalid values; corrupt files degrade to defaults', async () => {
+// REWRITTEN for U7a: the corrupt-file case has no direct equivalent — bags
+// are validated BEFORE they reach daemon storage. Degradation is still
+// exercised by storing an out-of-contract bag through the RAW service
+// (which skips validation) and asserting the RPC read coerces it back to
+// defaults; unknown/invalid patches keep their INVALID_INPUT refusal.
+it('filters-set rejects invalid values; out-of-contract stored bags degrade to defaults', async () => {
   const signal = new AbortController().signal
   const junk = await handler('filters-set', { filters: { sortOrder: 'sideways' } }, signal)
   expect(junk.ok).toBe(false)
   expect(junk.error.message).toContain('INVALID_INPUT')
 
-  const { writeFile } = await import('node:fs/promises')
-  await writeFile(join(home, 'ui-filters.json'), '{not json', 'utf8')
+  await service.filtersSet(fixture.globalHome, 'ui', { garbage: true } as never)
   const degraded = await handler('filters-get', {}, signal)
   expect(degraded.ok).toBe(true)
   expect(degraded.value.query).toBe('')

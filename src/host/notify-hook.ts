@@ -1,7 +1,8 @@
 /**
  * Run notifier (TICKET-0065 / EPIC-0003 decision 5, tier 3): subscribes to
- * core run events (one attach per core, via the pool's onCoreOpened) and
- * closes the notification loop towards the executor sessions:
+ * the runtime service's run-event stream (daemon event envelopes, one
+ * subscription per known home) and closes the notification loop towards the
+ * executor sessions:
  *
  *  1. item 完成逐个通知 — done/failed/blocked/skipped → inject 一条进度
  *     （「RUN-0003 进度 7/12：TICKET-0041 done」）。inject 不唤醒 idle
@@ -16,19 +17,21 @@
  *     followup（唤醒）注入各项计数 + 失败项 last_error；**interrupted
  *     终态不注入**（执行会话往往已销毁），走 UI 核对入口（TICKET-0068）。
  *
- * 合并/去重：同一 tick 内发往同一会话的多条通知合并为一条消息（wake
+ * 合并/去重：同一窗口内发往同一会话的多条通知合并为一条消息（wake
  * 优先——含 followup 类通知时整批走 followup），避免「最后一项完成 +
  * run 终态总结」「failed + paused 待决」这类同源事件连续注入。与 idle
  * nudge 的时序协调：nudge 只在 idle 事件触发、paused run 从不 nudge、
  * 待确认项不是 pending 不会被 nudge，两个钩子天然不撞车。
  *
- * 执行会话已销毁或通道抛错都被包容（warn），绝不抛出。
+ * U7a: daemon events arrive asynchronously over IPC, so batches flush on a
+ * short coalescing timer instead of a microtask. 执行会话已销毁或通道抛错都
+ * 被包容（warn），绝不抛出。
  */
 import type { Context } from '@deepseek-ai/cordis'
 import type { AgentsLike } from './agents-like.ts'
-import type { OmtCore, OmtRunEvent } from './core.ts'
 import { pluginUserMessage } from './messages.ts'
-import { isRunHistory, RUN_ITEM_FINAL_STATES, type OmtRun, type OmtRunItem, type RunItemState } from './types.ts'
+import type { OmtRunEvent, OmtService } from './service.ts'
+import { isRunHistory, RUN_ITEM_FINAL_STATES, type OmtRun, type OmtRunItem } from './types.ts'
 
 /** Structural agent face for delivery. */
 interface NotifyTarget {
@@ -37,21 +40,27 @@ interface NotifyTarget {
   inject(message: unknown): void
 }
 
-export interface OmtRunNotifier {
-  /** Attach to one freshly opened core (pool onCoreOpened callback). */
-  attach(core: OmtCore): void
+/** Item states that earn a per-item completion notification. */
+const NOTIFIED_ITEM_STATES: readonly string[] = ['done', 'failed', 'blocked', 'skipped']
+
+/** Coalescing window for one event burst (ms; small — notifications stay prompt). */
+const FLUSH_DELAY_MS = 20
+
+/** Per-state membership counts of a snapshot (same shape as core.runItemStateCounts). */
+function stateCounts(items: readonly OmtRunItem[]): Record<string, number> {
+  const counts: Record<string, number> = {}
+  let total = 0
+  for (const item of items) {
+    counts[item.state] = (counts[item.state] ?? 0) + 1
+    total += 1
+  }
+  return { ...counts, total }
 }
 
-/** Item states that earn a per-item completion notification. */
-const NOTIFIED_ITEM_STATES: readonly RunItemState[] = ['done', 'failed', 'blocked', 'skipped']
-
-function progressLine(core: OmtCore, run: OmtRun, item: OmtRunItem): string {
-  const counts = core.runItemStateCounts(run.id)
-  const total = counts.reduce((sum, entry) => sum + entry.count, 0)
-  const finished = counts
-    .filter(entry => (RUN_ITEM_FINAL_STATES as readonly string[]).includes(entry.state))
-    .reduce((sum, entry) => sum + entry.count, 0)
-  return `${run.id} 进度 ${finished}/${total}：${item.node_id} ${item.state}`
+function progressLine(items: readonly OmtRunItem[] | undefined, run: OmtRun, item: OmtRunItem): string {
+  const counts = stateCounts(items ?? [item])
+  const finished = RUN_ITEM_FINAL_STATES.reduce((sum, state) => sum + (counts[state] ?? 0), 0)
+  return `${run.id} 进度 ${finished}/${counts.total}：${item.node_id} ${item.state}`
 }
 
 function pausedLines(run: OmtRun, item: OmtRunItem): string[] {
@@ -69,7 +78,7 @@ function awaitingLine(run: OmtRun, item: OmtRunItem): string {
 
 function summaryLines(run: OmtRun, items: readonly OmtRunItem[]): string[] {
   // Same shape/order as a GROUP BY state scan (alphabetical by state).
-  const counts = new Map<RunItemState, number>()
+  const counts = new Map<string, number>()
   for (const item of items) counts.set(item.state, (counts.get(item.state) ?? 0) + 1)
   const parts = [...counts.entries()]
     .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
@@ -92,18 +101,21 @@ function executorSessions(items: readonly OmtRunItem[]): string[] {
   return [...sessions]
 }
 
-/** Create the notifier. Delivery batches per session per tick (wake wins). */
-export function createOmtRunNotifier(ctx: Context): OmtRunNotifier {
+/** Create the notifier. Delivery batches per session per window (wake wins). */
+export function createOmtRunNotifier(ctx: Context): {
+  /** Subscribe to one runtime service's event stream; returns the disposer. */
+  attach(service: OmtService): () => void
+} {
   const agents = (ctx as unknown as { agents?: AgentsLike<NotifyTarget> }).agents
 
   const warn = (messageText: string, error: unknown): void => {
     console.warn(`[omt] notify-hook: ${messageText}`, error)
   }
 
-  /** Per-session pending batch; flushed on one microtask. */
+  /** Per-session pending batch; flushed on one coalescing timer. */
   interface Batch { lines: string[]; wake: boolean }
   const batches = new Map<string, Batch>()
-  let flushScheduled = false
+  let flushTimer: ReturnType<typeof setTimeout> | undefined
 
   const deliver = (sessionId: string, batch: Batch): void => {
     const agent = agents?.get(sessionId)
@@ -118,7 +130,7 @@ export function createOmtRunNotifier(ctx: Context): OmtRunNotifier {
   }
 
   const flush = (): void => {
-    flushScheduled = false
+    flushTimer = undefined
     const pending = [...batches.entries()]
     batches.clear()
     for (const [sessionId, batch] of pending) deliver(sessionId, batch)
@@ -130,32 +142,49 @@ export function createOmtRunNotifier(ctx: Context): OmtRunNotifier {
     batch.lines.push(...lines)
     batch.wake = batch.wake || wake
     batches.set(sessionId, batch)
-    if (!flushScheduled) {
-      flushScheduled = true
-      queueMicrotask(flush)
+    if (flushTimer === undefined) {
+      flushTimer = setTimeout(() => flush(), FLUSH_DELAY_MS)
+      ;(flushTimer as unknown as { unref?: () => void }).unref?.()
     }
   }
 
-  const onEvent = (core: OmtCore, event: OmtRunEvent): void => {
+  const onEvent = (event: OmtRunEvent): void => {
+    const items = event.items ?? []
+    const history = isRunHistory(event.run.status)
+
     if (event.kind === 'item') {
       const item = event.item
-      if (item === undefined || item.state === event.fromItemState) return
+      if (item === undefined) return
       if ((NOTIFIED_ITEM_STATES as readonly string[]).includes(item.state)) {
         const wake = item.state === 'failed' && event.run.status === 'paused' && event.run.config.stopOnFailure
-        const lines = [progressLine(core, event.run, item)]
+        const lines = [progressLine(items.length > 0 ? items : [item], event.run, item)]
         if (wake) lines.push(...pausedLines(event.run, item))
-        enqueue(item.executor_session_id, lines, wake)
-      } else if (item.state === 'awaiting_confirmation') {
+        if (history) {
+          // U7a: the daemon derives the terminal status INSIDE the report and
+          // emits only the item event (no separate run.changed), so merge the
+          // summary here — report-driven completions still land as ONE waking
+          // message per executor (pre-daemon parity).
+          const summary = summaryLines(event.run, items)
+          lines.push(...summary)
+          enqueue(item.executor_session_id, lines, true)
+          for (const sessionId of executorSessions(items)) {
+            if (sessionId !== item.executor_session_id) enqueue(sessionId, summary, true)
+          }
+        } else {
+          enqueue(item.executor_session_id, lines, wake)
+        }
+        return
+      }
+      if (item.state === 'awaiting_confirmation') {
         enqueue(item.executor_session_id, [awaitingLine(event.run, item)], false)
       }
       return
     }
-    // Run events: terminal summary only; interrupted 终态不注入.
-    if (event.run.status === event.fromRunStatus) return
-    if (isRunHistory(event.run.status)) {
-      // One membership scan feeds both the summary lines and the
+
+    // Run events (control path): terminal summary only; interrupted 终态不注入.
+    if (history) {
+      // One membership snapshot feeds both the summary lines and the
       // executor-session targets.
-      const items = core.runItems(event.run.id)
       const lines = summaryLines(event.run, items)
       for (const sessionId of executorSessions(items)) {
         enqueue(sessionId, lines, true)
@@ -164,8 +193,14 @@ export function createOmtRunNotifier(ctx: Context): OmtRunNotifier {
   }
 
   return {
-    attach(core: OmtCore): void {
-      core.onRunEvent(event => onEvent(core, event))
+    attach(service: OmtService): () => void {
+      return service.onRunEvent(event => {
+        try {
+          onEvent(event)
+        } catch (error: unknown) {
+          warn('notification handling failed', error)
+        }
+      })
     },
   }
 }

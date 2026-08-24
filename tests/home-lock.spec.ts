@@ -2,7 +2,7 @@
  * Home owner-lock tests (U2b / R2): one writer per opened home. The lock is
  * a single JSON file at `<home>/home.lock` (for the global home that is
  * `~/.omt/home.lock`; for workspace homes `<ws>/.omt/home.lock` — this is
- * the cross-language path the Rust daemon must honor in U5). Semantics:
+ * the cross-language path the Rust daemon honors since U5b/U5c). Semantics:
  *
  *  - atomic O_EXCL create; JSON body {schemaVersion, ownerKind, pid,
  *    hostname?, acquiredAt, heartbeatAt, token};
@@ -11,7 +11,17 @@
  *  - live ts-bridge holder refuses with HOME_LOCKED {pid, acquiredAt};
  *  - no heartbeat beyond the stale window → steal with a fresh body;
  *  - release unlinks only when the body still matches our token.
+ *
+ * U7a split: the unit-level describes below still exercise the ts-bridge
+ * module directly (it remains for offline maintenance tooling). The former
+ * two-pool integration cases are REPLACED by daemon-surface equivalents:
+ * omt-daemon now owns home locking, and a foreign marker makes the daemon
+ * REFUSE TO BOOT — the adapter surfaces it as a ready()-time failure whose
+ * message carries the daemon's problem code (HOME_LOCKED /
+ * DAEMON_OWNS_HOME), not a per-call error.
  */
+import { spawn } from 'node:child_process'
+import { mkdirSync } from 'node:fs'
 import { mkdir, mkdtemp, rm, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -25,9 +35,9 @@ import {
   withHomeLock,
   type HomeLockBody,
 } from '../src/host/home-lock.ts'
-import { OmtCore } from '../src/host/core.ts'
-import { OmtCorePool } from '../src/host/pool.ts'
+import { OmtService } from '../src/host/service.ts'
 import { OmtError } from '../src/host/types.ts'
+import { daemonBinary, ensureDaemonBuilt, spawnDaemon } from './mocks/runtime-fixture.ts'
 
 let root: string
 let home: string
@@ -219,53 +229,111 @@ describe('heartbeat', () => {
   })
 })
 
-describe('integration: pools and cores on one home', () => {
-  it('two OmtCorePool instances on one home: second open throws HOME_LOCKED until the first disposes', async () => {
-    const pool1 = new OmtCorePool(home)
-    const core1 = await pool1.coreForHome(home)
-    const epic = await core1.create({ type: 'epic', title: '持有者' })
+// REWRITTEN for U7a (daemon owns home locking): the old two-pool cases
+// became daemon-boot-surface cases. A foreign marker makes omt-daemon EXIT
+// before publishing its descriptor; @omt/client-ts spawns with stdio
+// ignored and surfaces only a generic "no live descriptor" failure, so the
+// specific problem code is pinned here at process level (captured stderr),
+// plus ONE adapter-level assertion that ready() fails closed.
+describe('integration: home ownership through the daemon surface', () => {
+  /** A fresh ts-bridge-style marker body written directly into the home. */
+  async function plantMarker(overrides: Partial<HomeLockBody> = {}): Promise<void> {
+    const body: HomeLockBody = {
+      schemaVersion: 1,
+      ownerKind: 'ts-bridge',
+      pid: process.pid,
+      acquiredAt: new Date().toISOString(),
+      heartbeatAt: new Date().toISOString(),
+      token: 'foreign-token',
+      ...overrides,
+    }
+    await writeFile(homeLockPath(home), JSON.stringify(body), 'utf8')
+  }
 
-    const pool2 = new OmtCorePool(home)
-    await expect(pool2.coreForHome(home)).rejects.toMatchObject({
-      name: 'OmtError',
-      code: 'HOME_LOCKED',
-      details: { pid: process.pid },
+  /**
+   * Boot one daemon over `home` directly, capturing stderr until exit.
+   * Ownership refusals print their problem JSON there before exiting.
+   */
+  async function tryBootDaemon(): Promise<string> {
+    await ensureDaemonBuilt()
+    const runtimeDir = join(root, 'runtime')
+    mkdirSync(runtimeDir, { recursive: true })
+    return new Promise((resolve, reject) => {
+      const child = spawn(daemonBinary, ['--runtime-dir', runtimeDir, '--home', home], {
+        cwd: runtimeDir,
+        env: { ...process.env, OMT_RUNTIME_DIR: runtimeDir, OMT_HOME: home },
+        stdio: ['ignore', 'ignore', 'pipe'],
+      })
+      let stderr = ''
+      child.stderr?.on('data', chunk => {
+        stderr += String(chunk)
+      })
+      const timer = setTimeout(() => {
+        child.kill('SIGKILL')
+        reject(new Error(`daemon did not exit within 15s; stderr so far:\n${stderr}`))
+      }, 15_000)
+      child.on('exit', () => {
+        clearTimeout(timer)
+        resolve(stderr)
+      })
     })
+  }
 
-    await pool1.closeAll()
-    // After dispose the second pool succeeds (failed open evicted, lock free).
-    const core2 = await pool2.coreForHome(home)
+  /** Connect a service whose runtime dir spawns a fresh daemon over `home`. */
+  function connectService(): OmtService {
+    return new OmtService({ runtimeDir: join(root, 'runtime'), name: 'oh-my-ticket-home-lock-test' })
+  }
+
+  it('a live ts-bridge marker refuses the daemon at boot with HOME_LOCKED', async () => {
+    await plantMarker()
+    // Process level: the refusal problem JSON with takeover guidance.
+    const stderr = await tryBootDaemon()
+    expect(stderr).toContain('HOME_LOCKED')
+    expect(stderr).toMatch(/ts-bridge|takeover/i)
+    // The refusal never deletes the marker.
+    expect((await readHomeLock(home))?.ownerKind).toBe('ts-bridge')
+    // Adapter level: ready() fails closed (the client cannot see WHY — the
+    // spawned daemon died before publishing its descriptor).
+    const service = connectService()
     try {
-      expect(core2.tree().map(node => node.id)).toEqual([epic.id])
+      await expect(service.ready()).rejects.toBeInstanceOf(OmtError)
     } finally {
-      await pool2.closeAll()
+      await service.close()
     }
-  })
+  }, 30_000) // the adapter half waits out the client's 10s spawn window
 
-  it('OmtCore close releases the lock; reopen sees persisted data', async () => {
-    const core1 = await OmtCore.open(home)
-    const epic = await core1.create({ type: 'epic', title: '重启' })
-    await core1.close()
+  it('a LIVE daemon marker refuses with DAEMON_OWNS_HOME (second writer)', async () => {
+    // pid must be alive for the refusal; this process qualifies.
+    await plantMarker({ ownerKind: 'daemon', pid: process.pid })
+    const stderr = await tryBootDaemon()
+    expect(stderr).toContain('DAEMON_OWNS_HOME')
+    expect((await readHomeLock(home))?.ownerKind).toBe('daemon')
+  }, 30_000)
 
-    const core2 = await OmtCore.open(home)
+  it('a DEAD predecessor\'s daemon marker is auto-recovered, not refused', async () => {
+    // Binding ruling 1 (U5b): only our own kind may auto-recover, after a
+    // kernel-flock probe. The boot must SUCCEED and clear the stale marker.
+    await plantMarker({ ownerKind: 'daemon', pid: 2_147_000_000 })
+    const runtimeDir = join(root, 'runtime')
+    const daemon = await spawnDaemon(runtimeDir, [{ path: home, global: true }])
+    const service = new OmtService({ runtimeDir: daemon.runtimeDir, name: 'oh-my-ticket-home-lock-test' })
     try {
-      expect(core2.getNode(epic.id)?.title).toBe('重启')
+      await expect(service.ready()).resolves.toBeUndefined()
+      // The stale marker was replaced by the new daemon's OWN live marker.
+      const marker = await readHomeLock(home)
+      expect(marker?.ownerKind).toBe('daemon')
+      expect(marker?.token).not.toBe('foreign-token')
+      expect(marker?.pid).not.toBe(2_147_000_000)
+      expect(service.homes().length).toBeGreaterThan(0)
     } finally {
-      await core2.close()
+      await service.close()
+      try {
+        process.kill(daemon.pid, 'SIGTERM')
+      } catch {
+        /* already gone */
+      }
     }
-    // Home left unlocked after both closes.
-    expect(await readHomeLock(home)).toBeUndefined()
-  })
-
-  it('a failed open does not poison the pool cache for later retries', async () => {
-    const blocker = await acquireHomeLock(home)
-    const pool = new OmtCorePool(home)
-    await expect(pool.coreForHome(home)).rejects.toMatchObject({ code: 'HOME_LOCKED' })
-    await blocker.release()
-    const core = await pool.coreForHome(home)
-    expect(core.home).toBe(home)
-    await pool.closeAll()
-  })
+  }, 30_000)
 })
 
 /** Tiny helper: text of a file (undefined when missing). */

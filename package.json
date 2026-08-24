@@ -33,9 +33,11 @@
     "watch": "tsdown --watch",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "gen": "node scripts/gen-bindings.mjs"
+    "gen": "node scripts/gen-bindings.mjs",
+    "build:daemon": "node scripts/build-daemon.mjs"
   },
   "devDependencies": {
+    "@omt/client-ts": "link:./packages/client-ts",
     "@deepseek-ai/cordis": "link:./.dsh-checkout/vendor/cordis",
     "@deepseek-ai/dsh-client-connection": "link:./.dsh-checkout/packages/client/connection",
     "@deepseek-ai/dsh-client-ui-input-trigger": "link:./.dsh-checkout/packages/client/ui-input-trigger",

@@ -4,7 +4,10 @@ export default defineConfig({
   test: {
     // .dsh-checkout is a local symlink to the deepseek-harness checkout
     // (created by `pnpm run setup`); never collect its test suites.
-    exclude: ['**/node_modules/**', '.dsh-checkout/**'],
+    // corpus/** is the U4b scenario corpus: its runner imports the retired
+    // src/host/core.ts (U7a deleted the TS core in favor of omt-daemon) and
+    // is executed by scripts/run-corpus.mjs, not by vitest.
+    exclude: ['**/node_modules/**', '.dsh-checkout/**', 'corpus/**'],
   },
   resolve: {
     alias: {

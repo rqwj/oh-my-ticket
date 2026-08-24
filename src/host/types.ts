@@ -174,6 +174,11 @@ export interface OmtRunItem {
   readonly nudge_count: number
   readonly started_at?: string
   readonly finished_at?: string
+  /**
+   * Joined node title — present only on daemon detail views (run/get,
+   * run/control, claim); list projections omit it.
+   */
+  readonly title?: string
 }
 
 export function isRunItemState(value: unknown): value is RunItemState {
@@ -240,4 +245,60 @@ export function isNodeType(value: unknown): value is NodeType {
 
 export function isStatus(value: unknown): value is Status {
   return typeof value === 'string' && (STATUSES as readonly string[]).includes(value)
+}
+
+// ── shared operation results (formerly on core.ts; U7a moved here so the
+//    adapter surfaces can keep their shapes while data ops live behind the
+//    runtime service) ────────────────────────────────────────────────────
+
+/** Explicit report vocabulary (TICKET-0059): the only legal outcomes. */
+export const RUN_REPORT_OUTCOMES = ['done', 'failed', 'blocked', 'skipped'] as const
+export type RunReportOutcome = (typeof RUN_REPORT_OUTCOMES)[number]
+
+export interface ShowResult {
+  readonly node: OmtNode
+  readonly body: string
+  readonly parent?: OmtNode
+  readonly children: OmtNode[]
+}
+
+export type LineageContent =
+  | {
+      readonly node: OmtNode
+      /** User-owned Markdown only; the managed children block is excluded. */
+      readonly body: string
+      readonly error?: never
+    }
+  | {
+      readonly node: OmtNode
+      readonly body?: never
+      readonly error: string
+    }
+
+export interface ReindexResult {
+  readonly nodes: number
+  readonly edges: number
+  readonly skipped: number
+}
+
+/** Result of an explicit report: the transitioned item plus the node as-is. */
+export interface ReportResult {
+  readonly item: OmtRunItem
+  readonly node: OmtNode
+}
+
+/**
+ * Run/item transition broadcast (TICKET-0065 notification hooks), now
+ * synthesized by the runtime service from daemon event envelopes. The run
+ * snapshot is post-change; on item events the full membership rides along so
+ * notification lines can derive progress without a second roundtrip.
+ */
+export interface OmtRunEvent {
+  readonly kind: 'item' | 'run'
+  readonly run: OmtRun
+  readonly item?: OmtRunItem
+  /** Post-change membership (present when the synthesizing fetch succeeded). */
+  readonly items?: readonly OmtRunItem[]
+  readonly fromItemState?: RunItemState
+  readonly fromRunStatus?: RunStatus
 }
