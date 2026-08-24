@@ -1,170 +1,278 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://omt.dev/schemas/v1/problems.schema.json",
-  "title": "OMT protocol problem-code registry (v1)",
-  "description": "Registry of stable machine-readable problem codes (R5). The registry map is deliberately extensible (additionalProperties with a propertyNames pattern) so later units can subdivide coarse codes additively; clients must treat an unknown code by falling back to its nearest registered coarse ancestor. message text is diagnostic only and never part of assertions.",
-  "$defs": {
-    "ProblemDescriptor": {
-      "type": "object",
-      "description": "One registry entry: what the code means, its details shape, and coarse fallback for unknown subdivided codes.",
-      "properties": {
-        "summary": { "type": "string" },
-        "detailsShape": { "type": "string", "description": "Prose description of the Problem.details fields for this code." },
-        "coarseFallback": {
-          "description": "Nearest coarse ancestor to interpret when this exact code is unknown to an older client; absent when the code is itself coarse.",
-          "$ref": "common.schema.json#/$defs/ProblemCode"
-        },
-        "stability": {
-          "type": "string",
-          "enum": ["stable", "provisional"],
-          "description": "stable: the code will never change meaning. provisional: introduced as a subdivision and may still be folded back."
-        }
-      },
-      "required": ["summary", "stability"]
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://omt.dev/schemas/v1/problems.schema.json",
+ "title": "OMT protocol problem-code registry (v1)",
+ "description": "Registry of stable machine-readable problem codes (R5). The registry map is deliberately extensible (additionalProperties with a propertyNames pattern) so later units can subdivide coarse codes additively; clients must treat an unknown code by falling back to its nearest registered coarse ancestor. message text is diagnostic only and never part of assertions.",
+ "$defs": {
+  "ProblemDescriptor": {
+   "type": "object",
+   "description": "One registry entry: what the code means, its details shape, and coarse fallback for unknown subdivided codes.",
+   "properties": {
+    "summary": {
+     "type": "string"
     },
-    "ProblemRegistry": {
-      "type": "object",
-      "description": "Map of ProblemCode → descriptor. Open map: any key matching ^[A-Z][A-Z0-9_]+$ may appear.",
-      "propertyNames": {
-        "pattern": "^[A-Z][A-Z0-9_]+$"
-      },
-      "additionalProperties": { "$ref": "#/$defs/ProblemDescriptor" }
+    "detailsShape": {
+     "type": "string",
+     "description": "Prose description of the Problem.details fields for this code."
     },
-    "SeedProblemCodes": {
-      "type": "string",
-      "enum": [
-        "CONFLICT",
-        "INVALID_HIERARCHY",
-        "INVALID_INPUT",
-        "NOT_FOUND",
-        "IO",
-        "UNSUPPORTED_PROTOCOL",
-        "SCHEMA_TOO_NEW"
-      ],
-      "description": "The v1 seed set of coarse codes, carried forward from the TypeScript core's OmtError taxonomy. U2's pre-freeze pass subdivides these additively (e.g. ARCHIVED_READONLY under CONFLICT, DUPLICATE_MEMBER under INVALID_INPUT)."
+    "coarseFallback": {
+     "description": "Nearest coarse ancestor to interpret when this exact code is unknown to an older client; absent when the code is itself coarse.",
+     "$ref": "common.schema.json#/$defs/ProblemCode"
     },
-    "SeedProblemRegistry": {
-      "type": "object",
-      "description": "Seeded descriptors for the seven coarse codes.",
-      "properties": {
-        "CONFLICT": {
-          "$ref": "#/$defs/ProblemDescriptor",
-          "description": "Optimistic-concurrency or state-machine conflict: revision mismatch, illegal transition, mutating a read-only archived node (the archived case is subdivided as ARCHIVED_READONLY)."
-        },
-        "INVALID_HIERARCHY": {
-          "$ref": "#/$defs/ProblemDescriptor",
-          "description": "Hierarchy rule violation: illegal parent/child type pair (details.rule=child-type with parentType/childType), root creation of a non-epic (root-requires-epic), self-parent or descendant cycle (self-parent / descendant-cycle), cross-home move."
-        },
-        "INVALID_INPUT": {
-          "$ref": "#/$defs/ProblemDescriptor",
-          "description": "Payload failed semantic validation beyond schema shape: empty changeset, unsupported concurrency (subdivided as INVALID_CONCURRENCY), duplicate run member (subdivided as DUPLICATE_MEMBER), non-executable member type."
-        },
-        "NOT_FOUND": {
-          "$ref": "#/$defs/ProblemDescriptor",
-          "description": "Referenced home, node, run, item, or cursor does not exist. details.kind names the referent ('node' | 'run' | 'run-item') and details.id / runId+nodeId identify it."
-        },
-        "IO": {
-          "$ref": "#/$defs/ProblemDescriptor",
-          "description": "Filesystem or database failure while applying an operation."
-        },
-        "UNSUPPORTED_PROTOCOL": {
-          "$ref": "#/$defs/ProblemDescriptor",
-          "description": "Handshake or request used a protocol MAJOR the peer does not support."
-        },
-        "SCHEMA_TOO_NEW": {
-          "$ref": "#/$defs/ProblemDescriptor",
-          "description": "On-disk home schema is newer than this daemon understands; fail closed before any write."
-        }
-      },
-      "additionalProperties": false
-    },
-    "SubdividedProblemRegistry": {
-      "type": "object",
-      "description": "Subdivided codes introduced by U2's pre-freeze pass (additive; each carries a coarseFallback so older clients interpret unknown codes). Open map: any key matching ^[A-Z][A-Z0-9_]+$ may appear.",
-      "propertyNames": {
-        "pattern": "^[A-Z][A-Z0-9_]+$"
-      },
-      "additionalProperties": { "$ref": "#/$defs/ProblemDescriptor" }
-    },
-    "U2SubdivisionDescriptors": {
-      "type": "object",
-      "description": "The subdivision entries frozen with the behavioral corpus (U2, incl. the U2b owner-lock codes for R2 cross-language home ownership). Each property pins the exact descriptor instance registered for that code.",
-      "properties": {
-        "ARCHIVED_READONLY": {
-          "type": "object",
-          "properties": {
-            "summary": { "const": "The referenced node is archived and read-only; restore it before mutating." },
-            "detailsShape": { "const": "{ nodeId: string, operation: 'update' | 'report' | 'run-membership' }." },
-            "coarseFallback": { "const": "CONFLICT" },
-            "stability": { "const": "provisional" }
-          },
-          "required": ["summary", "detailsShape", "coarseFallback", "stability"]
-        },
-        "DUPLICATE_MEMBER": {
-          "type": "object",
-          "properties": {
-            "summary": { "const": "A run member list repeats a node id." },
-            "detailsShape": { "const": "{ nodeId: string } — the first duplicated id." },
-            "coarseFallback": { "const": "INVALID_INPUT" },
-            "stability": { "const": "provisional" }
-          },
-          "required": ["summary", "detailsShape", "coarseFallback", "stability"]
-        },
-        "INVALID_CONCURRENCY": {
-          "type": "object",
-          "properties": {
-            "summary": { "const": "Run concurrency must be a positive integer (v1 advertises runConcurrency: 1)." },
-            "detailsShape": { "const": "{ value: number | string } — the rejected value." },
-            "coarseFallback": { "const": "INVALID_INPUT" },
-            "stability": { "const": "provisional" }
-          },
-          "required": ["summary", "detailsShape", "coarseFallback", "stability"]
-        },
-        "HOME_LOCKED": {
-          "type": "object",
-          "description": "Owner-lock refusal (U2b/R2): one writer per opened home; lock file <home>/home.lock (e.g. ~/.omt/home.lock), JSON body {schemaVersion, ownerKind, pid, hostname?, acquiredAt, heartbeatAt, token}. Stale holders (>30 s silent) are stolen; unknown/future schemaVersion fails closed and is never stolen. Documented residual: the marker-check-to-write window stays TOCTOU-racy until the daemon adds a kernel flock on the same path (plan U5).",
-          "properties": {
-            "summary": { "const": "Another live writer already owns this home (per-home owner lock); only one writer may hold a home." },
-            "detailsShape": { "const": "{ pid: number | null, acquiredAt: string | null, schemaVersion?: number } — holder identity recorded in the owner lock; pid/acquiredAt are null when the lock body carries no readable identity; schemaVersion appears on incompatible-format refusals." },
-            "coarseFallback": { "const": "CONFLICT" },
-            "stability": { "const": "stable" }
-          },
-          "required": ["summary", "detailsShape", "coarseFallback", "stability"]
-        },
-        "DAEMON_OWNS_HOME": {
-          "type": "object",
-          "description": "Daemon-marker refusal (U2b/R2/F5): ownerKind \"daemon\" in <home>/home.lock always refuses TypeScript writers — even when stale — and blocks second-daemon takeover while present. Stable because takeover tooling (U6) and the daemon (U5) branch on it across languages.",
-          "properties": {
-            "summary": { "const": "The home carries a daemon owner marker (ownerKind 'daemon'); TypeScript writers always refuse, and no second daemon may take over while it is held." },
-            "detailsShape": { "const": "{ owner: object } — the full parsed owner-lock body (schemaVersion, ownerKind, pid, hostname?, acquiredAt, heartbeatAt, token)." },
-            "coarseFallback": { "const": "CONFLICT" },
-            "stability": { "const": "stable" }
-          },
-          "required": ["summary", "detailsShape", "coarseFallback", "stability"]
-        }
-      },
-      "additionalProperties": false
-    },
-    "U4SubdivisionDescriptors": {
-      "type": "object",
-      "description": "Subdivided codes introduced by U4's storage plane (additive; each carries a coarseFallback so older clients interpret unknown codes). Open map: any key matching ^[A-Z][A-Z0-9_]+$ may appear.",
-      "propertyNames": {
-        "pattern": "^[A-Z][A-Z0-9_]+$"
-      },
-      "properties": {
-        "REINDEX_REQUIRED": {
-          "type": "object",
-          "description": "Manual drift / ambiguous crash residue gate (U4/R19): observed on-disk content diverges from what the journaled plan wrote; nothing is overwritten — reindex first, then retry. Emitted by the recovery layer when a pending plan's target files were hand-edited while the writer was down, or when move source/target presence is ambiguous.",
-          "properties": {
-            "summary": { "const": "Observed on-disk content diverges from what the journaled plan wrote (manual drift or ambiguous crash residue); nothing was overwritten — run reindex and retry." },
-            "detailsShape": { "const": "{ requiresReindex: true, commandId?: string, from?: string, to?: string } — commandId identifies the pending journal plan; from/to appear for move-drift refusals." },
-            "coarseFallback": { "const": "CONFLICT" },
-            "stability": { "const": "stable" }
-          },
-          "required": ["summary", "detailsShape", "coarseFallback", "stability"]
-        }
-      },
-      "additionalProperties": false
+    "stability": {
+     "type": "string",
+     "enum": [
+      "stable",
+      "provisional"
+     ],
+     "description": "stable: the code will never change meaning. provisional: introduced as a subdivision and may still be folded back."
     }
+   },
+   "required": [
+    "summary",
+    "stability"
+   ]
+  },
+  "ProblemRegistry": {
+   "type": "object",
+   "description": "Map of ProblemCode \u2192 descriptor. Open map: any key matching ^[A-Z][A-Z0-9_]+$ may appear.",
+   "propertyNames": {
+    "pattern": "^[A-Z][A-Z0-9_]+$"
+   },
+   "additionalProperties": {
+    "$ref": "#/$defs/ProblemDescriptor"
+   }
+  },
+  "SeedProblemCodes": {
+   "type": "string",
+   "enum": [
+    "CONFLICT",
+    "INVALID_HIERARCHY",
+    "INVALID_INPUT",
+    "NOT_FOUND",
+    "IO",
+    "UNSUPPORTED_PROTOCOL",
+    "SCHEMA_TOO_NEW",
+    "UNAUTHORIZED",
+    "FORBIDDEN",
+    "BOOTSTRAP_TIMEOUT"
+   ],
+   "description": "The v1 seed set of coarse codes, carried forward from the TypeScript core's OmtError taxonomy. U2's pre-freeze pass subdivides these additively (e.g. ARCHIVED_READONLY under CONFLICT, DUPLICATE_MEMBER under INVALID_INPUT); the runtime plane (U5) adds its connection-identity coarse codes UNAUTHORIZED / FORBIDDEN and lifecycle code BOOTSTRAP_TIMEOUT."
+  },
+  "SeedProblemRegistry": {
+   "type": "object",
+   "description": "Seeded descriptors for the seven coarse codes.",
+   "properties": {
+    "CONFLICT": {
+     "$ref": "#/$defs/ProblemDescriptor",
+     "description": "Optimistic-concurrency or state-machine conflict: revision mismatch, illegal transition, mutating a read-only archived node (the archived case is subdivided as ARCHIVED_READONLY)."
+    },
+    "INVALID_HIERARCHY": {
+     "$ref": "#/$defs/ProblemDescriptor",
+     "description": "Hierarchy rule violation: illegal parent/child type pair (details.rule=child-type with parentType/childType), root creation of a non-epic (root-requires-epic), self-parent or descendant cycle (self-parent / descendant-cycle), cross-home move."
+    },
+    "INVALID_INPUT": {
+     "$ref": "#/$defs/ProblemDescriptor",
+     "description": "Payload failed semantic validation beyond schema shape: empty changeset, unsupported concurrency (subdivided as INVALID_CONCURRENCY), duplicate run member (subdivided as DUPLICATE_MEMBER), non-executable member type."
+    },
+    "NOT_FOUND": {
+     "$ref": "#/$defs/ProblemDescriptor",
+     "description": "Referenced home, node, run, item, or cursor does not exist. details.kind names the referent ('node' | 'run' | 'run-item') and details.id / runId+nodeId identify it."
+    },
+    "IO": {
+     "$ref": "#/$defs/ProblemDescriptor",
+     "description": "Filesystem or database failure while applying an operation."
+    },
+    "UNSUPPORTED_PROTOCOL": {
+     "$ref": "#/$defs/ProblemDescriptor",
+     "description": "Handshake or request used a protocol MAJOR the peer does not support."
+    },
+    "SCHEMA_TOO_NEW": {
+     "$ref": "#/$defs/ProblemDescriptor",
+     "description": "On-disk home schema is newer than this daemon understands; fail closed before any write."
+    },
+    "UNAUTHORIZED": {
+     "$ref": "#/$defs/ProblemDescriptor",
+     "description": "No valid credential on a request that requires one, or an expired/unknown token (details.reason in missing-credential | unknown-credential | expired-credential). Credentials are server-minted at handshake; nothing client-supplied can mint or widen one."
+    },
+    "FORBIDDEN": {
+     "$ref": "#/$defs/ProblemDescriptor",
+     "description": "Authenticated principal lacks the parity class, operation scope, home scope, or administrator grant for this action (details.reason in parity-adapter-only | admin-required | home-not-scoped | operation-not-granted | cross-uid-connection)."
+    },
+    "BOOTSTRAP_TIMEOUT": {
+     "$ref": "#/$defs/ProblemDescriptor",
+     "description": "Daemon election gave up: no live daemon appeared within the loser descriptor-poll budget and the bootstrap lock could not be won (HOME_LOCKED-style coarse refusal; details.runtimeDir)."
+    }
+   },
+   "additionalProperties": false
+  },
+  "SubdividedProblemRegistry": {
+   "type": "object",
+   "description": "Subdivided codes introduced by U2's pre-freeze pass (additive; each carries a coarseFallback so older clients interpret unknown codes). Open map: any key matching ^[A-Z][A-Z0-9_]+$ may appear.",
+   "propertyNames": {
+    "pattern": "^[A-Z][A-Z0-9_]+$"
+   },
+   "additionalProperties": {
+    "$ref": "#/$defs/ProblemDescriptor"
+   }
+  },
+  "U2SubdivisionDescriptors": {
+   "type": "object",
+   "description": "The subdivision entries frozen with the behavioral corpus (U2, incl. the U2b owner-lock codes for R2 cross-language home ownership). Each property pins the exact descriptor instance registered for that code.",
+   "properties": {
+    "ARCHIVED_READONLY": {
+     "type": "object",
+     "properties": {
+      "summary": {
+       "const": "The referenced node is archived and read-only; restore it before mutating."
+      },
+      "detailsShape": {
+       "const": "{ nodeId: string, operation: 'update' | 'report' | 'run-membership' }."
+      },
+      "coarseFallback": {
+       "const": "CONFLICT"
+      },
+      "stability": {
+       "const": "provisional"
+      }
+     },
+     "required": [
+      "summary",
+      "detailsShape",
+      "coarseFallback",
+      "stability"
+     ]
+    },
+    "DUPLICATE_MEMBER": {
+     "type": "object",
+     "properties": {
+      "summary": {
+       "const": "A run member list repeats a node id."
+      },
+      "detailsShape": {
+       "const": "{ nodeId: string } \u2014 the first duplicated id."
+      },
+      "coarseFallback": {
+       "const": "INVALID_INPUT"
+      },
+      "stability": {
+       "const": "provisional"
+      }
+     },
+     "required": [
+      "summary",
+      "detailsShape",
+      "coarseFallback",
+      "stability"
+     ]
+    },
+    "INVALID_CONCURRENCY": {
+     "type": "object",
+     "properties": {
+      "summary": {
+       "const": "Run concurrency must be a positive integer (v1 advertises runConcurrency: 1)."
+      },
+      "detailsShape": {
+       "const": "{ value: number | string } \u2014 the rejected value."
+      },
+      "coarseFallback": {
+       "const": "INVALID_INPUT"
+      },
+      "stability": {
+       "const": "provisional"
+      }
+     },
+     "required": [
+      "summary",
+      "detailsShape",
+      "coarseFallback",
+      "stability"
+     ]
+    },
+    "HOME_LOCKED": {
+     "type": "object",
+     "description": "Owner-lock refusal (U2b/R2): one writer per opened home; lock file <home>/home.lock (e.g. ~/.omt/home.lock), JSON body {schemaVersion, ownerKind, pid, hostname?, acquiredAt, heartbeatAt, token}. Stale holders (>30 s silent) are stolen; unknown/future schemaVersion fails closed and is never stolen. Documented residual: the marker-check-to-write window stays TOCTOU-racy until the daemon adds a kernel flock on the same path (plan U5).",
+     "properties": {
+      "summary": {
+       "const": "Another live writer already owns this home (per-home owner lock); only one writer may hold a home."
+      },
+      "detailsShape": {
+       "const": "{ pid: number | null, acquiredAt: string | null, schemaVersion?: number } \u2014 holder identity recorded in the owner lock; pid/acquiredAt are null when the lock body carries no readable identity; schemaVersion appears on incompatible-format refusals."
+      },
+      "coarseFallback": {
+       "const": "CONFLICT"
+      },
+      "stability": {
+       "const": "stable"
+      }
+     },
+     "required": [
+      "summary",
+      "detailsShape",
+      "coarseFallback",
+      "stability"
+     ]
+    },
+    "DAEMON_OWNS_HOME": {
+     "type": "object",
+     "description": "Daemon-marker refusal (U2b/R2/F5): ownerKind \"daemon\" in <home>/home.lock always refuses TypeScript writers \u2014 even when stale \u2014 and blocks second-daemon takeover while present. Stable because takeover tooling (U6) and the daemon (U5) branch on it across languages.",
+     "properties": {
+      "summary": {
+       "const": "The home carries a daemon owner marker (ownerKind 'daemon'); TypeScript writers always refuse, and no second daemon may take over while it is held."
+      },
+      "detailsShape": {
+       "const": "{ owner: object } \u2014 the full parsed owner-lock body (schemaVersion, ownerKind, pid, hostname?, acquiredAt, heartbeatAt, token)."
+      },
+      "coarseFallback": {
+       "const": "CONFLICT"
+      },
+      "stability": {
+       "const": "stable"
+      }
+     },
+     "required": [
+      "summary",
+      "detailsShape",
+      "coarseFallback",
+      "stability"
+     ]
+    }
+   },
+   "additionalProperties": false
+  },
+  "U4SubdivisionDescriptors": {
+   "type": "object",
+   "description": "Subdivided codes introduced by U4's storage plane (additive; each carries a coarseFallback so older clients interpret unknown codes). Open map: any key matching ^[A-Z][A-Z0-9_]+$ may appear.",
+   "propertyNames": {
+    "pattern": "^[A-Z][A-Z0-9_]+$"
+   },
+   "properties": {
+    "REINDEX_REQUIRED": {
+     "type": "object",
+     "description": "Manual drift / ambiguous crash residue gate (U4/R19): observed on-disk content diverges from what the journaled plan wrote; nothing is overwritten \u2014 reindex first, then retry. Emitted by the recovery layer when a pending plan's target files were hand-edited while the writer was down, or when move source/target presence is ambiguous.",
+     "properties": {
+      "summary": {
+       "const": "Observed on-disk content diverges from what the journaled plan wrote (manual drift or ambiguous crash residue); nothing was overwritten \u2014 run reindex and retry."
+      },
+      "detailsShape": {
+       "const": "{ requiresReindex: true, commandId?: string, from?: string, to?: string } \u2014 commandId identifies the pending journal plan; from/to appear for move-drift refusals."
+      },
+      "coarseFallback": {
+       "const": "CONFLICT"
+      },
+      "stability": {
+       "const": "stable"
+      }
+     },
+     "required": [
+      "summary",
+      "detailsShape",
+      "coarseFallback",
+      "stability"
+     ]
+    }
+   },
+   "additionalProperties": false
   }
+ }
 }

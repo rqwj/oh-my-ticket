@@ -1,131 +1,293 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://omt.dev/schemas/v1/events.schema.json",
-  "title": "OMT protocol events (v1)",
-  "description": "Durable per-home event stream (F4, R11). EventEnvelope carries a per-home monotonically increasing cursor; consumers resume via events/resume. Attention payloads carry the required action, qualified reference, reason, optional deadline and recovery options — never lease secrets. The type field mirrors payload.kind for cheap client switching; producers keep them equal.",
-  "$defs": {
-    "EventCursor": {
-      "type": "integer",
-      "minimum": 0,
-      "description": "Per-home durable event sequence number."
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://omt.dev/schemas/v1/events.schema.json",
+ "title": "OMT protocol events (v1)",
+ "description": "Durable per-home event stream (F4, R11). EventEnvelope carries a per-home monotonically increasing cursor; consumers resume via events/resume. Attention payloads carry the required action, qualified reference, reason, optional deadline and recovery options \u2014 never lease secrets. The type field mirrors payload.kind for cheap client switching; producers keep them equal.",
+ "$defs": {
+  "EventCursor": {
+   "type": "integer",
+   "minimum": 0,
+   "description": "Per-home durable event sequence number."
+  },
+  "NodeChangedEvent": {
+   "type": "object",
+   "description": "A node was created/updated/moved/archived/unarchived.",
+   "properties": {
+    "kind": {
+     "type": "string",
+     "enum": [
+      "node.changed"
+     ]
     },
-    "NodeChangedEvent": {
-      "type": "object",
-      "description": "A node was created/updated/moved/archived/unarchived.",
-      "properties": {
-        "kind": { "type": "string", "enum": ["node.changed"] },
-        "ref": { "$ref": "common.schema.json#/$defs/QualifiedNodeRef" },
-        "change": { "type": "string", "enum": ["created", "updated", "moved", "archived", "unarchived"] }
-      },
-      "required": ["kind", "ref", "change"]
+    "ref": {
+     "$ref": "common.schema.json#/$defs/QualifiedNodeRef"
     },
-    "RunChangedEvent": {
-      "type": "object",
-      "description": "Run-level state changed (created, started, paused, resumed, canceled, completed...).",
-      "properties": {
-        "kind": { "type": "string", "enum": ["run.changed"] },
-        "ref": { "$ref": "common.schema.json#/$defs/QualifiedRunRef" }
-      },
-      "required": ["kind", "ref"]
-    },
-    "RunItemChangedEvent": {
-      "type": "object",
-      "description": "One run member changed state (claimed, reported, retried, removed...).",
-      "properties": {
-        "kind": { "type": "string", "enum": ["run.item_changed"] },
-        "ref": {
-          "type": "object",
-          "properties": {
-            "homeId": { "$ref": "common.schema.json#/$defs/HomeId" },
-            "runId": { "$ref": "common.schema.json#/$defs/RunId" },
-            "nodeId": { "$ref": "common.schema.json#/$defs/NodeId" }
-          },
-          "required": ["homeId", "runId", "nodeId"]
-        },
-        "state": { "$ref": "common.schema.json#/$defs/RunItemState" }
-      },
-      "required": ["kind", "ref", "state"]
-    },
-    "AttentionRaisedEvent": {
-      "type": "object",
-      "description": "Human or agent attention required: carries required action, qualified reference, reason, optional deadline and recovery options without lease secrets (R11). DSH maps this to followup/inject delivery.",
-      "properties": {
-        "kind": { "type": "string", "enum": ["attention.raised"] },
-        "action": { "type": "string", "minLength": 1, "description": "Required action token, e.g. \"review.awaiting_confirmation\", \"resume.stalled\"." },
-        "ref": {
-          "oneOf": [
-            { "$ref": "common.schema.json#/$defs/QualifiedNodeRef" },
-            { "$ref": "common.schema.json#/$defs/QualifiedRunRef" }
-          ]
-        },
-        "reason": { "type": "string" },
-        "deadline": { "$ref": "common.schema.json#/$defs/Iso8601Time" },
-        "recoveryOptions": {
-          "type": "array",
-          "items": { "type": "string", "minLength": 1 },
-          "description": "Open-vocabulary recovery tokens, e.g. \"run/control retry\", \"human confirm\"."
-        }
-      },
-      "required": ["kind", "action", "ref", "reason"]
-    },
-    "SnapshotResyncEvent": {
-      "type": "object",
-      "description": "Retention expired before a consumer's cursor: resynchronize from snapshot.",
-      "properties": {
-        "kind": { "type": "string", "enum": ["snapshot.resync"] },
-        "homeId": { "$ref": "common.schema.json#/$defs/HomeId" },
-        "reason": { "type": "string" }
-      },
-      "required": ["kind", "homeId", "reason"]
-    },
-    "NodeQuarantinedEvent": {
-      "type": "object",
-      "description": "Reindex quarantined a DB node whose Markdown file is gone (R19): identity snapshot preserved in the quarantine table; nothing silently deleted or rebound. Consumers must refresh any cached tree.",
-      "properties": {
-        "kind": { "type": "string", "enum": ["node.quarantined"] },
-        "nodeId": { "$ref": "common.schema.json#/$defs/NodeId" },
-        "path": { "type": "string", "description": "Last known home-relative Markdown path of the missing member." },
-        "reason": { "type": "string" }
-      },
-      "required": ["kind", "nodeId", "path", "reason"]
-    },
-    "EventPayload": {
-      "description": "Any committed event payload, discriminated by its kind constant.",
-      "oneOf": [
-        { "$ref": "#/$defs/NodeChangedEvent" },
-        { "$ref": "#/$defs/RunChangedEvent" },
-        { "$ref": "#/$defs/RunItemChangedEvent" },
-        { "$ref": "#/$defs/AttentionRaisedEvent" },
-        { "$ref": "#/$defs/SnapshotResyncEvent" },
-        { "$ref": "#/$defs/NodeQuarantinedEvent" }
-      ]
-    },
-    "EventType": {
-      "type": "string",
-      "enum": ["node.changed", "run.changed", "run.item_changed", "attention.raised", "snapshot.resync", "node.quarantined"],
-      "description": "Mirror of payload.kind carried on the envelope for cheap switching."
-    },
-    "EventEnvelope": {
-      "type": "object",
-      "description": "One durably committed event of one home.",
-      "properties": {
-        "cursor": { "$ref": "#/$defs/EventCursor" },
-        "homeId": { "$ref": "common.schema.json#/$defs/HomeId" },
-        "type": { "$ref": "#/$defs/EventType" },
-        "occurredAt": { "$ref": "common.schema.json#/$defs/Iso8601Time" },
-        "payload": { "$ref": "#/$defs/EventPayload" }
-      },
-      "required": ["cursor", "homeId", "type", "occurredAt", "payload"]
-    },
-    "EventBatch": {
-      "type": "object",
-      "description": "Ordered page of the event stream as returned by events/resume.",
-      "properties": {
-        "cursor": { "$ref": "#/$defs/EventCursor" },
-        "resync": { "type": "boolean" },
-        "events": { "type": "array", "items": { "$ref": "#/$defs/EventEnvelope" } }
-      },
-      "required": ["cursor", "resync", "events"]
+    "change": {
+     "type": "string",
+     "enum": [
+      "created",
+      "updated",
+      "moved",
+      "archived",
+      "unarchived"
+     ]
     }
+   },
+   "required": [
+    "kind",
+    "ref",
+    "change"
+   ]
+  },
+  "RunChangedEvent": {
+   "type": "object",
+   "description": "Run-level state changed (created, started, paused, resumed, canceled, completed...).",
+   "properties": {
+    "kind": {
+     "type": "string",
+     "enum": [
+      "run.changed"
+     ]
+    },
+    "ref": {
+     "$ref": "common.schema.json#/$defs/QualifiedRunRef"
+    }
+   },
+   "required": [
+    "kind",
+    "ref"
+   ]
+  },
+  "RunItemChangedEvent": {
+   "type": "object",
+   "description": "One run member changed state (claimed, reported, retried, removed...).",
+   "properties": {
+    "kind": {
+     "type": "string",
+     "enum": [
+      "run.item_changed"
+     ]
+    },
+    "ref": {
+     "type": "object",
+     "properties": {
+      "homeId": {
+       "$ref": "common.schema.json#/$defs/HomeId"
+      },
+      "runId": {
+       "$ref": "common.schema.json#/$defs/RunId"
+      },
+      "nodeId": {
+       "$ref": "common.schema.json#/$defs/NodeId"
+      }
+     },
+     "required": [
+      "homeId",
+      "runId",
+      "nodeId"
+     ]
+    },
+    "state": {
+     "$ref": "common.schema.json#/$defs/RunItemState"
+    }
+   },
+   "required": [
+    "kind",
+    "ref",
+    "state"
+   ]
+  },
+  "AttentionRaisedEvent": {
+   "type": "object",
+   "description": "Human or agent attention required: carries required action, qualified reference, reason, optional deadline and recovery options without lease secrets (R11). DSH maps this to followup/inject delivery.",
+   "properties": {
+    "kind": {
+     "type": "string",
+     "enum": [
+      "attention.raised"
+     ]
+    },
+    "action": {
+     "type": "string",
+     "minLength": 1,
+     "description": "Required action token, e.g. \"review.awaiting_confirmation\", \"resume.stalled\"."
+    },
+    "ref": {
+     "oneOf": [
+      {
+       "$ref": "common.schema.json#/$defs/QualifiedNodeRef"
+      },
+      {
+       "$ref": "common.schema.json#/$defs/QualifiedRunRef"
+      }
+     ]
+    },
+    "reason": {
+     "type": "string"
+    },
+    "deadline": {
+     "$ref": "common.schema.json#/$defs/Iso8601Time"
+    },
+    "recoveryOptions": {
+     "type": "array",
+     "items": {
+      "type": "string",
+      "minLength": 1
+     },
+     "description": "Open-vocabulary recovery tokens, e.g. \"run/control retry\", \"human confirm\"."
+    }
+   },
+   "required": [
+    "kind",
+    "action",
+    "ref",
+    "reason"
+   ]
+  },
+  "SnapshotResyncEvent": {
+   "type": "object",
+   "description": "Retention expired before a consumer's cursor: resynchronize from snapshot. prunedThroughSeq/consumerCursor are additive U5 fields retained optional until retention pruning ships.",
+   "properties": {
+    "kind": {
+     "type": "string",
+     "enum": [
+      "snapshot.resync"
+     ]
+    },
+    "homeId": {
+     "$ref": "common.schema.json#/$defs/HomeId"
+    },
+    "reason": {
+     "type": "string"
+    },
+    "prunedThroughSeq": {
+     "$ref": "#/$defs/EventCursor",
+     "description": "Additive keying aid (U5): every event with cursor <= prunedThroughSeq was pruned by retention; consumers resuming from an older cursor must resynchronize instead of replaying."
+    },
+    "consumerCursor": {
+     "$ref": "#/$defs/EventCursor",
+     "description": "Additive keying aid (U5): the consumer cursor that triggered this resync, so a consumer can correlate the signal with its own resume attempt."
+    }
+   },
+   "required": [
+    "kind",
+    "homeId",
+    "reason"
+   ]
+  },
+  "NodeQuarantinedEvent": {
+   "type": "object",
+   "description": "Reindex quarantined a DB node whose Markdown file is gone (R19): identity snapshot preserved in the quarantine table; nothing silently deleted or rebound. Consumers must refresh any cached tree.",
+   "properties": {
+    "kind": {
+     "type": "string",
+     "enum": [
+      "node.quarantined"
+     ]
+    },
+    "nodeId": {
+     "$ref": "common.schema.json#/$defs/NodeId"
+    },
+    "path": {
+     "type": "string",
+     "description": "Last known home-relative Markdown path of the missing member."
+    },
+    "reason": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "kind",
+    "nodeId",
+    "path",
+    "reason"
+   ]
+  },
+  "EventPayload": {
+   "description": "Any committed event payload, discriminated by its kind constant.",
+   "oneOf": [
+    {
+     "$ref": "#/$defs/NodeChangedEvent"
+    },
+    {
+     "$ref": "#/$defs/RunChangedEvent"
+    },
+    {
+     "$ref": "#/$defs/RunItemChangedEvent"
+    },
+    {
+     "$ref": "#/$defs/AttentionRaisedEvent"
+    },
+    {
+     "$ref": "#/$defs/SnapshotResyncEvent"
+    },
+    {
+     "$ref": "#/$defs/NodeQuarantinedEvent"
+    }
+   ]
+  },
+  "EventType": {
+   "type": "string",
+   "enum": [
+    "node.changed",
+    "run.changed",
+    "run.item_changed",
+    "attention.raised",
+    "snapshot.resync",
+    "node.quarantined"
+   ],
+   "description": "Mirror of payload.kind carried on the envelope for cheap switching."
+  },
+  "EventEnvelope": {
+   "type": "object",
+   "description": "One durably committed event of one home.",
+   "properties": {
+    "cursor": {
+     "$ref": "#/$defs/EventCursor"
+    },
+    "homeId": {
+     "$ref": "common.schema.json#/$defs/HomeId"
+    },
+    "type": {
+     "$ref": "#/$defs/EventType"
+    },
+    "occurredAt": {
+     "$ref": "common.schema.json#/$defs/Iso8601Time"
+    },
+    "payload": {
+     "$ref": "#/$defs/EventPayload"
+    }
+   },
+   "required": [
+    "cursor",
+    "homeId",
+    "type",
+    "occurredAt",
+    "payload"
+   ]
+  },
+  "EventBatch": {
+   "type": "object",
+   "description": "Ordered page of the event stream as returned by events/resume.",
+   "properties": {
+    "cursor": {
+     "$ref": "#/$defs/EventCursor"
+    },
+    "resync": {
+     "type": "boolean"
+    },
+    "events": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/EventEnvelope"
+     }
+    }
+   },
+   "required": [
+    "cursor",
+    "resync",
+    "events"
+   ]
   }
+ }
 }

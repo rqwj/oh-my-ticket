@@ -23,3 +23,6 @@ fs4 = "1"
 sha2 = "0.10"
 getrandom = "0.3"
 tempfile = { version = "3" }
+# U5 runtime plane (KTD1/KTD9): unix domain socket peer credentials
+# (SO_PEERCRED / LOCAL_PEERCRED) and signal-masked SIGTERM/SIGINT handling.
+libc = "0.2"

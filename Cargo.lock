@@ -786,6 +786,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "omt-runtime"
+version = "0.1.0"
+dependencies = [
+ "getrandom",
+ "libc",
+ "omt-contracts",
+ "omt-domain",
+ "omt-storage",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "omt-storage"
 version = "0.1.0"
 dependencies = [

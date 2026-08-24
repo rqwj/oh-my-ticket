@@ -112,11 +112,11 @@ export interface AttentionRaisedEvent {
   [k: string]: unknown;
 }
 /**
- * Retention expired before a consumer's cursor: resynchronize from snapshot.
+ * Retention expired before a consumer's cursor: resynchronize from snapshot. prunedThroughSeq/consumerCursor are additive U5 fields retained optional until retention pruning ships.
  */
 
 /**
- * Retention expired before a consumer's cursor: resynchronize from snapshot.
+ * Retention expired before a consumer's cursor: resynchronize from snapshot. prunedThroughSeq/consumerCursor are additive U5 fields retained optional until retention pruning ships.
  */
 export interface SnapshotResyncEvent {
   kind: "snapshot.resync";
@@ -125,6 +125,14 @@ export interface SnapshotResyncEvent {
    */
   homeId: string;
   reason: string;
+  /**
+   * Additive keying aid (U5): every event with cursor <= prunedThroughSeq was pruned by retention; consumers resuming from an older cursor must resynchronize instead of replaying.
+   */
+  prunedThroughSeq?: number;
+  /**
+   * Additive keying aid (U5): the consumer cursor that triggered this resync, so a consumer can correlate the signal with its own resume attempt.
+   */
+  consumerCursor?: number;
   [k: string]: unknown;
 }
 /**

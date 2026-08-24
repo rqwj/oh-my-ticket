@@ -11,6 +11,9 @@ export const SEED_PROBLEM_CODES = [
   'IO',
   'UNSUPPORTED_PROTOCOL',
   'SCHEMA_TOO_NEW',
+  'UNAUTHORIZED',
+  'FORBIDDEN',
+  'BOOTSTRAP_TIMEOUT',
 ] as const
 
 export type SeedProblemCode = (typeof SEED_PROBLEM_CODES)[number]
