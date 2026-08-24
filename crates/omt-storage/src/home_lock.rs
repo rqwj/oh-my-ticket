@@ -143,7 +143,12 @@ fn daemon_owns(home: &str, body: &LockBody) -> Problem {
             "home {} is owned by an omt-daemon (pid {:?}); close the daemon or remove its owner marker",
             home, body.pid
         ),
-        details: Some(serde_json::json!({ "owner": body })),
+        details: Some(serde_json::json!({
+            "owner": body,
+            // TICKET-0124 acceptance 3: a post-takeover fence must tell a
+            // legacy writer HOW to proceed, not just that it may not.
+            "hint": "this home is managed by omt-daemon; upgrade your omt tooling (legacy bridge writers are no longer supported)",
+        })),
     }
 }
 
@@ -200,7 +205,22 @@ pub fn acquire(
 
         match verdict {
             Inspect::Body(ref body) if body.owner_kind == "daemon" => {
-                return Err(daemon_owns(&home_text, body));
+                // A LIVE daemon always holds the kernel flock; the flock,
+                // not the pid, is the authority on liveness. Only the NEW
+                // world (daemon/CLI acquirers) may probe-and-recover an
+                // un-flocked TOMBSTONE (e.g. the TICKET-0124 takeover
+                // fence): legacy ts-bridge writers cannot probe, so they
+                // are fenced outright with upgrade guidance.
+                match config.owner_kind {
+                    OwnerKind::Daemon => {
+                        if inode_is_flocked_public(home)? {
+                            return Err(daemon_owns(&home_text, body));
+                        }
+                        let _ = std::fs::remove_file(home.join(LOCK_FILE_NAME));
+                        continue;
+                    }
+                    OwnerKind::TsBridge => return Err(daemon_owns(&home_text, body)),
+                }
             }
             Inspect::Body(ref body) if body.schema_version != LOCK_SCHEMA_VERSION => {
                 return Err(home_locked(

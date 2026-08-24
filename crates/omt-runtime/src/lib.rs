@@ -20,4 +20,5 @@ pub mod paths;
 pub mod problem;
 pub mod server;
 pub mod signal;
+pub mod takeover;
 pub mod views;

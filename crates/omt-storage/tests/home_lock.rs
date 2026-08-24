@@ -24,6 +24,13 @@ fn daemon_cfg() -> LockConfig {
     }
 }
 
+fn ts_bridge_cfg() -> LockConfig {
+    LockConfig {
+        owner_kind: OwnerKind::TsBridge,
+        ..daemon_cfg()
+    }
+}
+
 fn write_marker(home: &std::path::Path, body: &LockBody) {
     let files = DiskFiles::new(home);
     files
@@ -49,23 +56,35 @@ fn body_of(owner_kind: &str, acquired_at: i64, token: &str) -> LockBody {
 }
 
 #[test]
-fn daemon_marker_refuses_always_even_when_stale() {
+fn daemon_tombstone_splits_by_acquirer_generation() {
     let (_dir, home) = temp_home();
     let clock = fixed_clock();
-    // Stale by an hour — still refuses (contract: ALWAYS).
+    // Stale by an hour, NO holder behind it (no flock): a TOMBSTONE.
+    // TICKET-0124: new-world acquirers clear it automatically (the flock,
+    // not the pid, is the liveness authority) — but legacy ts-bridge
+    // writers cannot probe, so they are fenced with upgrade guidance.
     write_marker(
         &home,
-        &body_of("daemon", T0_MS - 3_600_000, "dead-daemon-token"),
+        &body_of("daemon", T0_MS - 3_600_000, "tombstone-token"),
     );
-    let problem = expect_problem(acquire(&home, &daemon_cfg(), clock), "DAEMON_OWNS_HOME");
-    let owner = problem.details.unwrap()["owner"].clone();
-    assert_eq!(owner["ownerKind"], "daemon");
-    assert_eq!(owner["token"], "dead-daemon-token");
+    let problem = expect_problem(
+        acquire(&home, &ts_bridge_cfg(), clock.clone()),
+        "DAEMON_OWNS_HOME",
+    );
+    let details = problem.details.unwrap();
+    assert_eq!(details["owner"]["ownerKind"], "daemon");
+    let hint = details["hint"].as_str().expect("upgrade hint");
+    assert!(hint.contains("upgrade"), "{hint}");
     assert_eq!(
         marker(&home).unwrap().token,
-        "dead-daemon-token",
-        "marker untouched"
+        "tombstone-token",
+        "legacy attempt leaves the marker untouched"
     );
+
+    // New-world acquirer takes the tombstone transparently.
+    let handle = acquire(&home, &daemon_cfg(), clock).expect("daemon recovers tombstone");
+    assert_eq!(handle.body().owner_kind, "daemon");
+    handle.release().unwrap();
 }
 
 #[test]
@@ -164,27 +183,22 @@ fn heartbeat_refreshes_body_in_place_and_survives_steal_window() {
     assert!(!handle.is_lost());
 
     // A contender looking NOW still sees a holder; since our own marker says
-    // "daemon" the contract's strongest code applies (ALWAYS, even fresh).
+    // "daemon" AND the inode is flocked, even the new-world flock-authority
+    // rule refuses (a live lease never loses its home).
     expect_problem(
         acquire(&home, &daemon_cfg(), clock.clone()),
         "DAEMON_OWNS_HOME",
     );
 
-    // After the stale window WITHOUT heartbeats the abandoned DAEMON marker
-    // STILL refuses (contract: DAEMON_OWNS_HOME always, even stale — crashed
-    // daemons need explicit takeover, never silent auto-steal).
+    // After the stale window WITHOUT heartbeats the fd is closed (no flock
+    // behind the marker) — the marker is a TOMBSTONE: the next daemon
+    // acquirer recovers it automatically (TICKET-0124), while a legacy
+    // ts-bridge writer would still be fenced.
     let token = handle.token().to_string();
     drop(handle);
     clock.advance(31_000);
-    let problem = expect_problem(
-        acquire(&home, &daemon_cfg(), clock.clone()),
-        "DAEMON_OWNS_HOME",
-    );
-    assert_eq!(problem.details.unwrap()["owner"]["token"], token);
-
-    // Manual marker removal (the takeover-tooling path) re-enables ownership.
-    std::fs::remove_file(home.join("home.lock")).unwrap();
-    let successor = acquire(&home, &daemon_cfg(), clock.clone()).expect("clean re-acquire");
+    let successor = acquire(&home, &daemon_cfg(), clock.clone()).expect("tombstone recovered");
+    assert_ne!(successor.token(), token);
     successor.release().unwrap();
 }
 
@@ -229,24 +243,28 @@ fn flock_double_daemon_kernel_exclusion() {
 }
 
 #[test]
-fn dead_daemon_marker_requires_manual_takeover() {
+fn dead_daemon_marker_auto_recovers_for_new_world() {
     let (_dir, home) = temp_home();
     let clock = fixed_clock();
     let a = acquire(&home, &daemon_cfg(), clock.clone()).expect("a acquires");
-    let token = a.token().to_string();
-    drop(a); // crash: fd closed, marker remains
+    drop(a); // crash: fd closed (flock released), marker remains
 
-    clock.advance(3_600_000); // an hour later — still refuses
+    clock.advance(3_600_000); // an hour later
+    // TICKET-0124: the un-flocked marker is a tombstone — the next daemon
+    // acquirer recovers it without manual tooling (D1: no user-visible gap).
+    let b = acquire(&home, &daemon_cfg(), clock.clone()).expect("auto-recovered");
+    b.release().unwrap();
+
+    // A LEGACY writer over a daemon marker is still fenced with guidance:
+    write_marker(
+        &home,
+        &body_of("daemon", T0_MS - 3_600_000, "fence-token"),
+    );
     let problem = expect_problem(
-        acquire(&home, &daemon_cfg(), clock.clone()),
+        acquire(&home, &ts_bridge_cfg(), clock),
         "DAEMON_OWNS_HOME",
     );
-    assert_eq!(problem.details.unwrap()["owner"]["token"], token);
-
-    // Takeover tooling removes the marker explicitly, then ownership works.
-    std::fs::remove_file(home.join("home.lock")).unwrap();
-    let b = acquire(&home, &daemon_cfg(), clock.clone()).expect("post-takeover acquire");
-    b.release().unwrap();
+    assert!(problem.details.unwrap()["hint"].is_string());
 }
 
 #[test]

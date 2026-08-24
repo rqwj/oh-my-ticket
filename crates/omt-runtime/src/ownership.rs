@@ -63,14 +63,13 @@ pub fn recover_own_dead_daemon_marker(home: &std::path::Path) -> Result<()> {
         )),
         "daemon" => {
             let alive = marker.pid.map(descriptor::pid_live).unwrap_or(false);
-            if alive {
-                return Err(daemon_owns_problem(home, marker.pid));
-            }
-            // Dead (or unrecorded) pid: probe the kernel lease before
-            // removing — a held flock means SOMEONE lives behind the marker.
+            // The flock, not the pid, is the liveness authority: a marker
+            // whose inode is NOT flocked is a tombstone (e.g. the
+            // TICKET-0124 takeover fence left by an exited CLI) even when
+            // its recorded pid happens to be recycled/alive.
             let flocked =
                 omt_storage::home_lock::inode_is_flocked_public(home).unwrap_or(true);
-            if flocked {
+            if alive && flocked {
                 return Err(daemon_owns_problem(home, marker.pid));
             }
             let path = home.join(omt_storage::home_lock::LOCK_FILE_NAME);
@@ -162,12 +161,38 @@ mod tests {
 
     #[test]
     fn live_daemon_pid_refuses_second_writer() {
+        let dir = temp_home_with_marker(
+            r#"{"schemaVersion":1,"ownerKind":"daemon","pid":1,"acquiredAt":"x","heartbeatAt":"y","token":"t"}"#,
+        );
+        // A LIVE lease = the recorded pid is alive AND the kernel flock is
+        // held. Simulate by actually acquiring in the same home: the handle
+        // flocks the inode, so recovery must refuse.
+        let clock = std::sync::Arc::new(omt_storage::clock::SystemClock);
+        let _handle = omt_storage::home_lock::acquire(
+            dir.path(),
+            &omt_storage::home_lock::LockConfig {
+                owner_kind: omt_storage::home_lock::OwnerKind::Daemon,
+                hostname: "ownership-test".to_string(),
+                ..Default::default()
+            },
+            clock,
+        )
+        .expect("live holder acquires");
+        let err = recover_own_dead_daemon_marker(dir.path()).unwrap_err();
+        assert_eq!(err.code, "DAEMON_OWNS_HOME");
+    }
+
+    #[test]
+    fn live_pid_without_flock_is_a_tombstone() {
+        // TICKET-0124 fence semantics: an ALIVE pid behind an UN-FLOCKED
+        // inode is a takeover tombstone — the flock is the liveness
+        // authority, so boot recovery clears it instead of refusing.
         let mine = std::process::id() as i64;
         let dir = temp_home_with_marker(&format!(
             r#"{{"schemaVersion":1,"ownerKind":"daemon","pid":{mine},"acquiredAt":"x","heartbeatAt":"y","token":"t"}}"#
         ));
-        let err = recover_own_dead_daemon_marker(dir.path()).unwrap_err();
-        assert_eq!(err.code, "DAEMON_OWNS_HOME");
+        recover_own_dead_daemon_marker(dir.path()).expect("tombstone recovered");
+        assert!(!dir.path().join("home.lock").exists(), "marker removed");
     }
 
     #[test]

@@ -302,12 +302,49 @@ describe('integration: home ownership through the daemon surface', () => {
     }
   }, 30_000) // the adapter half waits out the client's 10s spawn window
 
-  it('a LIVE daemon marker refuses with DAEMON_OWNS_HOME (second writer)', async () => {
-    // pid must be alive for the refusal; this process qualifies.
+  it('a LIVE daemon lease (flock held) refuses a second writer with DAEMON_OWNS_HOME', async () => {
+    // TICKET-0124: liveness authority is the kernel flock. Boot a REAL
+    // daemon over the home (it holds the lock), then attempt a second
+    // boot: refused while the first lease lives.
+    const runtimeDir = join(root, 'runtime')
+    mkdirSync(runtimeDir, { recursive: true })
+    const first = await spawnDaemon(runtimeDir, [{ path: home, global: true }])
+    try {
+      const stderr = await tryBootDaemon()
+      expect(stderr).toContain('DAEMON_OWNS_HOME')
+      expect((await readHomeLock(home))?.ownerKind).toBe('daemon')
+    } finally {
+      try {
+        process.kill(first.pid, 'SIGTERM')
+      } catch {
+        /* already gone */
+      }
+    }
+  }, 30_000)
+
+  it('an un-flocked daemon marker is a tombstone the boot recovers (TICKET-0124)', async () => {
+    // Alive pid but NO flock behind the marker: the takeover fence shape.
+    // The new-world boot probes the kernel lease and takes over cleanly.
     await plantMarker({ ownerKind: 'daemon', pid: process.pid })
-    const stderr = await tryBootDaemon()
-    expect(stderr).toContain('DAEMON_OWNS_HOME')
-    expect((await readHomeLock(home))?.ownerKind).toBe('daemon')
+    const runtimeDir = join(root, 'runtime')
+    mkdirSync(runtimeDir, { recursive: true })
+    const daemon = await spawnDaemon(runtimeDir, [{ path: home, global: true }])
+    const service = new OmtService({ runtimeDir: daemon.runtimeDir, name: 'oh-my-ticket-home-lock-test' })
+    try {
+      await expect(service.ready()).resolves.toBeUndefined()
+      const marker = await readHomeLock(home)
+      expect(marker?.ownerKind).toBe('daemon')
+      expect(marker?.token).not.toBe('foreign-token')
+      expect(marker?.pid).not.toBe(process.pid)
+      expect(service.homes().length).toBeGreaterThan(0)
+    } finally {
+      await service.close()
+      try {
+        process.kill(daemon.pid, 'SIGTERM')
+      } catch {
+        /* already gone */
+      }
+    }
   }, 30_000)
 
   it('a DEAD predecessor\'s daemon marker is auto-recovered, not refused', async () => {
