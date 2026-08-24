@@ -233,6 +233,9 @@ pub fn dispatch_cancellable(
         "run/control" => run_control(ctx, &params),
         "run/claim" => run_claim(ctx, &params),
         "run/report" => run_report(ctx, &params),
+        "run/add-members" => run_add_members(ctx, &params),
+        "run/nudge-record" => run_nudge_record(ctx, &params),
+        "run/interrupt" => run_interrupt(ctx, &params),
         "events/resume" => events_resume(ctx, &params),
         "ui/filters-get" => filters_get(ctx, &params),
         "ui/filters-set" => filters_set(ctx, &params),
@@ -2192,7 +2195,12 @@ fn build_claim_context(
             Ok(Some(raw)) => match omt_domain::markdown::parse_node_file(&raw) {
                 Ok(parsed) => {
                     let remaining = ANCESTOR_BUDGET_BYTES.saturating_sub(used);
-                    let take = remaining.min(parsed.body.len());
+                    // Char-boundary-safe cut: a raw byte slice here panicked
+                    // on CJK bodies (TICKET-0130).
+                    let take = omt_domain::markdown::floor_char_boundary(
+                        &parsed.body,
+                        remaining.min(parsed.body.len()),
+                    );
                     let truncated_entry = take < parsed.body.len();
                     if truncated_entry {
                         truncated_total = true;
@@ -2383,6 +2391,26 @@ fn run_report(ctx: &mut Ctx, params: &Value) -> Result<Value> {
         .expect("leases")
         .remove(&(run_id.clone(), node_id.clone()));
 
+    // TICKET-0130 item 2: a done/blocked/skipped report changes the ticket
+    // status, so passive observation (TICKET-0061) must broadcast to every
+    // OTHER active run holding this node — same funnel as node/update.
+    // `failed` touches only the item (corpus-pinned), no status change.
+    if let Some(state) = outcome_state {
+        observe_node_status(
+            ctx,
+            &node_id,
+            Some(
+                state
+                    .to_string()
+                    .parse()
+                    .unwrap_or(omt_domain::types::NodeStatus::Done),
+            ),
+            None,
+            Some(&ctx.auth.actor_namespace),
+            true,
+        )?;
+    }
+
     // Response renders from the post-execute state; replays re-render from
     // the converged state identically.
     let conn = ctx.storage.conn();
@@ -2397,6 +2425,277 @@ fn run_report(ctx: &mut Ctx, params: &Value) -> Result<Value> {
         "run": crate::views::run_view(&home_id, &final_run, &counts, &items),
         "item": crate::views::run_item_view(&home_id, &final_item, Some(&final_node.title)),
         "node": views_node(&home_id, conn, &final_node),
+    }))
+}
+
+// ═══════════ run-plane additions (TICKET-0130 item 4) ═══════════
+
+/// run/add-members: append ticket/subticket members to a PENDING run.
+fn run_add_members(ctx: &mut Ctx, params: &Value) -> Result<Value> {
+    let home_id = ctx.home_id()?.to_string();
+    let conn = ctx.storage.conn();
+    let run_id = require_str(params, "runId")?.to_string();
+    let node_ids: Vec<String> = params
+        .get("nodeIds")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|n| n.as_str().map(str::to_string))
+                .collect()
+        })
+        .ok_or_else(|| invalid_input("nodeIds", "required array"))?;
+    if node_ids.is_empty() {
+        return Err(invalid_input("nodeIds", "minItems 1"));
+    }
+    check_idempotency_room(ctx, &command_id(params))?;
+    let run = store::get_run(conn, &run_id)?.ok_or_else(|| error::not_found_run(&run_id))?;
+    if run.status != RunStatus::Pending {
+        return Err(Problem::with_details(
+            error::INVALID_INPUT,
+            format!(
+                "run {run_id} is {} — members can only be added while pending",
+                run.status
+            ),
+            |d| {
+                d.insert("rule".into(), "run-status-gate".into());
+                d.insert("runId".into(), run_id.clone().into());
+                d.insert("current".into(), run.status.to_string().into());
+                d.insert("required".into(), json!(["pending"]));
+            },
+        ));
+    }
+    let existing = store::list_run_items(conn, &run_id)?;
+    let mut seen: std::collections::BTreeSet<String> =
+        existing.iter().map(|it| it.node_id.clone()).collect();
+    for node_id in &node_ids {
+        if !seen.insert(node_id.clone()) {
+            return Err(Problem::with_details(
+                error::DUPLICATE_MEMBER,
+                format!("duplicate run member: {node_id}"),
+                |d| {
+                    d.insert("nodeId".into(), node_id.clone().into());
+                    d.insert("runId".into(), run_id.clone().into());
+                },
+            ));
+        }
+        let node = require_node(conn, node_id)?;
+        if !omt_domain::types::is_run_member_node_type(node.node_type) {
+            return Err(Problem::with_details(
+                error::INVALID_INPUT,
+                format!(
+                    "run member {node_id} must be a ticket/subticket ({} is context only)",
+                    node.node_type
+                ),
+                |d| {
+                    d.insert("rule".into(), "member-type".into());
+                    d.insert("nodeId".into(), node_id.clone().into());
+                },
+            ));
+        }
+        if node.archived {
+            return Err(Problem::with_details(
+                error::ARCHIVED_READONLY,
+                format!("run member {node_id} is archived"),
+                |d| {
+                    d.insert("nodeId".into(), node_id.clone().into());
+                    d.insert("operation".into(), "run-membership".into());
+                },
+            ));
+        }
+    }
+    let start_position = existing.len() as i64;
+    let added_items: Vec<RunItemRow> = node_ids
+        .iter()
+        .enumerate()
+        .map(|(offset, node_id)| {
+            RunItemRow::new(&run_id, node_id, start_position + offset as i64, RunItemState::Pending)
+        })
+        .collect();
+    let mut changes: Vec<DbChange> = Vec::new();
+    for item in &added_items {
+        changes.push(DbChange::ItemInsert {
+            item: omt_storage::journal::ItemDto::from_row(item),
+        });
+    }
+    let events = vec![(
+        "run.changed",
+        json!({
+            "kind": "run.changed",
+            "ref": { "homeId": home_id, "runId": run_id },
+            "added": node_ids,
+        }),
+    )];
+    let joined = node_ids.join(",");
+    let mutation = ctx.storage.plan_run_mutation(
+        &command_id(params),
+        "run_add_members",
+        &[&run_id, &joined],
+        changes,
+        events,
+        json!({ "runId": run_id, "addedCount": node_ids.len() }),
+    );
+    execute_journaled(ctx, &mutation)?;
+    let items = store::list_run_items(ctx.storage.conn(), &run_id)?;
+    let counts = state_counts(ctx.storage.conn(), &run_id)?;
+    let final_run = store::get_run(ctx.storage.conn(), &run_id)?.expect("run");
+    Ok(json!({
+        "homeId": home_id,
+        "run": crate::views::run_view(&home_id, &final_run, &counts, &items),
+    }))
+}
+
+/// run/nudge-record: record a nudge on one pending item (or every pending
+/// item of the run when nodeId is omitted). Stalled convention TICKET-0062.
+fn run_nudge_record(ctx: &mut Ctx, params: &Value) -> Result<Value> {
+    let home_id = ctx.home_id()?.to_string();
+    let conn = ctx.storage.conn();
+    let run_id = require_str(params, "runId")?.to_string();
+    let node_id = opt_str(params, "nodeId").map(str::to_string);
+    check_idempotency_room(ctx, &command_id(params))?;
+    store::get_run(conn, &run_id)?.ok_or_else(|| error::not_found_run(&run_id))?;
+    let now = ctx.now_iso();
+    let targets: Vec<RunItemRow> = match &node_id {
+        Some(id) => vec![store::get_run_item(conn, &run_id, id)?
+            .ok_or_else(|| error::not_found_run_item(&run_id, id))?],
+        None => store::list_run_items(conn, &run_id)?
+            .into_iter()
+            .filter(|it| it.state == RunItemState::Pending)
+            .collect(),
+    };
+    let mut nudged: Vec<serde_json::Value> = Vec::new();
+    let mut changes: Vec<DbChange> = Vec::new();
+    for item in targets {
+        if item.state != RunItemState::Pending {
+            continue;
+        }
+        let count = item.nudge_count + 1;
+        changes.push(DbChange::ItemPatch {
+            patch: omt_storage::journal::ItemPatch {
+                run_id: run_id.clone(),
+                node_id: item.node_id.clone(),
+                set_state: None,
+                set_executor_session_id: None,
+                clear_executor_session_id: false,
+                set_attempts: None,
+                set_last_error: None,
+                clear_last_error: false,
+                set_nudged_at: Some(now.clone()),
+                set_nudge_count: Some(count),
+                set_started_at_preserve: None,
+                set_started_at: None,
+                set_finished_at: None,
+                clear_finished_at: false,
+            },
+        });
+        nudged.push(json!({ "nodeId": item.node_id, "nudgeCount": count }));
+    }
+    if changes.is_empty() {
+        return Err(invalid_input(
+            "nodeId",
+            "no pending item to nudge",
+        ));
+    }
+    let events = vec![(
+        "run.changed",
+        json!({
+            "kind": "run.changed",
+            "ref": { "homeId": home_id, "runId": run_id },
+            "nudged": nudged,
+        }),
+    )];
+    let fingerprint = format!("{}/{}", run_id, node_id.unwrap_or_default());
+    let mutation = ctx.storage.plan_run_mutation(
+        &command_id(params),
+        "run_nudge_record",
+        &[&fingerprint],
+        changes,
+        events,
+        json!({ "runId": run_id, "nudged": nudged }),
+    );
+    execute_journaled(ctx, &mutation)?;
+    Ok(json!({
+        "homeId": home_id,
+        "runId": run_id,
+        "nudged": nudged,
+    }))
+}
+
+/// run/interrupt: demote every in-flight item of a running/paused run to
+/// interrupted (janitor two-pass semantics), then derive terminal state.
+fn run_interrupt(ctx: &mut Ctx, params: &Value) -> Result<Value> {
+    let home_id = ctx.home_id()?.to_string();
+    let conn = ctx.storage.conn();
+    let run_id = require_str(params, "runId")?.to_string();
+    check_idempotency_room(ctx, &command_id(params))?;
+    let run_before = store::get_run(conn, &run_id)?.ok_or_else(|| error::not_found_run(&run_id))?;
+    if !matches!(run_before.status, RunStatus::Running | RunStatus::Paused) {
+        return Err(Problem::with_details(
+            error::INVALID_INPUT,
+            format!(
+                "run {run_id} is {} — only running/paused runs can be interrupted",
+                run_before.status
+            ),
+            |d| {
+                d.insert("rule".into(), "run-status-gate".into());
+                d.insert("current".into(), run_before.status.to_string().into());
+                d.insert("required".into(), json!(["running", "paused"]));
+            },
+        ));
+    }
+    let items = store::list_run_items(conn, &run_id)?;
+    let now = ctx.now_iso();
+    let demoted: Vec<String> = items
+        .iter()
+        .filter(|it| omt_domain::types::is_run_item_in_flight(it.state))
+        .map(|it| it.node_id.clone())
+        .collect();
+    // Two-pass janitor order: ALL demotions first, THEN terminal derivation.
+    for node_id in &demoted {
+        transition_item_sql(
+            ctx,
+            &run_id,
+            node_id,
+            RunItemState::Interrupted,
+            None,
+            None,
+        )?;
+    }
+    leases().lock().expect("leases").retain(|rid, _| rid.0 != run_id);
+    let refreshed = store::list_run_items(ctx.storage.conn(), &run_id)?;
+    // Interrupted runs PAUSE first (janitor two-pass), then the terminal
+    // derivation may promote the pause to a sealed terminal state.
+    let paused = if demoted.is_empty() {
+        run_before.status
+    } else {
+        RunStatus::Paused
+    };
+    let terminal = omt_domain::runs::derive_terminal(paused, &refreshed);
+    let final_status = terminal.unwrap_or(paused);
+    if final_status != run_before.status {
+        let mutation = ctx.storage.plan_run_mutation(
+            &crate::problem::entropy::short_id(),
+            "run_interrupt_derive",
+            &[&run_id, &format!("derive-{now}")],
+            vec![DbChange::RunPatch {
+                patch: omt_storage::journal::RunPatch {
+                    run_id: run_id.clone(),
+                    set_status: Some(final_status.to_string()),
+                    set_finished_at: terminal.map(|_| now.clone()),
+                    clear_finished_at: false,
+                },
+            }],
+            vec![],
+            Value::Null,
+        );
+        execute_journaled(ctx, &mutation)?;
+    }
+    let final_run = store::get_run(ctx.storage.conn(), &run_id)?.expect("run");
+    let final_items = store::list_run_items(ctx.storage.conn(), &run_id)?;
+    let counts = state_counts(ctx.storage.conn(), &run_id)?;
+    Ok(json!({
+        "homeId": home_id,
+        "run": crate::views::run_view(&home_id, &final_run, &counts, &final_items),
+        "interrupted": demoted,
     }))
 }
 

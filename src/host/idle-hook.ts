@@ -12,15 +12,15 @@
  *
  * Nudge budget: one pending item is nudged at most NUDGE_BUDGET times with
  * exponential backoff (interval = base × 2^(count-1), first nudge
- * immediate). U7a: this daemon build exposes no nudge-record RPC, so the
- * durable bookkeeping (run_items.nudged_at/nudge_count) is replaced by an
- * ADAPTER-SIDE ledger inside OmtService — in-memory, so a host restart
- * resets budgets (documented deviation; a nudge-record protocol command is
- * an open U7b item). Exhaustion leaves the item pending and reads as
- * stalled (isRunItemStalled) — a human retries it via omt_run_control
- * retry, which clears both the daemon row and the adapter ledger. The
- * budget is also the loop guard: a nudge-driven turn that idles without
- * progress hits the backoff, then the ceiling, then silence.
+ * immediate). TICKET-0130 item 4: budgets are DURABLE — the adapter records
+ * each nudge through the daemon's run/nudge-record RPC (run_items.nudged_at
+ * /nudge_count), so a host restart no longer resets budgets; the in-process
+ * ledger only mirrors the server count for view consistency. Exhaustion
+ * leaves the item pending and reads as stalled (isRunItemStalled) — a human
+ * retries it via omt_run_control retry, which clears both the daemon row
+ * and the adapter mirror. The budget is also the loop guard: a nudge-driven
+ * turn that idles without progress hits the backoff, then the ceiling, then
+ * silence.
  *
  * Backoff timers are unref'd (never hold the process open) and cleared on
  * plugin dispose; a firing timer revalidates everything (agent still idle,

@@ -56,7 +56,7 @@ fn ready() -> (TestCtx, DaemonProcess, String) {
 #[test]
 fn every_schema_action_routes_to_a_handler() {
     let actions = canonical_actions();
-    assert_eq!(actions.len(), 21, "canonical v1 matrix size");
+    assert_eq!(actions.len(), 24, "canonical v1 matrix size (21 + TICKET-0130 additions)");
 
     let (_ctx, mut proc, endpoint) = ready();
     let (mut agent, agent_cred) = connected_client(&endpoint, "cli").expect("agent client");
@@ -122,6 +122,32 @@ fn every_schema_action_routes_to_a_handler() {
         )
         .expect("run create");
     let run_id = run["run"]["runId"].as_str().unwrap().to_string();
+
+    // A second ticket + PENDING run for the TICKET-0130 additions
+    // (add-members / nudge-record), started so run/interrupt is legal.
+    let ticket2 = agent
+        .call(
+            "node/create",
+            authed(
+                json!({ "type": "ticket", "title": "coverage third", "parentId": story_id }),
+                &agent_cred,
+            ),
+        )
+        .expect("fixture third ticket");
+    let ticket2_id = ticket2["node"]["nodeId"].as_str().unwrap().to_string();
+    let run3 = agent
+        .call(
+            "run/create",
+            authed(json!({ "nodeIds": [&ticket2_id], "config": {} }), &agent_cred),
+        )
+        .expect("run three");
+    let run3_id = run3["run"]["runId"].as_str().unwrap().to_string();
+    agent
+        .call(
+            "run/control",
+            authed(json!({ "runId": run3_id, "action": "start" }), &agent_cred),
+        )
+        .expect("start run three");
 
     // (method, classification, params, which client)
     let cases: Vec<(&str, &str, Value, &str)> = vec![
@@ -193,6 +219,24 @@ fn every_schema_action_routes_to_a_handler() {
             "run/report",
             "agent_available",
             json!({ "runId": run_id, "nodeId": node_id, "outcome": "done" }),
+            "agent",
+        ),
+        (
+            "run/add-members",
+            "agent_available",
+            json!({ "runId": run3_id, "nodeIds": [node_id] }),
+            "agent",
+        ),
+        (
+            "run/nudge-record",
+            "agent_available",
+            json!({ "runId": run3_id }),
+            "agent",
+        ),
+        (
+            "run/interrupt",
+            "agent_available",
+            json!({ "runId": run3_id }),
             "agent",
         ),
         (

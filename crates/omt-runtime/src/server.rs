@@ -513,11 +513,39 @@ fn handle_handshake(
         return;
     };
     let peer = state.peer;
-    let scopes = request
+    // Session-level principal nesting (TICKET-0130 item 3): a handshake that
+    // presents client/sessionId derives the per-session actor namespace
+    // "<base>/<sessionId>" (base = kind:pid), so concurrent model sessions
+    // of one process are separately attributable at the trust gate while
+    // staying inside the same principal (R12 nesting rule in auth::issue).
+    let mut scopes = request
         .params
         .get("requestedScopes")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
+    if let Some(session_id) = request
+        .params
+        .pointer("/client/sessionId")
+        .and_then(|v| v.as_str())
+    {
+        let valid = !session_id.is_empty()
+            && session_id.len() <= 64
+            && session_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        if valid {
+            if !scopes.is_object() {
+                scopes = serde_json::json!({});
+            }
+            let base = format!("{}:{}", kind.as_str(), peer.pid);
+            if let Some(obj) = scopes.as_object_mut() {
+                obj.insert(
+                    "actorNamespace".into(),
+                    serde_json::json!(format!("{base}/{session_id}")),
+                );
+            }
+        }
+    }
     let open_ids = state.homes.open_ids();
     let (token, credential) =
         match state

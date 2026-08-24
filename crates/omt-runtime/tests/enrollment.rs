@@ -268,3 +268,47 @@ fn scope_narrowing_and_actor_namespace_rules() {
 
     proc.kill();
 }
+
+/// TICKET-0130 item 3: presenting client/sessionId at handshake derives the
+/// per-session nested actor namespace "<base>/<sessionId>"; an invalid
+/// session id silently falls back to the server-assigned base.
+#[test]
+fn session_id_derives_nested_actor_namespace() {
+    let (_ctx, mut proc, endpoint) = ready();
+    let mut client = TestClient::connect(&endpoint).unwrap();
+
+    let result = client
+        .call(
+            "handshake/request",
+            json!({
+                "protocolVersion": "1.0",
+                "client": { "kind": "dsh", "name": "omt-test-dsh", "sessionId": "sess_A-1" },
+                "requestedScopes": {},
+            }),
+        )
+        .expect("session handshake");
+    let namespace = result["credential"]["actorNamespace"].as_str().unwrap().to_string();
+    assert!(
+        namespace.starts_with("dsh:") && namespace.ends_with("/sess_A-1"),
+        "expected '<base>/sess_A-1', got {namespace}"
+    );
+
+    // Invalid session id → base namespace, no nesting suffix.
+    let result = client
+        .call(
+            "handshake/request",
+            json!({
+                "protocolVersion": "1.0",
+                "client": { "kind": "dsh", "name": "omt-test-dsh", "sessionId": "bad space!" },
+                "requestedScopes": {},
+            }),
+        )
+        .expect("fallback handshake");
+    let fallback = result["credential"]["actorNamespace"].as_str().unwrap().to_string();
+    assert!(
+        !fallback.contains('/'),
+        "invalid sessionId must not nest: {fallback}"
+    );
+
+    proc.kill();
+}

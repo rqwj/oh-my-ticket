@@ -196,7 +196,12 @@ export class OmtClient {
    * from the active credential's origin is impossible to know — so callers
    * should treat this as connect-once per client instance.
    */
-  async connect(kind: ClientKind, scopes: RequestedScopes = {}, name?: string): Promise<HandshakeOutcome> {
+  async connect(
+    kind: ClientKind,
+    scopes: RequestedScopes = {},
+    name?: string,
+    sessionId?: string,
+  ): Promise<HandshakeOutcome> {
     if (this.transport?.isConnected && this.handshakeResult) return this.handshakeResult
     this.connectArgs = { kind, scopes, name }
     this.closedByCaller = false
@@ -217,7 +222,10 @@ export class OmtClient {
     })
     this.handshakeResult = (await this.transport.call('handshake/request', {
       protocolVersion: '1.0',
-      client: { kind, name: name ?? `client-ts-${process.pid}` },
+      // sessionId (TICKET-0130 item 3): the daemon derives a per-session
+      // actor namespace '<base>/<sessionId>' from this identity, keeping
+      // concurrent model sessions of one process separately attributable.
+      client: { kind, name: name ?? `client-ts-${process.pid}`, ...(sessionId ? { sessionId } : {}) },
       requestedScopes: scopes,
     })) as HandshakeOutcome
     return this.handshakeResult

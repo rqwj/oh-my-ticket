@@ -35,9 +35,12 @@ export interface ActionParityMatrix {
 export interface SeedActionParityMatrix {
   revision: 1;
   /**
-   * @minItems 21
+   * @minItems 24
    */
   entries: [
+    ActionParityEntry,
+    ActionParityEntry,
+    ActionParityEntry,
     ActionParityEntry,
     ActionParityEntry,
     ActionParityEntry,

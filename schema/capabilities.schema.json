@@ -14,7 +14,14 @@
           "description": "Principal class of the connecting client. adapter_only actions require dsh/desktop; cli/desktop/mcp/external map to their documented parity classes."
         },
         "name": { "type": "string", "minLength": 1 },
-        "version": { "type": "string", "minLength": 1 }
+        "version": { "type": "string", "minLength": 1 },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[A-Za-z0-9_-]+$",
+          "description": "Optional model-session identity (TICKET-0130 item 3): when present, the daemon derives a per-session actor namespace '<base>/<sessionId>' so concurrent sessions of one process are separately attributable at the trust gate."
+        }
       },
       "required": ["kind", "name"]
     },

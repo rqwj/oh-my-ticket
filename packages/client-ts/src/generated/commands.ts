@@ -505,6 +505,107 @@ export interface ReportRunResult {
   [k: string]: unknown;
 }
 /**
+ * Method run/add-members: append ticket/subticket members to a PENDING run (duplicates rejected, positions continue after existing members).
+ */
+
+/**
+ * Method run/add-members: append ticket/subticket members to a PENDING run (duplicates rejected, positions continue after existing members).
+ */
+export interface RunAddMembersParams {
+  /**
+   * Stable public identifier of one OMT home. Every public reference in the protocol must be qualified with a HomeId (R4). Bare filesystem/workspace paths are DSH-adapter compatibility inputs and are resolved to a HomeId before anything crosses the wire.
+   */
+  homeId: string;
+  /**
+   * Run identifier within one home, e.g. RUN-0001.
+   */
+  runId: string;
+  /**
+   * @minItems 1
+   */
+  nodeIds: [string, ...string[]];
+  [k: string]: unknown;
+}
+
+export interface RunAddMembersResult {
+  /**
+   * Stable public identifier of one OMT home. Every public reference in the protocol must be qualified with a HomeId (R4). Bare filesystem/workspace paths are DSH-adapter compatibility inputs and are resolved to a HomeId before anything crosses the wire.
+   */
+  homeId: string;
+  run: RunView;
+  [k: string]: unknown;
+}
+/**
+ * Method run/nudge-record: record a continuation nudge; nodeId targets one pending item, omission nudges every pending item of the run.
+ */
+
+/**
+ * Method run/nudge-record: record a continuation nudge; nodeId targets one pending item, omission nudges every pending item of the run.
+ */
+export interface RunNudgeRecordParams {
+  /**
+   * Stable public identifier of one OMT home. Every public reference in the protocol must be qualified with a HomeId (R4). Bare filesystem/workspace paths are DSH-adapter compatibility inputs and are resolved to a HomeId before anything crosses the wire.
+   */
+  homeId: string;
+  /**
+   * Run identifier within one home, e.g. RUN-0001.
+   */
+  runId: string;
+  /**
+   * Ticket node identifier within one home, e.g. TICKET-0001, EPIC-0003.
+   */
+  nodeId?: string;
+  [k: string]: unknown;
+}
+
+export interface RunNudgeRecordResult {
+  /**
+   * Stable public identifier of one OMT home. Every public reference in the protocol must be qualified with a HomeId (R4). Bare filesystem/workspace paths are DSH-adapter compatibility inputs and are resolved to a HomeId before anything crosses the wire.
+   */
+  homeId: string;
+  /**
+   * Run identifier within one home, e.g. RUN-0001.
+   */
+  runId: string;
+  nudged: {
+    /**
+     * Ticket node identifier within one home, e.g. TICKET-0001, EPIC-0003.
+     */
+    nodeId: string;
+    nudgeCount: number;
+    [k: string]: unknown;
+  }[];
+  [k: string]: unknown;
+}
+/**
+ * Method run/interrupt: demote every in-flight item of a running/paused run to interrupted, then derive terminal state.
+ */
+
+/**
+ * Method run/interrupt: demote every in-flight item of a running/paused run to interrupted, then derive terminal state.
+ */
+export interface RunInterruptParams {
+  /**
+   * Stable public identifier of one OMT home. Every public reference in the protocol must be qualified with a HomeId (R4). Bare filesystem/workspace paths are DSH-adapter compatibility inputs and are resolved to a HomeId before anything crosses the wire.
+   */
+  homeId: string;
+  /**
+   * Run identifier within one home, e.g. RUN-0001.
+   */
+  runId: string;
+  [k: string]: unknown;
+}
+
+export interface RunInterruptResult {
+  /**
+   * Stable public identifier of one OMT home. Every public reference in the protocol must be qualified with a HomeId (R4). Bare filesystem/workspace paths are DSH-adapter compatibility inputs and are resolved to a HomeId before anything crosses the wire.
+   */
+  homeId: string;
+  run: RunView;
+  interrupted: string[];
+  [k: string]: unknown;
+}
+/**
  * Method events/resume: fetch committed events after a stored cursor (F4); omit cursor to start from the oldest retained event.
  */
 

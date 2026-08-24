@@ -36,7 +36,7 @@
         "entries": {
           "type": "array",
           "items": { "$ref": "#/$defs/ActionParityEntry" },
-          "minItems": 21
+          "minItems": 24
         }
       },
       "required": ["revision", "entries"],
@@ -59,6 +59,9 @@
           { "action": "run/control", "classification": "agent_available", "summary": "start/pause/resume/cancel/retry/remove a run or member.", "since": "v1" },
           { "action": "run/claim", "classification": "agent_available", "summary": "Atomically claim next pending item with fenced lease.", "since": "v1" },
           { "action": "run/report", "classification": "agent_available", "summary": "Lease-fenced outcome report for a claimed item.", "since": "v1" },
+          { "action": "run/add-members", "classification": "agent_available", "summary": "Append ticket/subticket members to a pending run.", "since": "v1" },
+          { "action": "run/nudge-record", "classification": "agent_available", "summary": "Record a continuation nudge on pending item(s).", "since": "v1" },
+          { "action": "run/interrupt", "classification": "agent_available", "summary": "Demote in-flight items to interrupted and derive terminal state.", "since": "v1" },
           { "action": "events/resume", "classification": "agent_available", "summary": "Resume the durable event stream from a cursor.", "since": "v1" },
           { "action": "ui/filters-get", "classification": "adapter_only", "summary": "Adapter UI filter bag read.", "since": "v1" },
           { "action": "ui/filters-set", "classification": "adapter_only", "summary": "Adapter UI filter bag merge-write.", "since": "v1" },

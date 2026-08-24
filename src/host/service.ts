@@ -1039,19 +1039,24 @@ export class OmtService {
     return candidates
   }
 
-  /** Adapter-side nudge bookkeeping (no daemon RPC in this build). */
+  /** Durable nudge bookkeeping via run/nudge-record (TICKET-0130 item 4):
+   * the daemon persists nudged_at/nudge_count on run_items; the local
+   * ledger mirrors the server count so applyLedger stays view-consistent. */
   async recordItemNudge(homeOrId: HomeRef | string, runId: string, nodeId: string, at: string): Promise<OmtRunItem> {
     const homeId = typeof homeOrId === 'string' ? homeOrId : homeOrId.homeId
+    await this.ready()
+    const result = await this.client.call('run/nudge-record', { homeId, runId, nodeId }) as {
+      nudged?: { nodeId: string; nudgeCount: number }[]
+    }
+    const recorded = result.nudged?.find(entry => entry.nodeId === nodeId)
+    const count = recorded?.nudgeCount ?? 1
+    this.nudges.set(`${runId}:${nodeId}`, { count, at })
     const snapshot = await this.fetchRun(homeId, runId)
     const item = snapshot.items.find(candidate => candidate.node_id === nodeId)
     if (item === undefined) {
       throw new OmtError('NOT_FOUND', `run ${runId} has no item for node: ${nodeId}`, { kind: 'run-item', runId, nodeId })
     }
-    const entry = this.nudges.get(`${runId}:${nodeId}`) ?? { count: 0 }
-    entry.count += 1
-    entry.at = at
-    this.nudges.set(`${runId}:${nodeId}`, entry)
-    return { ...item, nudge_count: entry.count, ...(at !== undefined ? { nudged_at: at } : {}) }
+    return { ...item, nudge_count: count, ...(at !== undefined ? { nudged_at: at } : {}) }
   }
 
   private sessionOfItem(homeId: string, item: OmtRunItem): string | undefined {

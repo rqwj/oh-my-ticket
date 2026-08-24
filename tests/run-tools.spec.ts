@@ -663,13 +663,13 @@ describe('TICKET-0061 passive observation', () => {
     expect(after.items[1]).toMatchObject({ state: 'running', executor_session_id: 'sess-rpc' })
   })
 
-  it('an explicit report completes its own run but does NOT broadcast to other active runs (U7a deviation)', async () => {
-    // REWRITTEN for U7a (documented protocol gap): the pre-daemon report
-    // rode core.update, so the ticket double-write was OBSERVED and replayed
-    // into every other active run holding the ticket. The daemon's report
-    // handler transitions the node without an observation pass, so sibling
-    // runs keep their pending item until their own dispatch or a manual
-    // sync. Filed as an open question for U7b (report→observation bridge).
+  it('an explicit report completes its own run AND broadcasts to sibling active runs (TICKET-0130 item 2)', async () => {
+    // The U7a report→observation gap is CLOSED: a terminal report changes
+    // the ticket status, so the passive-observation funnel (corpus scenario
+    // observation-cross-run-broadcast) advances the matching item of every
+    // OTHER active run. reported=true is always trusted at the gate, and
+    // both runs execute under the same actor namespace here, so run B's
+    // pending item lands done directly.
     const ids = await ticketFixture(1)
     const runA = await startedRun(ids)
     const runB = await startedRun(ids)
@@ -684,8 +684,8 @@ describe('TICKET-0061 passive observation', () => {
     const detailB = await tool('omt_run_show').execute({ id: runB.id }, NO_EXEC)
     expect(detailA.items[0].state).toBe('done')
     expect(detailA.run.status).toBe('completed')
-    expect(detailB.items[0].state).toBe('pending') // no report→observation bridge on this build
-    expect(detailB.run.status).toBe('running')
+    expect(detailB.items[0].state).toBe('done') // bridge: sibling advanced
+    expect(detailB.run.status).toBe('completed')
   })
 
   it('manual status changes still never START a running mark (TICKET-0028)', async () => {

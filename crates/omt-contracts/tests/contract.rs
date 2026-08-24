@@ -662,6 +662,9 @@ fn parity_matrix_seed_covers_whole_vocabulary() {
         "run/control",
         "run/claim",
         "run/report",
+        "run/add-members",
+        "run/nudge-record",
+        "run/interrupt",
         "events/resume",
     ];
     let expected_adapter: &[&str] = &[
@@ -687,7 +690,7 @@ fn parity_matrix_seed_covers_whole_vocabulary() {
         assert_eq!(entry["since"], "v1", "seed entries all land in v1");
         seen.insert(action.to_string(), class.to_string());
     }
-    assert_eq!(entries.len(), 21, "seed matrix covers all v1 methods");
+    assert_eq!(entries.len(), 24, "seed matrix covers all v1 methods");
 
     for action in expected_agent {
         assert_eq!(seen[*action], "agent_available", "{action}");
@@ -698,7 +701,7 @@ fn parity_matrix_seed_covers_whole_vocabulary() {
     for action in expected_human {
         assert_eq!(seen[*action], "human_administrative", "{action}");
     }
-    assert_eq!(seen.len(), 21, "no duplicate actions in the matrix");
+    assert_eq!(seen.len(), 24, "no duplicate actions in the matrix");
 
     // The classification enum itself is the R22 three-way split.
     let reg = registry();
@@ -728,6 +731,17 @@ fn every_documented_method_has_params_and_result_defs() {
         ("run/control", "RunControlParams", "RunControlResult"),
         ("run/claim", "ClaimRunParams", "ClaimRunResult"),
         ("run/report", "ReportRunParams", "ReportRunResult"),
+        (
+            "run/add-members",
+            "RunAddMembersParams",
+            "RunAddMembersResult",
+        ),
+        (
+            "run/nudge-record",
+            "RunNudgeRecordParams",
+            "RunNudgeRecordResult",
+        ),
+        ("run/interrupt", "RunInterruptParams", "RunInterruptResult"),
         ("events/resume", "EventsResumeParams", "EventsResumeResult"),
         ("ui/filters-get", "FiltersGetParams", "FiltersGetResult"),
         ("ui/filters-set", "FiltersSetParams", "FiltersSetResult"),

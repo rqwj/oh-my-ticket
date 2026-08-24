@@ -1077,6 +1077,20 @@ fn js_is_space(c: char) -> bool {
     )
 }
 
+/// Greatest index `<= i` that is a `char` boundary of `s` (i > len → len).
+/// Byte-budget truncation of arbitrary text MUST cut here, never on a raw
+/// byte offset: a mid-char slice panics (TICKET-0130, CJK claim context).
+pub fn floor_char_boundary(s: &str, i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    let mut j = i;
+    while j > 0 && !s.is_char_boundary(j) {
+        j -= 1;
+    }
+    j
+}
+
 /// Filesystem-safe slug; keeps CJK, strips path-hostile characters.
 /// Byte-parity with `files.ts` `slugify`: `.slice(0, 40)` truncates by
 /// **UTF-16 code units**; a cut straddling a surrogate pair leaves a lone
@@ -1170,5 +1184,40 @@ pub fn dirname(path: &str) -> String {
     match path.rfind('/') {
         Some(index) => path[..index].to_string(),
         None => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::floor_char_boundary;
+
+    /// The U7a production crash shape: a byte budget cut inside a 3-byte
+    /// CJK char. Raw `s[..i]` panics; the helper must return the previous
+    /// boundary and never exceed `i`.
+    #[test]
+    fn floors_mid_char_cuts_for_every_residue() {
+        let s = "用ab用体系x"; // boundaries: 0,3,4,5,8,9,12,13
+        for i in 0..=s.len() {
+            let floored = floor_char_boundary(s, i);
+            assert!(s.is_char_boundary(floored), "i={i} -> {floored}");
+            assert!(floored <= i);
+            // Round-trip: slicing at the floored index is valid UTF-8.
+            let _ = &s[..floored];
+        }
+    }
+
+    #[test]
+    fn pure_multibyte_body_matches_ticket_0130_geometry() {
+        // "用"*6000 (18_000 B): every non-multiple-of-3 offset panicked
+        // before the fix.
+        let s = "用".repeat(6000);
+        for take in [16_381usize, 16_297, 1, 2, 4, 17_999] {
+            let floored = floor_char_boundary(&s, take);
+            assert!(s.is_char_boundary(floored));
+            assert_eq!(floored % 3, 0);
+            assert!(take >= s.len() || floored <= take);
+        }
+        assert_eq!(floor_char_boundary(&s, usize::MAX), s.len());
+        assert_eq!(floor_char_boundary("", 5), 0);
     }
 }
