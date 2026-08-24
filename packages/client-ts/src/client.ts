@@ -91,6 +91,7 @@ export class OmtClient {
     kind: ClientKind
     scopes: RequestedScopes
     name?: string
+    sessionId?: string
   } | null = null
   private closedByCaller = false
   private reconnecting = false
@@ -203,7 +204,7 @@ export class OmtClient {
     sessionId?: string,
   ): Promise<HandshakeOutcome> {
     if (this.transport?.isConnected && this.handshakeResult) return this.handshakeResult
-    this.connectArgs = { kind, scopes, name }
+    this.connectArgs = { kind, scopes, name, sessionId }
     this.closedByCaller = false
 
     const descriptor = await OmtClient.discoverOrSpawn(this.options)
@@ -251,7 +252,7 @@ export class OmtClient {
           this.reconnectAttempt += 1
           await sleep(delay)
           try {
-            await this.connect(this.connectArgs.kind, this.connectArgs.scopes, this.connectArgs.name)
+            await this.connect(this.connectArgs.kind, this.connectArgs.scopes, this.connectArgs.name, this.connectArgs.sessionId)
             this.reconnectAttempt = 0
             for (const resubscribe of [...this.resubscribers]) {
               try {

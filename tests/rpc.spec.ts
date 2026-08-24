@@ -147,3 +147,62 @@ it('filters-set rejects invalid values; out-of-contract stored bags degrade to d
   expect(degraded.value.query).toBe('')
   expect(degraded.value.sortOrder).toBe('none')
 })
+
+// TICKET-0123 identity translation: a payload sessionId must name a LIVE
+// Cordis agent before any home/executor resolution happens. The default
+// beforeEach stub has no agents registry (lenient path); these tests
+// re-register the channel against a stub that DOES carry one.
+describe('sessionId identity gate', () => {
+  const LIVE = 'sess-live-1'
+  let gatedHandler: Handler
+
+  beforeEach(() => {
+    const agentsStub = {
+      get(id: string) {
+        return id === LIVE
+          ? { session: { header: { cwd: fixture.root } } }
+          : undefined
+      },
+      list() {
+        return [{ id: LIVE }]
+      },
+    }
+    const stubCtx = {
+      agents: agentsStub,
+      connection: {
+        rpc: {
+          handle(_channel: string, h: Handler) {
+            gatedHandler = h
+          },
+        },
+      },
+    }
+    registerOmtRpc(stubCtx as never, service)
+  })
+
+  it('rejects a forged sessionId with FORBIDDEN', async () => {
+    const result = await gatedHandler(
+      'update',
+      { id: 'TICKET-0001', status: 'in_progress', sessionId: 'sess-forged' },
+      new AbortController().signal,
+    )
+    expect(result.ok).toBe(false)
+    expect(result.error.message).toContain('FORBIDDEN')
+  })
+
+  it('accepts a live sessionId and still resolves the workspace home', async () => {
+    const result = await gatedHandler(
+      'get',
+      { id: 'TICKET-0001', sessionId: LIVE },
+      new AbortController().signal,
+    )
+    expect(result.ok).toBe(true)
+    expect(result.value.node.id).toBe('TICKET-0001')
+  })
+
+  it('keeps the global-home fallback for absent sessionIds', async () => {
+    const result = await gatedHandler('tree', {}, new AbortController().signal)
+    expect(result.ok).toBe(true)
+    expect(result.value).toHaveLength(1)
+  })
+})

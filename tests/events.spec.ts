@@ -133,3 +133,42 @@ it('daemon events stream into the change hub until the client detaches', async (
     await fixture.stop()
   }
 })
+
+// TICKET-0123 acceptance: SSE survives a daemon restart BY CURSOR — the
+// observing service reconnects (client auto-resume replays from its last
+// delivered cursor), and a mutation committed by the NEW daemon still lands
+// in the hub with a fresh, monotonic version.
+it('hub keeps receiving frames after a daemon restart (cursor resume)', { timeout: 40_000 }, async () => {
+  const fixture: RuntimeFixture = await createRuntimeFixture({ label: 'events-restart' })
+  try {
+    const observer = new OmtService({ runtimeDir: fixture.runtimeDir, name: 'observer-restart' })
+    await observer.ready()
+    const seen: OmtChangeEvent[] = []
+    observer.hub.subscribe(event => seen.push(event))
+    await new Promise(resolve => setTimeout(resolve, 50))
+
+    const home = fixture.globalHome
+    await fixture.service.createNode(home, { type: 'epic', title: '重启前' })
+    await waitFor(() => (seen.length > 0 ? true : undefined))
+    // Baseline captured BEFORE the restart: every later frame proves the
+    // reconnect + cursor-replay path delivered post-restart state.
+    const baseline = seen.length
+
+    // Restart the daemon over the SAME runtime dir; the handed-out service
+    // reconnects with backoff and re-subscribes from its stored cursor.
+    await fixture.restart()
+
+    // The observer may still be mid-backoff when this mutation commits —
+    // exactly the gap the cursor replay exists to cover.
+    await fixture.service.createNode(home, { type: 'epic', title: '重启后' })
+    const deadline = Date.now() + 20_000
+    while (seen.length <= baseline && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 100))
+    }
+    expect(seen.length).toBeGreaterThan(baseline)
+    expect(seen.at(-1)?.home).toBe(home.homeId)
+    await observer.close()
+  } finally {
+    await fixture.stop()
+  }
+})

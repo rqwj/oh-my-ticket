@@ -223,6 +223,7 @@ export type ProblemCode =
   | 'INVALID_CONCURRENCY' // → INVALID_INPUT: run concurrency is not a positive integer
   | 'HOME_LOCKED'         // → CONFLICT: another live writer owns the home (owner lock, U2b/R2)
   | 'DAEMON_OWNS_HOME'    // → CONFLICT: a daemon owner marker is present; TS writers always refuse
+  | 'FORBIDDEN'           // → CONFLICT-family refusal: forged sessionId / unauthorized actor (TICKET-0123)
 
 /** Structured, assertion-ready details carried alongside a problem code (R5). */
 export type ProblemDetails = Record<string, unknown>

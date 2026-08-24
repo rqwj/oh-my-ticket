@@ -267,6 +267,23 @@ export function registerOmtRpc(ctx: Context, service: OmtService, recent?: Recen
     sessionId === undefined ? undefined : agents?.get(sessionId)?.session.header.cwd
 
   /**
+   * Identity translation gate (TICKET-0123): a payload-supplied sessionId
+   * must name a LIVE Cordis agent — a forged id must not steer home
+   * resolution or executor attribution. An absent sessionId (global-home
+   * fallback) and a registry-less context pass through unchanged.
+   */
+  const requireLiveSession = (sessionId: string | undefined): void => {
+    if (sessionId === undefined || agents === undefined) return
+    if (agents.get(sessionId) === undefined) {
+      throw new OmtError(
+        'FORBIDDEN',
+        `sessionId does not match a live session: ${sessionId.slice(0, 13)}`,
+        { kind: 'session' },
+      )
+    }
+  }
+
+  /**
    * Executor lineage view (TICKET-0066/0068): the RunningRegistry snapshot
    * wins while the ticket is still marked running; otherwise fall back to
    * the live session header (gone once the executor session is disposed).
@@ -311,6 +328,11 @@ export function registerOmtRpc(ctx: Context, service: OmtService, recent?: Recen
 
   ctx.connection.rpc.handle('/omt', async (endpoint, payload) => {
     try {
+      // Identity gate FIRST: every sessionId-bearing endpoint funnels the
+      // same check, so a forged session id is rejected before any home or
+      // executor resolution happens (TICKET-0123).
+      const rawSessionId = (payload as { sessionId?: unknown } | null)?.sessionId
+      if (typeof rawSessionId === 'string') requireLiveSession(rawSessionId)
       switch (endpoint) {
         case 'tree': {
           const parsed = treePayloadSchema.safeParse(payload ?? {})

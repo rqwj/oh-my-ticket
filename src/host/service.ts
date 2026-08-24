@@ -53,6 +53,42 @@ import {
   type RunStatus,
   type ShowResult,
 } from './types.ts'
+import { savedFiltersSchema } from './ui-state.ts'
+
+/**
+ * One-time import of a pre-U7a `<home>/ui-filters.json` bag into
+ * daemon-owned storage (TICKET-0123): parse → `ui/filters-set` under the
+ * adapter's bag key, then rename the file `.imported` so the adapter never
+ * re-imports and never again writes preference data into a daemon-owned
+ * home. Missing/corrupt/unparsable files are skipped silently; a failed
+ * daemon push leaves the file in place for the next connect.
+ * @internal exported for tests; production callers go through OmtService.
+ */
+export async function importLegacyUiFiltersFile(
+  homePath: string,
+  homeId: string,
+  setFilters: (homeId: string, key: string, filters: Record<string, unknown>) => Promise<void>,
+): Promise<boolean> {
+  const { readFile, rename } = await import('node:fs/promises')
+  const file = join(homePath, 'ui-filters.json')
+  let raw: string
+  try {
+    raw = await readFile(file, 'utf8')
+  } catch {
+    return false
+  }
+  let bag: unknown
+  try {
+    bag = JSON.parse(raw)
+  } catch {
+    return false
+  }
+  const parsed = savedFiltersSchema.safeParse(bag)
+  if (!parsed.success) return false
+  await setFilters(homeId, 'ui', parsed.data)
+  await rename(file, `${file}.imported`)
+  return true
+}
 
 // Re-exported so adapter surfaces keep importing these shapes from types.ts.
 export type { LineageContent, OmtRunEvent }
@@ -399,6 +435,9 @@ export class OmtService {
       for (const home of handshake.homes ?? []) {
         this.subscribeEvents(home.homeId)
       }
+      // TICKET-0123: one-time import of pre-U7a preference files so the
+      // adapter never needs to write into a daemon-owned home again.
+      await this.migrateLegacyUiFilters(registry.values())
     } catch (error) {
       // Graceful degradation: surface an actionable problem instead of a raw
       // stack — the plugin keeps loading without data ops (plan §System-Wide
@@ -1091,6 +1130,20 @@ export class OmtService {
       return result.filters ?? {}
     } catch (error) {
       throw wrap(error)
+    }
+  }
+
+  /** Best-effort legacy preference import across every open home (TICKET-0123). */
+  private async migrateLegacyUiFilters(homes: Iterable<HomeRef>): Promise<void> {
+    for (const home of homes) {
+      if (home.path === undefined) continue
+      try {
+        await importLegacyUiFiltersFile(home.path, home.homeId, async (homeId, key, filters) => {
+          await this.client.call('ui/filters-set', { homeId, key, filters })
+        })
+      } catch {
+        // Preference migration must never block plugin load (STORY-0023 rule).
+      }
     }
   }
 
