@@ -26,7 +26,11 @@ pub struct Problem {
 
 impl Problem {
     pub fn new(code: &'static str, message: impl Into<String>) -> Self {
-        Problem { code, message: message.into(), details: None }
+        Problem {
+            code,
+            message: message.into(),
+            details: None,
+        }
     }
 
     pub fn with_details(
@@ -36,7 +40,11 @@ impl Problem {
     ) -> Self {
         let mut map = Map::new();
         build(&mut map);
-        Problem { code, message: message.into(), details: Some(Value::Object(map)) }
+        Problem {
+            code,
+            message: message.into(),
+            details: Some(Value::Object(map)),
+        }
     }
 }
 
@@ -64,6 +72,20 @@ pub const IO: &str = "IO";
 pub const ARCHIVED_READONLY: &str = "ARCHIVED_READONLY";
 pub const DUPLICATE_MEMBER: &str = "DUPLICATE_MEMBER";
 pub const INVALID_CONCURRENCY: &str = "INVALID_CONCURRENCY";
+
+// ── U2b/U4 storage-plane codes (additive; registered in problems.schema.json
+//    for HOME_LOCKED / DAEMON_OWNS_HOME / SCHEMA_TOO_NEW; REINDEX_REQUIRED is
+//    emitted by the U4 recovery layer and still needs its schema registration) ──
+
+/// Owner-lock refusal (U2b/R2): another live writer holds `<home>/home.lock`.
+pub const HOME_LOCKED: &str = "HOME_LOCKED";
+/// Daemon-marker refusal (U2b/R2/F5): ownerKind "daemon" always refuses.
+pub const DAEMON_OWNS_HOME: &str = "DAEMON_OWNS_HOME";
+/// Future-schema preflight (R8): on-disk schema newer than this binary knows.
+pub const SCHEMA_TOO_NEW: &str = "SCHEMA_TOO_NEW";
+/// A pending journal plan's target files were hand-edited while the writer was
+/// down (U4): fail closed, never overwrite, reindex required.
+pub const REINDEX_REQUIRED: &str = "REINDEX_REQUIRED";
 
 // ── structured-details constructors mirroring core.ts throw sites ───────
 
