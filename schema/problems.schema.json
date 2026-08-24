@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://omt.dev/schemas/v1/problems.schema.json",
+  "title": "OMT protocol problem-code registry (v1)",
+  "description": "Registry of stable machine-readable problem codes (R5). The registry map is deliberately extensible (additionalProperties with a propertyNames pattern) so later units can subdivide coarse codes additively; clients must treat an unknown code by falling back to its nearest registered coarse ancestor. message text is diagnostic only and never part of assertions.",
+  "$defs": {
+    "ProblemDescriptor": {
+      "type": "object",
+      "description": "One registry entry: what the code means, its details shape, and coarse fallback for unknown subdivided codes.",
+      "properties": {
+        "summary": { "type": "string" },
+        "detailsShape": { "type": "string", "description": "Prose description of the Problem.details fields for this code." },
+        "coarseFallback": {
+          "description": "Nearest coarse ancestor to interpret when this exact code is unknown to an older client; absent when the code is itself coarse.",
+          "$ref": "common.schema.json#/$defs/ProblemCode"
+        },
+        "stability": {
+          "type": "string",
+          "enum": ["stable", "provisional"],
+          "description": "stable: the code will never change meaning. provisional: introduced as a subdivision and may still be folded back."
+        }
+      },
+      "required": ["summary", "stability"]
+    },
+    "ProblemRegistry": {
+      "type": "object",
+      "description": "Map of ProblemCode → descriptor. Open map: any key matching ^[A-Z][A-Z0-9_]+$ may appear.",
+      "propertyNames": {
+        "pattern": "^[A-Z][A-Z0-9_]+$"
+      },
+      "additionalProperties": { "$ref": "#/$defs/ProblemDescriptor" }
+    },
+    "SeedProblemCodes": {
+      "type": "string",
+      "enum": [
+        "CONFLICT",
+        "INVALID_HIERARCHY",
+        "INVALID_INPUT",
+        "NOT_FOUND",
+        "IO",
+        "UNSUPPORTED_PROTOCOL",
+        "SCHEMA_TOO_NEW"
+      ],
+      "description": "The v1 seed set of coarse codes, carried forward from the TypeScript core's OmtError taxonomy. U2's pre-freeze pass subdivides these additively (e.g. ARCHIVED_READONLY under CONFLICT, DUPLICATE_MEMBER under INVALID_INPUT)."
+    },
+    "SeedProblemRegistry": {
+      "type": "object",
+      "description": "Seeded descriptors for the seven coarse codes.",
+      "properties": {
+        "CONFLICT": {
+          "$ref": "#/$defs/ProblemDescriptor",
+          "description": "Optimistic-concurrency or state-machine conflict: revision mismatch, illegal transition, mutating a read-only archived node."
+        },
+        "INVALID_HIERARCHY": {
+          "$ref": "#/$defs/ProblemDescriptor",
+          "description": "Hierarchy rule violation: illegal parent/child type pair, cycle, cross-home move."
+        },
+        "INVALID_INPUT": {
+          "$ref": "#/$defs/ProblemDescriptor",
+          "description": "Payload failed semantic validation beyond schema shape: empty changeset, duplicate run member, unsupported concurrency."
+        },
+        "NOT_FOUND": {
+          "$ref": "#/$defs/ProblemDescriptor",
+          "description": "Referenced home, node, run, item, or cursor does not exist."
+        },
+        "IO": {
+          "$ref": "#/$defs/ProblemDescriptor",
+          "description": "Filesystem or database failure while applying an operation."
+        },
+        "UNSUPPORTED_PROTOCOL": {
+          "$ref": "#/$defs/ProblemDescriptor",
+          "description": "Handshake or request used a protocol MAJOR the peer does not support."
+        },
+        "SCHEMA_TOO_NEW": {
+          "$ref": "#/$defs/ProblemDescriptor",
+          "description": "On-disk home schema is newer than this daemon understands; fail closed before any write."
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

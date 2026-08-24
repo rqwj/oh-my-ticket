@@ -32,7 +32,8 @@
     "build": "tsdown",
     "watch": "tsdown --watch",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "gen": "node scripts/gen-bindings.mjs"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "link:./.dsh-checkout/vendor/cordis",
@@ -48,6 +49,7 @@
     "@types/react-dom": "^18.0.0",
     "js-yaml": "^4.1.0",
     "jsdom": "^24.0.0",
+    "json-schema-to-typescript": "^15.0.4",
     "lightningcss": "^1.27.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",

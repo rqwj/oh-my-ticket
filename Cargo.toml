@@ -1,0 +1,15 @@
+# Cargo workspace root (R16): hosts the Rust crates alongside the existing
+# root npm package (`oh-my-ticket`). The npm package remains untouched at the
+# repository root; everything under crates/ belongs to the Rust side.
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/deepseek-ai/oh-my-ticket"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

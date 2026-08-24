@@ -1,0 +1,131 @@
+//! Build-time code generation for `omt-contracts`.
+//!
+//! Deterministic path (documented in README.md): every `schema/*.schema.json`
+//! document is read, all `$defs` are merged into one flat namespace (names are
+//! globally unique across documents — enforced here), and the merged map is
+//! handed to typify. typify resolves `$ref` targets by the final path segment,
+//! so cross-file references such as
+//! `"common.schema.json#/$defs/HomeId"` resolve against the merged namespace.
+//! The generated Rust source is written to `$OUT_DIR` and included by
+//! `src/lib.rs`.
+
+use std::collections::BTreeMap;
+use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use schemars::schema::Schema;
+
+/// Prepare a schema document for typify:
+///
+/// 1. Rewrite cross-file references (`"common.schema.json#/$defs/HomeId"`)
+///    into internal pointers (`"#/$defs/HomeId"`). typify only resolves
+///    `#`-refs, but the merged flat namespace makes every def addressable
+///    internally, so the rewrite is lossless.
+/// 2. Drop the conditional-validation keywords `if` / `then` / `else`, which
+///    typify does not implement. They remain part of the schema documents and
+///    are enforced by schema validators (see tests/contract.rs); they carry no
+///    type-shape information.
+/// 3. Drop `format` keywords. typify hard-codes `format: "date-time"` to
+///    chrono types, which would drag chrono into every consumer of this
+///    contracts crate; timestamps stay validated ISO 8601 strings instead
+///    (`Iso8601Time` newtype). Format checking remains a schema-validator
+///    concern (see tests/contract.rs).
+fn prepare_for_typify(value: &mut serde_json::Value) {
+    const REF_KEY: &str = "$ref";
+    match value {
+        serde_json::Value::Object(map) => {
+            map.remove("if");
+            map.remove("then");
+            map.remove("else");
+            map.remove("format");
+            for (key, child) in map.iter_mut() {
+                if key == REF_KEY {
+                    if let Some(text) = child.as_str() {
+                        if let Some(hash) = text.find('#') {
+                            *child = serde_json::Value::String(text[hash..].to_string());
+                        }
+                    }
+                } else {
+                    prepare_for_typify(child);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                prepare_for_typify(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn main() {
+    if let Err(error) = generate() {
+        panic!("omt-contracts codegen failed: {error}");
+    }
+}
+
+fn schema_dir() -> PathBuf {
+    Path::new(&env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by cargo"))
+        .join("../../schema")
+        .canonicalize()
+        .expect("schema/ directory exists beside crates/")
+}
+
+fn generate() -> Result<(), String> {
+    let dir = schema_dir();
+    println!("cargo:rerun-if-changed={}", dir.display());
+
+    let mut files = fs::read_dir(&dir)
+        .map_err(|e| format!("read {}: {e}", dir.display()))?
+        .map(|entry| entry.expect("readdir entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .collect::<Vec<_>>();
+    // Sorted for deterministic output regardless of filesystem order.
+    files.sort();
+
+    let mut defs: BTreeMap<String, Schema> = BTreeMap::new();
+    for path in &files {
+        println!("cargo:rerun-if-changed={}", path.display());
+        let text = fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))?;
+        prepare_for_typify(&mut doc);
+        let doc_defs = doc
+            .get("$defs")
+            .and_then(|value| value.as_object())
+            .ok_or_else(|| format!("{} has no $defs object", path.display()))?
+            .clone();
+        for (name, def) in doc_defs {
+            let schema: Schema = serde_json::from_value(def)
+                .map_err(|e| format!("{} $defs/{name}: {e}", path.display()))?;
+            if defs.insert(name.clone(), schema).is_some() {
+                return Err(format!(
+                    "duplicate definition `{name}` across schema documents; \
+                     $defs names must be globally unique for the flat merge"
+                ));
+            }
+        }
+    }
+
+    let settings = typify::TypeSpaceSettings::default();
+    let mut type_space = typify::TypeSpace::new(&settings);
+    type_space
+        .add_ref_types(defs)
+        .map_err(|e| format!("typify conversion failed: {e}"))?;
+
+    let tokens = type_space.to_stream();
+    let out_dir = env::var("OUT_DIR").expect("OUT_DIR is set by cargo");
+    let dest = Path::new(&out_dir).join("contracts_generate.rs");
+    fs::write(
+        &dest,
+        format!(
+            "// @generated by crates/omt-contracts/build.rs from schema/*.schema.json — do not edit.\n\
+             // Regenerate implicitly via any cargo build/test of this crate.\n{tokens}"
+        ),
+    )
+    .map_err(|e| format!("write {}: {e}", dest.display()))?;
+
+    Ok(())
+}

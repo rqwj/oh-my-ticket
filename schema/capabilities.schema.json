@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://omt.dev/schemas/v1/capabilities.schema.json",
+  "title": "OMT protocol handshake and capabilities (v1)",
+  "description": "Handshake negotiation (F1): the client offers its best protocol version and feature tokens; the daemon answers with the selected version (highest shared MAJOR, daemon's MINOR), its identity, the homes it exposes with stable HomeIds, and its limits/features. A request whose MAJOR is unsupported fails with problem code UNSUPPORTED_PROTOCOL instead of a handshake result.",
+  "$defs": {
+    "ClientInfo": {
+      "type": "object",
+      "description": "Self-description of the connecting client; informational only.",
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "version": { "type": "string", "minLength": 1 }
+      },
+      "required": ["name"]
+    },
+    "HandshakeParams": {
+      "type": "object",
+      "description": "Params of method handshake/request.",
+      "properties": {
+        "protocolVersion": { "$ref": "common.schema.json#/$defs/ProtocolVersion" },
+        "client": { "$ref": "#/$defs/ClientInfo" },
+        "capabilities": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Optional feature tokens the client understands (open vocabulary, e.g. \"events.resume\", \"attention.payload.v1\")."
+        }
+      },
+      "required": ["protocolVersion", "client"]
+    },
+    "Limits": {
+      "type": "object",
+      "description": "Bounded-resource limits enforced by this daemon (R21 seed); clients must not exceed them.",
+      "properties": {
+        "maxPayloadBytes": { "type": "integer", "minimum": 1 },
+        "maxListLimit": { "type": "integer", "minimum": 1, "description": "Upper bound of any limit/page parameter." },
+        "maxEventBatch": { "type": "integer", "minimum": 1 },
+        "runConcurrency": { "type": "integer", "minimum": 1, "description": "Advertised run concurrency; values above it are rejected (plan: fixed at 1)." }
+      },
+      "required": ["maxPayloadBytes", "maxListLimit", "maxEventBatch", "runConcurrency"]
+    },
+    "Features": {
+      "type": "object",
+      "description": "Named feature switches of this build. Open map so new features can appear additively; known flags are always present (false when unsupported).",
+      "additionalProperties": { "type": "boolean" },
+      "properties": {
+        "actionParityMatrix": { "type": "boolean", "description": "The parity.schema.json matrix is published." },
+        "eventResume": { "type": "boolean", "description": "events/resume from a stored cursor is supported." },
+        "idempotencyKeys": { "type": "boolean", "description": "Mutations accept idempotency keys (R9); seeded false until U5." }
+      },
+      "required": ["actionParityMatrix", "eventResume", "idempotencyKeys"]
+    },
+    "HandshakeResult": {
+      "type": "object",
+      "description": "Result of method handshake/request.",
+      "properties": {
+        "protocolVersion": { "$ref": "common.schema.json#/$defs/ProtocolVersion", "description": "The negotiated version: shared MAJOR, daemon's MINOR." },
+        "daemon": {
+          "type": "object",
+          "properties": {
+            "name": { "const": "omt-daemon" },
+            "version": { "type": "string", "minLength": 1 }
+          },
+          "required": ["name", "version"]
+        },
+        "homes": {
+          "type": "array",
+          "items": { "$ref": "common.schema.json#/$defs/HomeInfo" },
+          "description": "Homes visible to this principal, each with its stable HomeId (R4)."
+        },
+        "limits": { "$ref": "#/$defs/Limits" },
+        "features": { "$ref": "#/$defs/Features" }
+      },
+      "required": ["protocolVersion", "daemon", "homes", "limits", "features"]
+    }
+  }
+}
