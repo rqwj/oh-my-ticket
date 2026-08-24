@@ -1,0 +1,24 @@
+{
+  "meta": {
+    "name": "reindex-after-db-loss",
+    "source": "tests/core.spec.ts#reindex > rebuilds the index from scratch after the database is lost",
+    "description": "Opening a home whose database is gone but whose markdown exists triggers a full rebuild; id counters survive via resetCounters (next epic continues the sequence)."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "用户体系" },
+      { "type": "story", "title": "登录", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "登录接口", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "reopen", "params": { "freshDb": true } },
+    { "op": "tree", "label": "forest" },
+    { "op": "create", "params": { "type": "epic", "title": "第二个" }, "label": "epic2" }
+  ],
+  "invariants": [
+    { "expect": "length", "op": "forest", "value": 1 },
+    { "expect": "equals", "op": "forest", "path": "0.children.0.children.0.id", "value": "TICKET-0001" },
+    { "expect": "equals", "op": "epic2", "path": "id", "value": "EPIC-0002" }
+  ]
+}

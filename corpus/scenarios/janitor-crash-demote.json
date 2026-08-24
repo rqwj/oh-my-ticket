@@ -1,0 +1,46 @@
+{
+  "meta": {
+    "name": "janitor-crash-demote",
+    "source": "tests/run-core.spec.ts#startup janitor > demotes crash residue to interrupted on reopen",
+    "description": "Reopening a home (no live sessions) demotes running runs/items to interrupted; resume re-dispatches only pending work; retry reopens the derived run."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "批量" },
+      { "type": "story", "title": "批次", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "任务1", "parentId": "STORY-0001" },
+      { "type": "ticket", "title": "任务2", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "createRun", "params": { "nodeIds": ["TICKET-0001", "TICKET-0002"] } },
+    { "op": "startRun", "params": { "id": "RUN-0001" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "to": "running", "executorSessionId": "sess-dead" } },
+    { "op": "reopen", "label": "crashReopen" },
+    { "op": "getRun", "params": { "id": "RUN-0001" }, "label": "reopenedRun" },
+    { "op": "getRunItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001" }, "label": "demotedItem" },
+    { "op": "getRunItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0002" }, "label": "pendingItem" },
+    { "op": "resumeRun", "params": { "id": "RUN-0001" }, "label": "resumed" },
+    { "op": "getRunItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001" }, "label": "stillInterrupted" },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0002", "to": "running", "executorSessionId": "sess-2" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0002", "to": "done" } },
+    { "op": "getRun", "params": { "id": "RUN-0001" }, "label": "derivedCwf" },
+    { "op": "retryItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001" }, "label": "retried" },
+    { "op": "getRun", "params": { "id": "RUN-0001" }, "label": "reopenedToRunning" },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "to": "running" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "to": "done" } },
+    { "op": "getRun", "params": { "id": "RUN-0001" }, "label": "finallyCompleted" }
+  ],
+  "invariants": [
+    { "expect": "equals", "op": "reopenedRun", "path": "status", "value": "interrupted" },
+    { "expect": "equals", "op": "demotedItem", "path": "state", "value": "interrupted" },
+    { "expect": "equals", "op": "pendingItem", "path": "state", "value": "pending" },
+    { "expect": "equals", "op": "resumed", "path": "status", "value": "running" },
+    { "expect": "equals", "op": "stillInterrupted", "path": "state", "value": "interrupted" },
+    { "expect": "equals", "op": "derivedCwf", "path": "status", "value": "completed_with_failures" },
+    { "expect": "equals", "op": "retried", "path": "state", "value": "pending" },
+    { "expect": "equals", "op": "retried", "path": "attempts", "value": 1 },
+    { "expect": "equals", "op": "reopenedToRunning", "path": "status", "value": "running" },
+    { "expect": "equals", "op": "finallyCompleted", "path": "status", "value": "completed" }
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "meta": {
+    "name": "pool-home-routing",
+    "source": "tests/pool.spec.ts (workspace-routing half that moves into the daemon)",
+    "description": "Workspace-aware home resolution: a workspace-local .omt directory wins; otherwise the global home is the fallback, including for an absent cwd."
+  },
+  "setup": {
+    "pool": {
+      "globalDirName": "global",
+      "workspaces": [
+        { "name": "ws-with-omt", "omt": true },
+        { "name": "ws-bare", "omt": false }
+      ]
+    }
+  },
+  "operations": [
+    { "op": "openRouted", "params": { "cwd": null } },
+    { "op": "resolveHome", "params": { "cwd": "$global" }, "label": "explicitGlobal" },
+    { "op": "resolveHome", "params": { "cwd": null }, "label": "nullCwd" },
+    { "op": "resolveHome", "params": { "cwd": "$ws-bare" }, "label": "bareWorkspace" },
+    { "op": "resolveHome", "params": { "cwd": "$ws-with-omt" }, "label": "localWorkspace" }
+  ],
+  "invariants": [
+    { "expect": "equals", "op": "explicitGlobal", "valueFrom": "nullCwd" },
+    { "expect": "equals", "op": "bareWorkspace", "value": "$global" },
+    { "expect": "contains", "op": "localWorkspace", "value": ".omt" },
+    { "expect": "contains", "op": "localWorkspace", "value": "ws-with-omt" }
+  ]
+}

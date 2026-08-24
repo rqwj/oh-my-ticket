@@ -1,0 +1,25 @@
+{
+  "meta": {
+    "name": "observation-ownership-kept",
+    "source": "tests/run-core.spec.ts observeNodeStatus — claim priority: observation never rebinds executor ownership",
+    "description": "An already-running claimed item is left alone by a later in_progress observation; its executor_session_id survives."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "批量" },
+      { "type": "story", "title": "批次", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "任务1", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "createRun", "params": { "nodeIds": ["TICKET-0001"] } },
+    { "op": "startRun", "params": { "id": "RUN-0001" } },
+    { "op": "claimRunItem", "params": { "runId": "RUN-0001", "executorSessionId": "claimer" } },
+    { "op": "update", "params": { "id": "TICKET-0001", "status": "in_progress", "executorSessionId": "someone-else" } },
+    { "op": "getRunItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001" }, "label": "item" }
+  ],
+  "invariants": [
+    { "expect": "equals", "op": "item", "path": "state", "value": "running" },
+    { "expect": "equals", "op": "item", "path": "executor_session_id", "value": "claimer" }
+  ]
+}

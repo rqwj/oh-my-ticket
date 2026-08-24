@@ -1,0 +1,36 @@
+{
+  "meta": {
+    "name": "terminal-derivation-failures",
+    "source": "tests/run-core.spec.ts#terminal derivation > a failed item / an interrupted item counts as failure",
+    "description": "failed keeps last_error and derives completed_with_failures; interrupted counts as failure the same way."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "批量" },
+      { "type": "story", "title": "批次", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "任务1", "parentId": "STORY-0001" },
+      { "type": "ticket", "title": "任务2", "parentId": "STORY-0001" },
+      { "type": "ticket", "title": "任务3", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "createRun", "params": { "nodeIds": ["TICKET-0001", "TICKET-0002"] }, "label": "runA" },
+    { "op": "startRun", "params": { "id": "RUN-0001" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "to": "running" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "to": "failed", "error": "编译失败" } },
+    { "op": "getRunItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001" }, "label": "failedItem" },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0002", "to": "running" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0002", "to": "done" } },
+    { "op": "getRun", "params": { "id": "RUN-0001" }, "label": "cwf" },
+    { "op": "createRun", "params": { "nodeIds": ["TICKET-0003"] }, "label": "runB" },
+    { "op": "startRun", "params": { "id": "RUN-0002" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0002", "nodeId": "TICKET-0003", "to": "running", "executorSessionId": "sess-dead" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0002", "nodeId": "TICKET-0003", "to": "interrupted" } },
+    { "op": "getRun", "params": { "id": "RUN-0002" }, "label": "cwfB" }
+  ],
+  "invariants": [
+    { "expect": "equals", "op": "failedItem", "path": "last_error", "value": "编译失败" },
+    { "expect": "equals", "op": "cwf", "path": "status", "value": "completed_with_failures" },
+    { "expect": "equals", "op": "cwfB", "path": "status", "value": "completed_with_failures" }
+  ]
+}

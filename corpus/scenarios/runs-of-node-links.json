@@ -1,0 +1,27 @@
+{
+  "meta": {
+    "name": "runs-of-node-links",
+    "source": "tests/run-core.spec.ts#runsOfNode > returns non-terminal runs holding the node, with the item state",
+    "description": "Ticket detail run links: only non-terminal runs holding the node are listed; history runs are excluded; unknown nodes yield nothing."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "批量" },
+      { "type": "story", "title": "批次", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "任务1", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "createRun", "params": { "nodeIds": ["TICKET-0001"] } },
+    { "op": "createRun", "params": { "nodeIds": ["TICKET-0001"] } },
+    { "op": "cancelRun", "params": { "id": "RUN-0002" } },
+    { "op": "runsOfNode", "params": { "nodeId": "TICKET-0001" }, "label": "memberships" },
+    { "op": "runsOfNode", "params": { "nodeId": "TICKET-9999" }, "label": "unknown" }
+  ],
+  "invariants": [
+    { "expect": "length", "op": "memberships", "value": 1 },
+    { "expect": "equals", "op": "memberships", "path": "0.run.id", "value": "RUN-0001" },
+    { "expect": "equals", "op": "memberships", "path": "0.item.state", "value": "pending" },
+    { "expect": "equals", "op": "unknown", "value": [] }
+  ]
+}

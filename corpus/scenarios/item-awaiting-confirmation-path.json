@@ -1,0 +1,28 @@
+{
+  "meta": {
+    "name": "item-awaiting-confirmation-path",
+    "source": "tests/run-core.spec.ts#item state machine > supports running → awaiting_confirmation → done",
+    "description": "awaiting_confirmation is not final: the run stays running until the confirming transition lands."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "批量" },
+      { "type": "story", "title": "批次", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "任务1", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "createRun", "params": { "nodeIds": ["TICKET-0001"] } },
+    { "op": "startRun", "params": { "id": "RUN-0001" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "to": "running", "executorSessionId": "sess-1" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "to": "awaiting_confirmation" }, "label": "awaiting" },
+    { "op": "getRun", "params": { "id": "RUN-0001" }, "label": "midRun" },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "to": "done" } },
+    { "op": "getRun", "params": { "id": "RUN-0001" }, "label": "endRun" }
+  ],
+  "invariants": [
+    { "expect": "equals", "op": "awaiting", "path": "state", "value": "awaiting_confirmation" },
+    { "expect": "equals", "op": "midRun", "path": "status", "value": "running" },
+    { "expect": "equals", "op": "endRun", "path": "status", "value": "completed" }
+  ]
+}

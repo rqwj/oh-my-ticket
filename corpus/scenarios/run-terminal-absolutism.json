@@ -1,0 +1,30 @@
+{
+  "meta": {
+    "name": "run-terminal-absolutism",
+    "source": "tests/run-core.spec.ts#run state machine > rejects every transition out of absolute terminal states",
+    "description": "A completed run rejects start/pause/resume/cancel; cancel itself out of completed is an illegal run transition."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "批量" },
+      { "type": "story", "title": "批次", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "任务1", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "createRun", "params": { "nodeIds": ["TICKET-0001"] } },
+    { "op": "startRun", "params": { "id": "RUN-0001" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "to": "running" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "to": "done" } },
+    { "op": "startRun", "params": { "id": "RUN-0001" }, "label": "start" },
+    { "op": "pauseRun", "params": { "id": "RUN-0001" }, "label": "pause" },
+    { "op": "resumeRun", "params": { "id": "RUN-0001" }, "label": "resume" },
+    { "op": "cancelRun", "params": { "id": "RUN-0001" }, "label": "cancel" }
+  ],
+  "invariants": [
+    { "expect": "matches", "op": "start", "path": "error", "value": { "code": "CONFLICT", "details": { "rule": "run-status-gate", "current": "completed" } } },
+    { "expect": "matches", "op": "pause", "path": "error", "value": { "code": "CONFLICT", "details": { "rule": "run-status-gate", "current": "completed" } } },
+    { "expect": "matches", "op": "resume", "path": "error", "value": { "code": "CONFLICT", "details": { "rule": "run-status-gate", "current": "completed" } } },
+    { "expect": "matches", "op": "cancel", "path": "error", "value": { "code": "CONFLICT", "details": { "rule": "run-transition", "from": "completed", "to": "canceled" } } }
+  ]
+}

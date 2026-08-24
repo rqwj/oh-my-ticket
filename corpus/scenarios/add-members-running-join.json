@@ -1,0 +1,27 @@
+{
+  "meta": {
+    "name": "add-members-running-join",
+    "source": "tests/run-core.spec.ts#addRunMembers > inserts in_progress members directly as running with an executor snapshot",
+    "description": "state=running joins insert the item directly running (started_at stamped, executor recorded) — deliberately no transition."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "批量" },
+      { "type": "story", "title": "批次", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "任务1", "parentId": "STORY-0001" },
+      { "type": "ticket", "title": "任务2", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "createRun", "params": { "nodeIds": ["TICKET-0001"] } },
+    { "op": "addRunMembers", "params": { "runId": "RUN-0001", "members": [
+        { "nodeId": "TICKET-0002", "state": "running", "executorSessionId": "sess-ui" }
+      ] }, "label": "joined" }
+  ],
+  "invariants": [
+    { "expect": "equals", "op": "joined", "path": "added.0.state", "value": "running" },
+    { "expect": "equals", "op": "joined", "path": "added.0.executor_session_id", "value": "sess-ui" },
+    { "expect": "defined", "op": "joined", "path": "added.0.started_at" },
+    { "expect": "equals", "op": "joined", "path": "added.0.attempts", "value": 0 }
+  ]
+}

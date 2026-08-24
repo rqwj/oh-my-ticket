@@ -1,0 +1,26 @@
+{
+  "meta": {
+    "name": "move-syncs-parents",
+    "source": "tests/core.spec.ts#move > moves a ticket to another story and syncs both parents",
+    "description": "Moving relocates the file, rewrites the frontmatter parent, and updates both parents' children blocks."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "用户体系" },
+      { "type": "story", "title": "登录", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "登录接口", "parentId": "STORY-0001" },
+      { "type": "story", "title": "注册", "parentId": "EPIC-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "move", "params": { "id": "TICKET-0001", "newParentId": "STORY-0002" }, "label": "moved" },
+    { "op": "tree", "label": "forest" }
+  ],
+  "invariants": [
+    { "expect": "contains", "op": "moved", "path": "path", "value": "STORY-0002-注册" },
+    { "expect": "fileContains", "file": "tickets/EPIC-0001-用户体系/STORY-0002-注册/TICKET-0001-登录接口/ticket.md", "text": "parent: STORY-0002" },
+    { "expect": "equals", "op": "forest", "path": "0.children.0.children", "value": [] },
+    { "expect": "equals", "op": "forest", "path": "0.children.1.children.0.id", "value": "TICKET-0001" },
+    { "expect": "fileNotContains", "file": "tickets/EPIC-0001-用户体系/STORY-0001-登录/story.md", "text": "TICKET-0001 登录接口" }
+  ]
+}

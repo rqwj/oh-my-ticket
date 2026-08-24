@@ -1,0 +1,40 @@
+{
+  "meta": {
+    "name": "janitor-derived-terminal",
+    "source": "tests/run-core.spec.ts#startup janitor > derives the terminal state when the demotion finishes the last item (paused and running variants)",
+    "description": "When demotion completes the last in-flight item, both paused and running runs derive their terminal state instead of stalling or interrupting."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "批量" },
+      { "type": "story", "title": "批次", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "任务1", "parentId": "STORY-0001" },
+      { "type": "ticket", "title": "任务2", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "createRun", "params": { "nodeIds": ["TICKET-0001", "TICKET-0002"] } },
+    { "op": "startRun", "params": { "id": "RUN-0001" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "to": "running" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "to": "done" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0002", "to": "running", "executorSessionId": "sess-dead" } },
+    { "op": "pauseRun", "params": { "id": "RUN-0001" } },
+    { "op": "reopen" },
+    { "op": "getRunItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0002" }, "label": "pausedDemoted" },
+    { "op": "getRun", "params": { "id": "RUN-0001" }, "label": "pausedDerived" },
+    { "op": "createRun", "params": { "nodeIds": ["TICKET-0001", "TICKET-0002"] } },
+    { "op": "startRun", "params": { "id": "RUN-0002" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0002", "nodeId": "TICKET-0001", "to": "running" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0002", "nodeId": "TICKET-0001", "to": "done" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0002", "nodeId": "TICKET-0002", "to": "running", "executorSessionId": "sess-dead" } },
+    { "op": "reopen" },
+    { "op": "getRunItem", "params": { "runId": "RUN-0002", "nodeId": "TICKET-0002" }, "label": "runningDemoted" },
+    { "op": "getRun", "params": { "id": "RUN-0002" }, "label": "runningDerived" }
+  ],
+  "invariants": [
+    { "expect": "equals", "op": "pausedDemoted", "path": "state", "value": "interrupted" },
+    { "expect": "equals", "op": "pausedDerived", "path": "status", "value": "completed_with_failures" },
+    { "expect": "equals", "op": "runningDemoted", "path": "state", "value": "interrupted" },
+    { "expect": "equals", "op": "runningDerived", "path": "status", "value": "completed_with_failures" }
+  ]
+}

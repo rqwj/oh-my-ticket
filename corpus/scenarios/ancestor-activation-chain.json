@@ -1,0 +1,24 @@
+{
+  "meta": {
+    "name": "ancestor-activation-chain",
+    "source": "tests/core.spec.ts#ancestor activation > activates the full ancestor chain when a ticket starts",
+    "description": "Starting a ticket lights up epic and story to in_progress (db + frontmatter)."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "用户体系" },
+      { "type": "story", "title": "登录", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "登录接口", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "update", "params": { "id": "TICKET-0001", "status": "in_progress" } },
+    { "op": "getNode", "params": { "id": "EPIC-0001" }, "label": "epic" },
+    { "op": "getNode", "params": { "id": "STORY-0001" }, "label": "story" }
+  ],
+  "invariants": [
+    { "expect": "equals", "op": "epic", "path": "status", "value": "in_progress" },
+    { "expect": "equals", "op": "story", "path": "status", "value": "in_progress" },
+    { "expect": "fileContains", "file": "tickets/EPIC-0001-用户体系/STORY-0001-登录/story.md", "text": "status: in_progress" }
+  ]
+}

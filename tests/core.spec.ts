@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { OmtCore } from '../src/host/core.ts'
-import { OmtError } from '../src/host/types.ts'
+import { expectProblem } from './mocks/fixtures.ts'
 
 let home: string
 let core: OmtCore
@@ -89,16 +89,16 @@ describe('create', () => {
     const { epic, story, ticket } = await standardFixture()
 
     // Root creation is epic-only.
-    await expect(core.create({ type: 'story', title: '孤儿' })).rejects.toThrow(OmtError)
+    await expectProblem(core.create({ type: 'story', title: '孤儿' }), 'INVALID_HIERARCHY', { rule: 'root-requires-epic', childType: 'story' })
     // epic only contains story; story contains substory|ticket; nothing contains epic.
-    await expect(core.create({ type: 'ticket', title: '跨层', parentId: epic.id })).rejects.toThrow(/cannot contain/)
-    await expect(core.create({ type: 'substory', title: '错层', parentId: ticket.id })).rejects.toThrow(/cannot contain/)
-    await expect(core.create({ type: 'epic', title: '嵌套', parentId: story.id })).rejects.toThrow(/cannot contain/)
-    await expect(core.create({ type: 'ticket', title: '无父', parentId: 'STORY-9999' })).rejects.toThrow(/unknown node/)
+    await expectProblem(core.create({ type: 'ticket', title: '跨层', parentId: epic.id }), 'INVALID_HIERARCHY', { rule: 'child-type', parentType: 'epic', childType: 'ticket' })
+    await expectProblem(core.create({ type: 'substory', title: '错层', parentId: ticket.id }), 'INVALID_HIERARCHY', { rule: 'child-type', parentType: 'ticket', childType: 'substory' })
+    await expectProblem(core.create({ type: 'epic', title: '嵌套', parentId: story.id }), 'INVALID_HIERARCHY', { rule: 'child-type', parentType: 'story', childType: 'epic' })
+    await expectProblem(core.create({ type: 'ticket', title: '无父', parentId: 'STORY-9999' }), 'NOT_FOUND', { kind: 'node', id: 'STORY-9999' })
   })
 
   it('rejects an empty title', async () => {
-    await expect(core.create({ type: 'epic', title: '  ' })).rejects.toThrow(/title/)
+    await expectProblem(core.create({ type: 'epic', title: '  ' }), 'INVALID_INPUT', { field: 'title' })
   })
 })
 
@@ -203,7 +203,19 @@ describe('move', () => {
 
   it('rejects moving a node under its own descendant', async () => {
     const { story, ticket } = await standardFixture()
-    await expect(core.move(story.id, ticket.id)).rejects.toThrow(/descendant|cannot contain/)
+    // U2 characterization: the child-type rule always fires first — under the
+    // current HIERARCHY matrix no legal type pair can reach the ancestry check
+    // (a node's descendants can never legally contain that node's type), so
+    // `descendant-cycle` stays defensive-only. The old /descendant|cannot
+    // contain/ regex masked this ordering.
+    await expectProblem(core.move(story.id, ticket.id), 'INVALID_HIERARCHY', { rule: 'child-type', parentType: 'ticket', childType: 'story' })
+
+    // Same outcome for the only parent-capable pair inside a subtree
+    // (ticket → subticket): still rejected by child-type… wait — subtickets
+    // are leaves (HIERARCHY.subticket is empty), so even here child-type fires.
+    const subticket = await core.create({ type: 'subticket', title: '子票据', parentId: ticket.id })
+    await expectProblem(core.move(ticket.id, subticket.id), 'INVALID_HIERARCHY', { rule: 'child-type', parentType: 'subticket', childType: 'ticket' })
+    expect(subticket.id).toBe('SUBTICKET-0001')
   })
 })
 

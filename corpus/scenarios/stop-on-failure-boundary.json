@@ -1,0 +1,36 @@
+{
+  "meta": {
+    "name": "stop-on-failure-boundary",
+    "source": "tests/run-core.spec.ts#boundary semantics > stop-on-failure: only failed pauses the run",
+    "description": "blocked and skipped transitions never pause; failed pauses the run and leaves pending items untouched."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "批量" },
+      { "type": "story", "title": "批次", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "任务1", "parentId": "STORY-0001" },
+      { "type": "ticket", "title": "任务2", "parentId": "STORY-0001" },
+      { "type": "ticket", "title": "任务3", "parentId": "STORY-0001" },
+      { "type": "ticket", "title": "任务4", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "createRun", "params": { "config": { "stopOnFailure": true }, "nodeIds": ["TICKET-0001", "TICKET-0002", "TICKET-0003", "TICKET-0004"] } },
+    { "op": "startRun", "params": { "id": "RUN-0001" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "to": "running" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "to": "blocked" } },
+    { "op": "getRun", "params": { "id": "RUN-0001" }, "label": "afterBlocked" },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0002", "to": "skipped" } },
+    { "op": "getRun", "params": { "id": "RUN-0001" }, "label": "afterSkipped" },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0003", "to": "running" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0003", "to": "failed", "error": "炸了" } },
+    { "op": "getRun", "params": { "id": "RUN-0001" }, "label": "afterFailed" },
+    { "op": "getRunItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0004" }, "label": "lastPending" }
+  ],
+  "invariants": [
+    { "expect": "equals", "op": "afterBlocked", "path": "status", "value": "running" },
+    { "expect": "equals", "op": "afterSkipped", "path": "status", "value": "running" },
+    { "expect": "equals", "op": "afterFailed", "path": "status", "value": "paused" },
+    { "expect": "equals", "op": "lastPending", "path": "state", "value": "pending" }
+  ]
+}

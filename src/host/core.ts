@@ -297,23 +297,35 @@ export class OmtCore {
 
   async create(input: CreateInput): Promise<OmtNode> {
     const title = input.title.trim()
-    if (title === '') throw new OmtError('INVALID_INPUT', 'title must not be empty')
-    if (!isNodeType(input.type)) throw new OmtError('INVALID_INPUT', `unknown node type: ${String(input.type)}`)
+    if (title === '') throw new OmtError('INVALID_INPUT', 'title must not be empty', { field: 'title' })
+    if (!isNodeType(input.type)) {
+      throw new OmtError('INVALID_INPUT', `unknown node type: ${String(input.type)}`, { field: 'type', value: String(input.type) })
+    }
 
     let parent: OmtNode | undefined
     if (input.parentId === undefined) {
       if (input.type !== 'epic') {
-        throw new OmtError('INVALID_HIERARCHY', `${input.type} requires a parent; only epic can be created at root`)
+        throw new OmtError('INVALID_HIERARCHY', `${input.type} requires a parent; only epic can be created at root`, {
+          rule: 'root-requires-epic',
+          childType: input.type,
+        })
       }
     } else {
       parent = this.requireNode(input.parentId)
       if (!HIERARCHY[parent.type].includes(input.type)) {
-        throw new OmtError('INVALID_HIERARCHY', `${parent.type} cannot contain ${input.type}`)
+        throw new OmtError('INVALID_HIERARCHY', `${parent.type} cannot contain ${input.type}`, {
+          rule: 'child-type',
+          parentId: parent.id,
+          parentType: parent.type,
+          childType: input.type,
+        })
       }
     }
 
     const id = input.id ?? this.store.nextId(input.type)
-    if (this.store.getNode(id) !== undefined) throw new OmtError('CONFLICT', `duplicate node id: ${id}`)
+    if (this.store.getNode(id) !== undefined) {
+      throw new OmtError('CONFLICT', `duplicate node id: ${id}`, { rule: 'duplicate-node-id', nodeId: id })
+    }
     const now = new Date().toISOString()
     const path = this.files.pathFor(input.type, id, title, parent?.path)
     const node: OmtNode = {
@@ -351,7 +363,10 @@ export class OmtCore {
       const touchesContent = input.title !== undefined || input.status !== undefined
         || input.priority !== undefined || input.body !== undefined || input.append !== undefined
       if (touchesContent || input.archived === true) {
-        throw new OmtError('INVALID_INPUT', `${input.id} 已归档，请先恢复（archived: false）再做修改`)
+        throw new OmtError('ARCHIVED_READONLY', `${input.id} 已归档，请先恢复（archived: false）再做修改`, {
+          nodeId: input.id,
+          operation: 'update',
+        })
       }
     }
     const now = new Date().toISOString()
@@ -361,11 +376,17 @@ export class OmtCore {
     const patch: { title?: string; status?: Status; archived?: boolean; priority?: number; updated_at?: string } = { updated_at: now }
     if (input.title !== undefined) {
       const title = input.title.trim()
-      if (title === '') throw new OmtError('INVALID_INPUT', 'title must not be empty')
+      if (title === '') throw new OmtError('INVALID_INPUT', 'title must not be empty', { field: 'title', nodeId: input.id })
       patch.title = title
     }
     if (input.status !== undefined) {
-      if (!isStatus(input.status)) throw new OmtError('INVALID_INPUT', `unknown status: ${String(input.status)}`)
+      if (!isStatus(input.status)) {
+        throw new OmtError('INVALID_INPUT', `unknown status: ${String(input.status)}`, {
+          field: 'status',
+          value: String(input.status),
+          nodeId: input.id,
+        })
+      }
       patch.status = input.status
     }
     if (input.priority !== undefined) patch.priority = input.priority
@@ -428,18 +449,39 @@ export class OmtCore {
   async move(id: string, newParentId: string): Promise<OmtNode> {
     const node = this.requireNode(id)
     const newParent = this.requireNode(newParentId)
-    if (id === newParentId) throw new OmtError('INVALID_HIERARCHY', 'a node cannot be its own parent')
+    if (id === newParentId) {
+      throw new OmtError('INVALID_HIERARCHY', 'a node cannot be its own parent', {
+        rule: 'self-parent',
+        nodeId: id,
+      })
+    }
     if (!HIERARCHY[newParent.type].includes(node.type)) {
-      throw new OmtError('INVALID_HIERARCHY', `${newParent.type} cannot contain ${node.type}`)
+      throw new OmtError('INVALID_HIERARCHY', `${newParent.type} cannot contain ${node.type}`, {
+        rule: 'child-type',
+        parentId: newParentId,
+        parentType: newParent.type,
+        childType: node.type,
+      })
     }
     for (const ancestorId of this.ancestorIds(newParentId)) {
-      if (ancestorId === id) throw new OmtError('INVALID_HIERARCHY', 'cannot move a node under its own descendant')
+      if (ancestorId === id) {
+        throw new OmtError('INVALID_HIERARCHY', 'cannot move a node under its own descendant', {
+          rule: 'descendant-cycle',
+          nodeId: id,
+          targetParentId: newParentId,
+        })
+      }
     }
 
     const oldParent = this.store.parentOf(id)
     const oldPath = node.path
     const newPath = this.files.pathFor(node.type, node.id, node.title, newParent.path)
-    if (oldPath === newPath) throw new OmtError('CONFLICT', 'node is already at the target location')
+    if (oldPath === newPath) {
+      throw new OmtError('CONFLICT', 'node is already at the target location', {
+        rule: 'already-at-target',
+        nodeId: id,
+      })
+    }
 
     const now = new Date().toISOString()
     await this.files.moveDir(oldPath, newPath)
@@ -557,7 +599,7 @@ export class OmtCore {
     }
     if (rootId !== undefined) {
       const root = byId.get(rootId)
-      if (root === undefined) throw new OmtError('NOT_FOUND', `unknown node: ${rootId}`)
+      if (root === undefined) throw new OmtError('NOT_FOUND', `unknown node: ${rootId}`, { kind: 'node', id: rootId })
       return [root]
     }
     return roots.sort((a, b) => a.id.localeCompare(b.id))
@@ -578,7 +620,7 @@ export class OmtCore {
   async saveSavedFilters(filters: unknown): Promise<SavedFilters> {
     const parsed = savedFiltersSchema.safeParse(filters)
     if (!parsed.success) {
-      throw new OmtError('INVALID_INPUT', `invalid filters payload: ${parsed.error.issues.map(issue => issue.path.join('.')).join(', ')}`)
+      throw new OmtError('INVALID_INPUT', `invalid filters payload: ${parsed.error.issues.map(issue => issue.path.join('.')).join(', ')}`, { field: 'filters' })
     }
     await writeSavedFilters(this.home, parsed.data)
     return parsed.data
@@ -671,13 +713,17 @@ export class OmtCore {
   async createRun(input: CreateRunInput): Promise<OmtRun> {
     const seen = new Set<string>()
     for (const nodeId of input.nodeIds) {
-      if (seen.has(nodeId)) throw new OmtError('INVALID_INPUT', `duplicate run member: ${nodeId}`)
+      if (seen.has(nodeId)) {
+        throw new OmtError('DUPLICATE_MEMBER', `duplicate run member: ${nodeId}`, { nodeId })
+      }
       seen.add(nodeId)
       this.requireRunMemberNode(nodeId)
     }
     const config: RunConfig = { ...DEFAULT_RUN_CONFIG, ...input.config }
     if (!Number.isInteger(config.concurrency) || config.concurrency < 1) {
-      throw new OmtError('INVALID_INPUT', `concurrency must be a positive integer, got ${String(config.concurrency)}`)
+      throw new OmtError('INVALID_CONCURRENCY', `concurrency must be a positive integer, got ${String(config.concurrency)}`, {
+        value: config.concurrency,
+      })
     }
     const run: OmtRun = {
       id: this.store.nextRunId(),
@@ -700,7 +746,7 @@ export class OmtCore {
   /** Run lookup with the shared NOT_FOUND error (public for tool wrappers). */
   requireRun(id: string): OmtRun {
     const run = this.store.getRun(id)
-    if (run === undefined) throw new OmtError('NOT_FOUND', `unknown run: ${id}`)
+    if (run === undefined) throw new OmtError('NOT_FOUND', `unknown run: ${id}`, { kind: 'run', id })
     return run
   }
 
@@ -740,7 +786,11 @@ export class OmtCore {
     if (!isRunActive(run.status)) {
       throw new OmtError('CONFLICT', run.status === 'interrupted'
         ? `run ${runId} 处于 interrupted（需人工核对）；请先 resume 再加入成员`
-        : `run ${runId} 已终态（${run.status}），不可加入成员；请另建 run`)
+        : `run ${runId} 已终态（${run.status}），不可加入成员；请另建 run`, {
+        rule: 'run-not-active',
+        runId,
+        runStatus: run.status,
+      })
     }
     let position = this.store.listRunItems(runId).reduce((max, item) => Math.max(max, item.position), -1) + 1
     const added: OmtRunItem[] = []
@@ -787,7 +837,14 @@ export class OmtCore {
   /** start: pending → running; an empty run derives completed immediately. */
   async startRun(id: string): Promise<OmtRun> {
     const run = this.requireRun(id)
-    if (run.status !== 'pending') throw new OmtError('CONFLICT', `only a pending run can start (${id} is ${run.status})`)
+    if (run.status !== 'pending') {
+      throw new OmtError('CONFLICT', `only a pending run can start (${id} is ${run.status})`, {
+        rule: 'run-status-gate',
+        runId: id,
+        current: run.status,
+        required: ['pending'],
+      })
+    }
     this.setRunStatus(id, 'running')
     this.deriveRunTerminal(id)
     return this.requireRun(id)
@@ -796,7 +853,14 @@ export class OmtCore {
   /** pause: running → paused; only dispatch stops, running items keep being observed. */
   async pauseRun(id: string): Promise<OmtRun> {
     const run = this.requireRun(id)
-    if (run.status !== 'running') throw new OmtError('CONFLICT', `only a running run can be paused (${id} is ${run.status})`)
+    if (run.status !== 'running') {
+      throw new OmtError('CONFLICT', `only a running run can be paused (${id} is ${run.status})`, {
+        rule: 'run-status-gate',
+        runId: id,
+        current: run.status,
+        required: ['running'],
+      })
+    }
     this.setRunStatus(id, 'paused')
     return this.requireRun(id)
   }
@@ -805,7 +869,12 @@ export class OmtCore {
   async resumeRun(id: string): Promise<OmtRun> {
     const run = this.requireRun(id)
     if (run.status !== 'paused' && run.status !== 'interrupted') {
-      throw new OmtError('CONFLICT', `only a paused or interrupted run can resume (${id} is ${run.status})`)
+      throw new OmtError('CONFLICT', `only a paused or interrupted run can resume (${id} is ${run.status})`, {
+        rule: 'run-status-gate',
+        runId: id,
+        current: run.status,
+        required: ['paused', 'interrupted'],
+      })
     }
     this.setRunStatus(id, 'running')
     return this.requireRun(id)
@@ -824,20 +893,42 @@ export class OmtCore {
    * and terminal derivation run after final-state transitions.
    */
   async transitionItem(runId: string, nodeId: string, to: RunItemState, options: TransitionItemOptions = {}): Promise<OmtRunItem> {
-    if (!isRunItemState(to)) throw new OmtError('INVALID_INPUT', `unknown run item state: ${String(to)}`)
+    if (!isRunItemState(to)) {
+      throw new OmtError('INVALID_INPUT', `unknown run item state: ${String(to)}`, { field: 'to', value: String(to) })
+    }
     const run = this.requireRun(runId)
     const item = this.store.getRunItem(runId, nodeId)
-    if (item === undefined) throw new OmtError('NOT_FOUND', `run ${runId} has no item for node: ${nodeId}`)
+    if (item === undefined) {
+      throw new OmtError('NOT_FOUND', `run ${runId} has no item for node: ${nodeId}`, { kind: 'run-item', runId, nodeId })
+    }
 
     if (run.status === 'paused') {
       if (!isRunItemInFlight(item.state)) {
-        throw new OmtError('CONFLICT', `run ${runId} is paused; dispatch is stopped (item ${nodeId} is ${item.state})`)
+        throw new OmtError('CONFLICT', `run ${runId} is paused; dispatch is stopped (item ${nodeId} is ${item.state})`, {
+          rule: 'dispatch-paused',
+          runId,
+          nodeId,
+          runStatus: run.status,
+          itemState: item.state,
+        })
       }
     } else if (run.status !== 'running') {
-      throw new OmtError('CONFLICT', `run ${runId} is ${run.status}; items are frozen`)
+      throw new OmtError('CONFLICT', `run ${runId} is ${run.status}; items are frozen`, {
+        rule: 'items-frozen',
+        runId,
+        runStatus: run.status,
+        nodeId,
+        itemState: item.state,
+      })
     }
     if (!ITEM_TRANSITIONS[item.state].includes(to)) {
-      throw new OmtError('CONFLICT', `illegal item transition for ${nodeId}: ${item.state} → ${to}`)
+      throw new OmtError('CONFLICT', `illegal item transition for ${nodeId}: ${item.state} → ${to}`, {
+        rule: 'item-transition',
+        runId,
+        nodeId,
+        from: item.state,
+        to,
+      })
     }
 
     const now = new Date().toISOString()
@@ -868,12 +959,24 @@ export class OmtCore {
   async retryItem(runId: string, nodeId: string): Promise<OmtRunItem> {
     const run = this.requireRun(runId)
     if (run.status === 'canceled' || run.status === 'completed') {
-      throw new OmtError('CONFLICT', `run ${runId} is ${run.status}; retry is unavailable`)
+      throw new OmtError('CONFLICT', `run ${runId} is ${run.status}; retry is unavailable`, {
+        rule: 'retry-run-gate',
+        runId,
+        runStatus: run.status,
+      })
     }
     const item = this.store.getRunItem(runId, nodeId)
-    if (item === undefined) throw new OmtError('NOT_FOUND', `run ${runId} has no item for node: ${nodeId}`)
+    if (item === undefined) {
+      throw new OmtError('NOT_FOUND', `run ${runId} has no item for node: ${nodeId}`, { kind: 'run-item', runId, nodeId })
+    }
     if (item.state !== 'failed' && item.state !== 'interrupted' && item.state !== 'pending') {
-      throw new OmtError('CONFLICT', `only failed/interrupted/pending items can retry (${nodeId} is ${item.state})`)
+      throw new OmtError('CONFLICT', `only failed/interrupted/pending items can retry (${nodeId} is ${item.state})`, {
+        rule: 'retry-state-gate',
+        runId,
+        nodeId,
+        itemState: item.state,
+        required: ['failed', 'interrupted', 'pending'],
+      })
     }
     this.store.updateRunItem(runId, nodeId, {
       state: 'pending',
@@ -900,12 +1003,24 @@ export class OmtCore {
   async replayItem(runId: string, nodeId: string): Promise<OmtRunItem> {
     const run = this.requireRun(runId)
     if (run.status !== 'pending' && run.status !== 'running' && run.status !== 'paused' && run.status !== 'interrupted') {
-      throw new OmtError('CONFLICT', `run ${runId} is ${run.status}; replay requires an in-progress run`)
+      throw new OmtError('CONFLICT', `run ${runId} is ${run.status}; replay requires an in-progress run`, {
+        rule: 'replay-run-gate',
+        runId,
+        runStatus: run.status,
+      })
     }
     const item = this.store.getRunItem(runId, nodeId)
-    if (item === undefined) throw new OmtError('NOT_FOUND', `run ${runId} has no item for node: ${nodeId}`)
+    if (item === undefined) {
+      throw new OmtError('NOT_FOUND', `run ${runId} has no item for node: ${nodeId}`, { kind: 'run-item', runId, nodeId })
+    }
     if (item.state !== 'done' && item.state !== 'blocked' && item.state !== 'skipped') {
-      throw new OmtError('CONFLICT', `only done/blocked/skipped items can replay (${nodeId} is ${item.state})`)
+      throw new OmtError('CONFLICT', `only done/blocked/skipped items can replay (${nodeId} is ${item.state})`, {
+        rule: 'replay-state-gate',
+        runId,
+        nodeId,
+        itemState: item.state,
+        required: ['done', 'blocked', 'skipped'],
+      })
     }
     this.store.updateRunItem(runId, nodeId, {
       state: 'pending',
@@ -933,13 +1048,23 @@ export class OmtCore {
   async claimRunItem(runId: string, executorSessionId: string): Promise<OmtRunItem | undefined> {
     const run = this.requireRun(runId)
     if (executorSessionId.trim() === '') {
-      throw new OmtError('INVALID_INPUT', 'claim requires an executor session id')
+      throw new OmtError('INVALID_INPUT', 'claim requires an executor session id', { field: 'executorSessionId' })
     }
     if (run.status === 'pending') {
-      throw new OmtError('CONFLICT', `run ${runId} has not started; start it before claiming`)
+      throw new OmtError('CONFLICT', `run ${runId} has not started; start it before claiming`, {
+        rule: 'claim-run-gate',
+        runId,
+        current: run.status,
+        required: ['running'],
+      })
     }
     if (run.status !== 'running') {
-      throw new OmtError('CONFLICT', `run ${runId} is ${run.status}; only a running run dispatches claims`)
+      throw new OmtError('CONFLICT', `run ${runId} is ${run.status}; only a running run dispatches claims`, {
+        rule: 'claim-run-gate',
+        runId,
+        current: run.status,
+        required: ['running'],
+      })
     }
     const { claimed, skipped } = await this.store.claimNextRunItem(runId, executorSessionId, new Date().toISOString())
     for (const item of skipped) {
@@ -1005,7 +1130,9 @@ export class OmtCore {
   recordItemNudge(runId: string, nodeId: string, at: string = new Date().toISOString()): OmtRunItem {
     this.requireRun(runId)
     const item = this.store.getRunItem(runId, nodeId)
-    if (item === undefined) throw new OmtError('NOT_FOUND', `run ${runId} has no item for node: ${nodeId}`)
+    if (item === undefined) {
+      throw new OmtError('NOT_FOUND', `run ${runId} has no item for node: ${nodeId}`, { kind: 'run-item', runId, nodeId })
+    }
     this.store.updateRunItem(runId, nodeId, { nudged_at: at, nudge_count: item.nudge_count + 1 })
     return this.store.getRunItem(runId, nodeId) as OmtRunItem
   }
@@ -1023,11 +1150,18 @@ export class OmtCore {
   async removeRunItem(runId: string, nodeId: string): Promise<void> {
     this.requireRun(runId)
     const item = this.store.getRunItem(runId, nodeId)
-    if (item === undefined) throw new OmtError('NOT_FOUND', `run ${runId} has no item for node: ${nodeId}`)
+    if (item === undefined) {
+      throw new OmtError('NOT_FOUND', `run ${runId} has no item for node: ${nodeId}`, { kind: 'run-item', runId, nodeId })
+    }
     if (isRunItemInFlight(item.state)) {
       const node = this.store.getNode(nodeId)
       if (node !== undefined && !node.archived) {
-        throw new OmtError('CONFLICT', `item ${nodeId} is ${item.state} (in-flight); it cannot be removed`)
+        throw new OmtError('CONFLICT', `item ${nodeId} is ${item.state} (in-flight); it cannot be removed`, {
+          rule: 'remove-in-flight',
+          runId,
+          nodeId,
+          itemState: item.state,
+        })
       }
     }
     this.store.deleteRunItem(runId, nodeId)
@@ -1044,7 +1178,10 @@ export class OmtCore {
    */
   async reportRunItem(runId: string, nodeId: string, outcome: RunReportOutcome, note?: string): Promise<ReportResult> {
     if (!RUN_REPORT_OUTCOMES.includes(outcome)) {
-      throw new OmtError('INVALID_INPUT', `unknown report outcome: ${String(outcome)} (done/failed/blocked/skipped)`)
+      throw new OmtError('INVALID_INPUT', `unknown report outcome: ${String(outcome)} (done/failed/blocked/skipped)`, {
+        field: 'outcome',
+        value: String(outcome),
+      })
     }
     this.requireRun(runId)
     const node = this.requireNode(nodeId)
@@ -1052,12 +1189,23 @@ export class OmtCore {
     // Preserve the archived-ticket rejection while allowing legacy archived
     // containers to reach the quarantine path below.
     if (node.archived && executable) {
-      throw new OmtError('CONFLICT', `${nodeId} 已归档，无法接受 report`)
+      throw new OmtError('ARCHIVED_READONLY', `${nodeId} 已归档，无法接受 report`, {
+        nodeId,
+        operation: 'report',
+      })
     }
     const item = this.store.getRunItem(runId, nodeId)
-    if (item === undefined) throw new OmtError('NOT_FOUND', `run ${runId} has no item for node: ${nodeId}`)
+    if (item === undefined) {
+      throw new OmtError('NOT_FOUND', `run ${runId} has no item for node: ${nodeId}`, { kind: 'run-item', runId, nodeId })
+    }
     if (!isRunItemInFlight(item.state)) {
-      throw new OmtError('CONFLICT', `only in-flight items can report (${nodeId} is ${item.state})`)
+      throw new OmtError('CONFLICT', `only in-flight items can report (${nodeId} is ${item.state})`, {
+        rule: 'report-state-gate',
+        runId,
+        nodeId,
+        itemState: item.state,
+        required: ['running', 'awaiting_confirmation'],
+      })
     }
     // Upgrade safety: pre-filter runs may still contain an in-flight hierarchy
     // container. Quarantine the item without writing its status/body.
@@ -1227,7 +1375,12 @@ export class OmtCore {
   private setRunStatus(id: string, to: RunStatus): void {
     const run = this.requireRun(id)
     if (!RUN_TRANSITIONS[run.status].includes(to)) {
-      throw new OmtError('CONFLICT', `illegal run transition for ${id}: ${run.status} → ${to}`)
+      throw new OmtError('CONFLICT', `illegal run transition for ${id}: ${run.status} → ${to}`, {
+        rule: 'run-transition',
+        runId: id,
+        from: run.status,
+        to,
+      })
     }
     const now = new Date().toISOString()
     this.store.updateRun(id, {
@@ -1256,7 +1409,7 @@ export class OmtCore {
 
   private requireNode(id: string): OmtNode {
     const node = this.store.getNode(id)
-    if (node === undefined) throw new OmtError('NOT_FOUND', `unknown node: ${id}`)
+    if (node === undefined) throw new OmtError('NOT_FOUND', `unknown node: ${id}`, { kind: 'node', id })
     return node
   }
 
@@ -1264,11 +1417,18 @@ export class OmtCore {
   private requireRunMemberNode(id: string): OmtNode {
     const node = this.requireNode(id)
     if (!isRunMemberNodeType(node.type)) {
-      throw new OmtError('INVALID_INPUT', `run member ${id} must be an executable ticket/subticket (${node.type} is context only)`)
+      throw new OmtError('INVALID_INPUT', `run member ${id} must be an executable ticket/subticket (${node.type} is context only)`, {
+        rule: 'member-type',
+        nodeId: id,
+        nodeType: node.type,
+      })
     }
     // Archived nodes are read-only, so they could never accept a report.
     if (node.archived) {
-      throw new OmtError('INVALID_INPUT', `run member ${id} is archived (已归档成员不能加入 run；请先恢复)`)
+      throw new OmtError('ARCHIVED_READONLY', `run member ${id} is archived (已归档成员不能加入 run；请先恢复)`, {
+        nodeId: id,
+        operation: 'run-membership',
+      })
     }
     return node
   }

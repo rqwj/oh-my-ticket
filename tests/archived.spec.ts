@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { OmtCore } from '../src/host/core.ts'
-import { OmtError } from '../src/host/types.ts'
+import { expectProblem } from './mocks/fixtures.ts'
 
 let home: string
 let core: OmtCore
@@ -39,9 +39,9 @@ it('archived nodes reject content changes; restore unlocks them', async () => {
   const epic = await core.create({ type: 'epic', title: '用户体系' })
   await core.update({ id: epic.id, archived: true })
 
-  await expect(core.update({ id: epic.id, status: 'done' })).rejects.toThrow(OmtError)
-  await expect(core.update({ id: epic.id, append: 'x' })).rejects.toThrow(/已归档/)
-  await expect(core.update({ id: epic.id, title: '改名' })).rejects.toThrow(/已归档/)
+  await expectProblem(core.update({ id: epic.id, status: 'done' }), 'ARCHIVED_READONLY', { nodeId: epic.id, operation: 'update' })
+  await expectProblem(core.update({ id: epic.id, append: 'x' }), 'ARCHIVED_READONLY', { nodeId: epic.id, operation: 'update' })
+  await expectProblem(core.update({ id: epic.id, title: '改名' }), 'ARCHIVED_READONLY', { nodeId: epic.id, operation: 'update' })
 
   const restored = await core.update({ id: epic.id, archived: false })
   expect(restored.archived).toBe(false)

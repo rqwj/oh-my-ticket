@@ -1,0 +1,23 @@
+{
+  "meta": {
+    "name": "update-append-search-refresh",
+    "source": "tests/core.spec.ts#update > appends progress notes to the body and refreshes the FTS index",
+    "description": "An appended progress note becomes visible via show and searchable through the content mirror."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "用户体系" },
+      { "type": "story", "title": "登录", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "登录接口", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "update", "params": { "id": "TICKET-0001", "append": "- 2026-08-17 完成参数校验" } },
+    { "op": "show", "params": { "id": "TICKET-0001" }, "label": "shown" },
+    { "op": "list", "params": { "query": "参数校验" }, "label": "hits" }
+  ],
+  "invariants": [
+    { "expect": "contains", "op": "shown", "path": "body", "value": "完成参数校验" },
+    { "expect": "contains", "op": "hits", "value": { "id": "TICKET-0001" } }
+  ]
+}

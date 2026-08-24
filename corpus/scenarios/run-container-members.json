@@ -1,0 +1,25 @@
+{
+  "meta": {
+    "name": "run-container-members",
+    "source": "tests/run-core.spec.ts#createRun > rejects epic/story/substory containers as run members",
+    "description": "Hierarchy containers are context only: INVALID_INPUT with rule=member-type on both createRun and addRunMembers."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "背景" },
+      { "type": "story", "title": "范围", "parentId": "EPIC-0001" },
+      { "type": "substory", "title": "补充背景", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "createRun", "params": { "nodeIds": ["EPIC-0001"] }, "label": "epicMember" },
+    { "op": "createRun", "params": { "nodeIds": ["STORY-0001"] }, "label": "storyMember" },
+    { "op": "createRun", "params": { "nodeIds": [] }, "label": "emptyRun" },
+    { "op": "addRunMembers", "params": { "runId": "RUN-0001", "members": [{ "nodeId": "SUBSTORY-0001" }] }, "label": "addContainer" }
+  ],
+  "invariants": [
+    { "expect": "matches", "op": "epicMember", "path": "error", "value": { "code": "INVALID_INPUT", "details": { "rule": "member-type", "nodeType": "epic" } } },
+    { "expect": "matches", "op": "storyMember", "path": "error", "value": { "code": "INVALID_INPUT", "details": { "rule": "member-type", "nodeType": "story" } } },
+    { "expect": "matches", "op": "addContainer", "path": "error", "value": { "code": "INVALID_INPUT", "details": { "rule": "member-type", "nodeType": "substory" } } }
+  ]
+}

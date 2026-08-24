@@ -1,0 +1,39 @@
+{
+  "meta": {
+    "name": "item-illegal-transitions",
+    "source": "tests/run-core.spec.ts#item state machine > rejects illegal item transitions and unknown states",
+    "description": "pending refuses executor-side states; unknown states are INVALID_INPUT; unknown items NOT_FOUND; done is final for direct moves; items freeze once the run is terminal."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "批量" },
+      { "type": "story", "title": "批次", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "任务1", "parentId": "STORY-0001" },
+      { "type": "ticket", "title": "任务2", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "createRun", "params": { "nodeIds": ["TICKET-0001", "TICKET-0002"] } },
+    { "op": "startRun", "params": { "id": "RUN-0001" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "to": "failed" }, "label": "pendingToFailed" },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "to": "awaiting_confirmation" }, "label": "pendingToAwaiting" },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "to": "interrupted" }, "label": "pendingToInterrupted" },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "to": "bogus" }, "label": "unknownState" },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-9999", "to": "running" }, "label": "unknownItem" },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "to": "running" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "to": "done" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "to": "failed" }, "label": "doneToFailed" },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0002", "to": "running" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0002", "to": "done" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "to": "running" }, "label": "afterTerminal" }
+  ],
+  "invariants": [
+    { "expect": "matches", "op": "pendingToFailed", "path": "error", "value": { "code": "CONFLICT", "details": { "rule": "item-transition", "from": "pending", "to": "failed" } } },
+    { "expect": "matches", "op": "pendingToAwaiting", "path": "error", "value": { "code": "CONFLICT", "details": { "rule": "item-transition", "from": "pending" } } },
+    { "expect": "matches", "op": "pendingToInterrupted", "path": "error", "value": { "code": "CONFLICT", "details": { "rule": "item-transition", "from": "pending" } } },
+    { "expect": "matches", "op": "unknownState", "path": "error", "value": { "code": "INVALID_INPUT", "details": { "field": "to", "value": "bogus" } } },
+    { "expect": "matches", "op": "unknownItem", "path": "error", "value": { "code": "NOT_FOUND", "details": { "kind": "run-item", "nodeId": "TICKET-9999" } } },
+    { "expect": "matches", "op": "doneToFailed", "path": "error", "value": { "code": "CONFLICT", "details": { "rule": "item-transition", "from": "done" } } },
+    { "expect": "matches", "op": "afterTerminal", "path": "error", "value": { "code": "CONFLICT", "details": { "rule": "items-frozen", "runStatus": "completed" } } }
+  ]
+}

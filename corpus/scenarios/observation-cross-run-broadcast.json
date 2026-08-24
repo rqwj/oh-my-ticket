@@ -1,0 +1,27 @@
+{
+  "meta": {
+    "name": "observation-cross-run-broadcast",
+    "source": "tests/run-core.spec.ts observeNodeStatus — passive observation broadcasts to every ACTIVE run holding the node (EPIC-0003 decision 1)",
+    "description": "One node update advances the matching item of every active run in the home; terminal runs are untouched."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "批量" },
+      { "type": "story", "title": "批次", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "任务1", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "createRun", "params": { "nodeIds": ["TICKET-0001"] }, "label": "runA" },
+    { "op": "createRun", "params": { "nodeIds": ["TICKET-0001"] }, "label": "runB" },
+    { "op": "cancelRun", "params": { "id": "RUN-0002" } },
+    { "op": "startRun", "params": { "id": "RUN-0001" } },
+    { "op": "update", "params": { "id": "TICKET-0001", "status": "in_progress", "executorSessionId": "s1" } },
+    { "op": "getRunItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001" }, "label": "advanced" },
+    { "op": "getRunItem", "params": { "runId": "RUN-0002", "nodeId": "TICKET-0001" }, "label": "historyUntouched" }
+  ],
+  "invariants": [
+    { "expect": "equals", "op": "advanced", "path": "state", "value": "running" },
+    { "expect": "equals", "op": "historyUntouched", "path": "state", "value": "pending" }
+  ]
+}

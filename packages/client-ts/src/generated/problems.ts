@@ -217,3 +217,43 @@ export interface ProblemDescriptor7 {
   stability: "stable" | "provisional";
   [k: string]: unknown;
 }
+/**
+ * Subdivided codes introduced by U2's pre-freeze pass (additive; each carries a coarseFallback so older clients interpret unknown codes). Open map: any key matching ^[A-Z][A-Z0-9_]+$ may appear.
+ */
+
+/**
+ * Subdivided codes introduced by U2's pre-freeze pass (additive; each carries a coarseFallback so older clients interpret unknown codes). Open map: any key matching ^[A-Z][A-Z0-9_]+$ may appear.
+ */
+export interface SubdividedProblemRegistry {
+  [k: string]: ProblemDescriptor;
+}
+/**
+ * The subdivision entries frozen with the behavioral corpus (U2). Each property pins the exact descriptor instance registered for that code.
+ */
+
+/**
+ * The subdivision entries frozen with the behavioral corpus (U2). Each property pins the exact descriptor instance registered for that code.
+ */
+export interface U2SubdivisionDescriptors {
+  ARCHIVED_READONLY?: {
+    summary: "The referenced node is archived and read-only; restore it before mutating.";
+    detailsShape: "{ nodeId: string, operation: 'update' | 'report' | 'run-membership' }.";
+    coarseFallback: "CONFLICT";
+    stability: "provisional";
+    [k: string]: unknown;
+  };
+  DUPLICATE_MEMBER?: {
+    summary: "A run member list repeats a node id.";
+    detailsShape: "{ nodeId: string } — the first duplicated id.";
+    coarseFallback: "INVALID_INPUT";
+    stability: "provisional";
+    [k: string]: unknown;
+  };
+  INVALID_CONCURRENCY?: {
+    summary: "Run concurrency must be a positive integer (v1 advertises runConcurrency: 1).";
+    detailsShape: "{ value: number | string } — the rejected value.";
+    coarseFallback: "INVALID_INPUT";
+    stability: "provisional";
+    [k: string]: unknown;
+  };
+}

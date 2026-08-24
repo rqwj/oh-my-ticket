@@ -1,0 +1,28 @@
+{
+  "meta": {
+    "name": "list-filters",
+    "source": "tests/core.spec.ts#search > filters by type and status",
+    "description": "list() filters by node type and lifecycle status; ids order deterministically."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "用户体系" },
+      { "type": "story", "title": "登录", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "登录接口", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "update", "params": { "id": "TICKET-0001", "status": "done" } },
+    { "op": "list", "params": { "type": "ticket" }, "label": "tickets" },
+    { "op": "list", "params": { "status": "done" }, "label": "done" },
+    { "op": "list", "params": { "status": "open" }, "label": "open" }
+  ],
+  "invariants": [
+    { "expect": "length", "op": "tickets", "value": 1 },
+    { "expect": "equals", "op": "done", "path": "0.id", "value": "TICKET-0001" },
+    { "expect": "length", "op": "done", "value": 1 },
+    { "expect": "equals", "op": "open", "path": "0.id", "value": "EPIC-0001" },
+    { "expect": "equals", "op": "open", "path": "1.id", "value": "STORY-0001" },
+    { "expect": "length", "op": "open", "value": 2 }
+  ]
+}

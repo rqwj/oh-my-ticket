@@ -1,0 +1,30 @@
+{
+  "meta": {
+    "name": "wedge-force-remove",
+    "source": "tests/run-core.spec.ts#archived members > removeRunItem force-removes an in-flight item whose node is archived",
+    "description": "In-flight items are not removable while the node is live; after cancel + out-of-band archive wedges the item, forced removal recovers without touching the ticket."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "批量" },
+      { "type": "story", "title": "批次", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "任务1", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "createRun", "params": { "nodeIds": ["TICKET-0001"] } },
+    { "op": "startRun", "params": { "id": "RUN-0001" } },
+    { "op": "claimRunItem", "params": { "runId": "RUN-0001", "executorSessionId": "sess-1" } },
+    { "op": "removeRunItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001" }, "label": "liveRemove" },
+    { "op": "cancelRun", "params": { "id": "RUN-0001" } },
+    { "op": "update", "params": { "id": "TICKET-0001", "archived": true } },
+    { "op": "removeRunItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001" }, "label": "forcedRemove" },
+    { "op": "getRunItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001" }, "label": "gone" },
+    { "op": "getNode", "params": { "id": "TICKET-0001" }, "label": "ticketAfter" }
+  ],
+  "invariants": [
+    { "expect": "matches", "op": "liveRemove", "path": "error", "value": { "code": "CONFLICT", "details": { "rule": "remove-in-flight", "itemState": "running" } } },
+    { "expect": "equals", "op": "gone", "value": null },
+    { "expect": "equals", "op": "ticketAfter", "path": "status", "value": "open" }
+  ]
+}

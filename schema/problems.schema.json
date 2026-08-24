@@ -49,19 +49,19 @@
       "properties": {
         "CONFLICT": {
           "$ref": "#/$defs/ProblemDescriptor",
-          "description": "Optimistic-concurrency or state-machine conflict: revision mismatch, illegal transition, mutating a read-only archived node."
+          "description": "Optimistic-concurrency or state-machine conflict: revision mismatch, illegal transition, mutating a read-only archived node (the archived case is subdivided as ARCHIVED_READONLY)."
         },
         "INVALID_HIERARCHY": {
           "$ref": "#/$defs/ProblemDescriptor",
-          "description": "Hierarchy rule violation: illegal parent/child type pair, cycle, cross-home move."
+          "description": "Hierarchy rule violation: illegal parent/child type pair (details.rule=child-type with parentType/childType), root creation of a non-epic (root-requires-epic), self-parent or descendant cycle (self-parent / descendant-cycle), cross-home move."
         },
         "INVALID_INPUT": {
           "$ref": "#/$defs/ProblemDescriptor",
-          "description": "Payload failed semantic validation beyond schema shape: empty changeset, duplicate run member, unsupported concurrency."
+          "description": "Payload failed semantic validation beyond schema shape: empty changeset, unsupported concurrency (subdivided as INVALID_CONCURRENCY), duplicate run member (subdivided as DUPLICATE_MEMBER), non-executable member type."
         },
         "NOT_FOUND": {
           "$ref": "#/$defs/ProblemDescriptor",
-          "description": "Referenced home, node, run, item, or cursor does not exist."
+          "description": "Referenced home, node, run, item, or cursor does not exist. details.kind names the referent ('node' | 'run' | 'run-item') and details.id / runId+nodeId identify it."
         },
         "IO": {
           "$ref": "#/$defs/ProblemDescriptor",
@@ -74,6 +74,51 @@
         "SCHEMA_TOO_NEW": {
           "$ref": "#/$defs/ProblemDescriptor",
           "description": "On-disk home schema is newer than this daemon understands; fail closed before any write."
+        }
+      },
+      "additionalProperties": false
+    },
+    "SubdividedProblemRegistry": {
+      "type": "object",
+      "description": "Subdivided codes introduced by U2's pre-freeze pass (additive; each carries a coarseFallback so older clients interpret unknown codes). Open map: any key matching ^[A-Z][A-Z0-9_]+$ may appear.",
+      "propertyNames": {
+        "pattern": "^[A-Z][A-Z0-9_]+$"
+      },
+      "additionalProperties": { "$ref": "#/$defs/ProblemDescriptor" }
+    },
+    "U2SubdivisionDescriptors": {
+      "type": "object",
+      "description": "The subdivision entries frozen with the behavioral corpus (U2). Each property pins the exact descriptor instance registered for that code.",
+      "properties": {
+        "ARCHIVED_READONLY": {
+          "type": "object",
+          "properties": {
+            "summary": { "const": "The referenced node is archived and read-only; restore it before mutating." },
+            "detailsShape": { "const": "{ nodeId: string, operation: 'update' | 'report' | 'run-membership' }." },
+            "coarseFallback": { "const": "CONFLICT" },
+            "stability": { "const": "provisional" }
+          },
+          "required": ["summary", "detailsShape", "coarseFallback", "stability"]
+        },
+        "DUPLICATE_MEMBER": {
+          "type": "object",
+          "properties": {
+            "summary": { "const": "A run member list repeats a node id." },
+            "detailsShape": { "const": "{ nodeId: string } — the first duplicated id." },
+            "coarseFallback": { "const": "INVALID_INPUT" },
+            "stability": { "const": "provisional" }
+          },
+          "required": ["summary", "detailsShape", "coarseFallback", "stability"]
+        },
+        "INVALID_CONCURRENCY": {
+          "type": "object",
+          "properties": {
+            "summary": { "const": "Run concurrency must be a positive integer (v1 advertises runConcurrency: 1)." },
+            "detailsShape": { "const": "{ value: number | string } — the rejected value." },
+            "coarseFallback": { "const": "INVALID_INPUT" },
+            "stability": { "const": "provisional" }
+          },
+          "required": ["summary", "detailsShape", "coarseFallback", "stability"]
         }
       },
       "additionalProperties": false

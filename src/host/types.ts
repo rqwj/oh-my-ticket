@@ -198,11 +198,34 @@ export function isRunItemStalled(item: Pick<OmtRunItem, 'state' | 'nudge_count'>
   return item.state === 'pending' && item.nudge_count >= NUDGE_BUDGET
 }
 
-/** Error with a stable machine-readable code for tool/API surfaces. */
+/**
+ * Problem codes raised by the TypeScript core (U2 pre-freeze taxonomy). The
+ * first five are the coarse v1 codes; the indented ones are subdivisions
+ * introduced before the behavioral corpus freeze so assertions bind to
+ * codes/details instead of message regexes. The registry lives in
+ * schema/problems.schema.json; unknown subdivided codes fall back to their
+ * registered coarse ancestor.
+ */
+export type ProblemCode =
+  | 'CONFLICT'
+  | 'INVALID_HIERARCHY'
+  | 'INVALID_INPUT'
+  | 'NOT_FOUND'
+  | 'IO'
+  // Subdivisions (each falls back to a coarse code above):
+  | 'ARCHIVED_READONLY'   // → CONFLICT: the node is archived and read-only
+  | 'DUPLICATE_MEMBER'    // → INVALID_INPUT: a run member list repeats a node
+  | 'INVALID_CONCURRENCY' // → INVALID_INPUT: run concurrency is not a positive integer
+
+/** Structured, assertion-ready details carried alongside a problem code (R5). */
+export type ProblemDetails = Record<string, unknown>
+
+/** Error with a stable machine-readable code (+ optional structured details) for tool/API surfaces. */
 export class OmtError extends Error {
   constructor(
-    readonly code: 'NOT_FOUND' | 'INVALID_HIERARCHY' | 'INVALID_INPUT' | 'CONFLICT' | 'IO',
+    readonly code: ProblemCode,
     message: string,
+    readonly details?: ProblemDetails,
   ) {
     super(message)
     this.name = 'OmtError'

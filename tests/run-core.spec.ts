@@ -11,8 +11,8 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { bridgeRunEvents, ChangeHub, type OmtChangeEvent } from '../src/host/changes.ts'
 import { OmtCore, type OmtRunEvent } from '../src/host/core.ts'
 import { OmtStore } from '../src/host/store.ts'
-import { isRunItemStalled, NUDGE_BUDGET, OmtError } from '../src/host/types.ts'
-import { requireItem, ticketFixture } from './mocks/fixtures.ts'
+import { isRunItemStalled, NUDGE_BUDGET, type OmtRun, type OmtRunItem, type RunConfig } from '../src/host/types.ts'
+import { expectProblem, requireItem, ticketFixture } from './mocks/fixtures.ts'
 
 let home: string
 let core: OmtCore
@@ -50,16 +50,16 @@ describe('createRun', () => {
 
   it('rejects unknown members, duplicates, and unknown run ids', async () => {
     const [ticket] = await fixture(1)
-    await expect(core.createRun({ nodeIds: ['TICKET-9999'] })).rejects.toThrow(OmtError)
-    await expect(core.createRun({ nodeIds: [ticket.id, ticket.id] })).rejects.toThrow(/duplicate/i)
-    await expect(core.createRun({ nodeIds: [], config: { concurrency: 0 } })).rejects.toThrow(/concurrency/)
-    expect(() => core.runItems('RUN-9999')).toThrow(OmtError)
+    await expectProblem(core.createRun({ nodeIds: ['TICKET-9999'] }), 'NOT_FOUND', { kind: 'node', id: 'TICKET-9999' })
+    await expectProblem(core.createRun({ nodeIds: [ticket!.id, ticket!.id] }), 'DUPLICATE_MEMBER', { nodeId: ticket!.id })
+    await expectProblem(core.createRun({ nodeIds: [], config: { concurrency: 0 } }), 'INVALID_CONCURRENCY', { value: 0 })
+    await expectProblem(Promise.resolve().then(() => core.runItems('RUN-9999')), 'NOT_FOUND', { kind: 'run', id: 'RUN-9999' })
   })
 
   it('rejects archived members up front (they could never accept a report)', async () => {
     const [a, b] = await fixture(2)
     await core.update({ id: a!.id, archived: true })
-    await expect(core.createRun({ nodeIds: [a!.id, b!.id] })).rejects.toThrow(/archived|已归档/)
+    await expectProblem(core.createRun({ nodeIds: [a!.id, b!.id] }), 'ARCHIVED_READONLY', { nodeId: a!.id, operation: 'run-membership' })
     // Restoring the node unblocks the run creation.
     await core.update({ id: a!.id, archived: false })
     const run = await core.createRun({ nodeIds: [a!.id, b!.id] })
@@ -71,11 +71,11 @@ describe('createRun', () => {
     const story = await core.create({ type: 'story', title: '范围', parentId: epic.id })
     const substory = await core.create({ type: 'substory', title: '补充背景', parentId: story.id })
 
-    await expect(core.createRun({ nodeIds: [epic.id] })).rejects.toThrow(/executable|ticket|可执行/i)
-    await expect(core.createRun({ nodeIds: [story.id] })).rejects.toThrow(/executable|ticket|可执行/i)
+    await expectProblem(core.createRun({ nodeIds: [epic.id] }), 'INVALID_INPUT', { rule: 'member-type', nodeId: epic.id, nodeType: 'epic' })
+    await expectProblem(core.createRun({ nodeIds: [story.id] }), 'INVALID_INPUT', { rule: 'member-type', nodeType: 'story' })
 
     const run = await core.createRun({ nodeIds: [] })
-    await expect(core.addRunMembers(run.id, [{ nodeId: substory.id }])).rejects.toThrow(/executable|ticket|可执行/i)
+    await expectProblem(core.addRunMembers(run.id, [{ nodeId: substory.id }]), 'INVALID_INPUT', { rule: 'member-type', nodeType: 'substory' })
   })
 })
 
@@ -126,16 +126,16 @@ describe('run state machine', () => {
     const run = await core.createRun({ nodeIds: tickets.map(t => t.id) })
 
     // pending: only start/cancel are legal.
-    await expect(core.pauseRun(run.id)).rejects.toThrow(/paused/)
-    await expect(core.resumeRun(run.id)).rejects.toThrow()
+    await expectProblem(core.pauseRun(run.id), 'CONFLICT', { rule: 'run-status-gate', current: 'pending' })
+    await expectProblem(core.resumeRun(run.id), 'CONFLICT', { rule: 'run-status-gate', current: 'pending' })
 
     await core.startRun(run.id)
     expect(core.getRun(run.id)?.status).toBe('running')
-    await expect(core.startRun(run.id)).rejects.toThrow(/running/)
+    await expectProblem(core.startRun(run.id), 'CONFLICT', { rule: 'run-status-gate', current: 'running' })
 
     await core.pauseRun(run.id)
     expect(core.getRun(run.id)?.status).toBe('paused')
-    await expect(core.pauseRun(run.id)).rejects.toThrow(/paused/)
+    await expectProblem(core.pauseRun(run.id), 'CONFLICT', { rule: 'run-status-gate', current: 'paused' })
 
     await core.resumeRun(run.id)
     expect(core.getRun(run.id)?.status).toBe('running')
@@ -149,10 +149,10 @@ describe('run state machine', () => {
     await core.transitionItem(run.id, tickets[0]!.id, 'done')
     expect(core.getRun(run.id)?.status).toBe('completed')
 
-    await expect(core.startRun(run.id)).rejects.toThrow(OmtError)
-    await expect(core.pauseRun(run.id)).rejects.toThrow(OmtError)
-    await expect(core.resumeRun(run.id)).rejects.toThrow(OmtError)
-    await expect(core.cancelRun(run.id)).rejects.toThrow(OmtError)
+    await expectProblem(core.startRun(run.id), 'CONFLICT', { rule: 'run-status-gate', current: 'completed' })
+    await expectProblem(core.pauseRun(run.id), 'CONFLICT', { rule: 'run-status-gate', current: 'completed' })
+    await expectProblem(core.resumeRun(run.id), 'CONFLICT', { rule: 'run-status-gate', current: 'completed' })
+    await expectProblem(core.cancelRun(run.id), 'CONFLICT', { rule: 'run-transition', from: 'completed', to: 'canceled' })
   })
 
   it('starts an empty run straight into completed (vacuous success)', async () => {
@@ -185,22 +185,22 @@ describe('item state machine', () => {
 
     // pending can go to running (dispatch) or done/blocked/skipped (passive
     // observation direct sets, TICKET-0061) — but not to executor-side states.
-    await expect(core.transitionItem(run.id, a!.id, 'failed')).rejects.toThrow(/pending/)
-    await expect(core.transitionItem(run.id, a!.id, 'awaiting_confirmation')).rejects.toThrow(/pending/)
-    await expect(core.transitionItem(run.id, a!.id, 'interrupted')).rejects.toThrow(/pending/)
-    await expect(core.transitionItem(run.id, a!.id, 'bogus' as never)).rejects.toThrow(/unknown/i)
-    await expect(core.transitionItem(run.id, 'TICKET-9999', 'running')).rejects.toThrow(OmtError)
+    await expectProblem(core.transitionItem(run.id, a!.id, 'failed'), 'CONFLICT', { rule: 'item-transition', from: 'pending', to: 'failed' })
+    await expectProblem(core.transitionItem(run.id, a!.id, 'awaiting_confirmation'), 'CONFLICT', { rule: 'item-transition', from: 'pending' })
+    await expectProblem(core.transitionItem(run.id, a!.id, 'interrupted'), 'CONFLICT', { rule: 'item-transition', from: 'pending' })
+    await expectProblem(core.transitionItem(run.id, a!.id, 'bogus' as never), 'INVALID_INPUT', { field: 'to', value: 'bogus' })
+    await expectProblem(core.transitionItem(run.id, 'TICKET-9999', 'running'), 'NOT_FOUND', { kind: 'run-item' })
 
     // done is final for direct transitions (replay is a dedicated method).
     await core.transitionItem(run.id, a!.id, 'running')
     await core.transitionItem(run.id, a!.id, 'done')
-    await expect(core.transitionItem(run.id, a!.id, 'failed')).rejects.toThrow(/done/)
+    await expectProblem(core.transitionItem(run.id, a!.id, 'failed'), 'CONFLICT', { rule: 'item-transition', from: 'done' })
 
     // Items are frozen once the run is terminal: no more dispatch.
     await core.transitionItem(run.id, b!.id, 'running')
     await core.transitionItem(run.id, b!.id, 'done')
     expect(core.getRun(run.id)?.status).toBe('completed')
-    await expect(core.transitionItem(run.id, a!.id, 'running')).rejects.toThrow(/completed/)
+    await expectProblem(core.transitionItem(run.id, a!.id, 'running'), 'CONFLICT', { rule: 'items-frozen', runStatus: 'completed' })
   })
 
   it('supports running → awaiting_confirmation → done', async () => {
@@ -305,7 +305,7 @@ describe('boundary semantics (TICKET-0055)', () => {
     await core.pauseRun(run.id)
 
     // Dispatch of a pending item is stopped…
-    await expect(core.transitionItem(run.id, b!.id, 'running')).rejects.toThrow(/paused/)
+    await expectProblem(core.transitionItem(run.id, b!.id, 'running'), 'CONFLICT', { rule: 'dispatch-paused', runStatus: 'paused', itemState: 'pending' })
     // …but the in-flight item can still be observed to completion, and the
     // run can still derive its terminal state from paused.
     await core.transitionItem(run.id, a!.id, 'done')
@@ -342,7 +342,7 @@ describe('boundary semantics (TICKET-0055)', () => {
     // done items are not retryable.
     await core.transitionItem(run.id, a!.id, 'running')
     await core.transitionItem(run.id, a!.id, 'done')
-    await expect(core.retryItem(run.id, a!.id)).rejects.toThrow(/done/)
+    await expectProblem(core.retryItem(run.id, a!.id), 'CONFLICT', { rule: 'retry-state-gate', itemState: 'done' })
   })
 
   it('retry rejects a completed run (full success has no reopen path)', async () => {
@@ -354,7 +354,7 @@ describe('boundary semantics (TICKET-0055)', () => {
     expect(core.getRun(run.id)?.status).toBe('completed')
 
     // Unlike completed_with_failures, completed accepts no row-level retry.
-    await expect(core.retryItem(run.id, a!.id)).rejects.toThrow(/completed/)
+    await expectProblem(core.retryItem(run.id, a!.id), 'CONFLICT', { rule: 'retry-run-gate', runStatus: 'completed' })
   })
 
   it('replay returns done/blocked/skipped items to pending, keeping position', async () => {
@@ -380,7 +380,7 @@ describe('boundary semantics (TICKET-0055)', () => {
     await expect(core.replayItem(run.id, c!.id)).resolves.toMatchObject({ state: 'pending', position: 2 })
     // running/pending items have nothing to replay.
     await core.transitionItem(run.id, a!.id, 'running')
-    await expect(core.replayItem(run.id, a!.id)).rejects.toThrow(/running/)
+    await expectProblem(core.replayItem(run.id, a!.id), 'CONFLICT', { rule: 'replay-state-gate', itemState: 'running' })
   })
 
   it('replay clears the nudge budget: a replayed item is no longer stalled', async () => {
@@ -437,9 +437,9 @@ describe('boundary semantics (TICKET-0055)', () => {
     expect(core.getNode(b!.id)?.status).toBe('open')
 
     // A canceled run accepts nothing: no retry, no resume, no item moves.
-    await expect(core.retryItem(run.id, a!.id)).rejects.toThrow(/canceled/)
-    await expect(core.resumeRun(run.id)).rejects.toThrow(/canceled/)
-    await expect(core.transitionItem(run.id, a!.id, 'done')).rejects.toThrow(/canceled/)
+    await expectProblem(core.retryItem(run.id, a!.id), 'CONFLICT', { rule: 'retry-run-gate', runStatus: 'canceled' })
+    await expectProblem(core.resumeRun(run.id), 'CONFLICT', { rule: 'run-status-gate', current: 'canceled' })
+    await expectProblem(core.transitionItem(run.id, a!.id, 'done'), 'CONFLICT', { rule: 'items-frozen', runStatus: 'canceled' })
   })
 })
 
@@ -473,7 +473,7 @@ describe('archived members (wedge fixes)', () => {
     await core.claimRunItem(run.id, 'sess-1')
 
     // In-flight items are not removable while the node is live…
-    await expect(core.removeRunItem(run.id, a!.id)).rejects.toThrow(/in-flight/)
+    await expectProblem(core.removeRunItem(run.id, a!.id), 'CONFLICT', { rule: 'remove-in-flight', itemState: 'running' })
 
     // …but a node archived out of band (here: cancel freezes observation,
     // like a reindex of hand-edited files would) wedges the item — reports
@@ -541,7 +541,7 @@ describe('reportRunItem write order', () => {
     // Make the note-append fail (node file gone): the transition must
     // already have landed, matching the other outcomes' order.
     await rm(join(home, a!.path))
-    await expect(core.reportRunItem(run.id, a!.id, 'failed', '炸了')).rejects.toThrow(/node file missing/)
+    await expectProblem(core.reportRunItem(run.id, a!.id, 'failed', '炸了'), 'IO')
     const item = requireItem(core, run.id, a!.id)
     expect(item.state).toBe('failed')
     expect(item.last_error).toBe('炸了')
@@ -713,7 +713,7 @@ describe('addRunMembers (TICKET-0067 host side)', () => {
     const [a, b, c] = await fixture(3)
     const canceled = await core.createRun({ nodeIds: [a!.id] })
     await core.cancelRun(canceled.id)
-    await expect(core.addRunMembers(canceled.id, [{ nodeId: b!.id }])).rejects.toThrow(/终态|另建/)
+    await expectProblem(core.addRunMembers(canceled.id, [{ nodeId: b!.id }]), 'CONFLICT', { rule: 'run-not-active', runStatus: 'canceled' })
 
     const interrupted = await core.createRun({ nodeIds: [a!.id, b!.id] })
     await core.startRun(interrupted.id)
@@ -721,15 +721,15 @@ describe('addRunMembers (TICKET-0067 host side)', () => {
     // Demote the only running item with pending work left: run → interrupted.
     core.janitorSweep(() => false)
     expect(core.getRun(interrupted.id)?.status).toBe('interrupted')
-    await expect(core.addRunMembers(interrupted.id, [{ nodeId: c!.id }])).rejects.toThrow(/resume/)
+    await expectProblem(core.addRunMembers(interrupted.id, [{ nodeId: c!.id }]), 'CONFLICT', { rule: 'run-not-active', runStatus: 'interrupted' })
   })
 
   it('rejects archived and unknown members (unknown = foreign home)', async () => {
     const [a, b] = await fixture(2)
     const run = await core.createRun({ nodeIds: [a!.id] })
     await core.update({ id: b!.id, archived: true })
-    await expect(core.addRunMembers(run.id, [{ nodeId: b!.id }])).rejects.toThrow(/归档|archived/)
-    await expect(core.addRunMembers(run.id, [{ nodeId: 'TICKET-9999' }])).rejects.toThrow(OmtError)
+    await expectProblem(core.addRunMembers(run.id, [{ nodeId: b!.id }]), 'ARCHIVED_READONLY', { nodeId: b!.id, operation: 'run-membership' })
+    await expectProblem(core.addRunMembers(run.id, [{ nodeId: 'TICKET-9999' }]), 'NOT_FOUND', { kind: 'node', id: 'TICKET-9999' })
     // A rejected batch member must not wedge the run: prior adds still stand.
     expect(core.runItems(run.id).map(item => item.node_id)).toEqual([a!.id])
   })

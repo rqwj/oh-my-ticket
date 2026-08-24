@@ -1,0 +1,33 @@
+{
+  "meta": {
+    "name": "janitor-live-session",
+    "source": "tests/run-core.spec.ts#startup janitor > keeps items whose executor session is still active (+ pool wiring)",
+    "description": "Opening with activeSessionIds preserves the live executor's running item and the run itself while orphaned siblings are demoted."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "批量" },
+      { "type": "story", "title": "批次", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "任务1", "parentId": "STORY-0001" },
+      { "type": "ticket", "title": "任务2", "parentId": "STORY-0001" },
+      { "type": "ticket", "title": "任务3", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "createRun", "params": { "nodeIds": ["TICKET-0001", "TICKET-0002", "TICKET-0003"] } },
+    { "op": "startRun", "params": { "id": "RUN-0001" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "to": "running", "executorSessionId": "sess-alive" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0002", "to": "running", "executorSessionId": "sess-dead" } },
+    { "op": "reopen", "params": { "activeSessionIds": ["sess-alive"] } },
+    { "op": "getRun", "params": { "id": "RUN-0001" }, "label": "keptRun" },
+    { "op": "getRunItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001" }, "label": "liveItem" },
+    { "op": "getRunItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0002" }, "label": "deadItem" },
+    { "op": "getRunItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0003" }, "label": "pendingItem" }
+  ],
+  "invariants": [
+    { "expect": "equals", "op": "keptRun", "path": "status", "value": "running" },
+    { "expect": "equals", "op": "liveItem", "path": "state", "value": "running" },
+    { "expect": "equals", "op": "deadItem", "path": "state", "value": "interrupted" },
+    { "expect": "equals", "op": "pendingItem", "path": "state", "value": "pending" }
+  ]
+}

@@ -1,0 +1,40 @@
+{
+  "meta": {
+    "name": "cancel-freezes-items",
+    "source": "tests/run-core.spec.ts#boundary semantics > cancel freezes items in place and never touches the ticket nodes",
+    "description": "Cancel freezes item states (no interrupted downgrade), leaves ticket statuses alone, and seals the run against retry/resume/transitions."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "批量" },
+      { "type": "story", "title": "批次", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "任务1", "parentId": "STORY-0001" },
+      { "type": "ticket", "title": "任务2", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "createRun", "params": { "nodeIds": ["TICKET-0001", "TICKET-0002"] } },
+    { "op": "startRun", "params": { "id": "RUN-0001" } },
+    { "op": "update", "params": { "id": "TICKET-0001", "status": "in_progress", "executorSessionId": "sess-1" } },
+    { "op": "getRunItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001" }, "label": "dispatchedViaObservation" },
+    { "op": "cancelRun", "params": { "id": "RUN-0001" }, "label": "canceled" },
+    { "op": "getRunItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001" }, "label": "frozenRunning" },
+    { "op": "getRunItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0002" }, "label": "frozenPending" },
+    { "op": "getNode", "params": { "id": "TICKET-0001" }, "label": "ticketA" },
+    { "op": "getNode", "params": { "id": "TICKET-0002" }, "label": "ticketB" },
+    { "op": "retryItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001" }, "label": "retryAfterCancel" },
+    { "op": "resumeRun", "params": { "id": "RUN-0001" }, "label": "resumeAfterCancel" },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "to": "done" }, "label": "moveAfterCancel" }
+  ],
+  "invariants": [
+    { "expect": "equals", "op": "dispatchedViaObservation", "path": "state", "value": "running" },
+    { "expect": "equals", "op": "canceled", "path": "status", "value": "canceled" },
+    { "expect": "equals", "op": "frozenRunning", "path": "state", "value": "running" },
+    { "expect": "equals", "op": "frozenPending", "path": "state", "value": "pending" },
+    { "expect": "equals", "op": "ticketA", "path": "status", "value": "in_progress" },
+    { "expect": "equals", "op": "ticketB", "path": "status", "value": "open" },
+    { "expect": "matches", "op": "retryAfterCancel", "path": "error", "value": { "code": "CONFLICT", "details": { "rule": "retry-run-gate", "runStatus": "canceled" } } },
+    { "expect": "matches", "op": "resumeAfterCancel", "path": "error", "value": { "code": "CONFLICT", "details": { "rule": "run-status-gate", "current": "canceled" } } },
+    { "expect": "matches", "op": "moveAfterCancel", "path": "error", "value": { "code": "CONFLICT", "details": { "rule": "items-frozen", "runStatus": "canceled" } } }
+  ]
+}

@@ -1,0 +1,39 @@
+{
+  "meta": {
+    "name": "run-legacy-container-quarantine",
+    "source": "tests/run-core.spec.ts#legacy container run members > skips persisted containers during claim/report without mutating their nodes",
+    "description": "Seed primitive replaces direct OmtStore writes: a pre-filter run holding archived containers claims past them (epic skipped in-claim), and reporting an in-flight container quarantines the item to skipped without touching its status or body."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "旧 Epic 背景" },
+      { "type": "story", "title": "旧 Story 背景", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "实际任务", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "show", "params": { "id": "STORY-0001" }, "label": "before" },
+    { "op": "update", "params": { "id": "STORY-0001", "archived": true } },
+    { "op": "seedRun", "params": {
+        "status": "running",
+        "items": [
+          { "nodeId": "EPIC-0001", "position": 0, "state": "pending" },
+          { "nodeId": "STORY-0001", "position": 1, "state": "running", "executorSessionId": "legacy-session" },
+          { "nodeId": "TICKET-0001", "position": 2, "state": "pending" }
+        ]
+      }, "label": "seeded" },
+    { "op": "claimRunItem", "params": { "runId": "RUN-0001", "executorSessionId": "new-session" }, "label": "claimed" },
+    { "op": "getRunItem", "params": { "runId": "RUN-0001", "nodeId": "EPIC-0001" }, "label": "epicItem" },
+    { "op": "reportRunItem", "params": { "runId": "RUN-0001", "nodeId": "STORY-0001", "outcome": "done", "note": "不应写入容器" }, "label": "reported" },
+    { "op": "getNode", "params": { "id": "STORY-0001" }, "label": "storyAfter" },
+    { "op": "show", "params": { "id": "STORY-0001" }, "label": "after" }
+  ],
+  "invariants": [
+    { "expect": "equals", "op": "claimed", "path": "node_id", "value": "TICKET-0001" },
+    { "expect": "equals", "op": "epicItem", "path": "state", "value": "skipped" },
+    { "expect": "equals", "op": "reported", "path": "item.state", "value": "skipped" },
+    { "expect": "equals", "op": "storyAfter", "path": "status", "value": "open" },
+    { "expect": "equals", "op": "storyAfter", "path": "archived", "value": true },
+    { "expect": "equals", "op": "after", "path": "body", "valueFrom": "before" }
+  ]
+}

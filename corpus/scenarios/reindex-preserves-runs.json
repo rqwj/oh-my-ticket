@@ -1,0 +1,33 @@
+{
+  "meta": {
+    "name": "reindex-preserves-runs",
+    "source": "tests/run-core.spec.ts#startup janitor > reindex never touches run data (+ store rebuild protection)",
+    "description": "Rebuild replaces only nodes/edges/search mirror: runs, items, and the RUN counter survive a full reindex."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "批量" },
+      { "type": "story", "title": "批次", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "任务1", "parentId": "STORY-0001" },
+      { "type": "ticket", "title": "任务2", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "createRun", "params": { "nodeIds": ["TICKET-0001", "TICKET-0002"] } },
+    { "op": "startRun", "params": { "id": "RUN-0001" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "to": "running", "executorSessionId": "sess-1" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "to": "done" } },
+    { "op": "reindex", "label": "rebuilt" },
+    { "op": "getRun", "params": { "id": "RUN-0001" }, "label": "runAfter" },
+    { "op": "runItems", "params": { "runId": "RUN-0001" }, "label": "itemsAfter" },
+    { "op": "createRun", "params": { "nodeIds": ["TICKET-0001"] }, "label": "nextRun" }
+  ],
+  "invariants": [
+    { "expect": "gte", "op": "rebuilt", "path": "nodes", "value": 4 },
+    { "expect": "equals", "op": "runAfter", "path": "status", "value": "running" },
+    { "expect": "equals", "op": "itemsAfter", "path": "0.node_id", "value": "TICKET-0001" },
+    { "expect": "equals", "op": "itemsAfter", "path": "0.state", "value": "done" },
+    { "expect": "equals", "op": "itemsAfter", "path": "1.state", "value": "pending" },
+    { "expect": "equals", "op": "nextRun", "path": "id", "value": "RUN-0002" }
+  ]
+}

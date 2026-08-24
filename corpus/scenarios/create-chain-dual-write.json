@@ -1,0 +1,27 @@
+{
+  "meta": {
+    "name": "create-chain-dual-write",
+    "source": "tests/core.spec.ts#create > creates an epic→story→ticket chain with dual-write consistency",
+    "description": "Epic→story→ticket creation allocates ids per type, lays out markdown files with frontmatter, maintains the parent's managed children block, and assembles the tree from the index."
+  },
+  "operations": [
+    { "op": "create", "params": { "type": "epic", "title": "用户体系" } },
+    { "op": "create", "params": { "type": "story", "title": "登录", "parentId": "EPIC-0001" }, "label": "story" },
+    { "op": "create", "params": { "type": "ticket", "title": "登录接口", "parentId": "STORY-0001" }, "label": "ticket" },
+    { "op": "tree", "label": "forest" }
+  ],
+  "invariants": [
+    { "expect": "equals", "op": 0, "path": "id", "value": "EPIC-0001" },
+    { "expect": "equals", "op": 1, "path": "id", "value": "STORY-0001" },
+    { "expect": "equals", "op": 2, "path": "id", "value": "TICKET-0001" },
+    { "expect": "fileContains", "file": "tickets/EPIC-0001-用户体系/STORY-0001-登录/TICKET-0001-登录接口/ticket.md", "text": "id: TICKET-0001" },
+    { "expect": "fileContains", "file": "tickets/EPIC-0001-用户体系/STORY-0001-登录/TICKET-0001-登录接口/ticket.md", "text": "type: ticket" },
+    { "expect": "fileContains", "file": "tickets/EPIC-0001-用户体系/STORY-0001-登录/TICKET-0001-登录接口/ticket.md", "text": "parent: STORY-0001" },
+    { "expect": "fileContains", "file": "tickets/EPIC-0001-用户体系/STORY-0001-登录/TICKET-0001-登录接口/ticket.md", "text": "status: open" },
+    { "expect": "fileContains", "file": "tickets/EPIC-0001-用户体系/STORY-0001-登录/story.md", "text": "## 子节点" },
+    { "expect": "fileContains", "file": "tickets/EPIC-0001-用户体系/STORY-0001-登录/story.md", "text": "- [TICKET-0001 登录接口](TICKET-0001-登录接口/ticket.md) — open" },
+    { "expect": "length", "op": "forest", "value": 1 },
+    { "expect": "equals", "op": "forest", "path": "0.id", "value": "EPIC-0001" },
+    { "expect": "equals", "op": "forest", "path": "0.children.0.children.0.id", "value": "TICKET-0001" }
+  ]
+}

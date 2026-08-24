@@ -4,7 +4,7 @@
  */
 import { expect } from 'vitest'
 import type { OmtCore } from '../../src/host/core.ts'
-import type { OmtNode, OmtRunItem } from '../../src/host/types.ts'
+import { OmtError, type OmtNode, type OmtRunItem } from '../../src/host/types.ts'
 import { toolOf, type RegisteredTool } from './registered-tool.ts'
 
 /** Standard fixture: epic → story → `count` tickets, created through core. */
@@ -36,4 +36,25 @@ export function requireItem(core: OmtCore, runId: string, nodeId: string): OmtRu
   const item = core.getRunItem(runId, nodeId)
   expect(item).toBeDefined()
   return item as OmtRunItem
+}
+
+/**
+ * Assert a promise rejects with an OmtError carrying exactly `code` and
+ * (optionally) a `details` subset — the post-U2 assertion style: problem
+ * codes plus structured details, never message text (R5).
+ */
+export async function expectProblem(
+  exec: Promise<unknown>,
+  code: OmtError['code'],
+  details?: Record<string, unknown>,
+): Promise<OmtError> {
+  const thrown: unknown = await exec.then(
+    () => undefined,
+    (error: unknown) => error,
+  )
+  expect(thrown, `expected a rejection with ${code}`).toBeInstanceOf(OmtError)
+  const omt = thrown as OmtError
+  expect(omt.code).toBe(code)
+  if (details !== undefined) expect(omt.details).toMatchObject(details)
+  return omt
 }

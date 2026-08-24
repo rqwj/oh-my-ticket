@@ -1,0 +1,35 @@
+{
+  "meta": {
+    "name": "add-members-append-dedupe",
+    "source": "tests/run-core.spec.ts#addRunMembers > appends members after existing positions and reports duplicates",
+    "description": "Members append after the current max position; existing membership and in-call repeats are skipped-and-reported, never an error."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "批量" },
+      { "type": "story", "title": "批次", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "任务1", "parentId": "STORY-0001" },
+      { "type": "ticket", "title": "任务2", "parentId": "STORY-0001" },
+      { "type": "ticket", "title": "任务3", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "createRun", "params": { "nodeIds": ["TICKET-0001"] } },
+    { "op": "addRunMembers", "params": { "runId": "RUN-0001", "members": [
+        { "nodeId": "TICKET-0002" },
+        { "nodeId": "TICKET-0001" },
+        { "nodeId": "TICKET-0002" },
+        { "nodeId": "TICKET-0003" }
+      ] }, "label": "added" },
+    { "op": "runItems", "params": { "runId": "RUN-0001" }, "label": "items" }
+  ],
+  "invariants": [
+    { "expect": "equals", "op": "added", "path": "duplicates", "value": ["TICKET-0001", "TICKET-0002"] },
+    { "expect": "equals", "op": "added", "path": "added.0.node_id", "value": "TICKET-0002" },
+    { "expect": "equals", "op": "added", "path": "added.0.position", "value": 1 },
+    { "expect": "equals", "op": "added", "path": "added.0.state", "value": "pending" },
+    { "expect": "equals", "op": "added", "path": "added.1.node_id", "value": "TICKET-0003" },
+    { "expect": "equals", "op": "added", "path": "added.1.position", "value": 2 },
+    { "expect": "length", "op": "items", "value": 3 }
+  ]
+}
