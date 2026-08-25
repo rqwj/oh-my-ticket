@@ -2508,7 +2508,12 @@ fn run_add_members(ctx: &mut Ctx, params: &Value) -> Result<Value> {
         .iter()
         .enumerate()
         .map(|(offset, node_id)| {
-            RunItemRow::new(&run_id, node_id, start_position + offset as i64, RunItemState::Pending)
+            RunItemRow::new(
+                &run_id,
+                node_id,
+                start_position + offset as i64,
+                RunItemState::Pending,
+            )
         })
         .collect();
     let mut changes: Vec<DbChange> = Vec::new();
@@ -2590,10 +2595,7 @@ fn run_nudge_record(ctx: &mut Ctx, params: &Value) -> Result<Value> {
         nudged.push(json!({ "nodeId": item.node_id, "nudgeCount": count }));
     }
     if changes.is_empty() {
-        return Err(invalid_input(
-            "nodeId",
-            "no pending item to nudge",
-        ));
+        return Err(invalid_input("nodeId", "no pending item to nudge"));
     }
     let events = vec![(
         "run.changed",
@@ -2651,16 +2653,12 @@ fn run_interrupt(ctx: &mut Ctx, params: &Value) -> Result<Value> {
         .collect();
     // Two-pass janitor order: ALL demotions first, THEN terminal derivation.
     for node_id in &demoted {
-        transition_item_sql(
-            ctx,
-            &run_id,
-            node_id,
-            RunItemState::Interrupted,
-            None,
-            None,
-        )?;
+        transition_item_sql(ctx, &run_id, node_id, RunItemState::Interrupted, None, None)?;
     }
-    leases().lock().expect("leases").retain(|rid, _| rid.0 != run_id);
+    leases()
+        .lock()
+        .expect("leases")
+        .retain(|rid, _| rid.0 != run_id);
     let refreshed = store::list_run_items(ctx.storage.conn(), &run_id)?;
     // Interrupted runs PAUSE first (janitor two-pass), then the terminal
     // derivation may promote the pause to a sealed terminal state.

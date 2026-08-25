@@ -56,7 +56,11 @@ fn ready() -> (TestCtx, DaemonProcess, String) {
 #[test]
 fn every_schema_action_routes_to_a_handler() {
     let actions = canonical_actions();
-    assert_eq!(actions.len(), 24, "canonical v1 matrix size (21 + TICKET-0130 additions)");
+    assert_eq!(
+        actions.len(),
+        24,
+        "canonical v1 matrix size (21 + TICKET-0130 additions)"
+    );
 
     let (_ctx, mut proc, endpoint) = ready();
     let (mut agent, agent_cred) = connected_client(&endpoint, "cli").expect("agent client");
@@ -138,7 +142,10 @@ fn every_schema_action_routes_to_a_handler() {
     let run3 = agent
         .call(
             "run/create",
-            authed(json!({ "nodeIds": [&ticket2_id], "config": {} }), &agent_cred),
+            authed(
+                json!({ "nodeIds": [&ticket2_id], "config": {} }),
+                &agent_cred,
+            ),
         )
         .expect("run three");
     let run3_id = run3["run"]["runId"].as_str().unwrap().to_string();

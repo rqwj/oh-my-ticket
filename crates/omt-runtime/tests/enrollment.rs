@@ -287,7 +287,10 @@ fn session_id_derives_nested_actor_namespace() {
             }),
         )
         .expect("session handshake");
-    let namespace = result["credential"]["actorNamespace"].as_str().unwrap().to_string();
+    let namespace = result["credential"]["actorNamespace"]
+        .as_str()
+        .unwrap()
+        .to_string();
     assert!(
         namespace.starts_with("dsh:") && namespace.ends_with("/sess_A-1"),
         "expected '<base>/sess_A-1', got {namespace}"
@@ -304,7 +307,10 @@ fn session_id_derives_nested_actor_namespace() {
             }),
         )
         .expect("fallback handshake");
-    let fallback = result["credential"]["actorNamespace"].as_str().unwrap().to_string();
+    let fallback = result["credential"]["actorNamespace"]
+        .as_str()
+        .unwrap()
+        .to_string();
     assert!(
         !fallback.contains('/'),
         "invalid sessionId must not nest: {fallback}"

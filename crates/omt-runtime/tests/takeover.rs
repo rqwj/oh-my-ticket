@@ -52,8 +52,7 @@ fn make_bridge_home(root: &Path) -> std::path::PathBuf {
         let mut conn =
             rusqlite::Connection::open(home.join(omt_storage::DB_FILE_NAME)).expect("seed conn");
         omt_storage::store::apply_open_pragmas(&conn).expect("pragmas");
-        let plan =
-            omt_storage::reindex::dry_run(&conn, storage.files()).expect("reindex dry-run");
+        let plan = omt_storage::reindex::dry_run(&conn, storage.files()).expect("reindex dry-run");
         omt_storage::reindex::execute(&mut conn, storage.files(), &plan, &SystemClock)
             .expect("reindex execute");
     }
@@ -82,7 +81,10 @@ fn takeover_acceptance_matrix() {
     let details = err.details.expect("guidance details");
     assert_eq!(details["reason"], json!("active-legacy-writer"));
     let hint = details["hint"].as_str().expect("hint");
-    assert!(hint.contains("quiescence") || hint.contains("doctor"), "{hint}");
+    assert!(
+        hint.contains("quiescence") || hint.contains("doctor"),
+        "{hint}"
+    );
 
     // ── setup for acceptances 2+3: stale bridge marker = takeable ───────
     let home = make_bridge_home(&ctx.dir.path());
@@ -109,8 +111,8 @@ fn takeover_acceptance_matrix() {
     );
 
     // ── success path + acceptance 3: legacy open refused w/ upgrade hint ─
-    let report =
-        omt_runtime::takeover::takeover_home(&runtime_dir, &home, &backups_root).expect("takeover ok");
+    let report = omt_runtime::takeover::takeover_home(&runtime_dir, &home, &backups_root)
+        .expect("takeover ok");
     assert_eq!(report["generation"], json!(2));
     let fence_raw =
         std::fs::read_to_string(home.join(home_lock::LOCK_FILE_NAME)).expect("fence marker");
@@ -131,7 +133,10 @@ fn takeover_acceptance_matrix() {
         Err(problem) => problem,
     };
     assert_eq!(attempt.code, omt_domain::error::DAEMON_OWNS_HOME);
-    let hint = details_of(&attempt)["hint"].as_str().expect("upgrade hint").to_string();
+    let hint = details_of(&attempt)["hint"]
+        .as_str()
+        .expect("upgrade hint")
+        .to_string();
     assert!(hint.contains("upgrade"), "{hint}");
 
     // And the NEW world recovers cleanly: a daemon boot takes the home.
@@ -143,7 +148,10 @@ fn takeover_acceptance_matrix() {
             break;
         }
         if !proc.is_alive() {
-            panic!("daemon could not take over fenced home: {}", proc.stderr_text());
+            panic!(
+                "daemon could not take over fenced home: {}",
+                proc.stderr_text()
+            );
         }
         if std::time::Instant::now() > deadline {
             panic!("no descriptor within 20s after takeover fence");
@@ -152,7 +160,9 @@ fn takeover_acceptance_matrix() {
     }
 
     // The taken-over home serves real data through RPC.
-    let endpoint = common::Descriptor::read(&ctx.runtime_dir).expect("descriptor").endpoint;
+    let endpoint = common::Descriptor::read(&ctx.runtime_dir)
+        .expect("descriptor")
+        .endpoint;
     let (mut client, cred) = connected_client(&endpoint, "cli").expect("client");
     let tree = client
         .call("node/tree", authed(json!({}), &cred))

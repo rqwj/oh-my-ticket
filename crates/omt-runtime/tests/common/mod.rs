@@ -89,7 +89,11 @@ fn reaper_track_runtime_dir(dir: PathBuf) {
 fn reaper_track_pid(pid: u32) -> i32 {
     install_reaper_hook();
     let state = reaper();
-    state.pids.lock().expect("reaper pids lock").insert(pid as i32);
+    state
+        .pids
+        .lock()
+        .expect("reaper pids lock")
+        .insert(pid as i32);
     pid as i32
 }
 

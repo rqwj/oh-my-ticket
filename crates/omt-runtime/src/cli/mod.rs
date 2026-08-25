@@ -1228,8 +1228,9 @@ fn offline_doctor(globals: &GlobalArgs, args: &[String]) -> CliResult<()> {
 fn offline_takeover(globals: &GlobalArgs, args: &[String]) -> CliResult<()> {
     let home = offline_home_path(args)?;
     let runtime_dir = crate::paths::resolve(globals.runtime_dir.as_deref());
-    let backups_root = std::path::PathBuf::from(crate::paths::resolve(globals.runtime_dir.as_deref()))
-        .join("backups");
+    let backups_root =
+        std::path::PathBuf::from(crate::paths::resolve(globals.runtime_dir.as_deref()))
+            .join("backups");
     let report = crate::takeover::takeover_home(&runtime_dir, &home, &backups_root)
         .map_err(CliError::Problem)?;
     print_result(report, globals.json)

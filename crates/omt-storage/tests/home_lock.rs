@@ -250,20 +250,14 @@ fn dead_daemon_marker_auto_recovers_for_new_world() {
     drop(a); // crash: fd closed (flock released), marker remains
 
     clock.advance(3_600_000); // an hour later
-    // TICKET-0124: the un-flocked marker is a tombstone — the next daemon
-    // acquirer recovers it without manual tooling (D1: no user-visible gap).
+                              // TICKET-0124: the un-flocked marker is a tombstone — the next daemon
+                              // acquirer recovers it without manual tooling (D1: no user-visible gap).
     let b = acquire(&home, &daemon_cfg(), clock.clone()).expect("auto-recovered");
     b.release().unwrap();
 
     // A LEGACY writer over a daemon marker is still fenced with guidance:
-    write_marker(
-        &home,
-        &body_of("daemon", T0_MS - 3_600_000, "fence-token"),
-    );
-    let problem = expect_problem(
-        acquire(&home, &ts_bridge_cfg(), clock),
-        "DAEMON_OWNS_HOME",
-    );
+    write_marker(&home, &body_of("daemon", T0_MS - 3_600_000, "fence-token"));
+    let problem = expect_problem(acquire(&home, &ts_bridge_cfg(), clock), "DAEMON_OWNS_HOME");
     assert!(problem.details.unwrap()["hint"].is_string());
 }
 

@@ -92,22 +92,19 @@ fn cjk_ancestor_body_truncates_on_char_boundary_without_panicking() {
         .expect("claim must not panic on CJK ancestor truncation");
 
     // The home thread survived: daemon still answers.
-    assert!(
-        proc.is_alive(),
-        "daemon died: {}",
-        proc.stderr_text()
-    );
+    assert!(proc.is_alive(), "daemon died: {}", proc.stderr_text());
     let context = &claim["context"];
-    let ancestors = context["ancestors"]
-        .as_array()
-        .expect("ancestors array");
+    let ancestors = context["ancestors"].as_array().expect("ancestors array");
     let entry = ancestors
         .iter()
         .find(|a| a["truncated"] == json!(true))
         .expect("the oversized CJK ancestor is present and truncated");
     let body = entry["body"].as_str().expect("ancestor body string");
     // Included bytes must sit on a char boundary: re-encode round-trips.
-    assert_eq!(body.len(), entry["includedBytes"].as_u64().unwrap() as usize);
+    assert_eq!(
+        body.len(),
+        entry["includedBytes"].as_u64().unwrap() as usize
+    );
     assert!(std::str::from_utf8(body.as_bytes()).is_ok());
     assert!(entry["includedBytes"].as_u64().unwrap() <= 16 * 1024);
 

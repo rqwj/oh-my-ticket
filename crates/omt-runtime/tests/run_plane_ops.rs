@@ -41,7 +41,10 @@ fn add_members_nudge_and_interrupt_semantics() {
     let (mut client, cred) = connected_client(&endpoint, "cli").expect("client");
 
     let epic = client
-        .call("node/create", authed(json!({ "type": "epic", "title": "ops epic" }), &cred))
+        .call(
+            "node/create",
+            authed(json!({ "type": "epic", "title": "ops epic" }), &cred),
+        )
         .expect("epic");
     let story = client
         .call(
@@ -53,7 +56,8 @@ fn add_members_nudge_and_interrupt_semantics() {
         )
         .expect("story");
     let parent_id = story["node"]["nodeId"].as_str().unwrap().to_string();
-    let mk_ticket = |title: &str| json!({ "type": "ticket", "title": title, "parentId": parent_id });
+    let mk_ticket =
+        |title: &str| json!({ "type": "ticket", "title": title, "parentId": parent_id });
     let t1 = client
         .call("node/create", authed(mk_ticket("ops one").clone(), &cred))
         .expect("t1");
@@ -98,7 +102,10 @@ fn add_members_nudge_and_interrupt_semantics() {
     let late = client
         .call(
             "run/add-members",
-            authed(json!({ "runId": run_id, "nodeIds": [epic["node"]["nodeId"]] }), &cred),
+            authed(
+                json!({ "runId": run_id, "nodeIds": [epic["node"]["nodeId"]] }),
+                &cred,
+            ),
         )
         .unwrap_err();
     assert_eq!(problem_of(&late), "INVALID_INPUT");
@@ -132,10 +139,7 @@ fn add_members_nudge_and_interrupt_semantics() {
 
     // ── interrupt: in-flight demotion + terminal derivation ─────────────
     let interrupted = client
-        .call(
-            "run/interrupt",
-            authed(json!({ "runId": run_id }), &cred),
-        )
+        .call("run/interrupt", authed(json!({ "runId": run_id }), &cred))
         .expect("interrupt");
     assert_eq!(interrupted["interrupted"], json!([t1_id]));
     // Interrupted run pauses with one interrupted + one pending member.

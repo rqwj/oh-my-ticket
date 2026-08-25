@@ -120,10 +120,7 @@ struct Session {
 fn connect_session(endpoint: &str, kind: &str) -> Session {
     let (client, credential) = connected_client(endpoint, kind)
         .unwrap_or_else(|err| panic!("connect+enroll as {kind}: {err:?}"));
-    Session {
-        client,
-        credential,
-    }
+    Session { client, credential }
 }
 
 impl Session {
@@ -159,10 +156,9 @@ fn problem_code(err: &RpcError) -> String {
 
 fn problem_rule(err: &RpcError) -> String {
     match err {
-        RpcError::Problem { details, .. } => details["rule"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string(),
+        RpcError::Problem { details, .. } => {
+            details["rule"].as_str().unwrap_or_default().to_string()
+        }
         RpcError::Io(_) => String::new(),
     }
 }
@@ -248,8 +244,7 @@ struct Topology {
 fn seed_topology(endpoint: &str, scale: Scale, home_ids: &[String]) -> Topology {
     let homes = home_ids.len();
     let seeders = homes.min(8);
-    let partials: Vec<Mutex<Option<PartialHome>>> =
-        (0..homes).map(|_| Mutex::new(None)).collect();
+    let partials: Vec<Mutex<Option<PartialHome>>> = (0..homes).map(|_| Mutex::new(None)).collect();
     let partials_ref = &partials;
     std::thread::scope(|scope| {
         for seeder in 0..seeders {
@@ -300,7 +295,11 @@ fn seed_one_home(session: &mut Session, home_id: &str, scale: Scale) -> PartialH
     };
     let epic = create(
         session,
-        hp(&cred, home_id, json!({ "type": "epic", "title": format!("gate epic {home_id}") })),
+        hp(
+            &cred,
+            home_id,
+            json!({ "type": "epic", "title": format!("gate epic {home_id}") }),
+        ),
         "seed epic",
     );
     let story_a = create(
@@ -366,7 +365,11 @@ fn seed_one_home(session: &mut Session, home_id: &str, scale: Scale) -> PartialH
         let run_id = created["run"]["runId"].as_str().expect("runId").to_string();
         session.must(
             "run/control",
-            hp(&cred, home_id, json!({ "runId": run_id, "action": "start" })),
+            hp(
+                &cred,
+                home_id,
+                json!({ "runId": run_id, "action": "start" }),
+            ),
             "seed run start",
         );
         runs.push(run_id);
@@ -503,17 +506,14 @@ fn storm_worker(
                         }),
                     ) {
                         Ok(view) => {
-                            let node_id =
-                                view["node"]["nodeId"].as_str().expect("id").to_string();
+                            let node_id = view["node"]["nodeId"].as_str().expect("id").to_string();
                             scratch.push((h, node_id.clone()));
                             apply(ledger, move |ledger| {
                                 ledger.creates.push((h, node_id, title))
                             });
                         }
                         Err(err) => apply(ledger, move |ledger| {
-                            ledger.violation(format!(
-                                "[w{worker}] scratch create failed: {err:?}"
-                            ))
+                            ledger.violation(format!("[w{worker}] scratch create failed: {err:?}"))
                         }),
                     }
                 } else {
@@ -530,14 +530,25 @@ fn storm_worker(
                     let node_id = owned[rng.below(owned.len())].clone();
                     let target = {
                         let guard = ledger.lock().expect("ledger");
-                        match guard.moves.get(&(h, node_id.clone())).and_then(|t| t.last().cloned()) {
+                        match guard
+                            .moves
+                            .get(&(h, node_id.clone()))
+                            .and_then(|t| t.last().cloned())
+                        {
                             Some(last) if last == topo.story_b[h] => topo.story_a[h].clone(),
                             _ => topo.story_b[h].clone(),
                         }
                     };
-                    match send("node/move", json!({ "nodeId": node_id, "newParentId": target })) {
+                    match send(
+                        "node/move",
+                        json!({ "nodeId": node_id, "newParentId": target }),
+                    ) {
                         Ok(_) => apply(ledger, move |ledger| {
-                            ledger.moves.entry((h, node_id.clone())).or_default().push(target)
+                            ledger
+                                .moves
+                                .entry((h, node_id.clone()))
+                                .or_default()
+                                .push(target)
                         }),
                         Err(err) if problem_code(&err) == "CONFLICT" => {
                             assert_eq!(
@@ -547,9 +558,7 @@ fn storm_worker(
                             );
                         }
                         Err(err) => apply(ledger, move |ledger| {
-                            ledger.violation(format!(
-                                "[w{worker}] scratch move failed: {err:?}"
-                            ))
+                            ledger.violation(format!("[w{worker}] scratch move failed: {err:?}"))
                         }),
                     }
                 }
@@ -560,7 +569,9 @@ fn storm_worker(
                     let guard = ledger.lock().expect("ledger");
                     scratch
                         .iter()
-                        .filter(|(sh, id)| *sh == h && !guard.archives.contains(&(h, (*id).clone())))
+                        .filter(|(sh, id)| {
+                            *sh == h && !guard.archives.contains(&(h, (*id).clone()))
+                        })
                         .map(|(_, id)| id.clone())
                         .collect()
                 };
@@ -570,9 +581,7 @@ fn storm_worker(
                             ledger.archives.insert((h, node_id.clone()));
                         }),
                         Err(err) => apply(ledger, move |ledger| {
-                            ledger.violation(format!(
-                                "[w{worker}] scratch archive failed: {err:?}"
-                            ))
+                            ledger.violation(format!("[w{worker}] scratch archive failed: {err:?}"))
                         }),
                     }
                 }
@@ -599,10 +608,12 @@ fn storm_worker(
             // search (3/20)
             16..=18 => match send("node/search", json!({ "query": "gate", "limit": 20 })) {
                 Ok(view) => {
-                    if view["nodes"].as_array().is_some_and(|nodes| nodes.is_empty()) {
+                    if view["nodes"]
+                        .as_array()
+                        .is_some_and(|nodes| nodes.is_empty())
+                    {
                         apply(ledger, |ledger| {
-                            ledger
-                                .violation(format!("[w{worker}] search empty on a full home"))
+                            ledger.violation(format!("[w{worker}] search empty on a full home"))
                         });
                     }
                 }
@@ -641,7 +652,9 @@ fn storm_worker(
                                 }),
                             ) {
                                 Ok(_) => apply(ledger, move |ledger| {
-                                    ledger.reports.push((h, run_id.clone(), item.clone(), "done"))
+                                    ledger
+                                        .reports
+                                        .push((h, run_id.clone(), item.clone(), "done"))
                                 }),
                                 Err(err) => apply(ledger, move |ledger| {
                                     ledger.violation(format!(
@@ -699,7 +712,11 @@ fn fence_phase(endpoint: &str, topo: &Topology) {
 
     // Pick the first PENDING item (never touched by the storm's claims —
     // storm-reported items are already done).
-    let view = executor.must("run/get", hp(&executor.credential, &home_id, json!({ "runId": run_id })), "run/get");
+    let view = executor.must(
+        "run/get",
+        hp(&executor.credential, &home_id, json!({ "runId": run_id })),
+        "run/get",
+    );
     let item = view["items"]
         .as_array()
         .expect("items")
@@ -883,9 +900,7 @@ fn sql_stats(db_path: &std::path::Path) -> HomeSqlStats {
             "SELECT COUNT(DISTINCT command_id) FROM operations",
         ),
         journal_rows: scalar("SELECT COUNT(*) FROM journal"),
-        journal_distinct_command_ids: scalar(
-            "SELECT COUNT(DISTINCT command_id) FROM journal",
-        ),
+        journal_distinct_command_ids: scalar("SELECT COUNT(DISTINCT command_id) FROM journal"),
         journal_not_acknowledged: scalar(
             "SELECT COUNT(*) FROM journal WHERE phase <> 'acknowledged'",
         ),
@@ -895,12 +910,11 @@ fn sql_stats(db_path: &std::path::Path) -> HomeSqlStats {
 }
 
 fn open_readonly(db_path: &std::path::Path) -> rusqlite::Connection {
-    let conn = rusqlite::Connection::open_with_flags(
-        db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .unwrap_or_else(|err| panic!("readonly open {}: {err}", db_path.display()));
-    conn.busy_timeout(Duration::from_secs(5)).expect("busy timeout");
+    let conn =
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap_or_else(|err| panic!("readonly open {}: {err}", db_path.display()));
+    conn.busy_timeout(Duration::from_secs(5))
+        .expect("busy timeout");
     conn
 }
 
@@ -963,10 +977,7 @@ fn gate_envelope_multi_client_correctness() {
     let seed_s = phase.elapsed().as_secs_f32();
     eprintln!(
         "[envelope] seeded {} homes × {} nodes (+ {}×{} run members) in {seed_s:.2}s",
-        scale.homes,
-        scale.nodes_per_home,
-        scale.runs_per_home,
-        scale.items_per_run
+        scale.homes, scale.nodes_per_home, scale.runs_per_home, scale.items_per_run
     );
 
     // ── phase B: synchronized revision-COMB (CONFLICT exactly-when) ─────
@@ -986,7 +997,11 @@ fn gate_envelope_multi_client_correctness() {
                     for (h, node_id) in conflict_nodes.iter().enumerate() {
                         let view = session.must(
                             "node/get",
-                            hp(&session.credential, &home_ids[h], json!({ "nodeId": node_id })),
+                            hp(
+                                &session.credential,
+                                &home_ids[h],
+                                json!({ "nodeId": node_id }),
+                            ),
                             "comb pre-read",
                         );
                         let revision = view["node"]["revision"].as_i64().expect("revision");
@@ -1124,7 +1139,10 @@ fn verify_envelope(
     let mut get_node = |home: &str, node_id: &str, context: &str| -> Value {
         session
             .client
-            .call("node/get", hp(&credential, home, json!({ "nodeId": node_id })))
+            .call(
+                "node/get",
+                hp(&credential, home, json!({ "nodeId": node_id })),
+            )
             .unwrap_or_else(|err| panic!("{context}: {err:?}"))
     };
 
@@ -1248,11 +1266,9 @@ fn verify_envelope(
                 .unwrap_or_else(|err| panic!("run/get {run_id}: {err:?}"));
             for entry in view["items"].as_array().expect("items") {
                 let node_id = entry["nodeId"].as_str().expect("nodeId");
-                if ledger
-                    .reports
-                    .iter()
-                    .any(|(rh, r, item, outcome)| *rh == h && r == run_id && item == node_id && *outcome == "done")
-                {
+                if ledger.reports.iter().any(|(rh, r, item, outcome)| {
+                    *rh == h && r == run_id && item == node_id && *outcome == "done"
+                }) {
                     assert_eq!(
                         entry["state"],
                         json!("done"),
@@ -1298,7 +1314,11 @@ fn verify_envelope(
                 .expect("diag prepare");
             let odd: Vec<String> = stmt
                 .query_map([], |row| {
-                    Ok(format!("{}: {}", row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    Ok(format!(
+                        "{}: {}",
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?
+                    ))
                 })
                 .expect("diag query")
                 .filter_map(Result::ok)
@@ -1307,7 +1327,11 @@ fn verify_envelope(
                 "home {index}: node count diverged (expected {expected_nodes}, got {}) — \
                  creates recorded on this home: {}; non-scheme rows: {odd:?}",
                 stats.nodes_count,
-                ledger.creates.iter().filter(|(h, _, _)| *h == index).count(),
+                ledger
+                    .creates
+                    .iter()
+                    .filter(|(h, _, _)| *h == index)
+                    .count(),
             );
         }
         assert!(
@@ -1415,12 +1439,13 @@ fn inject_pending_journal_states(home: &std::path::Path, epic_id: &str, ticket_i
         pending >= 2,
         "expected the injected pending journal rows, found {pending}"
     );
-    eprintln!("[sigkill] pending journal rows at respawn: {pending} (2 injected + {} left by the kill)", pending - 2);
+    eprintln!(
+        "[sigkill] pending journal rows at respawn: {pending} (2 injected + {} left by the kill)",
+        pending - 2
+    );
     // Release the flock AND unlink our marker explicitly — Storage has no
     // Drop; a leftover live-pid marker would make the successor refuse.
-    storage
-        .release_lock()
-        .expect("release injection lock");
+    storage.release_lock().expect("release injection lock");
     drop(storage);
 }
 
@@ -1538,50 +1563,50 @@ fn gate_sigkill_to_ready_under_five_seconds() {
 
     // Daemon #1 serves the active home.
     let first = DaemonProcess::spawn(&ctx, &["--home", home_str]);
-    let first_descriptor = wait_for_descriptor(&ctx.runtime_dir, Duration::from_secs(30))
-        .expect("first daemon ready");
+    let first_descriptor =
+        wait_for_descriptor(&ctx.runtime_dir, Duration::from_secs(30)).expect("first daemon ready");
     let endpoint = first_descriptor.endpoint.clone();
 
     // Seed baseline content through honest RPC.
     let mut seeder = connect_session(&endpoint, "cli");
     let seed_cred = seeder.credential.clone();
-    let epic_id = seeder
-        .must(
-            "node/create",
-            authed(json!({ "type": "epic", "title": "sigkill epic" }), &seed_cred),
-            "epic",
-        )["node"]["nodeId"]
+    let epic_id = seeder.must(
+        "node/create",
+        authed(
+            json!({ "type": "epic", "title": "sigkill epic" }),
+            &seed_cred,
+        ),
+        "epic",
+    )["node"]["nodeId"]
         .as_str()
         .expect("id")
         .to_string();
-    let story_id = seeder
-        .must(
-            "node/create",
-            authed(
-                json!({ "type": "story", "title": "sigkill story", "parentId": epic_id }),
-                &seed_cred,
-            ),
-            "story",
-        )["node"]["nodeId"]
+    let story_id = seeder.must(
+        "node/create",
+        authed(
+            json!({ "type": "story", "title": "sigkill story", "parentId": epic_id }),
+            &seed_cred,
+        ),
+        "story",
+    )["node"]["nodeId"]
         .as_str()
         .expect("id")
         .to_string();
     let mut tickets = Vec::new();
     for index in 0..12 {
         tickets.push(
-            seeder
-                .must(
-                    "node/create",
-                    authed(
-                        json!({
-                            "type": "ticket",
-                            "title": format!("sigkill ticket {index}"),
-                            "parentId": story_id,
-                        }),
-                        &seed_cred,
-                    ),
-                    "ticket",
-                )["node"]["nodeId"]
+            seeder.must(
+                "node/create",
+                authed(
+                    json!({
+                        "type": "ticket",
+                        "title": format!("sigkill ticket {index}"),
+                        "parentId": story_id,
+                    }),
+                    &seed_cred,
+                ),
+                "ticket",
+            )["node"]["nodeId"]
                 .as_str()
                 .expect("id")
                 .to_string(),
@@ -1617,7 +1642,9 @@ fn gate_sigkill_to_ready_under_five_seconds() {
                     }
                     let outcome = {
                         let (ref mut client, ref credential) = *client.borrow_mut();
-                        hammer_step(client, credential, story_ref, &tickets, &mut rng, worker, &counter)
+                        hammer_step(
+                            client, credential, story_ref, &tickets, &mut rng, worker, &counter,
+                        )
                     };
                     match outcome {
                         Ok(Some(step)) => {
@@ -1687,14 +1714,17 @@ fn gate_sigkill_to_ready_under_five_seconds() {
     let mut ready_ms: Option<u128> = None;
     let mut second_endpoint = String::new();
     while respawn_at.elapsed() < Duration::from_secs(10) {
-        if let Some(descriptor) = wait_for_descriptor(&ctx.runtime_dir, Duration::from_millis(100)) {
+        if let Some(descriptor) = wait_for_descriptor(&ctx.runtime_dir, Duration::from_millis(100))
+        {
             if descriptor.generation <= first_descriptor.generation {
                 continue; // stale predecessor descriptor
             }
-            if let Ok((mut client, credential)) = connected_client(&descriptor.endpoint, "external") {
-                if let Ok(view) =
-                    client.call("node/get", authed(json!({ "nodeId": epic_id }), &credential))
-                {
+            if let Ok((mut client, credential)) = connected_client(&descriptor.endpoint, "external")
+            {
+                if let Ok(view) = client.call(
+                    "node/get",
+                    authed(json!({ "nodeId": epic_id }), &credential),
+                ) {
                     if view["node"]["title"].as_str() == Some(expected_epic_title) {
                         ready_ms = Some(respawn_at.elapsed().as_millis());
                         second_endpoint = descriptor.endpoint.clone();

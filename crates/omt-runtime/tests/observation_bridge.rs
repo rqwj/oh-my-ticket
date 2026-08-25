@@ -35,7 +35,10 @@ fn terminal_report_broadcasts_to_sibling_active_run() {
     let (mut client, cred) = connected_client(&endpoint, "cli").expect("client");
 
     let epic = client
-        .call("node/create", authed(json!({ "type": "epic", "title": "obs epic" }), &cred))
+        .call(
+            "node/create",
+            authed(json!({ "type": "epic", "title": "obs epic" }), &cred),
+        )
         .expect("epic");
     let story = client
         .call(

@@ -85,10 +85,7 @@ struct BenchSession {
 fn connect_session(endpoint: &str, kind: &str) -> BenchSession {
     let (client, credential) = connected_client(endpoint, kind)
         .unwrap_or_else(|err| panic!("connect+enroll as {kind}: {err:?}"));
-    BenchSession {
-        client,
-        credential,
-    }
+    BenchSession { client, credential }
 }
 
 /// Spawn one daemon over one fresh home; returns the endpoint.
@@ -232,15 +229,11 @@ fn bench_b1_ten_k_mixed_stress() {
                         match rng.below(3) {
                             0 => session.client.call(
                                 "node/search",
-                                authed(
-                                    json!({ "query": "b1", "limit": 50 }),
-                                    &session.credential,
-                                ),
+                                authed(json!({ "query": "b1", "limit": 50 }), &session.credential),
                             ),
-                            1 => session.client.call(
-                                "node/tree",
-                                authed(json!({}), &session.credential),
-                            ),
+                            1 => session
+                                .client
+                                .call("node/tree", authed(json!({}), &session.credential)),
                             _ => session.client.call(
                                 "node/list",
                                 authed(
@@ -269,10 +262,16 @@ fn bench_b1_ten_k_mixed_stress() {
     let wall_s = started.elapsed().as_secs_f64();
     let samples = latencies.into_inner().expect("latencies");
     let mut all: Vec<f64> = samples.iter().map(|(ms, _)| *ms).collect();
-    let mut mutations: Vec<f64> =
-        samples.iter().filter(|(_, m)| *m).map(|(ms, _)| *ms).collect();
-    let mut queries: Vec<f64> =
-        samples.iter().filter(|(_, m)| !*m).map(|(ms, _)| *ms).collect();
+    let mut mutations: Vec<f64> = samples
+        .iter()
+        .filter(|(_, m)| *m)
+        .map(|(ms, _)| *ms)
+        .collect();
+    let mut queries: Vec<f64> = samples
+        .iter()
+        .filter(|(_, m)| !*m)
+        .map(|(ms, _)| *ms)
+        .collect();
     let throughput = TOTAL as f64 / wall_s;
     let failed = failures.load(Ordering::SeqCst);
     let conflicted = conflicts.load(Ordering::SeqCst);
@@ -377,10 +376,7 @@ fn bench_b2_soak() {
                         match rng.below(4) {
                             0 => session.client.call(
                                 "node/search",
-                                authed(
-                                    json!({ "query": "b2", "limit": 30 }),
-                                    &session.credential,
-                                ),
+                                authed(json!({ "query": "b2", "limit": 30 }), &session.credential),
                             ),
                             1 | 2 => session.client.call(
                                 "node/list",
@@ -419,10 +415,16 @@ fn bench_b2_soak() {
     let total_commands = samples.len();
     let throughput = total_commands as f64 / wall_s;
     let mut all: Vec<f64> = samples.iter().map(|(ms, _)| *ms).collect();
-    let mut interactive: Vec<f64> =
-        samples.iter().filter(|(_, m)| !*m).map(|(ms, _)| *ms).collect();
-    let mut mutations: Vec<f64> =
-        samples.iter().filter(|(_, m)| *m).map(|(ms, _)| *ms).collect();
+    let mut interactive: Vec<f64> = samples
+        .iter()
+        .filter(|(_, m)| !*m)
+        .map(|(ms, _)| *ms)
+        .collect();
+    let mut mutations: Vec<f64> = samples
+        .iter()
+        .filter(|(_, m)| *m)
+        .map(|(ms, _)| *ms)
+        .collect();
     let p95_interactive = percentile(&mut interactive, 0.95);
     let failed = failures.load(Ordering::SeqCst);
     let conflicted = conflicts.load(Ordering::SeqCst);
@@ -545,7 +547,10 @@ fn bench_b3_hundred_k_events_resume() {
         if events.is_empty() {
             break;
         }
-        cursor = events.last().and_then(|e| e["cursor"].as_i64()).expect("cursor");
+        cursor = events
+            .last()
+            .and_then(|e| e["cursor"].as_i64())
+            .expect("cursor");
         consumed += events.len() as i64;
         pages += 1;
         if consumed >= DELTA || cursor >= RETAINED {

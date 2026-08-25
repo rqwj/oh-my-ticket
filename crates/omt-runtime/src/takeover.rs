@@ -17,7 +17,9 @@ use crate::descriptor::pid_live;
 use omt_domain::error;
 use omt_storage::backup::{backup_home, restore_home};
 use omt_storage::clock::{iso_from_ms, parse_iso_ms, MillisClock, SystemClock};
-use omt_storage::home_lock::{LockBody, OwnerKind, DEFAULT_STALE_MS, LOCK_FILE_NAME, LOCK_SCHEMA_VERSION};
+use omt_storage::home_lock::{
+    LockBody, OwnerKind, DEFAULT_STALE_MS, LOCK_FILE_NAME, LOCK_SCHEMA_VERSION,
+};
 use omt_storage::journal::OpenConfig;
 use omt_storage::{store, Problem, Result};
 use std::path::Path;
@@ -38,7 +40,11 @@ pub enum FaultPoint {
 
 /// Take over one bridge-era home end-to-end. Offline verb: the caller must
 /// ensure no live daemon serves the runtime dir (`refuse_if_served`).
-pub fn takeover_home(runtime_dir: &Path, home: &Path, backups_root: &Path) -> Result<serde_json::Value> {
+pub fn takeover_home(
+    runtime_dir: &Path,
+    home: &Path,
+    backups_root: &Path,
+) -> Result<serde_json::Value> {
     run(runtime_dir, home, backups_root, None)
 }
 
@@ -110,7 +116,11 @@ fn run(
         // Generation fence: future readers may refuse writers below the
         // floor; legacy writers simply ignore the key (and are fenced by
         // the marker left behind below).
-        store::set_meta(storage.conn(), TAKEOVER_GENERATION_KEY, &TAKEOVER_GENERATION.to_string())?;
+        store::set_meta(
+            storage.conn(),
+            TAKEOVER_GENERATION_KEY,
+            &TAKEOVER_GENERATION.to_string(),
+        )?;
         storage.release_lock()?;
 
         // ── 3. persistent fence for legacy writers ──────────────────────
@@ -139,7 +149,10 @@ fn run(
                     let db = home.join(format!("{}{suffix}", omt_storage::DB_FILE_NAME));
                     if db.exists() {
                         std::fs::remove_file(&db).map_err(|err| {
-                            Problem::new(error::IO, format!("rollback remove {}: {err}", db.display()))
+                            Problem::new(
+                                error::IO,
+                                format!("rollback remove {}: {err}", db.display()),
+                            )
                         })?;
                     }
                 }
@@ -147,9 +160,11 @@ fn run(
                 // Restore the pre-takeover marker verbatim (runtime state,
                 // never captured by the bundle).
                 match &marker_before {
-                    Some(text) => std::fs::write(home.join(LOCK_FILE_NAME), text).map_err(|err| {
-                        Problem::new(error::IO, format!("rollback restore marker: {err}"))
-                    })?,
+                    Some(text) => {
+                        std::fs::write(home.join(LOCK_FILE_NAME), text).map_err(|err| {
+                            Problem::new(error::IO, format!("rollback restore marker: {err}"))
+                        })?
+                    }
                     None => {
                         let _ = std::fs::remove_file(home.join(LOCK_FILE_NAME));
                     }
@@ -158,7 +173,10 @@ fn run(
             })();
             let mut extra = serde_json::Map::new();
             extra.insert("rolledBack".into(), serde_json::json!(rollback.is_ok()));
-            extra.insert("rollbackError".into(), serde_json::json!(rollback.err().map(|p| p.to_string())));
+            extra.insert(
+                "rollbackError".into(),
+                serde_json::json!(rollback.err().map(|p| p.to_string())),
+            );
             extra.insert("bundle".into(), bundle.display().to_string().into());
             match &mut problem.details {
                 Some(serde_json::Value::Object(existing)) => existing.extend(extra),
@@ -188,7 +206,10 @@ fn preflight(home: &Path) -> Result<()> {
                 ),
                 |d| {
                     d.insert("reason".into(), "active-daemon-writer".into());
-                    d.insert("hint".into(), "stop the serving daemon, then rerun `omt takeover`".into());
+                    d.insert(
+                        "hint".into(),
+                        "stop the serving daemon, then rerun `omt takeover`".into(),
+                    );
                 },
             ));
         }
@@ -226,7 +247,9 @@ fn read_marker(home: &Path) -> Option<serde_json::Value> {
 
 /// Remove a ts-bridge marker already proven quiescent by [`preflight`].
 fn clear_quiesced_bridge_marker(home: &Path) {
-    let Some(body) = read_marker(home) else { return };
+    let Some(body) = read_marker(home) else {
+        return;
+    };
     if body["ownerKind"].as_str() == Some("ts-bridge") {
         let _ = std::fs::remove_file(home.join(LOCK_FILE_NAME));
     }
