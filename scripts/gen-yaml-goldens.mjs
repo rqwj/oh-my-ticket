@@ -3,9 +3,18 @@
  * YAML byte-stability goldens (plan U4b).
  *
  * Generates adversarial frontmatter fixtures and records the EXACT full-file
- * bytes produced by the REAL TypeScript serializer (`src/host/markdown.ts`:
- * serializeNodeFile + renderChildrenBlock + replaceChildrenBlock, js-yaml 4
- * dump with { lineWidth: -1, noRefs: true }).
+ * bytes produced by the PINNED TypeScript serializer: serializeNodeFile +
+ * renderChildrenBlock + replaceChildrenBlock (js-yaml 4 dump with
+ * { lineWidth: -1, noRefs: true }).
+ *
+ * Post-U7a the live modules (`src/host/markdown.ts`, `src/host/files.ts`)
+ * were retired with the direct-storage path, so the script compiles the
+ * FROZEN baseline copies under `corpus/yaml-goldens/reference/` instead.
+ * Those copies are the exact sources that generated `cases.json`
+ * (extracted at `fcc444e~1`; content-identical to golden generation at
+ * `f5c218e`). They are a frozen artifact of the pinned dump conventions —
+ * edit them only to re-baseline the goldens deliberately, never to make a
+ * failing comparison pass.
  *
  * Modes:
  *   node scripts/gen-yaml-goldens.mjs            regenerate corpus/yaml-goldens/cases.json
@@ -14,7 +23,7 @@
  *
  * The TS sources are loaded through `typescript.transpileModule` (the repo's
  * own devDependency) because Node's strip-only mode rejects the parameter
- * properties in src/host/types.ts. Transpiled artifacts land under
+ * properties in the types source. Transpiled artifacts land under
  * node_modules/.omt-goldens/ so bare-specifier resolution still hits the
  * repo's js-yaml; the original sources are never modified.
  */
@@ -26,17 +35,18 @@ import ts from 'typescript'
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const cacheDir = path.join(repoRoot, 'node_modules', '.omt-goldens')
 const corpusDir = path.join(repoRoot, 'corpus', 'yaml-goldens')
+const referenceDir = path.join(corpusDir, 'reference')
 
-/** Transpile one real TS source to an ESM artifact string. */
-function transpile(relativePath) {
-  const full = path.join(repoRoot, relativePath)
+/** Transpile one frozen reference source to an ESM artifact string. */
+function transpile(fileName) {
+  const full = path.join(referenceDir, fileName)
   const source = fs.readFileSync(full, 'utf8')
   const out = ts.transpileModule(source, {
     compilerOptions: {
       module: ts.ModuleKind.ESNext,
       target: ts.ScriptTarget.ES2022,
     },
-    fileName: relativePath,
+    fileName,
   }).outputText
   // Rewrite sibling imports to the transpiled artifact names.
   return out.replaceAll("from './types.ts'", "from './types.gen.mjs'").replaceAll("from './markdown.ts'", "from './markdown.gen.mjs'")
@@ -45,9 +55,9 @@ function transpile(relativePath) {
 function loadRealSerializer() {
   fs.mkdirSync(cacheDir, { recursive: true })
   const modules = {
-    'types.gen.mjs': transpile('src/host/types.ts'),
-    'markdown.gen.mjs': transpile('src/host/markdown.ts'),
-    'files.gen.mjs': transpile('src/host/files.ts'),
+    'types.gen.mjs': transpile('types.frozen.ts'),
+    'markdown.gen.mjs': transpile('markdown.frozen.ts'),
+    'files.gen.mjs': transpile('files.frozen.ts'),
   }
   for (const [name, code] of Object.entries(modules)) {
     fs.writeFileSync(path.join(cacheDir, name), code)
