@@ -80,6 +80,14 @@ export interface ClientOptions {
    * active events() subscription from its last delivered cursor.
    */
   reconnect?: { initialDelayMs?: number; maxDelayMs?: number; enabled?: boolean }
+  /**
+   * Called after an AUTOMATIC reconnect completes its fresh handshake and
+   * BEFORE subscription replay. A daemon generation change can mint new
+   * home ids / credentials, so session-state owners (e.g. the DSH adapter's
+   * home registry) rebuild their derived state here. Listener faults are
+   * swallowed: they must not break reconnection (TICKET-0131).
+   */
+  onReconnected?: (handshake: HandshakeOutcome) => void | Promise<void>
 }
 
 export class OmtClient {
@@ -252,8 +260,19 @@ export class OmtClient {
           this.reconnectAttempt += 1
           await sleep(delay)
           try {
-            await this.connect(this.connectArgs.kind, this.connectArgs.scopes, this.connectArgs.name, this.connectArgs.sessionId)
+            const handshake = await this.connect(this.connectArgs.kind, this.connectArgs.scopes, this.connectArgs.name, this.connectArgs.sessionId)
             this.reconnectAttempt = 0
+            // TICKET-0131: hand the FRESH handshake to session-state owners
+            // BEFORE replaying subscriptions, so they can dispose state bound
+            // to dead home ids and register replacements without double
+            // delivery; surviving ids keep their cursor-based replay.
+            if (this.options.onReconnected !== undefined) {
+              try {
+                await this.options.onReconnected(handshake)
+              } catch {
+                /* a broken listener must not break reconnection */
+              }
+            }
             for (const resubscribe of [...this.resubscribers]) {
               try {
                 resubscribe()
@@ -414,6 +433,31 @@ export class OmtClient {
 
   /** Single-notification bridge wired at connect(); see events(). */
   private notificationBridge: ((method: string, params: unknown) => void) | null = null
+
+  /**
+   * Drop the live connection so the reconnect loop performs a FRESH
+   * discover-or-spawn + handshake, and resolve with the new handshake
+   * outcome. This is the state-healing path (TICKET-0132): unlike close()
+   * the client stays open for business — onReconnected fires and event
+   * subscriptions replay as after any unexpected close.
+   */
+  async forceReconnect(timeoutMs = 10_000): Promise<HandshakeOutcome> {
+    if (this.closedByCaller) throw new Error('client closed; call connect() first')
+    const transport = this.transport
+    if (transport !== null) {
+      // Clear fields BEFORE end(): onClose also resets them and schedules
+      // the reconnect; pre-clearing keeps the sequence unambiguous.
+      this.transport = null
+      this.handshakeResult = null
+      transport.end()
+    }
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      if (this.handshakeResult !== null && this.transport?.isConnected) return this.handshakeResult
+      await sleep(25)
+    }
+    throw new Error(`omt client rehandshake timed out after ${timeoutMs}ms`)
+  }
 
   /** Tear down the connection (credentials die server-side with expiry).
    *  Stops the automatic reconnect loop. */

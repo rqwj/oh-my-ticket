@@ -23,6 +23,7 @@ import { OmtClient, OmtProtocolError } from '@omt/client-ts'
 import type {
   ClaimContext,
   ClaimRunResult,
+  HandshakeOutcome,
   NodeFilter,
   NodeSummary as ProtoNodeSummary,
   NodeView,
@@ -54,6 +55,10 @@ import {
   type ShowResult,
 } from './types.ts'
 import { savedFiltersSchema } from './ui-state.ts'
+
+/** Minimum spacing between generation-change heals (TICKET-0132): bounds the
+ *  cost of a pathological stale-id loop while keeping recovery prompt. */
+const SERVICE_HEAL_COOLDOWN_MS = 30_000
 
 /**
  * One-time import of a pre-U7a `<home>/ui-filters.json` bag into
@@ -344,6 +349,14 @@ export class OmtService {
   private actorNamespace: string | undefined
   private connecting: Promise<void> | undefined
   private closed = false
+  /** Live events() disposers keyed by homeId; reconciled on every handshake. */
+  private readonly eventDisposers = new Map<string, () => void>()
+  /** Home ids from PREVIOUS daemon generations — the stale-home guardrail's
+   *  whitelist (TICKET-0132): only "our own past" heals, never strangers. */
+  private readonly knownHomeIds = new Set<string>()
+  private lastHealAttempt = 0
+  private healInFlight: Promise<void> | undefined
+  private initialLearnDone = false
 
   constructor(private readonly options: OmtServiceOptions = {}) {
     this.client = new OmtClient({
@@ -352,6 +365,9 @@ export class OmtService {
       daemonArgs: options.daemonArgs !== undefined ? [...options.daemonArgs] : undefined,
       requestTimeoutMs: options.requestTimeoutMs,
       reconnect: { initialDelayMs: 100, maxDelayMs: 5_000 },
+      // TICKET-0131: a daemon generation change mints new home ids; rebuild
+      // registry + subscriptions from the fresh handshake automatically.
+      onReconnected: handshake => this.learnRuntimeState(handshake),
     })
   }
 
@@ -414,30 +430,7 @@ export class OmtService {
   private async connect(): Promise<void> {
     try {
       const handshake = await this.client.connect('dsh', {}, this.options.name ?? 'oh-my-ticket-dsh')
-      this.actorNamespace = handshake.credential?.actorNamespace
-      const registry = new Map<string, HomeRef>()
-      let first: HomeRef | undefined
-      for (const home of handshake.homes ?? []) {
-        const ref: HomeRef = {
-          homeId: home.homeId,
-          name: home.name,
-          kind: home.kind === 'global' ? 'global' : 'workspace',
-          path: home.path,
-        }
-        first ??= ref
-        if (ref.kind === 'global') this.globalHomeRef = ref
-        registry.set(ref.homeId, ref)
-        if (ref.path !== undefined) registry.set(ref.path, ref)
-      }
-      this.globalHomeRef ??= first
-      this.homeRegistry = registry
-      this.ensureAdminGrant()
-      for (const home of handshake.homes ?? []) {
-        this.subscribeEvents(home.homeId)
-      }
-      // TICKET-0123: one-time import of pre-U7a preference files so the
-      // adapter never needs to write into a daemon-owned home again.
-      await this.migrateLegacyUiFilters(registry.values())
+      await this.learnRuntimeState(handshake)
     } catch (error) {
       // Graceful degradation: surface an actionable problem instead of a raw
       // stack — the plugin keeps loading without data ops (plan §System-Wide
@@ -447,6 +440,58 @@ export class OmtService {
         reason: 'runtime-unavailable',
         hint: 'set OMT_DAEMON to the omt-daemon binary or install it on PATH',
       })
+    }
+  }
+
+  /**
+   * Rebuild ALL handshake-derived state — home registry, actor namespace,
+   * admin grant, event subscriptions — from one handshake outcome. Runs on
+   * initial connect AND on every automatic reconnect (onReconnected), so a
+   * daemon generation change heals the adapter without an instance restart
+   * (TICKET-0131). Idempotent; subscription-safe (no double delivery).
+   */
+  private async learnRuntimeState(handshake: HandshakeOutcome): Promise<void> {
+    this.actorNamespace = handshake.credential?.actorNamespace
+    const registry = new Map<string, HomeRef>()
+    let first: HomeRef | undefined
+    let global: HomeRef | undefined
+    for (const home of handshake.homes ?? []) {
+      const ref: HomeRef = {
+        homeId: home.homeId,
+        name: home.name,
+        kind: home.kind === 'global' ? 'global' : 'workspace',
+        path: home.path,
+      }
+      first ??= ref
+      if (ref.kind === 'global') global = ref
+      registry.set(ref.homeId, ref)
+      if (ref.path !== undefined) registry.set(ref.path, ref)
+    }
+    // Archive outgoing ids BEFORE replacing the registry: the stale-home
+    // guardrail (TICKET-0132) heals only ids this service once trusted.
+    for (const prev of this.homeRegistry.values()) this.knownHomeIds.add(prev.homeId)
+    if (first !== undefined) this.globalHomeRef = global ?? first
+    this.homeRegistry = registry
+    this.ensureAdminGrant()
+    // Subscription reconcile: dispose subscriptions whose home vanished;
+    // never re-subscribe a surviving id — the client's cursor-based replay
+    // already covers it (a second events() would double-deliver).
+    for (const [id, dispose] of this.eventDisposers) {
+      if (!registry.has(id)) {
+        dispose()
+        this.eventDisposers.delete(id)
+      }
+    }
+    for (const home of handshake.homes ?? []) {
+      if (!this.eventDisposers.has(home.homeId)) this.subscribeEvents(home.homeId)
+    }
+    // TICKET-0123: one-time import of pre-U7a preference files so the
+    // adapter never needs to write into a daemon-owned home again. The
+    // imported files are renamed on success, so this is naturally once-only;
+    // the flag additionally keeps reconnects free of filesystem probing.
+    if (!this.initialLearnDone) {
+      this.initialLearnDone = true
+      await this.migrateLegacyUiFilters(registry.values())
     }
   }
 
@@ -481,7 +526,7 @@ export class OmtService {
   }
 
   private subscribeEvents(homeId: string): void {
-    this.client.events(homeId, envelope => {
+    const dispose = this.client.events(homeId, envelope => {
       const payload = envelope.payload as { kind?: string; ref?: Record<string, unknown>; state?: string } | undefined
       const kind = payload?.kind
       const ref = payload?.ref ?? {}
@@ -503,6 +548,85 @@ export class OmtService {
       // attention.raised / snapshot.resync / node.quarantined: informational.
       this.hub.bump(homeId)
     }, { onError: () => {} })
+    this.eventDisposers.set(homeId, dispose)
+  }
+
+  // ── stale-home guardrail (TICKET-0132) ────────────────────────────────
+
+  /**
+   * Extract the home id from a NOT_FOUND(kind:home) protocol error, if that
+   * is what `error` is. Any other error → undefined.
+   */
+  private staleHomeIdProblem(error: unknown): string | undefined {
+    if (!(error instanceof OmtProtocolError)) return undefined
+    if (error.problemCode !== 'NOT_FOUND') return undefined
+    const details = error.details as { kind?: unknown; id?: unknown } | null
+    if (details?.kind !== 'home') return undefined
+    return typeof details.id === 'string' && details.id !== '' ? details.id : undefined
+  }
+
+  /**
+   * Heal a daemon generation change: drop every subscription, force a fresh
+   * discover-or-spawn + handshake, rebuild state. Cooldown-guarded so a
+   * pathological caller cannot cause a handshake storm; single-flight so
+   * concurrent failures share one attempt. Within the cooldown this waits
+   * for an in-flight heal (if any) and otherwise returns immediately — the
+   * retry then simply runs against current state.
+   */
+  private async refreshAfterGenerationChange(): Promise<void> {
+    const now = Date.now()
+    if (now - this.lastHealAttempt < SERVICE_HEAL_COOLDOWN_MS) {
+      if (this.healInFlight !== undefined) await this.healInFlight.catch(() => {})
+      return
+    }
+    this.lastHealAttempt = now
+    const attempt = (async () => {
+      for (const dispose of this.eventDisposers.values()) dispose()
+      this.eventDisposers.clear()
+      const handshake = await this.client.forceReconnect(10_000)
+      await this.learnRuntimeState(handshake)
+    })()
+    this.healInFlight = attempt
+    try {
+      await attempt
+    } finally {
+      if (this.healInFlight === attempt) this.healInFlight = undefined
+    }
+  }
+
+  /**
+   * Single RPC bridge for ALL data operations: on NOT_FOUND(kind:home) with
+   * an id THIS service previously learned, heal the generation change once
+   * and retry the operation exactly once. The daemon rejects home resolution
+   * before executing anything, so the retry is effect-safe for reads AND
+   * writes. Everything else — including unknown home ids and every non-stale
+   * failure — propagates AS-IS: call sites branch on OmtProtocolError
+   * themselves (multi-home ownership probes, NOT_FOUND→undefined maps), so
+   * the bridge must not change the error contract.
+   */
+  private async rpc<T>(
+    method: string,
+    params: Record<string, unknown>,
+    hooks?: { onIssued?: (id: number) => void },
+  ): Promise<T> {
+    try {
+      return await this.client.call<T>(method, params, hooks)
+    } catch (error) {
+      const staleId = this.staleHomeIdProblem(error)
+      if (staleId === undefined || !this.knownHomeIds.has(staleId)) throw error
+      try {
+        await this.refreshAfterGenerationChange()
+      } catch {
+        // Healing itself failed (e.g. daemon still down): surface the
+        // ORIGINAL problem — it names the actual missing home.
+        throw error
+      }
+      try {
+        return await this.client.call<T>(method, params, hooks)
+      } catch (retryError) {
+        throw retryError
+      }
+    }
   }
 
   /** Fetch post-change snapshots and fan out to hook listeners. */
@@ -605,7 +729,7 @@ export class OmtService {
     let fallbackProblem: unknown
     for (const home of this.candidateHomes(cwd)) {
       try {
-        const result = await this.client.call<{ node: NodeView }>('node/get', { homeId: home.homeId, nodeId })
+        const result = await this.rpc<{ node: NodeView }>('node/get', { homeId: home.homeId, nodeId })
         return { home, node: nodeOf(result.node) }
       } catch (error) {
         fallbackProblem ??= error
@@ -625,7 +749,7 @@ export class OmtService {
     await this.ready()
     for (const home of this.candidateHomes(cwd)) {
       try {
-        await this.client.call('run/get', { homeId: home.homeId, runId })
+        await this.rpc('run/get', { homeId: home.homeId, runId })
         return home
       } catch (error) {
         if (!(error instanceof OmtProtocolError) || error.problemCode !== 'NOT_FOUND') throw wrap(error)
@@ -642,7 +766,7 @@ export class OmtService {
   ): Promise<OmtNode> {
     await this.ready()
     try {
-      const result = await this.client.call<{ node: NodeView }>('node/create', {
+      const result = await this.rpc<{ node: NodeView }>('node/create', {
         homeId: home.homeId,
         type: input.type,
         title: input.title,
@@ -664,7 +788,7 @@ export class OmtService {
         ...(filter.status !== undefined ? { status: filter.status as NodeFilter['status'] } : {}),
         ...(filter.query !== undefined ? { query: filter.query } : {}),
       }
-      const result = await this.client.call<{ nodes: ProtoNodeSummary[] }>('node/list', {
+      const result = await this.rpc<{ nodes: ProtoNodeSummary[] }>('node/list', {
         homeId: home.homeId,
         filter: protoFilter,
       })
@@ -677,7 +801,7 @@ export class OmtService {
   async showNode(id: string, cwd: string | undefined): Promise<ShowResult & { home: HomeRef; runs: Array<{ runId: string; title?: string; status: RunStatus; itemState: string; progress: Record<string, number> }> }> {
     const { home } = await this.resolveNodeHome(id, cwd)
     try {
-      const result = await this.client.call<{
+      const result = await this.rpc<{
         node: NodeView
         parent?: ProtoNodeSummary
         children: ProtoNodeSummary[]
@@ -707,7 +831,7 @@ export class OmtService {
   async getNodeIn(home: HomeRef, id: string): Promise<OmtNode | undefined> {
     await this.ready()
     try {
-      const result = await this.client.call<{ node: NodeView }>('node/get', { homeId: home.homeId, nodeId: id })
+      const result = await this.rpc<{ node: NodeView }>('node/get', { homeId: home.homeId, nodeId: id })
       return nodeOf(result.node)
     } catch (error) {
       if (error instanceof OmtProtocolError && error.problemCode === 'NOT_FOUND') return undefined
@@ -729,7 +853,7 @@ export class OmtService {
   ): Promise<{ node: OmtNode; home: HomeRef }> {
     const { home } = await this.resolveNodeHome(input.id, context.cwd)
     try {
-      const result = await this.client.call<{ node: NodeView }>('node/update', {
+      const result = await this.rpc<{ node: NodeView }>('node/update', {
         homeId: home.homeId,
         nodeId: input.id,
         changes: {
@@ -757,7 +881,7 @@ export class OmtService {
   async executeNode(id: string, context: { cwd?: string; sessionId?: string } = {}): Promise<{ node: OmtNode; home: HomeRef }> {
     const { home } = await this.resolveNodeHome(id, context.cwd)
     try {
-      const result = await this.client.call<{ node: NodeView }>('node/execute', { homeId: home.homeId, nodeId: id })
+      const result = await this.rpc<{ node: NodeView }>('node/execute', { homeId: home.homeId, nodeId: id })
       if (context.sessionId !== undefined) this.noteExecutor(id, context.sessionId)
       return { node: nodeOf(result.node), home }
     } catch (error) {
@@ -770,10 +894,10 @@ export class OmtService {
     const resolved = await this.resolveNodeHome(id, context.cwd)
     try {
       if (archived) {
-        const result = await this.client.call<{ node: NodeView }>('node/archive', { homeId: resolved.home.homeId, nodeId: id })
+        const result = await this.rpc<{ node: NodeView }>('node/archive', { homeId: resolved.home.homeId, nodeId: id })
         return { node: nodeOf(result.node), home: resolved.home }
       }
-      const result = await this.client.call<{ node: NodeView }>('node/update', {
+      const result = await this.rpc<{ node: NodeView }>('node/update', {
         homeId: resolved.home.homeId,
         nodeId: id,
         changes: { archived: false },
@@ -791,7 +915,7 @@ export class OmtService {
       throw new Error('omt_move 不支持跨 home 移动（节点与目标父节点不在同一个 OMT home）')
     }
     try {
-      const result = await this.client.call<{ node: NodeView }>('node/move', {
+      const result = await this.rpc<{ node: NodeView }>('node/move', {
         homeId: home.homeId,
         nodeId: id,
         newParentId,
@@ -805,7 +929,7 @@ export class OmtService {
   async reindex(home: HomeRef): Promise<ReindexResult> {
     await this.ready()
     try {
-      const result = await this.client.call<{ nodes: number; edges: number; skipped: number }>('home/reindex', {
+      const result = await this.rpc<{ nodes: number; edges: number; skipped: number }>('home/reindex', {
         homeId: home.homeId,
       })
       return { nodes: result.nodes, edges: result.edges, skipped: result.skipped }
@@ -817,7 +941,7 @@ export class OmtService {
   async tree(home: HomeRef, rootId?: string): Promise<OmtTreeNode[]> {
     await this.ready()
     try {
-      const result = await this.client.call<{ trees: TreeNode[] }>('node/tree', {
+      const result = await this.rpc<{ trees: TreeNode[] }>('node/tree', {
         homeId: home.homeId,
         ...(rootId !== undefined ? { rootId } : {}),
       })
@@ -834,7 +958,7 @@ export class OmtService {
   ): Promise<Array<{ id: string; type: ProtoNodeSummary['type']; title: string; status: ProtoNodeSummary['status']; archived: boolean; priority: number }>> {
     await this.ready()
     try {
-      const result = await this.client.call<{ nodes: ProtoNodeSummary[] }>('node/search', {
+      const result = await this.rpc<{ nodes: ProtoNodeSummary[] }>('node/search', {
         homeId: home.homeId,
         query,
         limit,
@@ -860,7 +984,7 @@ export class OmtService {
   ): Promise<{ run: OmtRun; items: OmtRunItem[] }> {
     await this.ready()
     try {
-      const result = await this.client.call<{ run: RunView; items: RunItemView[] }>('run/create', {
+      const result = await this.rpc<{ run: RunView; items: RunItemView[] }>('run/create', {
         homeId: home.homeId,
         ...(input.title !== undefined ? { title: input.title } : {}),
         ...(input.config !== undefined ? { config: input.config } : {}),
@@ -878,7 +1002,7 @@ export class OmtService {
   async listRuns(home: HomeRef, status?: RunStatus): Promise<OmtRun[]> {
     await this.ready()
     try {
-      const result = await this.client.call<{ runs: RunView[] }>('run/list', {
+      const result = await this.rpc<{ runs: RunView[] }>('run/list', {
         homeId: home.homeId,
         ...(status !== undefined ? { status: status as ProtoRunStatus } : {}),
       })
@@ -895,7 +1019,7 @@ export class OmtService {
   async listRunSummaries(home: HomeRef, status?: RunStatus): Promise<Array<{ run: OmtRun; progress: Record<string, number> }>> {
     await this.ready()
     try {
-      const result = await this.client.call<{ runs: RunView[] }>('run/list', {
+      const result = await this.rpc<{ runs: RunView[] }>('run/list', {
         homeId: home.homeId,
         ...(status !== undefined ? { status: status as ProtoRunStatus } : {}),
       })
@@ -913,7 +1037,7 @@ export class OmtService {
     await this.ready()
     const homeId = typeof homeOrId === 'string' ? homeOrId : homeOrId.homeId
     try {
-      const result = await this.client.call<{ run: RunView; items: RunItemView[] }>('run/get', { homeId, runId })
+      const result = await this.rpc<{ run: RunView; items: RunItemView[] }>('run/get', { homeId, runId })
       return {
         run: runOf(result.run),
         items: (result.items ?? [])
@@ -937,7 +1061,7 @@ export class OmtService {
       // The daemon answers every control action with the full run view
       // ({run, items}); a retry/remove response's controlled item is the
       // membership row matching nodeId.
-      const result = await this.client.call<{ run: RunView; items?: RunItemView[] }>('run/control', {
+      const result = await this.rpc<{ run: RunView; items?: RunItemView[] }>('run/control', {
         homeId,
         runId,
         action,
@@ -965,7 +1089,7 @@ export class OmtService {
     const homeId = typeof homeOrId === 'string' ? homeOrId : homeOrId.homeId
     let result: ClaimRunResult
     try {
-      result = await this.client.call<ClaimRunResult>('run/claim', { homeId, runId })
+      result = await this.rpc<ClaimRunResult>('run/claim', { homeId, runId })
     } catch (error) {
       throw wrap(error)
     }
@@ -1000,7 +1124,7 @@ export class OmtService {
     await this.ready()
     const homeId = typeof homeOrId === 'string' ? homeOrId : homeOrId.homeId
     try {
-      const result = await this.client.call<{ run: RunView; item: RunItemView; node: NodeView }>('run/report', {
+      const result = await this.rpc<{ run: RunView; item: RunItemView; node: NodeView }>('run/report', {
         homeId,
         runId,
         nodeId,
@@ -1016,7 +1140,7 @@ export class OmtService {
       // already transitioned.
       if (outcome === 'failed' && note !== undefined && note.trim() !== '') {
         try {
-          await this.client.call('node/update', {
+          await this.rpc('node/update', {
             homeId: (typeof homeOrId === 'string' ? homeId : homeOrId.homeId),
             nodeId,
             changes: { append: note },
@@ -1084,7 +1208,7 @@ export class OmtService {
   async recordItemNudge(homeOrId: HomeRef | string, runId: string, nodeId: string, at: string): Promise<OmtRunItem> {
     const homeId = typeof homeOrId === 'string' ? homeOrId : homeOrId.homeId
     await this.ready()
-    const result = await this.client.call('run/nudge-record', { homeId, runId, nodeId }) as {
+    const result = await this.rpc('run/nudge-record', { homeId, runId, nodeId }) as {
       nudged?: { nodeId: string; nudgeCount: number }[]
     }
     const recorded = result.nudged?.find(entry => entry.nodeId === nodeId)
@@ -1116,7 +1240,7 @@ export class OmtService {
   async filtersGet(home: HomeRef, key: string): Promise<SavedFilters> {
     await this.ready()
     try {
-      const result = await this.client.call<{ filters: SavedFilters }>('ui/filters-get', { homeId: home.homeId, key })
+      const result = await this.rpc<{ filters: SavedFilters }>('ui/filters-get', { homeId: home.homeId, key })
       return result.filters ?? {}
     } catch (error) {
       throw wrap(error)
@@ -1126,7 +1250,7 @@ export class OmtService {
   async filtersSet(home: HomeRef, key: string, filters: SavedFilters): Promise<SavedFilters> {
     await this.ready()
     try {
-      const result = await this.client.call<{ filters: SavedFilters }>('ui/filters-set', { homeId: home.homeId, key, filters })
+      const result = await this.rpc<{ filters: SavedFilters }>('ui/filters-set', { homeId: home.homeId, key, filters })
       return result.filters ?? {}
     } catch (error) {
       throw wrap(error)
@@ -1139,7 +1263,7 @@ export class OmtService {
       if (home.path === undefined) continue
       try {
         await importLegacyUiFiltersFile(home.path, home.homeId, async (homeId, key, filters) => {
-          await this.client.call('ui/filters-set', { homeId, key, filters })
+          await this.rpc('ui/filters-set', { homeId, key, filters })
         })
       } catch {
         // Preference migration must never block plugin load (STORY-0023 rule).
@@ -1157,7 +1281,7 @@ export class OmtService {
   async recentGet(key: string): Promise<string[] | undefined> {
     await this.ready()
     try {
-      const result = await this.client.call<{ refs: Array<{ homeId: string; nodeId: string }> }>('ui/recent-get', { key })
+      const result = await this.rpc<{ refs: Array<{ homeId: string; nodeId: string }> }>('ui/recent-get', { key })
       return (result.refs ?? []).map(ref => ref.nodeId)
     } catch (error) {
       throw wrap(error)
@@ -1167,7 +1291,7 @@ export class OmtService {
   async recentSet(key: string, ids: readonly string[]): Promise<void> {
     await this.ready()
     try {
-      await this.client.call('ui/recent-set', {
+      await this.rpc('ui/recent-set', {
         key,
         refs: ids.map(nodeId => ({ homeId: '', nodeId })),
       })
