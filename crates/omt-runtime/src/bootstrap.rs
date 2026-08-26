@@ -225,7 +225,7 @@ fn try_create(
         Err(err) => {
             return Err(omt_storage::Problem::new(
                 omt_domain::error::IO,
-                format!("bootstrap lock create failed: {err}"),
+                format!("bootstrap lock create failed for {lock_path:?}: {err}"),
             ))
         }
     };
