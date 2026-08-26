@@ -61,12 +61,24 @@ import { savedFiltersSchema } from './ui-state.ts'
 const SERVICE_HEAL_COOLDOWN_MS = 30_000
 
 /**
+ * UI bag key scoping (U4 / R3-R5, KD3): every surface writes its filters bag
+ * under its own prefix (DSH → `dsh:ui`, desktop → `tauri:ui`); the server
+ * does not enforce the prefix this generation. `recent` is the ONE shared
+ * cross-surface key (R4) — legacy per-session recent keys become orphans by
+ * design (no delete RPC).
+ */
+export const DSH_FILTERS_KEY = 'dsh:ui'
+export const LEGACY_FILTERS_KEY = 'ui'
+export const RECENT_SHARED_KEY = 'recent'
+
+/**
  * One-time import of a pre-U7a `<home>/ui-filters.json` bag into
  * daemon-owned storage (TICKET-0123): parse → `ui/filters-set` under the
- * adapter's bag key, then rename the file `.imported` so the adapter never
- * re-imports and never again writes preference data into a daemon-owned
- * home. Missing/corrupt/unparsable files are skipped silently; a failed
- * daemon push leaves the file in place for the next connect.
+ * surface-prefixed bag key (`dsh:ui`, U4), then rename the file `.imported`
+ * so the adapter never re-imports and never again writes preference data
+ * into a daemon-owned home. Missing/corrupt/unparsable files are skipped
+ * silently; a failed daemon push leaves the file in place for the next
+ * connect.
  * @internal exported for tests; production callers go through OmtService.
  */
 export async function importLegacyUiFiltersFile(
@@ -90,7 +102,7 @@ export async function importLegacyUiFiltersFile(
   }
   const parsed = savedFiltersSchema.safeParse(bag)
   if (!parsed.success) return false
-  await setFilters(homeId, 'ui', parsed.data)
+  await setFilters(homeId, DSH_FILTERS_KEY, parsed.data)
   await rename(file, `${file}.imported`)
   return true
 }
@@ -1245,6 +1257,23 @@ export class OmtService {
     } catch (error) {
       throw wrap(error)
     }
+  }
+
+  /**
+   * DSH-surface filters read with legacy migration (U4/R3-R5): read the
+   * prefixed `dsh:ui` bag; on an empty miss fall back to the bare `'ui'`
+   * bag written by pre-U4 builds and WRITE THROUGH to the prefixed key so
+   * the next read is single-legged. The bare key is never deleted (no
+   * delete RPC) — it stays as an orphan by design.
+   */
+  async filtersGetDsh(home: HomeRef): Promise<SavedFilters> {
+    const primary = await this.filtersGet(home, DSH_FILTERS_KEY)
+    if (Object.keys(primary).length > 0) return primary
+    const legacy = await this.filtersGet(home, LEGACY_FILTERS_KEY)
+    if (Object.keys(legacy).length > 0) {
+      await this.filtersSet(home, DSH_FILTERS_KEY, legacy)
+    }
+    return legacy
   }
 
   async filtersSet(home: HomeRef, key: string, filters: SavedFilters): Promise<SavedFilters> {

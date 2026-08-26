@@ -639,7 +639,7 @@ export interface EventsResumeResult {
  */
 
 /**
- * Method ui/filters-get. Adapter-only channel; key is the adapter-scoped bag key (e.g. DSH session id). Missing/corrupt bags fall back to defaults.
+ * Method ui/filters-get. Adapter-only channel; key is the surface-prefixed bag key (R3: DSH uses dsh:ui, desktop uses tauri:ui; the server does NOT enforce the prefix this generation). Missing/corrupt bags fall back to defaults; adapters migrate legacy bare keys on read (U4).
  */
 export interface FiltersGetParams {
   /**
@@ -659,7 +659,7 @@ export interface FiltersGetResult {
  */
 
 /**
- * Method ui/filters-set: merge patch onto the saved bag; merged result validated server-side.
+ * Method ui/filters-set: merge patch onto the saved bag under the surface-prefixed key (R3 prefix convention, unenforced server-side); merged result validated server-side.
  */
 export interface FiltersSetParams {
   /**
@@ -676,11 +676,11 @@ export interface FiltersSetResult {
   [k: string]: unknown;
 }
 /**
- * Method ui/recent-get: recently-touched qualified node refs for one adapter key. Recent bags are global-home scoped, not per workspace home.
+ * Method ui/recent-get: recently-touched qualified node refs for one bag key. Recent bags are global-home scoped, not per workspace home. R4: every surface shares the single global key 'recent' (legacy per-session keys become orphans by design — no delete RPC).
  */
 
 /**
- * Method ui/recent-get: recently-touched qualified node refs for one adapter key. Recent bags are global-home scoped, not per workspace home.
+ * Method ui/recent-get: recently-touched qualified node refs for one bag key. Recent bags are global-home scoped, not per workspace home. R4: every surface shares the single global key 'recent' (legacy per-session keys become orphans by design — no delete RPC).
  */
 export interface RecentGetParams {
   key: string;
@@ -698,11 +698,11 @@ export interface RecentGetResult {
   [k: string]: unknown;
 }
 /**
- * Method ui/recent-set: replace the bag (most-recent-first order preserved).
+ * Method ui/recent-set: replace the bag (most-recent-first order preserved) under the shared global key 'recent' per R4.
  */
 
 /**
- * Method ui/recent-set: replace the bag (most-recent-first order preserved).
+ * Method ui/recent-set: replace the bag (most-recent-first order preserved) under the shared global key 'recent' per R4.
  */
 export interface RecentSetParams {
   key: string;

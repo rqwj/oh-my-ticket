@@ -13,6 +13,10 @@ export interface ClientInfo {
   kind: "dsh" | "cli" | "desktop" | "mcp" | "external";
   name: string;
   version?: string;
+  /**
+   * Optional model-session identity (TICKET-0130 item 3): when present, the daemon derives a per-session actor namespace '<base>/<sessionId>' so concurrent sessions of one process are separately attributable at the trust gate.
+   */
+  sessionId?: string;
   [k: string]: unknown;
 }
 /**

@@ -20,7 +20,7 @@ import { RecentRegistry } from './host/recent.ts'
 import { RunningRegistry } from './host/running.ts'
 import { registerOmtRpc } from './host/rpc.ts'
 import { registerOmtRunsSkill, registerOmtSkill } from './host/skill.ts'
-import { OmtService } from './host/service.ts'
+import { OmtService, RECENT_SHARED_KEY } from './host/service.ts'
 import { registerOmtTools } from './host/tools.ts'
 
 export const name = 'oh-my-ticket'
@@ -71,11 +71,14 @@ export function apply(ctx: Context, config: Config): void {
   const recent = new RecentRegistry()
   const running = new RunningRegistry()
   // Persistence rides ui/recent-get|set on the GLOBAL home (TICKET-0019);
-  // bare ids are re-resolved by ownership on read.
+  // bare ids are re-resolved by ownership on read. U4/R4: every surface
+  // persists under the ONE shared key 'recent' (KD3's sole cross-surface
+  // exception) — the in-memory registry stays per-session, but storage is
+  // converged; legacy per-session keys are left as orphans by design.
   recent.attachPersistence({
-    load: sessionId => service.recentGet(sessionId),
-    save: async (sessionId, ids) => {
-      await service.recentSet(sessionId, ids)
+    load: () => service.recentGet(RECENT_SHARED_KEY),
+    save: async (_sessionId, ids) => {
+      await service.recentSet(RECENT_SHARED_KEY, ids)
     },
   })
   // SSE refresh is fed by daemon event envelopes through the service-owned

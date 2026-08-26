@@ -37,7 +37,7 @@ import {
   savedFiltersSchema,
   type SavedFilters,
 } from './ui-state.ts'
-import type { ChangeHub, HomeRef, OmtService } from './service.ts'
+import { DSH_FILTERS_KEY, type ChangeHub, type HomeRef, type OmtService } from './service.ts'
 import type { RecentRegistry } from './recent.ts'
 import { endsExecution, lineageOfHeader, type RunningRegistry } from './running.ts'
 import {
@@ -574,7 +574,7 @@ export function registerOmtRpc(ctx: Context, service: OmtService, recent?: Recen
           const parsed = filtersGetPayloadSchema.safeParse(payload ?? {})
           if (!parsed.success) return badRequest('invalid filters-get payload', parsed.error.issues)
           const home = await homeFor(parsed.data.sessionId)
-          return ok(coerceSavedFilters(await service.filtersGet(home, FILTERS_KEY)))
+          return ok(coerceSavedFilters(await service.filtersGetDsh(home)))
         }
         case 'filters-set': {
           const parsed = filtersSetPayloadSchema.safeParse(payload)
@@ -600,5 +600,9 @@ export function registerOmtRpc(ctx: Context, service: OmtService, recent?: Recen
   }, { authority: 'loopback' })
 }
 
-/** One bag per home (shared by every session of that home, as before). */
-const FILTERS_KEY = 'ui'
+/**
+ * DSH filters bag key (U4/R3): surface-prefixed per the bag scoping contract;
+ * legacy bare 'ui' bags migrate on read via filtersGetDsh (fallback +
+ * write-through), so this stays the only key the DSH surface ever writes.
+ */
+const FILTERS_KEY: string = DSH_FILTERS_KEY

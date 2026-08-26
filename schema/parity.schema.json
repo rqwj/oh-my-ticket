@@ -63,9 +63,9 @@
           { "action": "run/nudge-record", "classification": "agent_available", "summary": "Record a continuation nudge on pending item(s).", "since": "v1" },
           { "action": "run/interrupt", "classification": "agent_available", "summary": "Demote in-flight items to interrupted and derive terminal state.", "since": "v1" },
           { "action": "events/resume", "classification": "agent_available", "summary": "Resume the durable event stream from a cursor.", "since": "v1" },
-          { "action": "ui/filters-get", "classification": "adapter_only", "summary": "Adapter UI filter bag read.", "since": "v1" },
+          { "action": "ui/filters-get", "classification": "adapter_only", "summary": "Adapter UI filter bag read; keys are surface-prefixed (dsh:/tauri:) per R3.", "since": "v1" },
           { "action": "ui/filters-set", "classification": "adapter_only", "summary": "Adapter UI filter bag merge-write.", "since": "v1" },
-          { "action": "ui/recent-get", "classification": "adapter_only", "summary": "Recently-touched nodes per adapter key.", "since": "v1" },
+          { "action": "ui/recent-get", "classification": "adapter_only", "summary": "Recently-touched nodes under the single shared key 'recent' (R4).", "since": "v1" },
           { "action": "ui/recent-set", "classification": "adapter_only", "summary": "Replace recently-touched bag per adapter key.", "since": "v1" }
         ]
       }

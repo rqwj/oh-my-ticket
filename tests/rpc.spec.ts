@@ -117,12 +117,13 @@ it('filters-get defaults and filters-set persists via the daemon (STORY-0023)', 
   expect(reloaded.value).toEqual(saved.value)
 
   // Persistence is server-side: a brand-new client on the same daemon
-  // observes the saved bag (the old assertion read ui-filters.json).
-  const { OmtService } = await import('../src/host/service.ts')
+  // observes the saved bag (the old assertion read ui-filters.json). U4:
+  // the DSH surface persists under its surface-prefixed key.
+  const { OmtService, DSH_FILTERS_KEY } = await import('../src/host/service.ts')
   const freshService = new OmtService({ runtimeDir: fixture.runtimeDir, name: 'rpc-persist-probe' })
   try {
     await freshService.ready()
-    const probe = await freshService.filtersGet(fixture.globalHome, 'ui')
+    const probe = await freshService.filtersGet(fixture.globalHome, DSH_FILTERS_KEY)
     expect(probe.query).toBe('登录')
     expect(probe.sortOrder).toBe('priority-desc')
   } finally {
