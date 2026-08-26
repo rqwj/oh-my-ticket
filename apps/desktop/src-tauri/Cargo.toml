@@ -13,10 +13,15 @@ name = "oh-my-ticket-desktop"
 path = "src/main.rs"
 
 [dependencies]
+omt-client = { path = "../../../crates/omt-client" }
 tauri = { version = "2", features = [] }
 tauri-plugin-shell = "2"
+libc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
