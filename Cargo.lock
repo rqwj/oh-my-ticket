@@ -766,7 +766,7 @@ dependencies = [
 
 [[package]]
 name = "omt-contracts"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "jsonschema",
  "regress",
@@ -778,7 +778,7 @@ dependencies = [
 
 [[package]]
 name = "omt-domain"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "omt-contracts",
  "serde",
@@ -787,7 +787,7 @@ dependencies = [
 
 [[package]]
 name = "omt-runtime"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "getrandom",
  "libc",
@@ -802,7 +802,7 @@ dependencies = [
 
 [[package]]
 name = "omt-storage"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "fs4",
  "getrandom",

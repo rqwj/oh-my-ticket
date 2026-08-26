@@ -47,6 +47,34 @@ fn wait_ready(ctx: &TestCtx) -> String {
     }
 }
 
+/// U1 (R22/KTD1): both binaries expose `--version` reporting the unified
+/// workspace product version — the anchor install smoke and brew formula
+/// checks rely on.
+#[test]
+fn cli_and_daemon_version_flags_report_workspace_version() {
+    let out = Command::new(omt_path())
+        .arg("--version")
+        .output()
+        .expect("run omt --version");
+    assert!(out.status.success(), "omt --version must exit 0");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        format!("omt {}", env!("CARGO_PKG_VERSION")),
+        "omt --version must print '<name> <workspace version>'"
+    );
+
+    let out = Command::new(std::path::PathBuf::from(env!("CARGO_BIN_EXE_omt-daemon")))
+        .arg("--version")
+        .output()
+        .expect("run omt-daemon --version");
+    assert!(out.status.success(), "omt-daemon --version must exit 0");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        format!("omt-daemon {}", env!("CARGO_PKG_VERSION")),
+        "omt-daemon --version must print '<name> <workspace version>'"
+    );
+}
+
 /// Online verb happy paths against a real daemon.
 #[test]
 fn cli_online_node_and_run_verbs_happy_paths() {

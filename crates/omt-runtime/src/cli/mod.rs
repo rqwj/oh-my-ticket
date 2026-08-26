@@ -224,6 +224,12 @@ fn parse_bool(raw: &str) -> CliResult<bool> {
 // ── verb dispatch ───────────────────────────────────────────────────────
 
 fn dispatch_args(all: Vec<String>) -> CliResult<()> {
+    // U1 (R22): `--version` short-circuits before any verb/runtime-dir work —
+    // the anchor for install smoke (`./omt --version`) and brew formula checks.
+    if all.iter().any(|a| a == "--version") {
+        println!("omt {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     let split = split_globals(&all)?;
     let mut rest: std::collections::VecDeque<String> = split.rest.into();
     let Some(verb) = rest.pop_front() else {
@@ -1228,9 +1234,7 @@ fn offline_doctor(globals: &GlobalArgs, args: &[String]) -> CliResult<()> {
 fn offline_takeover(globals: &GlobalArgs, args: &[String]) -> CliResult<()> {
     let home = offline_home_path(args)?;
     let runtime_dir = crate::paths::resolve(globals.runtime_dir.as_deref());
-    let backups_root =
-        std::path::PathBuf::from(crate::paths::resolve(globals.runtime_dir.as_deref()))
-            .join("backups");
+    let backups_root = crate::paths::resolve(globals.runtime_dir.as_deref()).join("backups");
     let report = crate::takeover::takeover_home(&runtime_dir, &home, &backups_root)
         .map_err(CliError::Problem)?;
     print_result(report, globals.json)

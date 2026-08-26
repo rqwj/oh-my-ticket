@@ -34,6 +34,12 @@ pub fn current_limits() -> &'static Limits {
 /// Daemon entry point.
 pub fn run() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // U1 (R22): `--version` prints and exits before touching any runtime
+    // dir, lock, or descriptor — safe inside install smoke on a clean machine.
+    if args.iter().any(|a| a == "--version") {
+        println!("omt-daemon {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     let mut home_paths: Vec<PathBuf> = Vec::new();
     let mut runtime_dir_arg: Option<String> = None;
     let mut index = 0;

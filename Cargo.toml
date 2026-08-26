@@ -6,9 +6,21 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
+# U1 (KTD1/R22): the unified product version. All four crates inherit via
+# `version.workspace = true`; the npm root package keeps its own SemVer line
+# and declares a runtime compatibility floor separately (see
+# docs/runtime/config.md and the distribution docs).
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/deepseek-ai/oh-my-ticket"
+
+# U1 (R22): release profile tuned for distributable binaries — stripped
+# symbols, thin LTO, single codegen unit for size.
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

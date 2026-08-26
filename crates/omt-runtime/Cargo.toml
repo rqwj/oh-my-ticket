@@ -1,6 +1,6 @@
 [package]
 name = "omt-runtime"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "The runnable OMT runtime (plan U5): omt-daemon serving JSON-RPC 2.0 over UDS/named pipe with bootstrap election, peer-credential enrollment, per-home serialized mutation queues, and full command dispatch; plus the `omt` operator CLI."

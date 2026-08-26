@@ -1,6 +1,6 @@
 [package]
 name = "omt-storage"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Crash-recoverable dual-store persistence for OMT (plan U4): SQLite (WAL) + phased operation journal + ledgered migrations + kernel home ownership."
