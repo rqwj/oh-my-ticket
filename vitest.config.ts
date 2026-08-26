@@ -7,7 +7,9 @@ export default defineConfig({
     // corpus/** is the U4b scenario corpus: its runner imports the retired
     // src/host/core.ts (U7a deleted the TS core in favor of omt-daemon) and
     // is executed by scripts/run-corpus.mjs, not by vitest.
-    exclude: ['**/node_modules/**', '.dsh-checkout/**', 'corpus/**'],
+    // apps/** surfaces have their OWN vitest configs (jsdom + tauri API
+    // mocks); the root suite is node-only.
+    exclude: ['**/node_modules/**', '.dsh-checkout/**', 'corpus/**', 'apps/**'],
   },
   resolve: {
     alias: {

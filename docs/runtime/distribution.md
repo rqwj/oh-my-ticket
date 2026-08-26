@@ -128,8 +128,25 @@ permissions 最小化，仅 tag 触发 release，无 pull_request_target。
    - brew：`brew tap rqwj/omt <tap-url> && brew install omt`，
      两者各跑一次 `omt --version` 与 `omt doctor`。
 
+## npm 平台包降级（U13 已落地）
+
+DSH 适配层解析 daemon 二进制的优先级（KTD7）：显式选项 / `OMT_DAEMON`
+env → PATH + 产品渠道前缀（`~/.local/bin`、`/opt/homebrew/bin`、
+`/usr/local/bin`）→ 已安装的 npm 平台包兜底。平台包模板在
+`npm/platform-packages/{darwin-arm64,darwin-x64,linux-arm64,linux-x64}/`，
+由 release workflow 的 `npm-platform-packages` job 从 Release 资产填充
+（先校验 SHA256SUMS）后发布。**时序约束**：根包 `optionalDependencies`
+声明在首次平台包发布时才落地（pnpm 对不可解析的 optional 依赖静默忽略
+lockfile，导致 `--frozen-lockfile` specifier 校验失败——详见
+`npm/platform-packages/README.md`）。冒烟：`node scripts/pack-smoke.mjs`。
+
+## 平台支持声明
+
+当前发布矩阵仅 **macOS arm64**（aarch64-apple-darwin）。**Windows 明示
+不支持**；x86_64 macOS 与 Linux 的二进制在 workflow 中预留模板位但无
+资产产出（公式与安装脚本对缺失 triple 以清晰报错指引到 Releases 页）。
+
 ## 明确延后
 
-正式 Developer ID 签名与公证（等证书决策）；x86_64/Windows/Linux 目标
-（formula 的 Intel leg 随 x86_64 asset 一并补）；action SHA 钉扎执行；
-npm 平台包降级（U13）另行落地。
+正式 Developer ID 签名与公证（等证书决策）；x86_64/Linux 目标
+（formula 的 Intel leg 随 x86_64 asset 一并补）；action SHA 钉扎执行。
