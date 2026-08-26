@@ -19,4 +19,13 @@ export {
   type HandshakeOutcome,
   type RequestedScopes,
 } from './client.js'
+export {
+  DaemonNotFoundError,
+  DAEMON_INSTALL_HINT,
+  resolveDaemonBinary,
+  resetDaemonResolutionCache,
+  platformPackageFor,
+  daemonSearchPrefixes,
+} from './daemon-resolve.js'
+export type { DaemonBinary, DaemonSource, ResolveDaemonOptions } from './daemon-resolve.js'
 export * from './generated/index.js'

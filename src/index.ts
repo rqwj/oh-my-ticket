@@ -23,6 +23,16 @@ import { registerOmtRunsSkill, registerOmtSkill } from './host/skill.ts'
 import { OmtService, RECENT_SHARED_KEY } from './host/service.ts'
 import { registerOmtTools } from './host/tools.ts'
 
+// Zero-config daemon resolution (U13/KTD7): re-exported so packed-package
+// consumers (scripts/pack-smoke.mjs, embedders) share the SAME resolver the
+// adapter spawns through.
+export {
+  DAEMON_INSTALL_HINT,
+  DaemonNotFoundError,
+  resolveDaemonBinary,
+} from '@omt/client-ts'
+export type { DaemonBinary, DaemonSource } from '@omt/client-ts'
+
 export const name = 'oh-my-ticket'
 export const inject = ['tools', 'skills', 'connection', 'agents', 'userQuestions', 'webServer']
 

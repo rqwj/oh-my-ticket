@@ -5,8 +5,10 @@
  * Discovery order (F1):
  *   1. read `<runtime-dir>/descriptor.json` and probe liveness
  *      (pid alive AND the endpoint accepts a connection),
- *   2. otherwise spawn a fresh daemon detached from
- *      `OMT_DAEMON` (explicit binary path) or `omt-daemon` on PATH,
+ *   2. otherwise spawn a fresh daemon detached from the resolved binary —
+ *      `resolveDaemonBinary` (U13/KTD7): explicit `daemonPath` option or
+ *      `OMT_DAEMON` env, then `omt-daemon` on PATH and known install
+ *      prefixes, then the installed npm platform package as fallback,
  *   3. poll for the new generation's descriptor for up to 10 s.
  *
  * The runtime directory resolves as `OMT_RUNTIME_DIR` (tests/sandboxes)
@@ -23,6 +25,7 @@ import {
   OmtProtocolError,
   type ProblemShape,
 } from './transport.js'
+import { resolveDaemonBinary } from './daemon-resolve.js'
 import type { EventEnvelope } from './generated/events.js'
 
 export { OmtProtocolError }
@@ -67,7 +70,9 @@ export interface RequestedScopes {
 export interface ClientOptions {
   /** Explicit runtime dir; default `OMT_RUNTIME_DIR` then `~/.omt/run`. */
   runtimeDir?: string
-  /** Daemon binary for spawning. Default `OMT_DAEMON` env then `omt-daemon` on PATH. */
+  /** Daemon binary for spawning. Default: resolveDaemonBinary precedence
+   *  (U13/KTD7): this option / OMT_DAEMON env, then PATH + known prefixes,
+   *  then the installed npm platform package. */
   daemonPath?: string
   /** Extra args passed to a spawned daemon (e.g. ['--home', path]). */
   daemonArgs?: string[]
@@ -159,8 +164,11 @@ export class OmtClient {
 
   /**
    * discoverOrSpawn (F1): return a live daemon's descriptor, or launch one
-   * detached and poll up to 10 s for its readiness. Spawn resolution:
-   * `options.daemonPath` > `OMT_DAEMON` env > `omt-daemon` on PATH.
+   * detached and poll up to 10 s for its readiness. Spawn binary follows the
+   * shared resolver (U13/KTD7): `options.daemonPath` > `OMT_DAEMON` env >
+   * `omt-daemon` on PATH + known prefixes > installed npm platform package;
+   * exhaustion throws DaemonNotFoundError with install guidance BEFORE any
+   * spawn attempt.
    */
   static async discoverOrSpawn(options: ClientOptions = {}): Promise<DaemonDescriptor> {
     const runtimeDir = OmtClient.resolveRuntimeDir(options.runtimeDir)
@@ -170,17 +178,30 @@ export class OmtClient {
     if (options.noSpawn) throw new Error('no live omt-daemon found (noSpawn mode)')
 
     const before = OmtClient.readDescriptor(runtimeDir)
-    const binary =
-      options.daemonPath ?? process.env.OMT_DAEMON ?? 'omt-daemon'
-    const child = spawn(binary, [...(options.daemonArgs ?? []), '--runtime-dir', runtimeDir], {
-      detached: true,
-      stdio: 'ignore',
-      env: { ...process.env, OMT_RUNTIME_DIR: runtimeDir },
-    })
-    child.unref()
-    child.on('error', () => {
-      /* spawn failure surfaces as the discovery timeout below */
-    })
+    // Resolve the spawn binary lazily: when a descriptor already exists but
+    // failed the one-shot liveness probe (daemon still inside its boot
+    // window), a missing binary must NOT be terminal — the pre-U13 flow
+    // self-healed by polling the descriptor below even when the spawn
+    // attempt errored. Only with NO descriptor at all is the resolution
+    // failure terminal (there is nothing to wait for).
+    let binary: string | undefined
+    try {
+      binary = resolveDaemonBinary({ explicit: options.daemonPath }).path
+    } catch (error) {
+      if (before === undefined) throw error
+      binary = undefined
+    }
+    if (binary !== undefined) {
+      const child = spawn(binary, [...(options.daemonArgs ?? []), '--runtime-dir', runtimeDir], {
+        detached: true,
+        stdio: 'ignore',
+        env: { ...process.env, OMT_RUNTIME_DIR: runtimeDir },
+      })
+      child.unref()
+      child.on('error', () => {
+        /* spawn failure surfaces as the discovery timeout below */
+      })
+    }
 
     const deadline = Date.now() + 10_000
     while (Date.now() < deadline) {
@@ -191,11 +212,16 @@ export class OmtClient {
           candidate.generation > before.generation ||
           candidate.bootToken !== before.bootToken
         if (replaced && (await probeAlive(candidate))) return candidate
+        // Boot-window recovery: the descriptor was already on disk when the
+        // one-shot discover probe raced it — accept a now-live descriptor
+        // without demanding a generation bump (only when we could not spawn
+        // a competitor, i.e. binary resolution failed above).
+        if (!replaced && binary === undefined && (await probeAlive(candidate))) return candidate
       }
       await sleep(100)
     }
     throw new Error(
-      `spawned omt-daemon (${binary}) produced no live descriptor within 10s (runtime dir: ${runtimeDir})`,
+      `spawned omt-daemon (${binary ?? 'unresolved — polled existing descriptor'}) produced no live descriptor within 10s (runtime dir: ${runtimeDir})`,
     )
   }
 

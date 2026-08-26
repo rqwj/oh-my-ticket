@@ -1,7 +1,9 @@
 /**
  * OmtService (plan U7a): the thin DSH adapter's runtime boundary. Owns one
  * @omt/client-ts client lifecycle — discover-or-spawn of `omt-daemon` (via
- * OMT_DAEMON env or PATH), handshake as kind:"dsh", automatic reconnection
+ * the shared resolveDaemonBinary precedence: explicit option / OMT_DAEMON
+ * env, then PATH + known prefixes, then npm platform package — U13/KTD7),
+ * handshake as kind:"dsh", automatic reconnection
  * with capped backoff, and disposal — and translates every adapter data op
  * into typed protocol calls (packages/client-ts/src/generated). No module in
  * the host half opens SQLite or reads Markdown directly any more (R1): bare
@@ -55,6 +57,7 @@ import {
   type ShowResult,
 } from './types.ts'
 import { savedFiltersSchema } from './ui-state.ts'
+import { DAEMON_INSTALL_HINT, runtimeUnavailableFromResolution } from './util/daemon-resolve.ts'
 
 /** Minimum spacing between generation-change heals (TICKET-0132): bounds the
  *  cost of a pathological stale-id loop while keeping recovery prompt. */
@@ -121,7 +124,9 @@ export interface HomeRef {
 export interface OmtServiceOptions {
   /** Explicit runtime dir (tests); default OMT_RUNTIME_DIR then ~/.omt/run. */
   readonly runtimeDir?: string
-  /** Daemon binary for spawning; default OMT_DAEMON env then PATH. */
+  /** Daemon binary for spawning; default resolveDaemonBinary precedence
+   *  (U13/KTD7): this option / OMT_DAEMON env, then PATH + known prefixes,
+   *  then the installed npm platform package. */
   readonly daemonPath?: string
   /** Extra spawn args (e.g. ['--home', path]). */
   readonly daemonArgs?: readonly string[]
@@ -448,9 +453,15 @@ export class OmtService {
       // stack — the plugin keeps loading without data ops (plan §System-Wide
       // Impact: daemon-absent degradation is an adapter responsibility).
       if (error instanceof OmtProtocolError) throw toOmtError(error)
+      // U13/KTD7: an exhausted daemon search (explicit option, OMT_DAEMON,
+      // PATH + known prefixes, npm platform package) carries the updated
+      // install guidance — product channels (brew tap / install.sh) first,
+      // platform packages as fallback.
+      const resolutionMiss = runtimeUnavailableFromResolution(error)
+      if (resolutionMiss !== undefined) throw resolutionMiss
       throw new OmtError('IO', `OMT runtime unavailable: ${String((error as Error)?.message ?? error)}`, {
         reason: 'runtime-unavailable',
-        hint: 'set OMT_DAEMON to the omt-daemon binary or install it on PATH',
+        hint: DAEMON_INSTALL_HINT,
       })
     }
   }

@@ -145,8 +145,8 @@ jobs:
     name: npm platform packages
     runs-on: ubuntu-latest
     needs: binary-assets
-    # No-op until U13 adds the platform-package templates under
-    # npm/platform-packages/ (R21: packages become a thin DSH fallback filled
+    # Active since U13 landed the platform-package templates under
+    # npm/platform-packages/ (R21: packages are a thin DSH fallback filled
     # from Release artifacts).
     if: hashFiles('npm/platform-packages/**') != ''
     env:
@@ -157,15 +157,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 9
+      # U13 ratification: no workspace install here — template filling,
+      # npm pack verification, and publishing are pure npm CLI work, and a
+      # frozen root install cannot resolve the @oh-my-ticket/* optional
+      # dependencies before THIS job publishes them for the first time
+      # (chicken-and-egg). setup-node still pins Node and wires the npm
+      # registry for NODE_AUTH_TOKEN below.
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: pnpm
           registry-url: https://registry.npmjs.org/
-      - run: pnpm install --frozen-lockfile
 
       # Same-source binaries as job1 (KD5): download its artifact, verify the
       # checksums, then fill every package template with its triple's binaries.
