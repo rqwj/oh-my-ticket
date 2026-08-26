@@ -113,6 +113,7 @@ pub fn discover_or_spawn_and_enroll(dir: &Path) -> Result<(Enrollment, bool), St
         kind: "desktop".into(),
         name: Some("oh-my-ticket-desktop".into()),
         actor_namespace: None,
+        operations: None,
         credential_path: None,
     };
     let enrollment = Client::connect_and_enroll(&descriptor, &options)

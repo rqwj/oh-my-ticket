@@ -102,6 +102,7 @@ pub fn events_subscribe(
             kind: "desktop".into(),
             name: Some("oh-my-ticket-desktop-events".into()),
             actor_namespace: None,
+            operations: None,
             credential_path: None,
         };
         let Ok(mut enrollment) = omt_client::Client::connect_and_enroll(&descriptor, &options)

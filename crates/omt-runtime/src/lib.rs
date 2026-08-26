@@ -15,6 +15,7 @@ pub mod ipc;
 pub mod jsonrpc;
 pub mod limits;
 pub mod logging;
+pub mod mcp;
 pub mod ownership;
 pub mod paths;
 pub mod problem;

@@ -82,6 +82,10 @@ pub struct EnrollOptions {
     pub name: Option<String>,
     /// Optional requested actor namespace scope.
     pub actor_namespace: Option<String>,
+    /// Optional requested operations families (e.g. ["node", "run",
+    /// "events"] for the restricted mcp credential). Absent → the
+    /// server's default grant for the kind.
+    pub operations: Option<Vec<String>>,
     /// Credential persistence policy: when set, a previously stored token
     /// at this path is reused (probed once), and a fresh enrollment is
     /// persisted back with 0600 permissions. Absent → enroll per process.
@@ -94,6 +98,7 @@ impl Default for EnrollOptions {
             kind: "external".into(),
             name: None,
             actor_namespace: None,
+            operations: None,
             credential_path: None,
         }
     }
@@ -172,6 +177,24 @@ impl Client {
         Ok(Enrollment { client, handshake })
     }
 
+    /// Convenience: enroll with an explicit restricted operations set
+    /// (the mcp server's node/run/events-only credential, R7).
+    #[cfg(unix)]
+    pub fn connect_and_enroll_with_operations(
+        descriptor: &Descriptor,
+        options: &EnrollOptions,
+        operations: &[&str],
+    ) -> Result<Enrollment, Problem> {
+        let scoped = EnrollOptions {
+            kind: options.kind.clone(),
+            name: options.name.clone(),
+            actor_namespace: options.actor_namespace.clone(),
+            operations: Some(operations.iter().map(|op| op.to_string()).collect()),
+            credential_path: options.credential_path.clone(),
+        };
+        Self::connect_and_enroll(descriptor, &scoped)
+    }
+
     /// Fresh handshake/request enrollment; stores the issued token.
     pub fn enroll(&mut self, options: &EnrollOptions) -> Result<serde_json::Value, Problem> {
         let params = serde_json::json!({
@@ -181,11 +204,7 @@ impl Client {
                 "name": options.name.clone().unwrap_or_else(|| format!("omt-{}", options.kind)),
                 "version": env!("CARGO_PKG_VERSION"),
             },
-            "requestedScopes": options
-                .actor_namespace
-                .as_ref()
-                .map(|ns| serde_json::json!({ "actorNamespace": ns }))
-                .unwrap_or(serde_json::json!({})),
+            "requestedScopes": requested_scopes(options),
         });
         let handshake = self.request("handshake/request", params)?;
         self.token = handshake["credential"]["token"]
@@ -316,6 +335,17 @@ impl Client {
         }
         Err(Problem::new("IO", "connection closed before response"))
     }
+}
+
+fn requested_scopes(options: &EnrollOptions) -> serde_json::Value {
+    let mut scopes = serde_json::Map::new();
+    if let Some(ns) = &options.actor_namespace {
+        scopes.insert("actorNamespace".into(), serde_json::json!(ns));
+    }
+    if let Some(operations) = &options.operations {
+        scopes.insert("operations".into(), serde_json::json!(operations));
+    }
+    serde_json::Value::Object(scopes)
 }
 
 /// Problem.code is &'static str; wire codes are dynamic — intern the known

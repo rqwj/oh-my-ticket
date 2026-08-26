@@ -148,8 +148,8 @@ fn usage_err(message: impl Into<String>) -> CliError {
 
 // ── argument parsing ────────────────────────────────────────────────────
 
-struct GlobalArgs {
-    runtime_dir: Option<String>,
+pub struct GlobalArgs {
+    pub(crate) runtime_dir: Option<String>,
     homes: Vec<String>,
     json: bool,
     /// Stable cross-invocation actor namespace (leases fence to it).
@@ -273,6 +273,9 @@ fn dispatch_args(all: Vec<String>) -> CliResult<()> {
         "reindex" => offline_reindex(&split.globals, rest.make_contiguous()),
         "doctor" => offline_doctor(&split.globals, rest.make_contiguous()),
         "takeover" => offline_takeover(&split.globals, rest.make_contiguous()),
+        "mcp" => crate::mcp::serve(&split.globals)
+            .map(|_| ())
+            .map_err(CliError::Problem),
         "run-create" => online(&split.globals, |client, home_id| {
             run_create(client, home_id, rest.make_contiguous())
         }),
@@ -396,6 +399,7 @@ impl OnlineClient {
                     .clone()
                     .unwrap_or_else(|| format!("cli:{}", std::process::id())),
             ),
+            operations: None,
             credential_path: Some(cred_path.clone()),
         };
         let mut enrollment = omt_client::Client::connect_and_enroll(&descriptor, &options)
@@ -1077,6 +1081,7 @@ fn doctor_online_preamble(runtime_dir: &std::path::Path) -> DoctorPreamble {
                     kind: "cli".into(),
                     name: Some("omt-doctor".into()),
                     actor_namespace: None,
+                    operations: None,
                     credential_path: None,
                 };
                 match omt_client::Client::connect_and_enroll(&descriptor, &options) {
