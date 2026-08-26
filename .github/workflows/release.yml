@@ -1,7 +1,9 @@
-# Release pipeline (plan U11 / R19, KD1, KD5): a pushed v* tag produces the
-# trusted binary facts source on GitHub Releases — macOS arm64 binaries as
-# tar.gz + SHA256SUMS (job 1) and the Tauri desktop bundle .app/.dmg
-# (job 2; no-op until the U8 scaffold lands at apps/desktop).
+# Release pipeline (plan U11 / R19, KD1, KD5, R21): a pushed v* tag produces
+# the trusted binary facts source on GitHub Releases — macOS arm64 binaries
+# as tar.gz + SHA256SUMS (job 1), the Tauri desktop bundle .app/.dmg
+# (job 2; no-op until the U8 scaffold lands at apps/desktop), and npm
+# platform packages filled from the same release artifacts (job 3; no-op
+# until U13 adds templates under npm/platform-packages/).
 #
 # Supply-chain hygiene (KTD8): third-party actions are referenced by tag for
 # bootstrap; policy is to pin every third-party action to an immutable commit
@@ -138,3 +140,100 @@ jobs:
           releaseName: ${{ github.ref_name }}
           releaseDraft: false
           prerelease: false
+
+  npm-platform-packages:
+    name: npm platform packages
+    runs-on: ubuntu-latest
+    needs: binary-assets
+    # No-op until U13 adds the platform-package templates under
+    # npm/platform-packages/ (R21: packages become a thin DSH fallback filled
+    # from Release artifacts).
+    if: hashFiles('npm/platform-packages/**') != ''
+    env:
+      # Same skip philosophy as code signing (KTD5): without the token the job
+      # still fills and pack-verifies every package, then skips publishing
+      # with an explicit notice — nothing hard-fails on the missing secret.
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          registry-url: https://registry.npmjs.org/
+      - run: pnpm install --frozen-lockfile
+
+      # Same-source binaries as job1 (KD5): download its artifact, verify the
+      # checksums, then fill every package template with its triple's binaries.
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-binaries-${{ github.ref_name }}
+          path: dist/release
+
+      - name: Fill per-triple binaries into each platform package
+        run: |
+          set -euo pipefail
+          version="$(bash scripts/assemble-release-archive.sh --print-version)"
+          work="$(mktemp -d)"
+          mkdir "$work/extracted"
+          for tgz in dist/release/*.tar.gz; do tar -xzf "$tgz" -C "$work/extracted"; done
+          # Checksums gate everything downstream (KTD8).
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd dist/release && sha256sum -c SHA256SUMS)
+          else
+            (cd dist/release && shasum -a 256 -c SHA256SUMS)
+          fi
+          dir_to_triple() {
+            case "$1" in
+              darwin-arm64) echo aarch64-apple-darwin ;;
+              darwin-x64)   echo x86_64-apple-darwin ;;
+              linux-arm64)  echo aarch64-unknown-linux-gnu ;;
+              linux-x64)    echo x86_64-unknown-linux-gnu ;;
+              *)            echo "" ;;
+            esac
+          }
+          for pkg_dir in npm/platform-packages/*/; do
+            [ -d "$pkg_dir" ] || continue
+            name="$(basename "$pkg_dir")"
+            triple="$(dir_to_triple "$name")"
+            if [ -z "$triple" ]; then
+              echo "::error::platform package dir '$name' not in dir_to_triple mapping — extend it in release.yml"
+              exit 1
+            fi
+            src="$work/extracted/omt-${triple}-v${version}"
+            if [ ! -d "$src" ]; then
+              echo "::error::no release archive for triple ${triple} (package ${name}); the build matrix must cover every packaged triple"
+              exit 1
+            fi
+            mkdir -p "${pkg_dir}bin"
+            cp "$src/omt-daemon" "$src/omt" "${pkg_dir}bin/"
+            # Platform packages carry this tag's product version (R22 dual
+            # track: npm root package stays independent).
+            (cd "$pkg_dir" && npm version "$version" --allow-same-version --no-git-tag-version)
+            echo "filled ${name} ← ${triple}"
+          done
+
+      - name: Verify package contents (npm pack --dry-run)
+        run: |
+          for pkg_dir in npm/platform-packages/*/; do
+            [ -d "$pkg_dir" ] || continue
+            (cd "$pkg_dir" && npm pack --dry-run)
+          done
+
+      - name: Notice — publish skipped (NPM_TOKEN unset)
+        if: env.NPM_TOKEN == ''
+        run: echo "::notice::NPM_TOKEN is not configured — npm publish skipped cleanly; pack verification above still ran"
+
+      - name: Publish platform packages
+        if: env.NPM_TOKEN != ''
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for pkg_dir in npm/platform-packages/*/; do
+            [ -d "$pkg_dir" ] || continue
+            (cd "$pkg_dir" && npm publish --access public)
+          done

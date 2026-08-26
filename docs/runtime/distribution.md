@@ -40,6 +40,11 @@ bash scripts/assemble-release-archive.sh [--target <triple>] [--out-dir DIR]
     U8 脚手架落地前整体 no-op；用 tauri-action（`projectPath: apps/desktop`）
     构建 .app/.dmg 附到同一 Release；sidecar 取自本 Release 的 daemon 构建
     （KD5/R12），按 `binaries/omt-daemon-aarch64-apple-darwin` 暂存。
+  - `npm-platform-packages`：`if: hashFiles('npm/platform-packages/**') != ''`，
+    U13 模板落地前整体 no-op；下载 job1 归档并校验 SHA256SUMS 后按
+    目录名→triple 映射填充各平台包，`npm pack --dry-run` 验证内容；
+    `NPM_TOKEN` 未配置时以 notice 跳过 `npm publish --access public`
+    （与签名同一跳过哲学），配置后逐包发布。
 
 ## 签名策略（KTD5）
 
