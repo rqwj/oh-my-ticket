@@ -18,6 +18,7 @@ name = "omt"
 path = "src/cli_main.rs"
 
 [dependencies]
+omt-client = { path = "../omt-client" }
 omt-contracts = { path = "../omt-contracts" }
 omt-domain = { path = "../omt-domain" }
 omt-storage = { path = "../omt-storage" }

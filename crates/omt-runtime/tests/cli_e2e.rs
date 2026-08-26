@@ -553,3 +553,176 @@ fn cli_sigint_cancels_inflight_call() {
 
     daemon.kill();
 }
+
+/// U7 (R10/KTD4): doctor's online preamble — installed-binary vs
+/// running-daemon version consistency, observation-only against a live
+/// daemon (deep probes skip with a note instead of refusing).
+#[test]
+fn cli_doctor_online_preamble_reports_version_match() {
+    let ctx = TestCtx::spawn();
+    let out = run_cli(&ctx, &["--home", ctx.home_str(), "daemon-start"], &[]);
+    assert!(
+        out.status.success(),
+        "daemon-start: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    wait_ready(&ctx);
+
+    // Same-version daemon → match:true, exit 0, deep probes skipped with
+    // the runtime fields present.
+    let out = run_cli(&ctx, &["doctor", ctx.home_str()], &[]);
+    assert!(
+        out.status.success(),
+        "doctor against live daemon exits 0: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("doctor json");
+    assert_eq!(
+        report
+            .pointer("/runtime/descriptorFound")
+            .and_then(|v| v.as_bool()),
+        Some(true),
+        "{report}"
+    );
+    assert_eq!(
+        report.pointer("/runtime/match").and_then(|v| v.as_bool()),
+        Some(true),
+        "same-version daemon matches: {report}"
+    );
+    assert_eq!(
+        report
+            .pointer("/runtime/daemonVersion")
+            .and_then(|v| v.as_str()),
+        Some(env!("CARGO_PKG_VERSION")),
+        "{report}"
+    );
+    assert!(
+        report
+            .pointer("/runtime/generation")
+            .and_then(|v| v.as_i64())
+            .is_some(),
+        "{report}"
+    );
+    assert!(
+        report.to_string().contains("deep probes skipped"),
+        "deep probes deferred to the live daemon: {report}"
+    );
+
+    // Simulated version drift (test seam overrides the CLI side of the
+    // comparison — the comparison logic is the unit under test).
+    let out = run_cli(
+        &ctx,
+        &["doctor", ctx.home_str()],
+        &[("OMT_DOCTOR_CLI_VERSION_OVERRIDE", "9.9.9-drift".to_string())],
+    );
+    assert!(out.status.success());
+    let report: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("doctor json drift");
+    assert_eq!(
+        report.pointer("/runtime/match").and_then(|v| v.as_bool()),
+        Some(false),
+        "drifted version reports mismatch: {report}"
+    );
+    assert_eq!(
+        report
+            .pointer("/runtime/cliVersion")
+            .and_then(|v| v.as_str()),
+        Some("9.9.9-drift"),
+        "{report}"
+    );
+
+    let out = run_cli(&ctx, &["daemon-stop"], &[]);
+    assert!(
+        out.status.success(),
+        "daemon-stop: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// U7: no daemon → preamble says not-running and offline checks proceed
+/// exactly as before (exit 0, deep probe fields present).
+#[test]
+fn cli_doctor_preamble_degrades_without_daemon() {
+    let ctx = TestCtx::spawn();
+    let out = run_cli(&ctx, &["doctor", ctx.home_str()], &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("doctor json");
+    assert_eq!(
+        report
+            .pointer("/runtime/descriptorFound")
+            .and_then(|v| v.as_bool()),
+        Some(false),
+        "{report}"
+    );
+    assert_eq!(
+        report.pointer("/runtime/match").and_then(|v| v.as_str()),
+        Some("unknown"),
+        "{report}"
+    );
+    // Offline deep probes still ran (node count present).
+    assert!(
+        report.get("nodes").is_some(),
+        "offline checks proceed: {report}"
+    );
+    assert_eq!(
+        report.pointer("/healthy").and_then(|v| v.as_bool()),
+        Some(true),
+        "{report}"
+    );
+}
+
+/// U7: admin grants with a dead embedded pid surface in deadPidEntries.
+#[test]
+fn cli_doctor_admin_grants_surfaces_dead_pids() {
+    let ctx = TestCtx::spawn();
+    std::fs::write(
+        ctx.runtime_dir.join("admin-grants.json"),
+        json!({
+            "schemaVersion": 1,
+            "principalIds": [
+                "cli:2000000001",
+                "cli:2000000002",
+                "dsh:alive-no-numeric-suffix"
+            ]
+        })
+        .to_string(),
+    )
+    .expect("seed admin grants");
+
+    let out = run_cli(&ctx, &["doctor", ctx.home_str()], &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("doctor json");
+    assert_eq!(
+        report
+            .pointer("/adminGrants/totalEntries")
+            .and_then(as_count),
+        Some(3),
+        "{report}"
+    );
+    let dead = report
+        .pointer("/adminGrants/deadPidEntries")
+        .cloned()
+        .unwrap_or(json!([]));
+    let dead_text = dead.to_string();
+    assert!(dead_text.contains("2000000001"), "{dead_text}");
+    assert!(dead_text.contains("2000000002"), "{dead_text}");
+    assert!(
+        !dead_text.contains("alive-no-numeric-suffix"),
+        "non-pid principals never classify as dead: {dead_text}"
+    );
+}
+
+fn as_count(v: &serde_json::Value) -> Option<usize> {
+    v.as_u64().map(|n| n as usize)
+}

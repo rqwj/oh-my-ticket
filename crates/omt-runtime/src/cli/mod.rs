@@ -12,8 +12,6 @@
 //! - Ctrl-C during a call cancels it ($/cancelRequest semantics apply
 //!   server-side; the CLI aborts its socket read and exits 130).
 
-use std::io::{BufRead, BufReader};
-use std::os::unix::net::UnixStream;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -342,41 +340,25 @@ fn print_result(result: serde_json::Value, json: bool) -> CliResult<()> {
 
 // ── online plumbing ─────────────────────────────────────────────────────
 
+/// U7 (KTD4): the CLI's online plumbing now lives in the shared omt-client
+/// crate; OnlineClient is a thin wrapper adding the CLI's Ctrl-C semantics.
 struct OnlineClient {
-    stream: UnixStream,
-    next_id: u64,
+    inner: omt_client::Client,
     token: String,
-}
-
-fn resolve_and_finish(
-    mut client: OnlineClient,
-    globals: &GlobalArgs,
-) -> CliResult<(OnlineClient, String)> {
-    // Re-handshake ONLY to learn the homes list when needed is wasteful;
-    // instead resolve via a cheap authenticated listing call shape used by
-    // verbs themselves: the daemon reports open homes on every handshake,
-    // so do a lightweight handshake WITH the stored token attached (the
-    // server treats handshake as unauthenticated discovery).
-    let handshake = client.request(
-        "handshake/request",
-        serde_json::json!({
-            "protocolVersion": "1.0",
-            "client": { "kind": "cli", "name": "omt-cli", "version": env!("CARGO_PKG_VERSION") },
-        }),
-    )?;
-    let home_id = resolve_home_id(&handshake, globals)?;
-    Ok((client, home_id))
 }
 
 impl OnlineClient {
     /// Connect like the TS client: descriptor discovery → endpoint probe →
     /// handshake/enrollment with kind=cli and actorNamespace "cli:<pid>".
+    /// U7: transport + enrollment live in the shared omt-client crate; this
+    /// wrapper keeps the CLI's Ctrl-C cancel semantics, stored-token
+    /// policy, and CliError mapping.
     fn connect(globals: &GlobalArgs) -> CliResult<(OnlineClient, String)> {
         if CANCELED.load(Ordering::SeqCst) {
             return Err(CliError::Canceled);
         }
         let runtime_dir = crate::paths::resolve(globals.runtime_dir.as_deref());
-        let descriptor = crate::descriptor::read(&runtime_dir).ok_or_else(|| {
+        let descriptor = omt_client::read_descriptor(&runtime_dir).ok_or_else(|| {
             CliError::Problem(Problem::with_details(
                 omt_domain::error::NOT_FOUND,
                 format!(
@@ -403,79 +385,76 @@ impl OnlineClient {
                 },
             )));
         }
-        #[cfg(unix)]
-        let stream = UnixStream::connect(&descriptor.endpoint)
-            .map_err(|err| CliError::Problem(io_problem("endpoint connect", err)))?;
 
-        // Register fd for Ctrl-C abort.
+        let cred_path = runtime_dir.join("cli-credential.json");
+        let options = omt_client::EnrollOptions {
+            kind: "cli".into(),
+            name: Some("omt-cli".into()),
+            actor_namespace: Some(
+                globals
+                    .actor
+                    .clone()
+                    .unwrap_or_else(|| format!("cli:{}", std::process::id())),
+            ),
+            credential_path: Some(cred_path.clone()),
+        };
+        let mut enrollment = omt_client::Client::connect_and_enroll(&descriptor, &options)
+            .map_err(|problem| {
+                if problem.code == "CANCELED" {
+                    CliError::Canceled
+                } else {
+                    CliError::Problem(problem)
+                }
+            })?;
+
+        // U7/R10: home-SCOPE denials stamped requiresRehandshake (declared
+        // after enrollment, generation rotation) heal exactly once — delete
+        // the stored credential and re-enroll, mirroring the UNAUTHORIZED
+        // fallback inside connect_and_enroll.
+        let needs_credential_heal = {
+            let probe = enrollment
+                .client
+                .call("node/list", serde_json::json!({ "filter": {} }));
+            matches!(probe, Err(ref problem) if home_scope_rehandshake_hint(problem))
+        };
+        if needs_credential_heal {
+            let _ = std::fs::remove_file(&cred_path);
+            enrollment = omt_client::Client::connect_and_enroll(&descriptor, &options)
+                .map_err(CliError::Problem)?;
+        }
+
+        let token = enrollment.client.token().to_string();
+        let mut client = OnlineClient {
+            inner: enrollment.client,
+            token,
+        };
+        // The inner client already consumed one handshake for enrollment;
+        // resolve_home_id works off a fresh discovery handshake, so run the
+        // CLI's own finish step over the wrapper (keeps wire behavior
+        // identical to pre-U7).
+        client
+            .inner
+            .set_cancel_check(Box::new(|| CANCELED.load(Ordering::SeqCst)));
         #[cfg(unix)]
         {
-            use std::os::fd::AsRawFd;
-            *ACTIVE_FD.lock().expect("fd slot") = Some(stream.as_raw_fd());
+            *ACTIVE_FD.lock().expect("fd slot") = Some(client.raw_fd());
         }
+        let handshake = client.request(
+            "handshake/request",
+            serde_json::json!({
+                "protocolVersion": "1.0",
+                "client": { "kind": "cli", "name": "omt-cli", "version": env!("CARGO_PKG_VERSION") },
+            }),
+        )?;
+        let home_id = resolve_home_id(&handshake, globals)?;
+        Ok((client, home_id))
+    }
 
-        let mut client = OnlineClient {
-            stream,
-            next_id: 1,
-            token: String::new(),
-        };
-
-        // Persisted enrollment (real-CLI pattern): the FIRST invocation
-        // handshakes and stores its credential under the runtime dir;
-        // later invocations reuse it so leases fence consistently across
-        // processes (claim in one call, report in the next). A rejected
-        // stored token (daemon restart rotated the registry) transparently
-        // re-enrolls.
-        let cred_path = runtime_dir.join("cli-credential.json");
-        if let Ok(raw) = std::fs::read_to_string(&cred_path) {
-            if let Ok(stored) = serde_json::from_str::<serde_json::Value>(&raw) {
-                if let Some(token) = stored["token"].as_str() {
-                    client.token = token.to_string();
-                    let probe = client.call("node/list", serde_json::json!({ "filter": {} }));
-                    match probe {
-                        Ok(_) => return resolve_and_finish(client, globals),
-                        Err(CliError::Problem(ref problem))
-                            if problem.code == "UNAUTHORIZED" || problem.code == "FORBIDDEN" =>
-                        {
-                            // Stale credential: fall through to re-enroll.
-                            client.next_id += 1;
-                        }
-                        Err(_) => {
-                            // Transport problem unrelated to auth: keep the
-                            // stored token and let the verb surface it.
-                            return resolve_and_finish(client, globals);
-                        }
-                    }
-                }
-            }
-        }
-
-        let actor_namespace = globals
-            .actor
-            .clone()
-            .unwrap_or_else(|| format!("cli:{}", std::process::id()));
-        let handshake_params = serde_json::json!({
-            "protocolVersion": "1.0",
-            "client": { "kind": "cli", "name": "omt-cli", "version": env!("CARGO_PKG_VERSION") },
-            "requestedScopes": { "actorNamespace": actor_namespace },
-        });
-        let handshake = client.request("handshake/request", handshake_params)?;
-        let credential = handshake["credential"].clone();
-        client.token = credential["token"].as_str().unwrap_or_default().to_string();
-        // Best-effort persistence (0600); failures fall back to per-call
-        // enrollment without breaking the current invocation.
-        if !client.token.is_empty() {
-            let payload = serde_json::to_string(&credential).unwrap_or_default();
-            let _ = std::fs::write(&cred_path, payload);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ =
-                    std::fs::set_permissions(&cred_path, std::fs::Permissions::from_mode(0o600));
-            }
-        }
-
-        resolve_and_finish(client, globals)
+    /// Raw fd for the Ctrl-C abort registry (single-threaded CLI; the
+    /// wrapper owns the only handle).
+    #[cfg(unix)]
+    fn raw_fd(&self) -> i32 {
+        self.inner.stream_fd()
     }
 
     /// Authenticated business call (credential token attached in request).
@@ -483,110 +462,30 @@ impl OnlineClient {
         self.request(method, params)
     }
 
-    fn request(
-        &mut self,
-        method: &str,
-        mut params: serde_json::Value,
-    ) -> CliResult<serde_json::Value> {
-        self.next_id += 1;
-        let id = self.next_id;
-        if !method.starts_with("handshake") {
-            params["credential"] = serde_json::json!({ "token": self.token });
-        }
-        self.send_and_wait(id, method, params)
-    }
-
-    /// Write one request line and wait for ITS response, skipping
-    /// interleaved notifications. A Ctrl-C shutdown of the socket breaks
-    /// the read and surfaces as CANCELED.
-    fn send_and_wait(
-        &mut self,
-        id: u64,
-        method: &str,
-        params: serde_json::Value,
-    ) -> CliResult<serde_json::Value> {
-        let line = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params,
-        })
-        .to_string();
-        {
-            use std::io::Write;
-            let mut writer = &self.stream;
-            writeln!(writer, "{line}")
-                .map_err(|err| CliError::Problem(io_problem("request write", err)))?;
-        }
-        let reader = BufReader::new(match self.stream.try_clone() {
-            Ok(clone) => clone,
-            Err(err) => return Err(CliError::Problem(io_problem("stream clone", err))),
-        });
-        for line in reader.lines() {
-            if CANCELED.load(Ordering::SeqCst) {
-                return Err(CliError::Canceled);
+    fn request(&mut self, method: &str, params: serde_json::Value) -> CliResult<serde_json::Value> {
+        self.inner.set_token(self.token.clone());
+        match self.inner.request(method, params) {
+            Ok(value) => {
+                self.token = self.inner.token().to_string();
+                Ok(value)
             }
-            let Ok(line) = line else {
-                // Socket EOF right after a Ctrl-C shutdown IS the cancel.
-                if CANCELED.load(Ordering::SeqCst) {
-                    return Err(CliError::Canceled);
-                }
-                return Err(CliError::Problem(Problem::new(
-                    omt_domain::error::IO,
-                    "connection closed",
-                )));
-            };
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
-                continue;
-            };
-            if value.get("id").and_then(|v| v.as_u64()) != Some(id) {
-                continue; // interleaved omt/event notification
-            }
-            if let Some(error) = value.get("error") {
-                let data = error.get("data").cloned().unwrap_or(serde_json::json!({}));
-                return Err(CliError::Problem(Problem {
-                    code: leak_code(data["code"].as_str().unwrap_or("UNKNOWN")),
-                    message: data["message"].as_str().unwrap_or_default().to_string(),
-                    details: data.get("details").cloned(),
-                }));
-            }
-            return Ok(value
-                .get("result")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null));
+            Err(problem) if problem.code == "CANCELED" => Err(CliError::Canceled),
+            Err(problem) => Err(CliError::Problem(problem)),
         }
-        if CANCELED.load(Ordering::SeqCst) {
-            return Err(CliError::Canceled);
-        }
-        Err(CliError::Problem(Problem::new(
-            omt_domain::error::IO,
-            "connection closed before response",
-        )))
     }
 }
 
-/// Problem.code is &'static str; CLI codes come off the wire, so intern the
-/// small registry we know about (anything unknown collapses to UNKNOWN).
-fn leak_code(code: &str) -> &'static str {
-    match code {
-        "CONFLICT" => "CONFLICT",
-        "INVALID_HIERARCHY" => "INVALID_HIERARCHY",
-        "INVALID_INPUT" => "INVALID_INPUT",
-        "NOT_FOUND" => "NOT_FOUND",
-        "IO" => "IO",
-        "UNSUPPORTED_PROTOCOL" => "UNSUPPORTED_PROTOCOL",
-        "SCHEMA_TOO_NEW" => "SCHEMA_TOO_NEW",
-        "UNAUTHORIZED" => "UNAUTHORIZED",
-        "FORBIDDEN" => "FORBIDDEN",
-        "BOOTSTRAP_TIMEOUT" => "BOOTSTRAP_TIMEOUT",
-        "RATE_LIMITED" => "RATE_LIMITED",
-        "QUOTA_EXCEEDED" => "QUOTA_EXCEEDED",
-        "HOME_LOCKED" => "HOME_LOCKED",
-        "DAEMON_OWNS_HOME" => "DAEMON_OWNS_HOME",
-        "REINDEX_REQUIRED" => "REINDEX_REQUIRED",
-        "CANCELED" => "CANCELED",
-        _ => "UNKNOWN",
-    }
+/// U7/R10: is this problem a home-SCOPE denial stamped with the server's
+/// requiresRehandshake hint (KTD3)? Only FORBIDDEN home-not-scoped and
+/// NOT_FOUND kind:home carry it; op-family FORBIDDEN deliberately does not.
+fn home_scope_rehandshake_hint(problem: &Problem) -> bool {
+    let hint = problem
+        .details
+        .as_ref()
+        .and_then(|d| d.get("requiresRehandshake"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    hint && (problem.code == "FORBIDDEN" || problem.code == "NOT_FOUND")
 }
 
 fn io_problem(context: &str, err: std::io::Error) -> Problem {
@@ -1135,14 +1034,136 @@ fn offline_reindex(globals: &GlobalArgs, args: &[String]) -> CliResult<()> {
     print_result(outcome.map_err(CliError::Problem)?, globals.json)
 }
 
-/// `omt doctor <home-path>` — OFFLINE diagnostics over locally detectable
-/// writer cohorts (orchestrator ruling): ts-bridge live/stale markers,
-/// orphan recovery directories, too-new schema. Holds the exclusive owner
-/// lock during the scan; releases afterwards.
+/// U7/R10 preamble result, pre-serialized so both doctor report shapes
+/// embed identical fields.
+struct DoctorPreamble {
+    runtime: serde_json::Value,
+    admin_grants: serde_json::Value,
+}
+
+/// Online preamble (observation only — no locks, no ownership checks):
+/// installed `omt` binary version vs the RUNNING daemon's handshake
+/// version, plus the admin-grants cohort with dead-pid entries surfaced.
+/// Degrades gracefully: no descriptor → not-running; probe/handshake
+/// failure or missing version field → match:"unknown"; exit code stays 0.
+fn doctor_online_preamble(runtime_dir: &std::path::Path) -> DoctorPreamble {
+    // Test seam: e2e asserts the mismatch path without building a fake
+    // old daemon (the comparison itself is the unit under test).
+    let cli_version: String = std::env::var("OMT_DOCTOR_CLI_VERSION_OVERRIDE")
+        .unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_string());
+    let runtime = match omt_client::read_descriptor(runtime_dir) {
+        None => serde_json::json!({
+            "descriptorFound": false,
+            "daemonVersion": null,
+            "cliVersion": cli_version,
+            "match": "unknown",
+            "generation": null,
+            "note": "no daemon descriptor — daemon not running; offline checks below",
+        }),
+        Some(descriptor) => {
+            let live = crate::descriptor::pid_live(descriptor.pid)
+                && omt_client::endpoint_live(&descriptor.endpoint);
+            if !live {
+                serde_json::json!({
+                    "descriptorFound": true,
+                    "daemonVersion": null,
+                    "cliVersion": cli_version,
+                    "match": "unknown",
+                    "generation": descriptor.generation,
+                    "note": "descriptor stale (dead pid or unresponsive endpoint)",
+                })
+            } else {
+                let options = omt_client::EnrollOptions {
+                    kind: "cli".into(),
+                    name: Some("omt-doctor".into()),
+                    actor_namespace: None,
+                    credential_path: None,
+                };
+                match omt_client::Client::connect_and_enroll(&descriptor, &options) {
+                    Ok(enrollment) => {
+                        let daemon_version = enrollment.handshake["daemon"]["version"].clone();
+                        let match_value = match daemon_version.as_str() {
+                            None => serde_json::json!("unknown"),
+                            Some(v) if v == cli_version => serde_json::json!(true),
+                            Some(_) => serde_json::json!(false),
+                        };
+                        serde_json::json!({
+                            "descriptorFound": true,
+                            "daemonVersion": daemon_version,
+                            "cliVersion": cli_version,
+                            "match": match_value,
+                            "generation": descriptor.generation,
+                        })
+                    }
+                    Err(_) => serde_json::json!({
+                        "descriptorFound": true,
+                        "daemonVersion": null,
+                        "cliVersion": cli_version,
+                        "match": "unknown",
+                        "generation": descriptor.generation,
+                        "note": "handshake failed — version undetermined",
+                    }),
+                }
+            }
+        }
+    };
+
+    // Admin-grants cohort: total entries + entries whose embedded actor
+    // namespace pid is dead (namespaces shaped '<prefix>:<pid>').
+    let principals = crate::auth::admin_principals(runtime_dir);
+    let mut dead = Vec::new();
+    for principal in &principals {
+        if let Some(pid_str) = principal.rsplit(':').next() {
+            if let Ok(pid) = pid_str.parse::<i64>() {
+                if pid > 0 && !crate::descriptor::pid_live(pid) {
+                    dead.push(serde_json::json!({ "principalId": principal, "pid": pid }));
+                }
+            }
+        }
+    }
+    let admin_grants = serde_json::json!({
+        "totalEntries": principals.len(),
+        "deadPidEntries": dead,
+    });
+
+    DoctorPreamble {
+        runtime,
+        admin_grants,
+    }
+}
+
+/// `omt doctor <home-path>` — diagnostics with a U7/R10 ONLINE PREAMBLE
+/// (installed-binary vs running-daemon version + admin-grants cohort) and
+/// OFFLINE cohort scans (ts-bridge live/stale markers, orphan recovery
+/// directories, too-new schema). A live daemon skips deep probes with a
+/// note instead of refusing; the exclusive scan holds the owner lock
+/// during the scan and releases afterwards.
 fn offline_doctor(globals: &GlobalArgs, args: &[String]) -> CliResult<()> {
     let home = offline_home_path(args)?;
     let runtime_dir = crate::paths::resolve(globals.runtime_dir.as_deref());
-    crate::ownership::refuse_if_served(&runtime_dir).map_err(CliError::Problem)?;
+
+    // U7/R10: ONLINE PREAMBLE — installed-binary vs running-daemon
+    // consistency, computed BEFORE any lock acquisition (and before
+    // refuse_if_served: deep probes keep their served-daemon refusal, the
+    // preamble is pure observation). Never hard-fails: every failure mode
+    // degrades to match:"unknown" or not-running with exit code 0.
+    let preamble = doctor_online_preamble(&runtime_dir);
+    // A live daemon refuses the DEEP offline probes (they would race its
+    // home ownership) — but the preamble's whole purpose is reporting on
+    // exactly that situation (version drift after an upgrade), so report
+    // the runtime fields and skip the deep probes instead of erroring out
+    // (mirrors the ts-bridge cohort path below).
+    if let Err(refusal) = crate::ownership::refuse_if_served(&runtime_dir) {
+        let report = serde_json::json!({
+            "home": home.display().to_string(),
+            "healthy": null,
+            "runtime": preamble.runtime,
+            "adminGrants": preamble.admin_grants,
+            "note": "deep probes skipped: live daemon serving this runtime dir",
+            "refusal": { "code": refusal.code, "message": refusal.message },
+        });
+        return print_result(report, globals.json);
+    }
 
     // Cohort scan BEFORE acquiring (acquisition replaces the marker).
     let mut cohorts =
@@ -1180,6 +1201,8 @@ fn offline_doctor(globals: &GlobalArgs, args: &[String]) -> CliResult<()> {
         let report = serde_json::json!({
             "home": home.display().to_string(),
             "healthy": false,
+            "runtime": preamble.runtime,
+            "adminGrants": preamble.admin_grants,
             "cohorts": cohorts,
             "note": "deeper probes skipped: ts-bridge marker requires explicit takeover (U6)",
         });
@@ -1221,6 +1244,8 @@ fn offline_doctor(globals: &GlobalArgs, args: &[String]) -> CliResult<()> {
             "healthy": cohorts["orphans"].as_array().map(|a| a.is_empty()).unwrap_or(true)
                 && cohorts["schemaTooNew"] == serde_json::json!(false),
             "nodes": nodes,
+            "runtime": preamble.runtime,
+            "adminGrants": preamble.admin_grants,
             "cohorts": cohorts,
         }))
     })();
