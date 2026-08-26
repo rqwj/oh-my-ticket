@@ -26,6 +26,7 @@ import {
   type ProblemShape,
 } from './transport.js'
 import { resolveDaemonBinary } from './daemon-resolve.js'
+import type { DeclareHomeResult } from './generated/commands.js'
 import type { EventEnvelope } from './generated/events.js'
 
 export { OmtProtocolError }
@@ -61,6 +62,20 @@ export interface HandshakeOutcome {
 
 export type ClientKind = 'dsh' | 'cli' | 'desktop' | 'mcp' | 'external'
 
+/**
+ * U6/KTD3 predicate: does this error carry the server's home-scope
+ * rehandshake hint? Only FORBIDDEN home-not-scoped and NOT_FOUND kind:home
+ * problems are stamped with `details.requiresRehandshake: true` (server
+ * side, server.rs) — operation-family FORBIDDEN intentionally is not, so
+ * a hint here reliably means "your credential's home grant is stale".
+ */
+export function isHomeScopeRehandshakeHint(error: unknown): boolean {
+  if (!(error instanceof OmtProtocolError)) return false
+  const details = error.details as { requiresRehandshake?: unknown } | null
+  if (details?.requiresRehandshake !== true) return false
+  return error.problemCode === 'FORBIDDEN' || error.problemCode === 'NOT_FOUND'
+}
+
 export interface RequestedScopes {
   actorNamespace?: string
   homes?: string[]
@@ -95,6 +110,18 @@ export interface ClientOptions {
    * swallowed: they must not break reconnection (TICKET-0131).
    */
   onReconnected?: (handshake: HandshakeOutcome) => void | Promise<void>
+
+  /**
+   * U6/KTD3 defensive layer: when a home-SCOPE denial carries the server's
+   * `requiresRehandshake: true` hint, re-handshake once and retry the
+   * request once (covers homes declared by other clients, daemon
+   * generation changes, etc.). DEFAULT FALSE: the DSH adapter owns a
+   * curated stale-home heal (TICKET-0132: whitelist + cooldown + original
+   * problem surfacing) and would double-heal if the client layer also
+   * retried. Thin clients without their own heal logic (desktop, mcp)
+   * should set this true.
+   */
+  rehandshakeOnHomeScopeHint?: boolean
 }
 
 export class OmtClient {
@@ -349,6 +376,15 @@ export class OmtClient {
    * Typed JSON-RPC call: attaches `params.credential.token` automatically,
    * casts the result to T. Rejects with {@link OmtProtocolError} carrying
    * problem code/details on failure (R5).
+   *
+   * U6/KTD3 defensive layer: a home-SCOPE denial carrying the
+   * `requiresRehandshake: true` hint (FORBIDDEN home-not-scoped or
+   * NOT_FOUND kind:home) means the credential's home grant is stale — the
+   * home was declared by another client, another daemon generation, or a
+   * fresh server-side enrollment. The client re-handshakes ONCE and retries
+   * the request ONCE; a second failure propagates (no retry loop).
+   * Operation-family FORBIDDEN deliberately carries no hint (KTD3) and
+   * never reaches this path.
    */
   async call<T = unknown>(
     method: string,
@@ -359,7 +395,40 @@ export class OmtClient {
       throw new Error('client not connected; call connect() first')
     }
     const authedParams = { ...params, credential: { token: this.credential.token } }
-    return (await this.transport.call(method, authedParams, hooks)) as T
+    try {
+      return (await this.transport.call(method, authedParams, hooks)) as T
+    } catch (error) {
+      if (
+        method === 'handshake/request' ||
+        this.options.rehandshakeOnHomeScopeHint !== true ||
+        !isHomeScopeRehandshakeHint(error)
+      ) {
+        throw error
+      }
+      await this.forceReconnect()
+      return (await this.transport!.call(method, authedParams, hooks)) as T
+    }
+  }
+
+  /**
+   * home/declare (U6 consumer of U5/R6): register an existing on-disk home
+   * into the running daemon. Returns the (possibly pre-existing) homeId;
+   * `requiresRehandshake: true` means the caller must forceReconnect before
+   * the new home enters its scoped credential — OmtService does exactly
+   * that in its declare-then-retry resolution path.
+   */
+  async declareHome(path: string): Promise<DeclareHomeResult> {
+    return this.call<DeclareHomeResult>('home/declare', { path })
+  }
+
+  /**
+   * Handshake features map (additive open map — absent flag means
+   * unsupported; F4 version-drift fallback reads features.homeDeclare to
+   * decide between declare-then-retry and the legacy hard error).
+   */
+  get features(): Record<string, boolean> {
+    const features = (this.handshakeResult as { features?: Record<string, boolean> } | null)?.features
+    return features ?? {}
   }
 
   // ── events ───────────────────────────────────────────────────────────

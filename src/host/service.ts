@@ -697,13 +697,32 @@ export class OmtService {
 
   /**
    * Workspace home for a cwd — present only when the workspace carries an
-   * `.omt/` directory AND the daemon opened it (homes are declared at daemon
-   * startup in this build; dynamic registration is future work, U7b).
+   * `.omt/` directory AND the daemon opened it (declared at startup or via
+   * home/declare, U5/U6).
    */
   workspaceHome(cwd: string | undefined): HomeRef | undefined {
     if (cwd === undefined) return undefined
     const local = join(cwd, '.omt')
     if (!existsSync(local)) return undefined
+    return this.homeRegistry.get(local)
+  }
+
+  /**
+   * U6/R8: declare an on-disk-but-unregistered workspace home into the
+   * running daemon, then re-handshake so the new home enters this
+   * credential's scoped grant (requiresRehandshake). Returns the fresh
+   * HomeRef, or undefined when the daemon predates home/declare
+   * (features.homeDeclare absent — F4 version-drift fallback keeps the
+   * legacy hard error for that case). Idempotent per path: the daemon
+   * dedupes by canonical path, and a second call finds the home already
+   * in the registry before ever declaring again.
+   */
+  private async declareWorkspaceHome(local: string): Promise<HomeRef | undefined> {
+    if (this.client.features['homeDeclare'] !== true) return undefined
+    const result = await this.client.declareHome(local)
+    if (result.requiresRehandshake) {
+      await this.client.forceReconnect()
+    }
     return this.homeRegistry.get(local)
   }
 
@@ -713,9 +732,15 @@ export class OmtService {
     const workspace = this.workspaceHome(cwd)
     if (workspace !== undefined) return workspace
     if (cwd !== undefined && existsSync(join(cwd, '.omt'))) {
+      const local = join(cwd, '.omt')
+      // U6: declare-then-retry exactly once (the declare itself is the
+      // retry — the daemon's idempotency makes a repeat resolution a
+      // registry hit, never a second declare).
+      const declared = await this.declareWorkspaceHome(local)
+      if (declared !== undefined) return declared
       throw new OmtError('INVALID_INPUT',
-        `工作区 home ${join(cwd, '.omt')} 存在，但当前 omt-daemon 未收录该 home（需在 daemon 启动时以 --home 声明）`,
-        { rule: 'home-not-opened', path: join(cwd, '.omt') })
+        `工作区 home ${local} 存在，但当前 omt-daemon 未收录该 home（daemon 版本过旧不支持 home/declare，请升级 daemon）`,
+        { rule: 'home-not-opened', path: local })
     }
     return this.globalHome()
   }
@@ -728,8 +753,10 @@ export class OmtService {
       const local = join(cwd, '.omt')
       const known = this.homeRegistry.get(local)
       if (known !== undefined) return known
+      const declared = await this.declareWorkspaceHome(local)
+      if (declared !== undefined) return declared
       throw new OmtError('INVALID_INPUT',
-        `工作区 home ${local} 尚未在 omt-daemon 注册；本版本要求 daemon 启动时以 --home 声明工作区 home`,
+        `工作区 home ${local} 尚未在 omt-daemon 注册，且 daemon 不支持 home/declare 动态收录（请升级 daemon）`,
         { rule: 'home-not-opened', path: local })
     }
     return this.globalHome()

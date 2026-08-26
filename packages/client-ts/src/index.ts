@@ -12,6 +12,7 @@ export type {
 } from './transport.js'
 export {
   OmtClient,
+  isHomeScopeRehandshakeHint,
   type ClientKind,
   type ClientOptions,
   type CredentialInfo,
