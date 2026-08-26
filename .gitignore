@@ -31,3 +31,7 @@ lib/
 target/
 .cargo-home/
 .npm-cache/
+
+# U8: tauri sidecar staging is a build artifact (scripts/copy-sidecar.mjs)
+apps/desktop/src-tauri/binaries/omt-daemon-*
+apps/desktop/dist/

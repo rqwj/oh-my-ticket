@@ -1,0 +1,22 @@
+[package]
+name = "oh-my-ticket-desktop"
+version.workspace = true
+edition.workspace = true
+description = "oh-my-ticket desktop surface (Tauri 2) — a peer member of the multi-surface runtime (KD4: fresh UI, KD5: same-source sidecar daemon)."
+
+[lib]
+name = "oh_my_ticket_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "oh-my-ticket-desktop"
+path = "src/main.rs"
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }

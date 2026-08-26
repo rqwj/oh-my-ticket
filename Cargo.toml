@@ -3,7 +3,7 @@
 # repository root; everything under crates/ belongs to the Rust side.
 [workspace]
 resolver = "2"
-members = ["crates/*"]
+members = ["crates/*", "apps/desktop/src-tauri"]
 
 [workspace.package]
 # U1 (KTD1/R22): the unified product version. All four crates inherit via
