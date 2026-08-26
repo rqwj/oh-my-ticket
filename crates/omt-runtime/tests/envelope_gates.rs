@@ -19,7 +19,8 @@
 //! Gate 3 — SIGKILL-to-ready: daemon killed -9 mid-mutation on an active
 //! home → respawn through the bootstrap path → readiness (descriptor live
 //! + handshake + recovered state readable) measured wall-clock <5 s;
-//! convergence asserted down to planned bytes on disk, unique operations
+//!
+//! Convergence asserted down to planned bytes on disk, unique operations
 //! rows, journal phase = acknowledged for every command, and roll-forward
 //! of both pending crash states (`prepared` and `db_committed`).
 //!
@@ -265,8 +266,8 @@ fn seed_topology(endpoint: &str, scale: Scale, home_ids: &[String]) -> Topology 
         conflict_nodes: Vec::with_capacity(homes),
         run_ids: Vec::with_capacity(homes),
     };
-    for h in 0..homes {
-        let partial = partials[h]
+    for (h, partial_slot) in partials.iter().enumerate() {
+        let partial = partial_slot
             .lock()
             .expect("partial lock")
             .clone()
@@ -1076,7 +1077,7 @@ fn gate_envelope_multi_client_correctness() {
         });
     }
     let storm_s = phase.elapsed().as_secs_f32();
-    let mut ledger = ledger.into_inner().expect("ledger");
+    let ledger = ledger.into_inner().expect("ledger");
     assert!(
         ledger.violations.is_empty(),
         "storm contract violations: {:?}",
@@ -1686,7 +1687,7 @@ fn gate_sigkill_to_ready_under_five_seconds() {
     let acked_ops = acked.lock().expect("acked").len();
     let kill_landed_ms = spawn_at.elapsed().as_millis();
     assert!(
-        *hammer_error.lock().expect("lock") == None,
+        (*hammer_error.lock().expect("lock")).is_none(),
         "hammer failures before the kill: {:?}",
         hammer_error.lock().expect("lock")
     );

@@ -526,7 +526,7 @@ fn plain_safe_last(c: char) -> bool {
 fn plain_safe(c: char, prev: Option<char>) -> bool {
     let c_ns_or_ws = js_is_printable(c) && c != '\r' && c != '\n';
     let c_is_ns = c_ns_or_ws && !js_is_s_white(c);
-    if c_ns_or_ws && c != '#' && !(prev == Some(':') && !c_is_ns) {
+    if c_ns_or_ws && c != '#' && (prev != Some(':') || c_is_ns) {
         return true;
     }
     let Some(prev) = prev else { return false };
@@ -789,11 +789,11 @@ fn yaml_timestamp_resolves(text: &str) -> bool {
     let mut i = 5usize;
     // Month: 1–2 digits.
     let month_start = i;
-    if !b.get(i).map_or(false, u8::is_ascii_digit) {
+    if !b.get(i).is_some_and(u8::is_ascii_digit) {
         return false;
     }
     i += 1;
-    if i - month_start < 2 && b.get(i).map_or(false, u8::is_ascii_digit) {
+    if i - month_start < 2 && b.get(i).is_some_and(u8::is_ascii_digit) {
         i += 1;
     }
     if b.get(i) != Some(&b'-') {
@@ -802,11 +802,11 @@ fn yaml_timestamp_resolves(text: &str) -> bool {
     i += 1;
     // Day: 1–2 digits.
     let day_start = i;
-    if !b.get(i).map_or(false, u8::is_ascii_digit) {
+    if !b.get(i).is_some_and(u8::is_ascii_digit) {
         return false;
     }
     i += 1;
-    if i - day_start < 2 && b.get(i).map_or(false, u8::is_ascii_digit) {
+    if i - day_start < 2 && b.get(i).is_some_and(u8::is_ascii_digit) {
         i += 1;
     }
     // Separator: [Tt] or one-or-more space/tab.
@@ -821,11 +821,11 @@ fn yaml_timestamp_resolves(text: &str) -> bool {
     }
     // Hour: 1–2 digits.
     let hour_start = i;
-    if !b.get(i).map_or(false, u8::is_ascii_digit) {
+    if !b.get(i).is_some_and(u8::is_ascii_digit) {
         return false;
     }
     i += 1;
-    if i - hour_start < 2 && b.get(i).map_or(false, u8::is_ascii_digit) {
+    if i - hour_start < 2 && b.get(i).is_some_and(u8::is_ascii_digit) {
         i += 1;
     }
     // Minute and second: exactly two digits each, colon-separated.
@@ -840,7 +840,7 @@ fn yaml_timestamp_resolves(text: &str) -> bool {
     // Optional fraction: `.` then any run of digits.
     if b.get(i) == Some(&b'.') {
         i += 1;
-        while b.get(i).map_or(false, u8::is_ascii_digit) {
+        while b.get(i).is_some_and(u8::is_ascii_digit) {
             i += 1;
         }
     }
@@ -853,11 +853,11 @@ fn yaml_timestamp_resolves(text: &str) -> bool {
         Some(b'-' | b'+') => {
             i += 1;
             let tz_start = i;
-            if !b.get(i).map_or(false, u8::is_ascii_digit) {
+            if !b.get(i).is_some_and(u8::is_ascii_digit) {
                 return false;
             }
             i += 1;
-            if i - tz_start < 2 && b.get(i).map_or(false, u8::is_ascii_digit) {
+            if i - tz_start < 2 && b.get(i).is_some_and(u8::is_ascii_digit) {
                 i += 1;
             }
             if b.get(i) == Some(&b':') {

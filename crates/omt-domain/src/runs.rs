@@ -63,7 +63,7 @@ pub fn trust_gate_gates(
     }
     item_state == RunItemState::Running
         && observer_session.is_some()
-        && observer_session == item_executor_session.as_deref()
+        && observer_session == item_executor_session
         && !auto_verify
 }
 

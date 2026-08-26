@@ -46,7 +46,7 @@ impl Rng {
     }
 }
 
-fn percentile(sorted_ms: &mut Vec<f64>, p: f64) -> f64 {
+fn percentile(sorted_ms: &mut [f64], p: f64) -> f64 {
     if sorted_ms.is_empty() {
         return 0.0;
     }

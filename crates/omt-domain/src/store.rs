@@ -117,6 +117,10 @@ impl Store {
         self.nodes.insert(node.id.clone(), node);
     }
 
+    // Mirrors the patch shape of the update RPC one-to-one; callers pass
+    // positional Options, so a params struct would only relocate the count
+    // (clippy::too_many_arguments accepted deliberately).
+    #[allow(clippy::too_many_arguments)]
     pub fn update_node(
         &mut self,
         id: &str,
@@ -161,8 +165,8 @@ impl Store {
     ) -> Vec<NodeRow> {
         self.nodes
             .values()
-            .filter(|node| node_type.map_or(true, |t| node.node_type == t))
-            .filter(|node| status.map_or(true, |s| node.status == s))
+            .filter(|node| node_type.is_none_or(|t| node.node_type == t))
+            .filter(|node| status.is_none_or(|s| node.status == s))
             .cloned()
             .collect()
     }
@@ -285,7 +289,7 @@ impl Store {
     pub fn list_runs(&self, status: Option<RunStatus>) -> Vec<RunRow> {
         self.runs
             .values()
-            .filter(|run| status.map_or(true, |s| run.status == s))
+            .filter(|run| status.is_none_or(|s| run.status == s))
             .cloned()
             .collect()
     }

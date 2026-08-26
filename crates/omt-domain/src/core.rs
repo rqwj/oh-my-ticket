@@ -147,11 +147,14 @@ pub struct CoreDeps {
     pub store: Rc<RefCell<Store>>,
 }
 
+/// One change listener registered on a core (clippy::type_complexity).
+type Listener = Rc<dyn Fn(&RunEvent)>;
+
 /// The dual-write core bound to one home.
 pub struct OmtCore {
     home: String,
     deps: CoreDeps,
-    listeners: Vec<Rc<dyn Fn(&RunEvent)>>,
+    listeners: Vec<Listener>,
 }
 
 impl OmtCore {
@@ -451,9 +454,11 @@ impl OmtCore {
         )?;
 
         // A status change shows up in the parent's managed children list too.
-        if (patch_title.is_some() || patch_status.is_some()) && parent.is_some() {
-            let parent_id = parent.as_ref().unwrap().id.clone();
-            self.refresh_children_block(&parent_id)?;
+        if patch_title.is_some() || patch_status.is_some() {
+            if let Some(parent) = parent.as_ref() {
+                let parent_id = parent.id.clone();
+                self.refresh_children_block(&parent_id)?;
+            }
         }
 
         // Ancestor activation (STORY-0022): work starting anywhere lights up

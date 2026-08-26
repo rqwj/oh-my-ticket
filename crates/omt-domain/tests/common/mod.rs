@@ -18,6 +18,14 @@ use omt_domain::core::{
 use omt_domain::core::{parse_item_state, parse_node_status, parse_node_type};
 use omt_domain::error;
 use omt_domain::ports::{FixedClock, MemoryLeases};
+
+/// Test-fixture handle triple returned by [`FixtureHome::ensure_handle`]
+/// (clippy::type_complexity).
+type HomeHandles = (
+    Rc<RefCell<MemoryFiles>>,
+    Rc<RefCell<Store>>,
+    Rc<RefCell<MemoryLeases>>,
+);
 use omt_domain::store::{FileStore, Store};
 use omt_domain::types::*;
 use omt_domain::Problem;
@@ -250,14 +258,7 @@ impl Executor {
         }
     }
 
-    fn ensure_handle(
-        &mut self,
-        home: &str,
-    ) -> (
-        Rc<RefCell<MemoryFiles>>,
-        Rc<RefCell<Store>>,
-        Rc<RefCell<MemoryLeases>>,
-    ) {
+    fn ensure_handle(&mut self, home: &str) -> HomeHandles {
         let handle = self
             .homes
             .entry(home.to_string())
@@ -372,7 +373,7 @@ impl Executor {
                     .vfs
                     .borrow()
                     .get(&local)
-                    .map_or(false, |e| matches!(e, Entry::Dir))
+                    .is_some_and(|e| matches!(e, Entry::Dir))
                 {
                     local
                 } else {
@@ -1040,9 +1041,9 @@ fn value_eq(a: &Value, b: &Value) -> bool {
         }
         (Value::Object(left), Value::Object(right)) => {
             left.len() == right.len()
-                && left.iter().all(|(key, value)| {
-                    right.get(key).map_or(false, |other| value_eq(value, other))
-                })
+                && left
+                    .iter()
+                    .all(|(key, value)| right.get(key).is_some_and(|other| value_eq(value, other)))
         }
         _ => false,
     }
@@ -1410,7 +1411,7 @@ pub fn run_scenario(doc: &Value) -> ScenarioSummary {
                             format!(
                                 "{} != {}",
                                 at.map(stringify).unwrap_or_else(|| "undefined".into()),
-                                stringify(&expected)
+                                stringify(expected)
                             ),
                         );
                     }
@@ -1435,7 +1436,7 @@ pub fn run_scenario(doc: &Value) -> ScenarioSummary {
                             format!(
                                 "{} does not match {}",
                                 at.map(stringify).unwrap_or_else(|| "undefined".into()),
-                                stringify(&expected)
+                                stringify(expected)
                             ),
                         );
                     }
@@ -1457,7 +1458,7 @@ pub fn run_scenario(doc: &Value) -> ScenarioSummary {
                         }
                         (Some(Value::Array(entries)), _) => entries
                             .iter()
-                            .any(|entry| subset_match(Some(entry), &expected)),
+                            .any(|entry| subset_match(Some(entry), expected)),
                         _ => false,
                     };
                     if !hit {
@@ -1469,7 +1470,7 @@ pub fn run_scenario(doc: &Value) -> ScenarioSummary {
                             format!(
                                 "{} does not contain {}",
                                 at.map(stringify).unwrap_or_else(|| "undefined".into()),
-                                stringify(&expected)
+                                stringify(expected)
                             ),
                         );
                     }
@@ -1500,7 +1501,7 @@ pub fn run_scenario(doc: &Value) -> ScenarioSummary {
                             format!(
                                 "length of {} != {}",
                                 at.map(stringify).unwrap_or_else(|| "undefined".into()),
-                                stringify(&expected)
+                                stringify(expected)
                             ),
                         );
                     }
@@ -1529,7 +1530,7 @@ pub fn run_scenario(doc: &Value) -> ScenarioSummary {
                             format!(
                                 "{} < {}",
                                 at.map(stringify).unwrap_or_else(|| "undefined".into()),
-                                stringify(&expected)
+                                stringify(expected)
                             ),
                         );
                     }

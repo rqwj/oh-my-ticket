@@ -68,7 +68,7 @@ fn takeover_acceptance_matrix() {
     let backups_root = runtime_dir.join("backups");
 
     // ── acceptance 1: ACTIVE legacy writer refuses with guidance ────────
-    let live_home = make_bridge_home(&ctx.dir.path());
+    let live_home = make_bridge_home(ctx.dir.path());
     write_marker(
         &live_home,
         "ts-bridge",
@@ -87,7 +87,7 @@ fn takeover_acceptance_matrix() {
     );
 
     // ── setup for acceptances 2+3: stale bridge marker = takeable ───────
-    let home = make_bridge_home(&ctx.dir.path());
+    let home = make_bridge_home(ctx.dir.path());
     let db_path = home.join("omt.db");
     let pre_hash = std::fs::read(&db_path).expect("db exists pre-takeover");
 

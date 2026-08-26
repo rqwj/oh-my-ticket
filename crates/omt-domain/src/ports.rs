@@ -120,7 +120,7 @@ impl LeaseTable for MemoryLeases {
             None => self
                 .dynamic
                 .get(session_id)
-                .map_or(false, |g| self.now_ms < g.expires_at),
+                .is_some_and(|g| self.now_ms < g.expires_at),
         }
     }
 

@@ -10,6 +10,15 @@
 //! serde structs tolerate unknown fields so additive schema changes stay
 //! compatible for older peers.
 
+// Typify's generated code trips three clippy lints (`clone_on_copy` and
+// `possible_missing_else` from its Display/From chains, `derivable_impls`
+// from its manual Default impls). The lint attribute lives on the module
+// because inner attributes are not permitted inside an `include!` expansion.
+#[allow(
+    clippy::clone_on_copy,
+    clippy::possible_missing_else,
+    clippy::derivable_impls
+)]
 mod generated {
     include!(concat!(env!("OUT_DIR"), "/contracts_generate.rs"));
 }
