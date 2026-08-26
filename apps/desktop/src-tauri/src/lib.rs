@@ -19,6 +19,8 @@ pub fn run() {
             rpc_bridge::omt_call,
             rpc_bridge::daemon_status,
             rpc_bridge::daemon_ensure,
+            rpc_bridge::daemon_homes,
+            rpc_bridge::daemon_reconnect,
             rpc_bridge::events_subscribe,
         ])
         .run(tauri::generate_context!())

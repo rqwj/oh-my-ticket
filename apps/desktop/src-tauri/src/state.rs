@@ -38,18 +38,26 @@ impl DaemonSession {
             // desktop is fully functional as a non-admin surface).
             let _ = daemon::register_admin_grant(&runtime_dir, &principal);
         }
-        Ok(Self { enrollment, runtime_dir })
+        Ok(Self {
+            enrollment,
+            runtime_dir,
+        })
     }
 
     /// One authenticated call with single-shot daemon-gone recovery.
-    pub fn call(&mut self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+    pub fn call(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
         match self.enrollment.client.call(method, params.clone()) {
             Ok(value) => Ok(value),
             Err(problem) if daemon::is_daemon_gone(&problem.message, problem.code) => {
                 // The daemon exited legally (idle watchdog) or the endpoint
                 // died: rediscover-or-respawn, re-enroll, retry ONCE.
-                let (enrollment, _spawned) = daemon::discover_or_spawn_and_enroll(&self.runtime_dir)
-                    .map_err(|err| format!("rediscover after daemon loss: {err}"))?;
+                let (enrollment, _spawned) =
+                    daemon::discover_or_spawn_and_enroll(&self.runtime_dir)
+                        .map_err(|err| format!("rediscover after daemon loss: {err}"))?;
                 self.enrollment = enrollment;
                 self.enrollment
                     .client

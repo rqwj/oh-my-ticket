@@ -92,7 +92,9 @@ pub fn spawn_sidecar(dir: &Path) -> Result<Descriptor, String> {
             Ok(())
         });
     }
-    command.spawn().map_err(|err| format!("spawn sidecar: {err}"))?;
+    command
+        .spawn()
+        .map_err(|err| format!("spawn sidecar: {err}"))?;
     omt_client::wait_for_descriptor(dir, Duration::from_secs(10))
         .ok_or_else(|| "sidecar produced no descriptor within 10s".to_string())
 }
@@ -211,10 +213,21 @@ mod tests {
             .iter()
             .filter_map(|id| id.as_str())
             .collect();
-        let desktop_entries: Vec<&&str> = ids.iter().filter(|id| id.starts_with("desktop:")).collect();
-        assert_eq!(desktop_entries.len(), 1, "exactly one desktop entry: {ids:?}");
-        assert_eq!(*desktop_entries[0], "desktop:999", "entry is the current principal");
-        assert!(ids.contains(&"dsh:333") && ids.contains(&"cli:444"), "other principals preserved");
+        let desktop_entries: Vec<&&str> =
+            ids.iter().filter(|id| id.starts_with("desktop:")).collect();
+        assert_eq!(
+            desktop_entries.len(),
+            1,
+            "exactly one desktop entry: {ids:?}"
+        );
+        assert_eq!(
+            *desktop_entries[0], "desktop:999",
+            "entry is the current principal"
+        );
+        assert!(
+            ids.contains(&"dsh:333") && ids.contains(&"cli:444"),
+            "other principals preserved"
+        );
 
         // Second launch replaces again — never accumulates.
         register_admin_grant(dir.path(), "desktop:1000").expect("re-register");
@@ -226,8 +239,13 @@ mod tests {
             .iter()
             .filter_map(|id| id.as_str())
             .collect();
-        let desktop_entries: Vec<&&str> = ids.iter().filter(|id| id.starts_with("desktop:")).collect();
-        assert_eq!(desktop_entries.len(), 1, "still one entry after second launch: {ids:?}");
+        let desktop_entries: Vec<&&str> =
+            ids.iter().filter(|id| id.starts_with("desktop:")).collect();
+        assert_eq!(
+            desktop_entries.len(),
+            1,
+            "still one entry after second launch: {ids:?}"
+        );
         assert_eq!(*desktop_entries[0], "desktop:1000");
     }
 

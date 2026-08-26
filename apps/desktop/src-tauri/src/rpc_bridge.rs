@@ -22,7 +22,10 @@ fn with_session<R>(
     shared: &SharedSession,
     f: impl FnOnce(&mut DaemonSession) -> Result<R, String>,
 ) -> Result<R, String> {
-    let mut guard = shared.0.lock().map_err(|_| "session lock poisoned".to_string())?;
+    let mut guard = shared
+        .0
+        .lock()
+        .map_err(|_| "session lock poisoned".to_string())?;
     if guard.is_none() {
         *guard = Some(DaemonSession::establish()?);
     }
@@ -43,10 +46,36 @@ pub fn daemon_status() -> Result<daemon::DaemonStatus, String> {
     Ok(daemon::status(&daemon::runtime_dir()))
 }
 
+/// U10 home listing: the handshake projection of currently-open homes
+/// (pull-based freshness — the store re-invokes on window focus; v1 has
+/// no cross-surface push signal and homes-changed deliberately never
+/// enters the per-home outbox).
+#[tauri::command]
+pub fn daemon_homes(shared: State<'_, SharedSession>) -> Result<serde_json::Value, String> {
+    with_session(&shared, |session| {
+        Ok(serde_json::json!({ "homes": session.enrollment.handshake["homes"].clone() }))
+    })
+}
+
 #[tauri::command]
 pub fn daemon_ensure(shared: State<'_, SharedSession>) -> Result<daemon::DaemonStatus, String> {
     with_session(&shared, |_session| Ok(()))?;
     daemon_status()
+}
+
+/// Force a FRESH session (drop the cached enrollment and re-handshake) —
+/// used after home/declare so the new home enters the credential's scoped
+/// grant (requiresRehandshake semantics, KTD3 client half).
+#[tauri::command]
+pub fn daemon_reconnect(shared: State<'_, SharedSession>) -> Result<serde_json::Value, String> {
+    {
+        let mut guard = shared
+            .0
+            .lock()
+            .map_err(|_| "session lock poisoned".to_string())?;
+        *guard = None;
+    }
+    daemon_homes(shared)
 }
 
 /// U10 seam: start streaming daemon events for one home to the frontend
