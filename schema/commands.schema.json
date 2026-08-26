@@ -188,6 +188,30 @@
     },
     "ReindexHomeResult": { "$ref": "common.schema.json#/$defs/ReindexResult" },
 
+    "DeclareHomeParams": {
+      "type": "object",
+      "description": "Method home/declare (U5/R6): idempotently register an existing on-disk home directory into the running daemon. Deduplication is by canonical path; concurrent declares of one path return the winner's homeId. Advertised via handshake features.homeDeclare.",
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Filesystem path of an existing home directory. Missing paths and non-directories are rejected before any lock work."
+        }
+      },
+      "required": ["path"]
+    },
+    "DeclareHomeResult": {
+      "type": "object",
+      "description": "Method home/declare result: registry insertion happened before this response; requiresRehandshake tells memory-credential clients to rehandshake so the new home enters their scoped grant (R8/KTD3).",
+      "properties": {
+        "homeId": { "$ref": "common.schema.json#/$defs/HomeId" },
+        "requiresRehandshake": { "type": "boolean" },
+        "name": { "type": "string", "description": "Home display name (final path segment)." },
+        "kind": { "type": "string", "enum": ["workspace", "global"], "description": "Effective kind; global when the declared path equals the resolved global home." }
+      },
+      "required": ["homeId", "requiresRehandshake"]
+    },
+
     "RunCreateParams": {
       "type": "object",
       "description": "Method run/create: ordered batch of Ticket/SubTicket members; every member must belong to homeId.",

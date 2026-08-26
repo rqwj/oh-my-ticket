@@ -28,10 +28,24 @@ use omt_domain::error;
 use omt_storage::clock::{MillisClock, SystemClock};
 use omt_storage::journal::{OpenConfig, Storage};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::Arc;
+
+/// Bounded wait for a concurrent declare of the SAME canonical path
+/// (KTD2): waiters park on the opener's completion slot instead of
+/// double-opening (which would leak DAEMON_OWNS_HOME). Tests shrink this
+/// via `OMT_DECLARE_WAIT_TIMEOUT_MS`.
+const DEFAULT_DECLARE_WAIT_TIMEOUT_MS: u64 = 15_000;
+
+fn declare_wait_timeout_ms() -> u64 {
+    std::env::var("OMT_DECLARE_WAIT_TIMEOUT_MS")
+        .ok()
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or(DEFAULT_DECLARE_WAIT_TIMEOUT_MS)
+}
 
 /// One unit of home work.
 ///
@@ -79,6 +93,10 @@ impl HomeKind {
 pub struct OpenedHome {
     pub home_id: String,
     pub path: PathBuf,
+    /// Canonicalized path (U5): the dedupe key for `home/declare`, so
+    /// alias paths (symlinks, macOS `/var` ↔ `/private/var`) collapse.
+    /// Best-effort at startup opens; strict for declares (they validate).
+    pub canonical: PathBuf,
     pub name: String,
     pub kind: HomeKind,
     tx: SyncSender<Job>,
@@ -189,19 +207,84 @@ impl OpenedHome {
 }
 
 /// Registry of opened homes keyed by stable HomeId.
+///
+/// U5 (KTD2): `inner` holds REAL entries only. In-flight `home/declare`
+/// opens park in `opening` (keyed by canonical path) as placeholders, so
+/// every registry reader (handshake listing, quota counting, lock-release
+/// polling, shutdown snapshot) is placeholder-aware by construction —
+/// placeholders are structurally invisible to them.
 #[derive(Default)]
 pub struct Homes {
-    inner: std::sync::Mutex<Vec<std::sync::Arc<OpenedHome>>>,
+    /// Shared with each home actor so it can remove its own entry on exit
+    /// (idle AND shutdown paths alike): quota counts only live entries and
+    /// an exited home disappears from the handshake listing.
+    inner: Arc<std::sync::Mutex<Vec<Arc<OpenedHome>>>>,
     /// Live actor threads (idle exits decrement; the server polls this to
     /// notice an all-homes-idle shutdown).
     live_actors: Arc<AtomicUsize>,
+    /// Opening placeholders keyed by canonical path (declare in flight).
+    opening: Arc<std::sync::Mutex<HashMap<PathBuf, Arc<OpeningSlot>>>>,
+}
+
+/// Outcome of one in-flight declare, delivered to same-path waiters
+/// through the completion slot (KTD2: "wake waiters with the Problem").
+enum SlotOutcome {
+    Opened(Arc<OpenedHome>),
+    Failed(omt_storage::Problem),
+}
+
+/// Per-path completion slot for concurrent declares of one canonical path.
+struct OpeningSlot {
+    outcome: std::sync::Mutex<Option<SlotOutcome>>,
+    signal: std::sync::Condvar,
+}
+
+impl OpeningSlot {
+    fn new() -> Arc<OpeningSlot> {
+        Arc::new(OpeningSlot {
+            outcome: std::sync::Mutex::new(None),
+            signal: std::sync::Condvar::new(),
+        })
+    }
+
+    fn complete(&self, outcome: SlotOutcome) {
+        *self.outcome.lock().expect("opening slot") = Some(outcome);
+        self.signal.notify_all();
+    }
+
+    /// Block until the opener completes or the deadline passes; None means
+    /// the waiter timed out (structured retryable problem upstream).
+    fn wait_until(&self, deadline: std::time::Instant) -> Option<SlotOutcome> {
+        let mut guard = self.outcome.lock().expect("opening slot");
+        loop {
+            match guard.as_ref() {
+                Some(SlotOutcome::Opened(home)) => {
+                    return Some(SlotOutcome::Opened(Arc::clone(home)))
+                }
+                Some(SlotOutcome::Failed(problem)) => {
+                    return Some(SlotOutcome::Failed(problem.clone()))
+                }
+                None => {}
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let (next, _) = self
+                .signal
+                .wait_timeout(guard, deadline - now)
+                .expect("opening slot");
+            guard = next;
+        }
+    }
 }
 
 impl Homes {
     pub fn new() -> Homes {
         Homes {
-            inner: std::sync::Mutex::new(Vec::new()),
+            inner: Arc::new(std::sync::Mutex::new(Vec::new())),
             live_actors: Arc::new(AtomicUsize::new(0)),
+            opening: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -268,14 +351,184 @@ impl Homes {
                 let rule = extra.remove("rule").unwrap_or_default();
                 limits::quota_exceeded(rule.as_str().unwrap_or("open-homes"), details)
             })?;
-        crate::ownership::recover_own_dead_daemon_marker(&path)?;
 
-        let mut open_config = OpenConfig::new(&path);
+        let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        let opened =
+            self.open_storage_and_start(&path, canonical, kind, global_path, clock, config)?;
+
+        // Startup opens are sequential; registry insertion still lands
+        // before the caller proceeds (readiness descriptor ordering).
+        self.inner
+            .lock()
+            .expect("homes")
+            .push(std::sync::Arc::clone(&opened));
+        Ok(opened)
+    }
+
+    /// Declare an existing on-disk home into this RUNNING daemon (U5/R6).
+    /// Idempotent by canonical path; concurrent declares of one path are
+    /// serialized through an opening-placeholder + completion-slot protocol
+    /// (KTD2) so exactly one opener touches the store and losers get the
+    /// winner's homeId — never DAEMON_OWNS_HOME.
+    ///
+    /// Lock discipline: `fs::canonicalize` and ALL filesystem IO run
+    /// outside the registry mutexes; inside them only map lookups/inserts
+    /// happen. Mutex order is always `inner` → `opening`.
+    pub fn declare(
+        &self,
+        raw_path: PathBuf,
+        kind_hint: HomeKind,
+        global_path: Option<&std::path::Path>,
+        clock: Arc<dyn MillisClock>,
+        config: &crate::config::DaemonConfig,
+    ) -> Result<std::sync::Arc<OpenedHome>, omt_storage::Problem> {
+        // Pre-open validation OUTSIDE every registry lock (R9): structured
+        // rejection for missing paths and non-directories, never a panic.
+        let metadata = std::fs::metadata(&raw_path)
+            .map_err(|err| invalid_declare_path(&raw_path, "unreadable", &err.to_string()))?;
+        if !metadata.is_dir() {
+            return Err(invalid_declare_path(
+                &raw_path,
+                "not-a-directory",
+                "declare target exists but is not a directory",
+            ));
+        }
+        let canonical = std::fs::canonicalize(&raw_path).map_err(|err| {
+            invalid_declare_path(&raw_path, "uncanonicalizable", &err.to_string())
+        })?;
+
+        enum Admitted {
+            /// Present-and-open: idempotent replay of the live entry.
+            Existing(Arc<OpenedHome>),
+            /// This caller performs the open (placeholder inserted).
+            Opener(Arc<OpeningSlot>),
+            /// Another declare holds the placeholder: wait on its slot.
+            Waiter(Arc<OpeningSlot>),
+        }
+
+        let admitted = {
+            // Lock order inner → opening (documented above). The dedupe
+            // probe and quota probe both count REAL entries only.
+            let entries = self.inner.lock().expect("homes");
+            if let Some(existing) = entries.iter().find(|home| home.canonical == canonical) {
+                Admitted::Existing(Arc::clone(existing))
+            } else {
+                let mut opening = self.opening.lock().expect("homes-opening");
+                match opening.get(&canonical) {
+                    Some(slot) => Admitted::Waiter(Arc::clone(slot)),
+                    None => {
+                        // Quota BEFORE admitting the opener (fair order:
+                        // cheap probes precede expensive IO).
+                        config
+                            .limits
+                            .check_open_homes(entries.len())
+                            .map_err(|mut details| {
+                                let extra = details.as_object_mut().expect("object");
+                                let rule = extra.remove("rule").unwrap_or_default();
+                                limits::quota_exceeded(
+                                    rule.as_str().unwrap_or("open-homes"),
+                                    details,
+                                )
+                            })?;
+                        let slot = OpeningSlot::new();
+                        opening.insert(canonical.clone(), Arc::clone(&slot));
+                        Admitted::Opener(slot)
+                    }
+                }
+            }
+        };
+
+        match admitted {
+            Admitted::Existing(home) => Ok(home),
+            Admitted::Waiter(slot) => {
+                let timeout_ms = declare_wait_timeout_ms();
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+                match slot.wait_until(deadline) {
+                    Some(SlotOutcome::Opened(home)) => Ok(home),
+                    Some(SlotOutcome::Failed(problem)) => Err(problem),
+                    // Bounded wait exhausted: structured RETRYABLE problem
+                    // (RATE_LIMITED semantics — retry after backoff can
+                    // succeed once the in-flight declare settles).
+                    None => Err(limits::rate_limited(
+                        "home-declare-in-progress",
+                        serde_json::json!({
+                            "waitTimeoutMs": timeout_ms,
+                            "retryable": true,
+                        }),
+                    )),
+                }
+            }
+            Admitted::Opener(slot) => {
+                // Deterministic test window between placeholder insertion
+                // and Storage::open (starvation/race suites); production
+                // never sets the env.
+                test_declare_delay_hook();
+                let outcome = self.open_storage_and_start(
+                    &raw_path,
+                    canonical.clone(),
+                    kind_hint,
+                    global_path,
+                    clock,
+                    config,
+                );
+                match outcome {
+                    Ok(home) => {
+                        // Registry insertion BEFORE waking waiters or
+                        // returning (KTD2): subsequent requests see the
+                        // home immediately.
+                        self.inner.lock().expect("homes").push(Arc::clone(&home));
+                        self.opening
+                            .lock()
+                            .expect("homes-opening")
+                            .remove(&canonical);
+                        slot.complete(SlotOutcome::Opened(Arc::clone(&home)));
+                        Ok(home)
+                    }
+                    Err(problem) => {
+                        // ANY failure/cancel removes the placeholder under
+                        // the lock and wakes waiters with the Problem, so
+                        // the same path is immediately declarable again.
+                        self.opening
+                            .lock()
+                            .expect("homes-opening")
+                            .remove(&canonical);
+                        slot.complete(SlotOutcome::Failed(problem.clone()));
+                        Err(problem)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Shared tail of [`Homes::open`] and [`Homes::declare`]: dead-marker
+    /// recovery + journal recovery + `Storage::open`, hub watermark, then
+    /// actor spawn. Runs OUTSIDE any registry mutex (KTD2 heavy work).
+    #[allow(clippy::too_many_arguments)]
+    fn open_storage_and_start(
+        &self,
+        path: &std::path::Path,
+        canonical: PathBuf,
+        kind: HomeKind,
+        global_path: Option<&std::path::Path>,
+        clock: Arc<dyn MillisClock>,
+        config: &crate::config::DaemonConfig,
+    ) -> Result<std::sync::Arc<OpenedHome>, omt_storage::Problem> {
+        // Dead-marker recovery BEFORE any lock acquisition (orchestrator
+        // ruling, shared by startup opens AND declares since U5): our own
+        // dead predecessor's daemon marker is auto-cleared; a LIVE foreign
+        // daemon refuses with DAEMON_OWNS_HOME; a ts-bridge marker refuses
+        // with takeover guidance (never an automatic steal).
+        crate::ownership::recover_own_dead_daemon_marker(path)?;
+
+        let mut open_config = OpenConfig::new(path);
         open_config.clock = Arc::clone(&clock);
         open_config.acquire_lock = true;
         open_config.owner_kind = omt_storage::home_lock::OwnerKind::Daemon;
         open_config.recover_on_open = true;
         open_config.lock_heartbeat_ms = config.lock_heartbeat_ms;
+        // Fail closed on hostile stores: a corrupt/schema-violating home
+        // surfaces here as a structured Problem — no partial actor start.
         let storage = Storage::open(open_config)?;
         let home_id = storage
             .home_id()
@@ -291,10 +544,7 @@ impl Homes {
             .unwrap_or_else(|| "omt".to_string());
         // The kind passed in is a hint; the canonical rule is path equality
         // with the resolved global home (OMT_HOME / ~/.omt).
-        let effective_kind = if global_path
-            .map(|global| global == path.as_path())
-            .unwrap_or(false)
-        {
+        let effective_kind = if global_path.map(|global| global == path).unwrap_or(false) {
             HomeKind::Global
         } else {
             kind
@@ -303,7 +553,8 @@ impl Homes {
         let (tx, rx) = std::sync::mpsc::sync_channel::<Job>(config.limits.max_home_queue_depth);
         let opened = std::sync::Arc::new(OpenedHome {
             home_id: home_id.clone(),
-            path: path.clone(),
+            path: path.to_path_buf(),
+            canonical,
             name,
             kind: effective_kind,
             tx,
@@ -322,6 +573,10 @@ impl Homes {
         let idle_wake = crate::signal::idle_wake_handle();
         self.live_actors.fetch_add(1, Ordering::SeqCst);
         let live = Arc::clone(&self.live_actors);
+        // Registry handle for SELF-EVICTION (U5 review fix): whichever way
+        // this loop ends (idle quiet-exit, Shutdown job, daemon drain), the
+        // actor removes its own entry so quota counts only live homes.
+        let entries = Arc::clone(&self.inner);
         std::thread::Builder::new()
             .name(format!("omt-home-{home_id_actor}"))
             .spawn(move || {
@@ -383,6 +638,14 @@ impl Homes {
                                 && clock_actor.now_ms().saturating_sub(last_activity_ms)
                                     >= idle_quiet_ms
                             {
+                                // Subscriber keep-alive (U5 review fix): a
+                                // live event subscription IS activity even
+                                // when no RPC arrives — suppress the quiet
+                                // exit while the hub holds subscribers.
+                                if hub_actor.oldest_subscriber_cursor().is_some() {
+                                    last_activity_ms = clock_actor.now_ms();
+                                    continue;
+                                }
                                 crate::logging::log(
                                     "info",
                                     "IDLE_SHUTDOWN",
@@ -396,9 +659,13 @@ impl Homes {
                         }
                     }
                 }
-                // Drain complete: release the kernel lock + marker.
+                // Drain complete: release the kernel lock + marker, then
+                // evict our own registry entry (both exit paths converge).
                 let _ = storage.release_lock();
                 drop(hub_actor); // subscribers die with the hub clone
+                if let Ok(mut entries) = entries.lock() {
+                    entries.retain(|home| home.home_id != home_id_actor);
+                }
                 if live.fetch_sub(1, Ordering::SeqCst) == 1 {
                     // Last actor leaving: wake the accept loop so the
                     // process finishes its clean shutdown.
@@ -409,7 +676,6 @@ impl Homes {
             })
             .expect("spawn home actor");
 
-        self.inner.lock().expect("homes").push(Arc::clone(&opened));
         Ok(opened)
     }
 
@@ -435,6 +701,38 @@ impl Homes {
         }
         // Fallback grace for slow fsyncs even when markers vanished early.
         std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Structured pre-open rejection for a declare path that is missing,
+/// unreadable, or not a directory (R9: validation happens BEFORE any
+/// lock/marker work, so a bad path can never wedge the registry).
+fn invalid_declare_path(
+    path: &std::path::Path,
+    reason: &str,
+    detail: &str,
+) -> omt_storage::Problem {
+    omt_storage::Problem::with_details(
+        error::INVALID_INPUT,
+        format!("cannot declare {}: {reason} ({detail})", path.display()),
+        |d| {
+            d.insert("field".into(), serde_json::json!("path"));
+            d.insert("reason".into(), serde_json::json!(reason));
+            d.insert("path".into(), serde_json::json!(path.display().to_string()));
+        },
+    )
+}
+
+/// Deterministic slowdown inside `home/declare` between placeholder
+/// insertion and Storage::open (opt-in via `OMT_TEST_DECLARE_DELAY_MS`);
+/// gives suites a window where one path's declare is provably in flight
+/// while other connections keep making progress. Production never sets it.
+fn test_declare_delay_hook() {
+    let Ok(raw) = std::env::var("OMT_TEST_DECLARE_DELAY_MS") else {
+        return;
+    };
+    if let Ok(ms) = raw.parse::<u64>() {
+        std::thread::sleep(std::time::Duration::from_millis(ms.min(30_000)));
     }
 }
 

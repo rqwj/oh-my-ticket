@@ -346,6 +346,43 @@ export interface ReindexHomeResult {
   [k: string]: unknown;
 }
 /**
+ * Method home/declare (U5/R6): idempotently register an existing on-disk home directory into the running daemon. Deduplication is by canonical path; concurrent declares of one path return the winner's homeId. Advertised via handshake features.homeDeclare.
+ */
+
+/**
+ * Method home/declare (U5/R6): idempotently register an existing on-disk home directory into the running daemon. Deduplication is by canonical path; concurrent declares of one path return the winner's homeId. Advertised via handshake features.homeDeclare.
+ */
+export interface DeclareHomeParams {
+  /**
+   * Filesystem path of an existing home directory. Missing paths and non-directories are rejected before any lock work.
+   */
+  path: string;
+  [k: string]: unknown;
+}
+/**
+ * Method home/declare result: registry insertion happened before this response; requiresRehandshake tells memory-credential clients to rehandshake so the new home enters their scoped grant (R8/KTD3).
+ */
+
+/**
+ * Method home/declare result: registry insertion happened before this response; requiresRehandshake tells memory-credential clients to rehandshake so the new home enters their scoped grant (R8/KTD3).
+ */
+export interface DeclareHomeResult {
+  /**
+   * Stable public identifier of one OMT home. Every public reference in the protocol must be qualified with a HomeId (R4). Bare filesystem/workspace paths are DSH-adapter compatibility inputs and are resolved to a HomeId before anything crosses the wire.
+   */
+  homeId: string;
+  requiresRehandshake: boolean;
+  /**
+   * Home display name (final path segment).
+   */
+  name?: string;
+  /**
+   * Effective kind; global when the declared path equals the resolved global home.
+   */
+  kind?: "workspace" | "global";
+  [k: string]: unknown;
+}
+/**
  * Method run/create: ordered batch of Ticket/SubTicket members; every member must belong to homeId.
  */
 

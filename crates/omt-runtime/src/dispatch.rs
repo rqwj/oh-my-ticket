@@ -192,6 +192,12 @@ pub fn dispatch_cancellable(
     }
     // Home scope: methods carrying homeId must address THIS opened home AND
     // a granted home. (recent-* are global-home scoped without a homeId.)
+    // Home-scope denials carry `requiresRehandshake: true` (KTD3 daemon
+    // half, U5): a persisted-credential client treats the hint as stale-
+    // credential guidance — rehandshake/re-enroll picks up homes declared
+    // after the credential was minted. Operation-family FORBIDDEN above is
+    // deliberately NOT hinted: re-enrollment cannot widen an excluded op
+    // family, so a hint there would invite an endless retry loop.
     if let Some(home_id) = params.get("homeId").and_then(|v| v.as_str()) {
         let opened_id = storage.home_id().unwrap_or_default();
         if opened_id != home_id {
@@ -200,7 +206,7 @@ pub fn dispatch_cancellable(
         if !auth_credential.home_allowed(home_id) {
             return Err(auth::forbidden(
                 "home-not-scoped",
-                json!({ "homeId": home_id }),
+                json!({ "homeId": home_id, "requiresRehandshake": true }),
             ));
         }
     }
@@ -309,9 +315,12 @@ fn invalid_input_details(field: &str, mut details: Value) -> Problem {
 }
 
 fn not_found_home(home_id: &str) -> Problem {
+    // KTD3 daemon half (U5): NOT_FOUND kind:home is a home-scope denial and
+    // carries the rehandshake hint for persisted-credential self-healing.
     Problem::with_details(error::NOT_FOUND, format!("unknown home: {home_id}"), |d| {
         d.insert("kind".into(), "home".into());
         d.insert("id".into(), home_id.into());
+        d.insert("requiresRehandshake".into(), json!(true));
     })
 }
 

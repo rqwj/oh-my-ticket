@@ -66,7 +66,8 @@
           { "action": "ui/filters-get", "classification": "adapter_only", "summary": "Adapter UI filter bag read; keys are surface-prefixed (dsh:/tauri:) per R3.", "since": "v1" },
           { "action": "ui/filters-set", "classification": "adapter_only", "summary": "Adapter UI filter bag merge-write.", "since": "v1" },
           { "action": "ui/recent-get", "classification": "adapter_only", "summary": "Recently-touched nodes under the single shared key 'recent' (R4).", "since": "v1" },
-          { "action": "ui/recent-set", "classification": "adapter_only", "summary": "Replace recently-touched bag per adapter key.", "since": "v1" }
+          { "action": "ui/recent-set", "classification": "adapter_only", "summary": "Replace recently-touched bag per adapter key.", "since": "v1" },
+          { "action": "home/declare", "classification": "agent_available", "summary": "Idempotently register an existing on-disk home into the running daemon (U5/R6-R9); same-uid trust boundary, MCP minimum-privilege credentials exclude it via the home operation family.", "since": "v1" }
         ]
       }
     }

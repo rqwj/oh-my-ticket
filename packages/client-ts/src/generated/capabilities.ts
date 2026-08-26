@@ -128,6 +128,10 @@ export interface Features {
    * Mutations accept idempotency keys (R9); seeded false until U5.
    */
   idempotencyKeys: boolean;
+  /**
+   * Additive U5/R6: home/declare registers existing on-disk homes into the running daemon; clients gate the command on this flag (F4 version-drift fallback). Required in the schema because the post-U5 server ALWAYS emits it (true); clients still treat a missing flag as false when talking to pre-U5 daemons.
+   */
+  homeDeclare: boolean;
   [k: string]: boolean;
 }
 /**

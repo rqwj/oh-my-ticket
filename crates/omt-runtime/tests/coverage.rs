@@ -58,8 +58,10 @@ fn every_schema_action_routes_to_a_handler() {
     let actions = canonical_actions();
     assert_eq!(
         actions.len(),
-        24,
-        "canonical v1 matrix size (21 + TICKET-0130 additions)"
+        // U5 (R6): +1 for home/declare — bump this LOUDLY whenever the
+        // canonical matrix grows so parity additions never slip in silently.
+        25,
+        "canonical matrix size (21 seed + TICKET-0130 additions + U5 declare)"
     );
 
     let (_ctx, mut proc, endpoint) = ready();
@@ -156,8 +158,18 @@ fn every_schema_action_routes_to_a_handler() {
         )
         .expect("start run three");
 
+    // A directory to declare through the live daemon (U5 case below).
+    let declared_home = _ctx.dir.path().join("coverage-declared-home");
+    std::fs::create_dir_all(&declared_home).expect("declared home dir");
+
     // (method, classification, params, which client)
     let cases: Vec<(&str, &str, Value, &str)> = vec![
+        (
+            "home/declare",
+            "agent_available",
+            json!({ "path": declared_home.to_string_lossy() }),
+            "agent",
+        ),
         (
             "node/create",
             "agent_available",

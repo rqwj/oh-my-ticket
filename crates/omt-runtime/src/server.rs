@@ -72,7 +72,7 @@ pub fn run() {
     // Lifecycle configuration FIRST (fail closed on a malformed file before
     // touching locks or descriptors); then install the rotating log.
     let config = match DaemonConfig::load(&runtime_dir) {
-        Ok(config) => config,
+        Ok(config) => Arc::new(config),
         Err(err) => return fail_problem(&err),
     };
     let _ = CURRENT_LIMITS.set(config.limits.clone());
@@ -255,11 +255,21 @@ pub fn run() {
                 let registry_c = Arc::clone(&registry);
                 let homes_c = Arc::clone(&homes);
                 let clock_c = Arc::clone(&clock);
+                let config_c = Arc::clone(&config);
+                let global_home_c = global_path.clone();
                 let counter = Arc::clone(&live_connections);
                 std::thread::Builder::new()
                     .name("omt-conn".to_string())
                     .spawn(move || {
-                        serve_connection(stream, &registry_c, &homes_c, &clock_c, &runtime);
+                        serve_connection(
+                            stream,
+                            &registry_c,
+                            &homes_c,
+                            &clock_c,
+                            &runtime,
+                            &config_c,
+                            &global_home_c,
+                        );
                         counter.fetch_sub(1, Ordering::SeqCst);
                     })
                     .ok();
@@ -306,9 +316,13 @@ fn refuse_connection(stream: std::os::unix::net::UnixStream, cap: usize) {
 struct ConnState {
     registry: Arc<auth::Registry>,
     homes: Arc<Homes>,
-    #[allow(dead_code)] // kept for parity checks in future handshake paths
     clock: Arc<dyn MillisClock>,
     runtime_dir: PathBuf,
+    /// Lifecycle configuration snapshot this daemon booted with (declared
+    /// homes join the SAME limits/idle regime as startup-opened ones).
+    config: Arc<DaemonConfig>,
+    /// Resolved global home path (kind hint for declared homes).
+    global_home: PathBuf,
     /// Kernel-verified peer identity for this connection (handshake input).
     peer: ipc::PeerId,
     /// In-flight request id → cancel flag ($/cancelRequest flips these).
@@ -322,6 +336,8 @@ pub(crate) fn serve_connection(
     homes: &Arc<Homes>,
     clock: &std::sync::Arc<dyn MillisClock>,
     runtime_dir: &std::path::Path,
+    config: &Arc<DaemonConfig>,
+    global_home: &std::path::Path,
 ) {
     // Same-user gate BEFORE any protocol exchange: cross-uid connections
     // close immediately.
@@ -361,6 +377,8 @@ pub(crate) fn serve_connection(
         homes: Arc::clone(homes),
         clock: Arc::clone(clock),
         runtime_dir: runtime_dir.to_path_buf(),
+        config: Arc::clone(config),
+        global_home: global_home.to_path_buf(),
         peer,
         inflight: Arc::new(Mutex::new(std::collections::HashMap::new())),
     });
@@ -591,6 +609,9 @@ fn handle_handshake(
             "actionParityMatrix": true,
             "eventResume": true,
             "idempotencyKeys": true,
+            // U5/R6: home/declare is served (additive capability bit —
+            // clients gate the command on its presence, F4 version drift).
+            "homeDeclare": true,
         },
         "credential": {
             "token": token,
@@ -612,6 +633,16 @@ fn route_method(
     state: &Arc<ConnState>,
     line_tx: &std::sync::mpsc::Sender<String>,
 ) {
+    // ── home/declare route seam (U5/KTD2) ─────────────────────────────
+    // Intercepted BEFORE generic routing: declare carries no homeId yet,
+    // so it must not cross the per-home dispatch gate (which would answer
+    // "home not opened" before the home exists). Its authorization is
+    // checked explicitly in the handler.
+    if request.method == "home/declare" {
+        handle_declare(request, credential, state, line_tx);
+        return;
+    }
+
     let runtime_dir = &state.runtime_dir;
     let homes = &state.homes;
 
@@ -671,7 +702,13 @@ fn route_method(
                 &request.id,
                 jsonrpc::CODE_SERVER_ERROR,
                 omt_domain::error::NOT_FOUND,
-                serde_json::json!({ "kind": "home", "id": request.params.get("homeId").cloned().unwrap_or(serde_json::Value::String("global".into())) }),
+                serde_json::json!({
+                    "kind": "home",
+                    "id": request.params.get("homeId").cloned().unwrap_or(serde_json::Value::String("global".into())),
+                    // KTD3 daemon half: home-scope NOT_FOUND hints stale
+                    // credentials toward rehandshake/re-enroll.
+                    "requiresRehandshake": true,
+                }),
                 "home not opened",
             ),
         );
@@ -743,6 +780,102 @@ fn route_method(
     };
     state.inflight.lock().expect("inflight").remove(&request.id);
     respond(line_tx, jsonrpc::response(&request.id, &result));
+}
+
+/// `home/declare` (U5, R6-R9): idempotently register an existing on-disk
+/// home into the running daemon. Handled at the ROUTE SEAM — never through
+/// the per-home actor dispatch gate.
+///
+/// Authorization is EXPLICIT here (KTD2): declare bypasses dispatch, so the
+/// operation-family gate would not run otherwise. A credential whose
+/// operations exclude the "home" family (MCP minimum-privilege) gets a
+/// plain FORBIDDEN with NO `requiresRehandshake` hint — re-enrollment can
+/// never grant an excluded operation family, so a hint would loop forever
+/// (KTD3 amendment). Home-scope denials elsewhere DO carry the hint.
+fn handle_declare(
+    request: jsonrpc::Request,
+    credential: &auth::Credential,
+    state: &Arc<ConnState>,
+    line_tx: &std::sync::mpsc::Sender<String>,
+) {
+    // Operation-family check mirrors dispatch's stage: family = "home",
+    // "*" grants everything. Pure lookup, precedes any validation/IO.
+    if !credential.operation_allowed(&request.method) {
+        log_declare_failure(problem::FORBIDDEN, &request.params);
+        respond(
+            line_tx,
+            error_response_for_problem(
+                &request.id,
+                auth::forbidden(
+                    "operation-not-granted",
+                    serde_json::json!({
+                        "method": request.method,
+                        "operations": credential.operations,
+                    }),
+                ),
+            ),
+        );
+        return;
+    }
+
+    let Some(raw_path) = request.params.get("path").and_then(|v| v.as_str()) else {
+        let problem = omt_storage::Problem::with_details(
+            omt_domain::error::INVALID_INPUT,
+            "path: must be a string",
+            |d| {
+                d.insert("field".into(), serde_json::json!("path"));
+            },
+        );
+        log_declare_failure(problem.code, &request.params);
+        respond(line_tx, error_response_for_problem(&request.id, problem));
+        return;
+    };
+    let path = PathBuf::from(raw_path);
+
+    match state.homes.declare(
+        path,
+        HomeKind::Workspace,
+        Some(state.global_home.as_path()),
+        Arc::clone(&state.clock),
+        &state.config,
+    ) {
+        Ok(home) => {
+            crate::logging::log(
+                "info",
+                "DECLARE",
+                &format!(
+                    "home {} declared from {}",
+                    home.home_id,
+                    home.path.display()
+                ),
+            );
+            respond(
+                line_tx,
+                jsonrpc::response(
+                    &request.id,
+                    &serde_json::json!({
+                        "homeId": home.home_id,
+                        // R8/KTD3: existing sessions must rehandshake to
+                        // see the new home in their scoped credential.
+                        "requiresRehandshake": true,
+                        "name": home.name,
+                        "kind": home.kind.as_str(),
+                    }),
+                ),
+            );
+        }
+        Err(problem) => {
+            log_declare_failure(problem.code, &request.params);
+            respond(line_tx, error_response_for_problem(&request.id, problem));
+        }
+    }
+}
+
+/// DECLARE_FAILED log line (U5): code + path only — never params, tokens,
+/// or any payload content beyond the path itself.
+fn log_declare_failure(code: &str, params: &serde_json::Value) {
+    let path = params.get("path").and_then(|v| v.as_str()).unwrap_or("-");
+    crate::logging::log("warn", "DECLARE_FAILED", &format!("{code} {path}"));
 }
 
 // Re-exported parity vocabulary so cli/server share one source of truth.
