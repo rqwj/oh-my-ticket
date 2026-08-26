@@ -1,0 +1,140 @@
+# Release pipeline (plan U11 / R19, KD1, KD5): a pushed v* tag produces the
+# trusted binary facts source on GitHub Releases — macOS arm64 binaries as
+# tar.gz + SHA256SUMS (job 1) and the Tauri desktop bundle .app/.dmg
+# (job 2; no-op until the U8 scaffold lands at apps/desktop).
+#
+# Supply-chain hygiene (KTD8): third-party actions are referenced by tag for
+# bootstrap; policy is to pin every third-party action to an immutable commit
+# SHA before stable distribution use. No curl|bash steps anywhere; checksums
+# are always emitted by scripts/assemble-release-archive.sh; permissions are
+# least-privilege (contents:write only where assets are uploaded, tag push
+# only — no pull_request_target).
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  binary-assets:
+    name: binaries (aarch64-apple-darwin)
+    runs-on: macos-latest
+    permissions:
+      contents: write # attach assets to the GitHub Release
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify tag matches workspace version (KTD1)
+        run: |
+          version="$(bash scripts/assemble-release-archive.sh --print-version)"
+          if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match workspace version v${version} (root Cargo.toml [workspace.package])"
+            exit 1
+          fi
+          echo "tag ok: ${GITHUB_REF_NAME} == v${version}"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Build release binaries
+        run: cargo build --release --target aarch64-apple-darwin -p omt-runtime --bin omt-daemon --bin omt
+
+      - name: Assemble archive + SHA256SUMS (ad-hoc codesign inside)
+        run: bash scripts/assemble-release-archive.sh --target aarch64-apple-darwin --out-dir dist/release
+
+      - name: Smoke — extract archive and run ./omt --version
+        run: |
+          smoke="$(mktemp -d)"
+          tar -xzf dist/release/*.tar.gz -C "$smoke"
+          "$smoke"/*/omt --version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-binaries-${{ github.ref_name }}
+          path: |
+            dist/release/*.tar.gz
+            dist/release/SHA256SUMS
+          if-no-files-found: error
+
+      - name: Attach assets to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: |
+            dist/release/*.tar.gz
+            dist/release/SHA256SUMS
+          fail_on_unmatched_files: true
+
+  desktop-bundle:
+    name: desktop bundle (.app/.dmg)
+    runs-on: macos-latest
+    needs: binary-assets
+    # No-op until the Tauri scaffold (U8) creates apps/desktop.
+    if: hashFiles('apps/desktop/src-tauri/tauri.conf.json') != ''
+    permissions:
+      contents: write # tauri-action uploads bundles to the same Release
+    env:
+      # Signing/notarization is opt-in (KTD5): when these secrets are absent,
+      # tauri-bundler skips identity signing and notarization natively and
+      # ships an ad-hoc-signed bundle. Nothing here hard-fails on unset
+      # secrets — Gatekeeper caveats for unsigned downloads are documented in
+      # docs/runtime/distribution.md.
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Report signing mode
+        run: |
+          if [ -z "${APPLE_SIGNING_IDENTITY}" ]; then
+            echo "APPLE_SIGNING_IDENTITY unset → bundler signs ad-hoc / skips notarization"
+          else
+            echo "signing identity present → inside-out re-sign + notarization enabled"
+          fi
+
+      # KD5/R12: the desktop sidecar embeds exactly this Release's daemon
+      # build, staged under the externalBin target-triple name.
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-binaries-${{ github.ref_name }}
+          path: dist/release
+
+      - name: Stage daemon sidecar for tauri externalBin
+        run: |
+          stage="apps/desktop/src-tauri/binaries"
+          mkdir -p "$stage"
+          tmp="$(mktemp -d)"
+          tar -xzf dist/release/*.tar.gz -C "$tmp"
+          cp "$tmp"/*/omt-daemon "$stage/omt-daemon-aarch64-apple-darwin"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      - name: Build desktop bundle and attach to the same release
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: apps/desktop
+          args: --target aarch64-apple-darwin
+          tagName: ${{ github.ref_name }}
+          releaseName: ${{ github.ref_name }}
+          releaseDraft: false
+          prerelease: false

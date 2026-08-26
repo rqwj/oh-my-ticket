@@ -1,0 +1,57 @@
+# Minimal CI gate (plan U11): fmt/clippy/test for the Rust workspace plus
+# typecheck/test for the npm side. Deliberately kept minimal — it is the
+# canary prerequisite (U15), not a distribution surface.
+#
+# Supply-chain hygiene (KTD8): third-party actions are referenced by tag for
+# bootstrap; policy is to pin every third-party action to an immutable commit
+# SHA before stable distribution use. No curl|bash steps anywhere;
+# permissions are least-privilege per workflow.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: rust (fmt · clippy · test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo test
+        run: cargo test --workspace
+
+  node:
+    name: node (typecheck · test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Toolchain for the runtime-fixture daemon build path
+      # (scripts/build-daemon.mjs → cargo build -p omt-runtime).
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm test
