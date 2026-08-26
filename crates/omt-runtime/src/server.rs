@@ -103,7 +103,8 @@ pub fn run() {
         }
     }));
 
-    // Global home path convention (src/host/pool.ts): OMT_HOME else ~/.omt.
+    // Global home path convention: OMT_HOME else ~/.omt — precedence table
+    // in docs/runtime/config.md (U2/R2 backlink); mirrors src/host/pool.ts.
     let global_path = match std::env::var("OMT_HOME") {
         Ok(dir) if !dir.trim().is_empty() => PathBuf::from(dir),
         _ => {

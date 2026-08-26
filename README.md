@@ -84,6 +84,10 @@ run 机制支持把一批 ticket 交给模型批量执行，全程有状态机�
 内嵌两个 skill：`omt` 教 ticket 体系操作规范与状态流转约定，`omt-runs` 教
 run 批次纪律（创建/认领/报告/续跑响应）。
 
+运行时配置（home / runtime dir）的解析契约见
+[docs/runtime/config.md](docs/runtime/config.md)——参数 > 环境变量 >
+默认值，多端一致，由跨层 parity 测试锁定。
+
 ## 📦 安装
 
 ```sh

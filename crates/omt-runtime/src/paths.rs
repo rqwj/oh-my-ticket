@@ -1,5 +1,10 @@
 //! Per-user runtime directory resolution (U5a locked contract).
 //!
+//! The resolution contract (precedence table, multi-surface agreement,
+//! descriptor invariants, daemon-binary override order) is authored in
+//! `docs/runtime/config.md`; this module is the Rust half of the three
+//! implementations that document pins (U2/R2 backlink).
+//!
 //! Choice (documented in README.md): the per-user runtime directory is
 //! `$OMT_RUNTIME_DIR` when set (tests + sandboxes), otherwise
 //! `~/.omt/run/`. The existing TypeScript host has NO runtime-directory

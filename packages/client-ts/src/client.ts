@@ -10,7 +10,9 @@
  *   3. poll for the new generation's descriptor for up to 10 s.
  *
  * The runtime directory resolves as `OMT_RUNTIME_DIR` (tests/sandboxes)
- * then `~/.omt/run`, matching crates/omt-runtime/src/paths.rs.
+ * then `~/.omt/run`, matching crates/omt-runtime/src/paths.rs. The full
+ * resolution contract (precedence, multi-surface agreement, invariants)
+ * lives in docs/runtime/config.md (U2/R2 backlink).
  */
 import { spawn } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
