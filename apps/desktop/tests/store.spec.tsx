@@ -249,3 +249,40 @@ describe('过滤器状态一致性', () => {
     expect(lastPayload).toMatchObject({ query: '甲', showId: true }) // earlier keys survive
   })
 })
+
+describe('线上字段归一化（nodeId → id）', () => {
+  beforeEach(() => invokeMock.mockReset())
+
+  it('tree ingestion maps wire nodeId onto local id recursively', async () => {
+    invokeMock.mockImplementation((cmd: string, args?: { method?: string }) => {
+      if (cmd === 'daemon_homes') return Promise.resolve({ homes: [{ homeId: 'h1' }], homeDir: '/tmp' })
+      if (cmd === 'omt_call' && args?.method === 'node/tree') {
+        return Promise.resolve({
+          trees: [{
+            nodeId: 'EPIC-0001', type: 'epic', title: '根', status: 'open', archived: false, priority: 0,
+            children: [{ nodeId: 'TICKET-0007', type: 'ticket', title: '子', status: 'open', archived: false, priority: 0, children: [] }],
+          }],
+        })
+      }
+      return Promise.resolve({})
+    })
+    const { useTreeStore } = await import('../src/store')
+    const { renderHook, act } = await import('@testing-library/react')
+    const { result, unmount } = renderHook(() => useTreeStore())
+    await act(async () => {
+      await result.current.selectHome({ homeId: 'h1', kind: 'workspace', path: '/tmp/ws/.omt' })
+    })
+    const root = result.current.state.nodes[0]
+    expect(root.id).toBe('EPIC-0001')
+    expect(root.children![0].id).toBe('TICKET-0007')
+
+    // Selection + showId rendering consume the normalized id.
+    const { render, screen } = await import('@testing-library/react')
+    const { TreePanel } = await import('../src/TreePanel')
+    render(
+      <TreePanel nodes={result.current.state.nodes} filters={{ showId: true }} recentIds={[]} selectedId={null} onSelect={() => {}} onFilters={() => {}} />,
+    )
+    expect(screen.queryByText('TICKET-0007')).toBeTruthy()
+    unmount()
+  })
+})

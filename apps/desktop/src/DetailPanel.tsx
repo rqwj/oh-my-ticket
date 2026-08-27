@@ -28,9 +28,12 @@ export function DetailPanel({ home, nodeId, onUpdated }: Props) {
 
   const load = async () => {
     try {
-      const result = await omtCall<{ node?: NodeDetail }>('node/get', { homeId: home.homeId, id: nodeId })
-      setDetail(result.node ?? null)
-      setDraft(result.node?.body ?? '')
+      const result = await omtCall<{ node?: NodeDetail & { nodeId?: string } }>('node/get', { homeId: home.homeId, id: nodeId })
+      const wire = result.node
+      // Same boundary rule as the tree: wire views use nodeId.
+      const detail = wire ? { ...wire, id: wire.nodeId ?? wire.id } : null
+      setDetail(detail)
+      setDraft(detail?.body ?? '')
       setMessage(null)
     } catch (error) {
       setMessage(String(error))

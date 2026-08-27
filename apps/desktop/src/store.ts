@@ -102,7 +102,18 @@ export function useTreeStore() {
   const refreshNodes = useCallback(async (home: HomeInfo) => {
     try {
       const result = await omtCall<{ trees?: OmtNode[] }>('node/tree', { homeId: home.homeId })
-      setState(s => ({ ...s, nodes: result.trees ?? [], error: null }))
+      // Wire TreeNode uses `nodeId` (generated common.ts); the desktop's
+      // local model calls it `id`. Normalize AT THE BRIDGE BOUNDARY so
+      // every downstream consumer (row render, selection, recent, query
+      // filter) sees a real id.
+      const normalize = (wire: OmtNode & { nodeId?: string }): OmtNode => ({
+        ...wire,
+        id: wire.nodeId ?? wire.id,
+        children: ((wire as { children?: OmtNode[] }).children ?? []).map(child =>
+          normalize(child as OmtNode & { nodeId?: string }),
+        ),
+      })
+      setState(s => ({ ...s, nodes: (result.trees ?? []).map(normalize), error: null }))
     } catch (error) {
       setState(s => ({ ...s, error: presentError(error) }))
     }

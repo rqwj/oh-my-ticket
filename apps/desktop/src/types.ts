@@ -9,6 +9,8 @@ export type NodeType = 'epic' | 'story' | 'substory' | 'ticket' | 'subticket'
 export type NodeStatus = 'open' | 'in_progress' | 'done' | 'blocked' | 'skipped' | 'archived'
 
 export interface OmtNode {
+  /** 本地模型键；线上 TreeNode 的对应字段叫 `nodeId`——store 在桥接
+   *  边界归一化（见 store.refreshNodes 的 normalize）。 */
   id: string
   type: NodeType
   title: string
@@ -20,6 +22,8 @@ export interface OmtNode {
   /** 线上契约：archived 是独立布尔（status 保持 open/done 等生命周期值，
    *  不存在 status:'archived'）——归档过滤与呈现必须以本字段为准。 */
   archived?: boolean
+  /** node/tree 投影的子树（归一化后保留）。 */
+  children?: OmtNode[]
 }
 
 export interface HomeInfo {
