@@ -235,3 +235,8 @@ body {
 .harness-type { font-size: 12px; padding: 2px 8px; }
 .harness-path { color: var(--muted); font-size: 11px; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .harness-notice { color: var(--danger); font-size: 11px; }
+
+.run-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.run-progress { color: var(--muted); font-size: 12px; font-family: ui-monospace, monospace; }
+.stalled-row { color: var(--danger); }
+.error-cell { color: var(--danger); font-size: 12px; max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

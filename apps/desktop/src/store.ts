@@ -134,8 +134,10 @@ export function useTreeStore() {
 
   const refreshRuns = useCallback(async (home: HomeInfo) => {
     try {
-      const result = await omtCall<{ runs?: RunSummary[] }>('run/list', { homeId: home.homeId })
-      setState(s => ({ ...s, runs: result.runs ?? [] }))
+      const result = await omtCall<{ runs?: Array<RunSummary & { runId?: string }> }>('run/list', { homeId: home.homeId })
+      // 线上 RunView 用 runId 键——与 nodeId 同一类边界归一化。
+      const runs = (result.runs ?? []).map(wire => ({ ...wire, id: wire.runId ?? wire.id }))
+      setState(s => ({ ...s, runs }))
     } catch {
       /* runs are supplementary — tree stays usable */
     }
@@ -325,10 +327,15 @@ export function useTreeStore() {
     declareHome,
     refreshHomes,
     refreshNodes,
-    fetchRun: (runId: string) =>
-      activeHomeRef.current
-        ? omtCall<RunDetail>('run/get', { homeId: activeHomeRef.current.homeId, runId })
-        : Promise.reject(new Error('no active home')),
+    fetchRun: async (runId: string) => {
+      const home = activeHomeRef.current
+      if (!home) throw new Error('no active home')
+      const detail = await omtCall<RunDetail & { run: RunSummary & { runId?: string } }>('run/get', {
+        homeId: home.homeId,
+        runId,
+      })
+      return { ...detail, run: { ...detail.run, id: detail.run.runId ?? detail.run.id } }
+    },
     updateNode: async (id: string, patch: Record<string, unknown>, revision?: number) => {
       const home = activeHomeRef.current
       if (!home) return 'no active home'

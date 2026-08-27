@@ -43,20 +43,41 @@ export interface SavedFilters {
   sortOrder?: string
 }
 
+export interface RunProgress {
+  total: number
+  pending: number
+  running: number
+  done: number
+  failed: number
+  blocked: number
+  skipped: number
+  interrupted: number
+  awaitingConfirmation: number
+}
+
 export interface RunSummary {
+  /** 本地归一化键；线上 RunView 用 `runId`（store 在桥接边界归一）。 */
   id: string
   title?: string
   status: string
-  itemsTotal?: number
-  itemsDone?: number
+  progress?: RunProgress
+  stalledCount?: number
+  createdAt?: string
+  finishedAt?: string
   [k: string]: unknown
 }
 
 export interface RunItemView {
   nodeId: string
-  status: string
-  executor?: string
-  leaseExpiresAt?: string
+  /** 线上键名（不是 status）。 */
+  state: string
+  attempts: number
+  executorActor?: string
+  lastError?: string
+  stalled?: boolean
+  title?: string
+  startedAt?: string
+  finishedAt?: string
   [k: string]: unknown
 }
 

@@ -54,7 +54,10 @@ export function RunsPanel({ home, runs, fetchRun, onChanged }: Props) {
         {runs.map(run => (
           <button key={run.id} className={`run-row${detail?.run.id === run.id ? ' selected' : ''}`} onClick={() => void open(run.id)}>
             <span className="node-id">{run.id}</span>
-            <span>{run.title ?? ''}</span>
+            <span className="run-title">{run.title ?? ''}</span>
+            {run.progress && (
+              <span className="run-progress">{run.progress.done}/{run.progress.total}</span>
+            )}
             <span className="chip">{run.status}</span>
           </button>
         ))}
@@ -79,15 +82,16 @@ export function RunsPanel({ home, runs, fetchRun, onChanged }: Props) {
           </div>
           <table className="items-table">
             <thead>
-              <tr><th>节点</th><th>状态</th><th>执行者</th><th>租约至</th></tr>
+              <tr><th>节点</th><th>状态</th><th>执行者</th><th>尝试</th><th>错误</th></tr>
             </thead>
             <tbody>
               {detail.items.map(item => (
-                <tr key={item.nodeId}>
-                  <td>{item.nodeId}</td>
-                  <td>{item.status}</td>
-                  <td>{item.executor ?? '—'}</td>
-                  <td>{item.leaseExpiresAt ?? '—'}</td>
+                <tr key={item.nodeId} className={item.stalled ? 'stalled-row' : ''}>
+                  <td><span className="node-id">{item.nodeId}</span>{item.title ? ` ${item.title}` : ''}</td>
+                  <td>{item.state}</td>
+                  <td>{item.executorActor ?? '—'}</td>
+                  <td>{item.attempts}</td>
+                  <td className="error-cell">{item.lastError ?? ''}</td>
                 </tr>
               ))}
             </tbody>

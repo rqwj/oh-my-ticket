@@ -425,3 +425,44 @@ describe('agent harness 设置（每 workspace）', () => {
     unmount()
   })
 })
+
+describe('runs 线上归一化（runId → id）', () => {
+  beforeEach(() => invokeMock.mockReset())
+
+  it('run/list rows carry a real id; fetchRun targets runId on the wire', async () => {
+    invokeMock.mockImplementation((cmd: string, args?: { method?: string }) => {
+      if (cmd === 'daemon_homes') return Promise.resolve({ homes: [{ homeId: 'h1' }], homeDir: '/tmp' })
+      if (cmd === 'omt_call' && args?.method === 'run/list') {
+        return Promise.resolve({
+          runs: [{ runId: 'RUN-0001', title: '批次甲', status: 'running', progress: { total: 2, done: 1, pending: 0, running: 1, failed: 0, blocked: 0, skipped: 0, interrupted: 0, awaitingConfirmation: 0 } }],
+        })
+      }
+      if (cmd === 'omt_call' && args?.method === 'run/get') {
+        return Promise.resolve({
+          run: { runId: 'RUN-0001', title: '批次甲', status: 'running' },
+          items: [{ nodeId: 'TICKET-0001', state: 'done', attempts: 1, executorActor: 'cli:42' }],
+        })
+      }
+      return Promise.resolve({})
+    })
+    const { useTreeStore } = await import('../src/store')
+    const { renderHook, act } = await import('@testing-library/react')
+    const { result, unmount } = renderHook(() => useTreeStore())
+    await act(async () => {
+      await result.current.selectHome({ homeId: 'h1', kind: 'workspace', path: '/tmp/ws/.omt' })
+    })
+    expect(result.current.state.runs[0].id).toBe('RUN-0001')
+
+    let detail: { run: { id: string }; items: Array<{ state: string }> } | undefined
+    await act(async () => {
+      detail = await result.current.fetchRun('RUN-0001') as never
+    })
+    expect(detail!.run.id).toBe('RUN-0001')
+    expect(detail!.items[0].state).toBe('done')
+    const getCall = invokeMock.mock.calls.find(
+      c => c[0] === 'omt_call' && (c[1] as { method: string }).method === 'run/get',
+    )
+    expect((getCall![1] as { params: Record<string, unknown> }).params).toMatchObject({ homeId: 'h1', runId: 'RUN-0001' })
+    unmount()
+  })
+})
