@@ -74,7 +74,12 @@ export function SettingsPanel({ homes, knownHomes, homeDir, harnessByHome, onSav
         )}
       </section>
       <section>
-        <h3>Workspaces</h3>
+        <div className="section-header">
+          <h3>Workspaces</h3>
+          <button className="chip active" disabled={picking} onClick={() => void pickWorkspace()}>
+            {picking ? '选择中…' : '＋ 添加 workspace…'}
+          </button>
+        </div>
         <div className="home-list">
           {homes.map(home => (
             <button
@@ -111,11 +116,6 @@ export function SettingsPanel({ homes, knownHomes, homeDir, harnessByHome, onSav
             ))}
           </div>
         )}
-        <div className="declare-form">
-          <button className="chip active" disabled={picking} onClick={() => void pickWorkspace()}>
-            {picking ? '选择中…' : '＋ 添加 workspace…'}
-          </button>
-        </div>
         {declareMessage && <p className="info-banner">{declareMessage}</p>}
       </section>
       {isAdmin && (

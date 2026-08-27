@@ -246,3 +246,7 @@ body {
 .run-progress { color: var(--muted); font-size: 12px; font-family: ui-monospace, monospace; }
 .stalled-row { color: var(--danger); }
 .error-cell { color: var(--danger); font-size: 12px; max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.modal-header-actions { display: flex; gap: 8px; align-items: center; }
+.section-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.section-header h3 { margin: 0; }

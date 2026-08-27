@@ -59,7 +59,12 @@ export function WorkspaceSwitcher({ homes, knownHomes, activeHome, homeDir, harn
       <div className="modal-panel" onClick={e => e.stopPropagation()}>
         <header className="modal-header">
           <h3>切换 workspace</h3>
-          <button className="chip" onClick={onClose}>✕</button>
+          <div className="modal-header-actions">
+            <button className="chip active" disabled={picking} onClick={() => void pickWorkspace()}>
+              {picking ? '选择中…' : '＋ 添加 workspace…'}
+            </button>
+            <button className="chip" onClick={onClose}>✕</button>
+          </div>
         </header>
         <div className="home-list">
           {homes.map(home => (
@@ -98,11 +103,6 @@ export function WorkspaceSwitcher({ homes, knownHomes, activeHome, homeDir, harn
             ))}
           </div>
         )}
-        <div className="declare-form">
-          <button className="chip active" disabled={picking} onClick={() => void pickWorkspace()}>
-            {picking ? '选择中…' : '＋ 添加 workspace…'}
-          </button>
-        </div>
         {message && <p className="info-banner">{message}</p>}
       </div>
     </div>
