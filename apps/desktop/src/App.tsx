@@ -3,7 +3,7 @@
  * KD4 — fresh visual design; only domain concepts and status-color
  * semantics align with the DSH surface.
  */
-import { useState } from 'react'
+import { useCallback, useState } from 'react'
 import { useTreeStore } from './store'
 import { TreePanel } from './TreePanel'
 import { DetailPanel } from './DetailPanel'
@@ -13,10 +13,38 @@ import './styles.css'
 
 type CenterView = 'detail' | 'runs' | 'settings'
 
+const TREE_WIDTH_KEY = 'omt-desktop-tree-width'
+const clampWidth = (px: number) => Math.min(720, Math.max(240, Math.round(px)))
+
+function initialTreeWidth(): number {
+  const stored = Number(window.localStorage.getItem(TREE_WIDTH_KEY))
+  return Number.isFinite(stored) && stored > 0 ? clampWidth(stored) : 380
+}
+
 export function App() {
   const store = useTreeStore()
   const { state } = store
   const [view, setView] = useState<CenterView>('detail')
+  const [treeWidth, setTreeWidth] = useState(initialTreeWidth)
+
+  // Drag-to-resize the tree/center splitter: pointer captured on the
+  // divider, width clamped 240–720px, persisted across launches.
+  const startDrag = useCallback((down: React.PointerEvent) => {
+    down.preventDefault()
+    const startX = down.clientX
+    const startWidth = treeWidth
+    const onMove = (move: PointerEvent) => {
+      setTreeWidth(clampWidth(startWidth + (move.clientX - startX)))
+    }
+    const onUp = (up: PointerEvent) => {
+      const finalWidth = clampWidth(startWidth + (up.clientX - startX))
+      window.localStorage.setItem(TREE_WIDTH_KEY, String(finalWidth))
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+    }
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', onUp)
+  }, [treeWidth])
 
   if (state.loading) return <main className="app-shell"><p className="empty-hint">连接 daemon…</p></main>
 
@@ -33,6 +61,7 @@ export function App() {
       {state.error && <p className="error-banner">{state.error}</p>}
       <div className="content">
         {state.activeHome && (
+          <div className="tree-wrap" style={{ width: treeWidth }}>
           <TreePanel
             nodes={state.nodes}
             filters={state.filters}
@@ -41,7 +70,9 @@ export function App() {
             onSelect={id => { store.selectNode(id); setView('detail') }}
             onFilters={patch => state.activeHome && void store.saveFilters(state.activeHome, patch)}
           />
+          </div>
         )}
+        <div className="splitter" onPointerDown={startDrag} role="separator" aria-orientation="vertical" />
         <section className="center-pane">
           {view === 'detail' && state.activeHome && state.selectedId && (
             <DetailPanel home={state.activeHome} nodeId={state.selectedId} onUpdated={store.updateNode} />

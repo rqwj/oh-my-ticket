@@ -41,11 +41,17 @@ body {
 
 .content { display: flex; flex: 1; min-height: 0; }
 
+.tree-wrap { flex-shrink: 0; min-width: 0; display: flex; }
 .tree-panel {
-  width: 380px; min-width: 280px; flex-shrink: 0;
-  border-right: 1px solid var(--border);
+  width: 100%;
   display: flex; flex-direction: column; background: var(--bg);
 }
+.splitter {
+  width: 5px; flex-shrink: 0; cursor: col-resize;
+  border-right: 1px solid var(--border);
+  background: transparent;
+}
+.splitter:hover, .splitter:active { background: rgba(88, 166, 255, 0.25); }
 .filters-bar { padding: 10px 12px; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 8px; }
 .search-input {
   width: 100%; padding: 6px 12px; border-radius: 6px;

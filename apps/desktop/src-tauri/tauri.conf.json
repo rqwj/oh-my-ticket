@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "oh-my-ticket",
+  "productName": "Oh My Ticket",
   "version": "0.2.0",
   "identifier": "com.ohmyticket.desktop",
   "build": {
@@ -14,7 +14,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "oh-my-ticket",
+        "title": "Oh My Ticket",
         "width": 1100,
         "height": 760
       }
@@ -25,11 +25,16 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["app", "dmg"],
+    "targets": [
+      "app",
+      "dmg"
+    ],
     "icon": [],
     "macOS": {
       "minimumSystemVersion": "11.0"
     },
-    "externalBin": ["binaries/omt-daemon"]
+    "externalBin": [
+      "binaries/omt-daemon"
+    ]
   }
 }
