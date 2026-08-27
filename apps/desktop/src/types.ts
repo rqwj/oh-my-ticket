@@ -32,6 +32,7 @@ export interface SavedFilters {
   types?: string[]
   priorities?: number[]
   showArchived?: boolean
+  showId?: boolean
   sortOrder?: string
 }
 
