@@ -23,6 +23,8 @@ pub fn run() {
             rpc_bridge::daemon_homes,
             rpc_bridge::daemon_reconnect,
             rpc_bridge::events_subscribe,
+            rpc_bridge::harness_detect,
+            rpc_bridge::harness_validate_checkout,
         ])
         .run(tauri::generate_context!())
         .expect("error while running oh-my-ticket desktop")

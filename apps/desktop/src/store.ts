@@ -24,6 +24,7 @@ export interface TreeState {
   homes: HomeInfo[]
   knownHomes: KnownHome[]
   homeDir?: string
+  harnessByHome: Record<string, import('./HarnessSelect').HarnessConfig>
   activeHome: HomeInfo | null
   nodes: OmtNode[]
   selectedId: string | null
@@ -37,6 +38,7 @@ export interface TreeState {
 const INITIAL: TreeState = {
   homes: [],
   knownHomes: [],
+  harnessByHome: {},
   activeHome: null,
   nodes: [],
   selectedId: null,
@@ -83,6 +85,7 @@ export function useTreeStore() {
       const result = await invoke<{ homes?: HomeInfo[]; homeDir?: string }>('daemon_homes')
       const homes = result.homes ?? []
       void loadKnownHomes()
+      for (const home of homes) void loadHarness(home)
       if (result.homeDir !== undefined) setState(s => ({ ...s, homeDir: result.homeDir }))
       setState(s => {
         // A homes refresh must NEVER unset an existing selection — a
@@ -172,6 +175,41 @@ export function useTreeStore() {
       setState(s => ({ ...s, knownHomes: [] }))
     }
   }, [])
+
+  const loadHarness = useCallback(async (home: HomeInfo) => {
+    try {
+      const result = await omtCall<{ filters?: Record<string, unknown> }>('ui/filters-get', {
+        homeId: home.homeId,
+        key: 'tauri:harness',
+      })
+      const bag = (result.filters ?? {}) as { harness?: import('./HarnessSelect').HarnessConfig }
+      setState(s => ({
+        ...s,
+        harnessByHome: bag.harness
+          ? { ...s.harnessByHome, [home.homeId]: bag.harness! }
+          : Object.fromEntries(Object.entries(s.harnessByHome).filter(([id]) => id !== home.homeId)),
+      }))
+    } catch {
+      /* bag absent → no harness configured */
+    }
+  }, [])
+
+  const saveHarness = useCallback(
+    async (home: HomeInfo, config: import('./HarnessSelect').HarnessConfig | null) => {
+      setState(s => ({
+        ...s,
+        harnessByHome: config
+          ? { ...s.harnessByHome, [home.homeId]: config }
+          : Object.fromEntries(Object.entries(s.harnessByHome).filter(([id]) => id !== home.homeId)),
+      }))
+      await omtCall('ui/filters-set', {
+        homeId: home.homeId,
+        key: 'tauri:harness',
+        filters: config ? { harness: config } : {},
+      }).catch(() => {})
+    },
+    [],
+  )
 
   const loadRecent = useCallback(async () => {
     try {
@@ -280,6 +318,7 @@ export function useTreeStore() {
     state,
     loadFilters,
     loadKnownHomes,
+    saveHarness,
     selectHome,
     selectNode,
     saveFilters,

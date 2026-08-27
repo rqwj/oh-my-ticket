@@ -102,6 +102,8 @@ export function App() {
               homes={state.homes}
               knownHomes={state.knownHomes}
               homeDir={state.homeDir}
+              harnessByHome={state.harnessByHome}
+              onSaveHarness={store.saveHarness}
               activeHome={state.activeHome}
               onSelectHome={home => { void store.selectHome(home); setView('detail') }}
               onDeclare={store.declareHome}
@@ -115,6 +117,8 @@ export function App() {
           knownHomes={state.knownHomes}
           activeHome={state.activeHome}
           homeDir={state.homeDir}
+          harnessByHome={state.harnessByHome}
+          onSaveHarness={store.saveHarness}
           onSelect={home => void store.selectHome(home)}
           onDeclare={store.declareHome}
           onClose={() => setSwitcherOpen(false)}

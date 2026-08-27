@@ -14,6 +14,81 @@
 
 use tauri::{AppHandle, Emitter, State};
 
+/// 在 PATH 上查找可执行文件（harness 安装探测）。
+fn which_binary(name: &str) -> Option<std::path::PathBuf> {
+    let path_var = std::env::var("PATH").unwrap_or_default();
+    for dir in path_var.split(':') {
+        if dir.is_empty() {
+            continue;
+        }
+        let candidate = std::path::PathBuf::from(dir).join(name);
+        if candidate.is_file()
+            && std::fs::metadata(&candidate)
+                .map(|m| {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        m.permissions().mode() & 0o111 != 0
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        true
+                    }
+                })
+                .unwrap_or(false)
+        {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// `<binary> --version` 首行输出（2s 上限；失败不阻断探测）。
+fn probe_version(binary: &std::path::Path) -> Option<String> {
+    let output = std::process::Command::new(binary)
+        .arg("--version")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.lines().next().map(|line| line.trim().to_string()).filter(|line| !line.is_empty())
+}
+
+/// 检测本机已安装的 agent harness（dsh / opencode）：PATH 查找 +
+/// 版本探针。渲染进程无 fs/shell 能力，探测只能在 Rust 侧做。
+#[tauri::command]
+pub fn harness_detect(harness: String) -> Result<serde_json::Value, String> {
+    let binary = match harness.as_str() {
+        "dsh" => "dsh",
+        "opencode" => "opencode",
+        other => return Err(format!("unsupported harness type: {other}")),
+    };
+    match which_binary(binary) {
+        Some(path) => {
+            let version = probe_version(&path);
+            Ok(serde_json::json!({
+                "installed": true,
+                "path": path.display().to_string(),
+                "version": version,
+            }))
+        }
+        None => Ok(serde_json::json!({ "installed": false })),
+    }
+}
+
+/// 校验 DeepSeek Harness 源码 checkout（开发模式）：pnpm-workspace.yaml
+/// + apps/ + packages/ 三个标志性入口同时存在。
+#[tauri::command]
+pub fn harness_validate_checkout(path: String) -> Result<serde_json::Value, String> {
+    let dir = std::path::PathBuf::from(&path);
+    let valid = dir.is_dir()
+        && dir.join("pnpm-workspace.yaml").is_file()
+        && dir.join("apps").is_dir()
+        && dir.join("packages").is_dir();
+    Ok(serde_json::json!({ "valid": valid }))
+}
+
 use crate::daemon;
 use crate::state::{DaemonSession, SharedSession};
 

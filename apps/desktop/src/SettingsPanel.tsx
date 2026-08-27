@@ -10,17 +10,20 @@ import type { HomeInfo } from './types'
 import type { KnownHome } from './store'
 import { NOT_A_WORKSPACE_HINT, resolveHomeFromPickedDir } from './workspacePath'
 import { workspaceRootOf } from './homePath'
+import { HarnessSelect, type HarnessConfig } from './HarnessSelect'
 
 interface Props {
   homes: HomeInfo[]
   knownHomes: KnownHome[]
   homeDir?: string
+  harnessByHome: Record<string, HarnessConfig>
+  onSaveHarness: (home: HomeInfo, config: HarnessConfig | null) => Promise<void>
   activeHome: HomeInfo | null
   onSelectHome: (home: HomeInfo) => void
   onDeclare: (path: string) => Promise<string | null>
 }
 
-export function SettingsPanel({ homes, knownHomes, homeDir, activeHome, onSelectHome, onDeclare }: Props) {
+export function SettingsPanel({ homes, knownHomes, homeDir, harnessByHome, onSaveHarness, activeHome, onSelectHome, onDeclare }: Props) {
   const [status, setStatus] = useState<DaemonStatus | null>(null)
   const [declareMessage, setDeclareMessage] = useState<string | null>(null)
   const [isAdmin, setIsAdmin] = useState(false)
@@ -81,6 +84,8 @@ export function SettingsPanel({ homes, knownHomes, homeDir, activeHome, onSelect
             >
               <span className="chip">{home.kind ?? 'workspace'}</span>
               <span className="mono">{workspaceRootOf(home.path, homeDir, home.name ?? home.homeId)}</span>
+              <span className="row-spacer" />
+              <HarnessSelect home={home} config={harnessByHome[home.homeId]} onSave={onSaveHarness} />
             </button>
           ))}
         </div>

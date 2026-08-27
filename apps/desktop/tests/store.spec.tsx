@@ -5,10 +5,13 @@
  * and admin rendering gate. Bridge layer is mocked at the tauri invoke
  * boundary.
  */
-import { describe, expect, it, vi, beforeEach } from 'vitest'
+import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
+import { cleanup } from '@testing-library/react'
 import { presentError } from '../src/store'
 
 // Mock the tauri API boundary BEFORE importing bridge consumers.
+
+afterEach(cleanup)
 const invokeMock = vi.fn()
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: (...args: unknown[]) => invokeMock(...args),
@@ -365,5 +368,60 @@ describe('详情页线上契约（顶层 body + children summaries）', () => {
     expect(screen.queryByText('STORY-0018 邮件通知能力')).toBeTruthy()
     expect(screen.queryByText('STORY-0019 站内消息能力')).toBeTruthy()
     expect(screen.queryByText(/Created .* · Updated .*/)).toBeTruthy()
+  })
+})
+
+describe('agent harness 设置（每 workspace）', () => {
+  beforeEach(() => invokeMock.mockReset())
+
+  const home = { homeId: 'h1', kind: 'workspace', path: '/tmp/ws/.omt' }
+
+  it('选择类型后探测安装位置并保存配置到 tauri:harness bag', async () => {
+    invokeMock.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === 'harness_detect') {
+        return Promise.resolve({ installed: true, path: '/usr/local/bin/dsh', version: 'dsh 0.9.0' })
+      }
+      return Promise.resolve({})
+    })
+    const { render, screen, fireEvent, waitFor } = await import('@testing-library/react')
+    const { HarnessSelect } = await import('../src/HarnessSelect')
+    const saved: Array<unknown> = []
+    render(<HarnessSelect home={home} config={undefined} onSave={(_h, cfg) => { saved.push(cfg); return Promise.resolve() }} />)
+
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'dsh' } })
+    await waitFor(() => expect(saved.length).toBe(1))
+    expect(saved[0]).toMatchObject({ type: 'dsh', mode: 'install', installPath: '/usr/local/bin/dsh', version: 'dsh 0.9.0' })
+  })
+
+  it('未检测到安装时提示；dsh 可转开发模式', async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === 'harness_detect') return Promise.resolve({ installed: false })
+      return Promise.resolve({})
+    })
+    const { render, screen, fireEvent, waitFor } = await import('@testing-library/react')
+    const { HarnessSelect } = await import('../src/HarnessSelect')
+    const saved: Array<unknown> = []
+    render(<HarnessSelect home={home} config={undefined} onSave={(_h, cfg) => { saved.push(cfg); return Promise.resolve() }} />)
+
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'dsh' } })
+    await waitFor(() => expect(screen.queryByText(/未在 PATH 检测到 dsh/)).toBeTruthy())
+    expect(saved[0]).toMatchObject({ type: 'dsh', mode: 'dev' })
+  })
+
+  it('harness 配置经 bag 读写（key=tauri:harness）', async () => {
+    invokeMock.mockResolvedValue({})
+    const { useTreeStore } = await import('../src/store')
+    const { renderHook, act } = await import('@testing-library/react')
+    const { result, unmount } = renderHook(() => useTreeStore())
+    await act(async () => {
+      await result.current.saveHarness(home, { type: 'opencode', mode: 'install', installPath: '/opt/opencode' })
+    })
+    const call = invokeMock.mock.calls.find(
+      c => c[0] === 'omt_call' && (c[1] as { method: string }).method === 'ui/filters-set',
+    )
+    expect((call![1] as { params: { key: string; filters: unknown } }).params.key).toBe('tauri:harness')
+    expect((call![1] as { params: { filters: { harness: unknown } } }).params.filters.harness)
+      .toMatchObject({ type: 'opencode', installPath: '/opt/opencode' })
+    unmount()
   })
 })

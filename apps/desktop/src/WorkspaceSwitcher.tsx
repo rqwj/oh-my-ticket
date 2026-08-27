@@ -9,18 +9,21 @@ import type { HomeInfo } from './types'
 import type { KnownHome } from './store'
 import { workspaceRootOf } from './homePath'
 import { NOT_A_WORKSPACE_HINT, resolveHomeFromPickedDir } from './workspacePath'
+import { HarnessSelect, type HarnessConfig } from './HarnessSelect'
 
 interface Props {
   homes: HomeInfo[]
   knownHomes: KnownHome[]
   activeHome: HomeInfo | null
   homeDir?: string
+  harnessByHome: Record<string, HarnessConfig>
+  onSaveHarness: (home: HomeInfo, config: HarnessConfig | null) => Promise<void>
   onSelect: (home: HomeInfo) => void
   onDeclare: (path: string) => Promise<string | null>
   onClose: () => void
 }
 
-export function WorkspaceSwitcher({ homes, knownHomes, activeHome, homeDir, onSelect, onDeclare, onClose }: Props) {
+export function WorkspaceSwitcher({ homes, knownHomes, activeHome, homeDir, harnessByHome, onSaveHarness, onSelect, onDeclare, onClose }: Props) {
   const [message, setMessage] = useState<string | null>(null)
   const [picking, setPicking] = useState(false)
 
@@ -68,6 +71,8 @@ export function WorkspaceSwitcher({ homes, knownHomes, activeHome, homeDir, onSe
             >
               <span className="chip">{home.kind ?? 'workspace'}</span>
               <span className="mono">{rootOf(home)}</span>
+              <span className="row-spacer" />
+              <HarnessSelect home={home} config={harnessByHome[home.homeId]} onSave={onSaveHarness} />
             </button>
           ))}
         </div>
