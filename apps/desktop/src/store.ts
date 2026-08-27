@@ -65,6 +65,12 @@ export function presentError(error: unknown): string {
 export function useTreeStore() {
   const [state, setState] = useState<TreeState>(INITIAL)
   const disposers = useRef<Array<() => void>>([])
+  // Synchronous mirror of state.filters: saveFilters must compute the
+  // merged bag WITHOUT relying on React's async setState updater.
+  const filtersRef = useRef<SavedFilters>({})
+  useEffect(() => {
+    filtersRef.current = state.filters
+  }, [state.filters])
 
   const refreshHomes = useCallback(async () => {
     try {
@@ -73,13 +79,20 @@ export function useTreeStore() {
       const homes = result.homes ?? []
       void loadKnownHomes()
       if (result.homeDir !== undefined) setState(s => ({ ...s, homeDir: result.homeDir }))
-      setState(s => ({
-        ...s,
-        homes,
-        activeHome: s.activeHome && homes.some(h => h.homeId === s.activeHome!.homeId) ? s.activeHome : (homes[0] ?? null),
-        loading: false,
-        error: null,
-      }))
+      setState(s => {
+        const keep = s.activeHome && homes.some(h => h.homeId === s.activeHome!.homeId) ? s.activeHome : undefined
+        const next = keep ?? homes[0] ?? null
+        return {
+          ...s,
+          homes,
+          activeHome: next,
+          // Switching to a DIFFERENT home drops the previous home's bag so
+          // the load below adopts the new home's persisted filters.
+          filters: next && keep ? s.filters : {},
+          loading: false,
+          error: null,
+        }
+      })
     } catch (error) {
       setState(s => ({ ...s, loading: false, error: presentError(error) }))
     }
@@ -110,15 +123,22 @@ export function useTreeStore() {
         homeId: home.homeId,
         key: FILTERS_KEY,
       })
-      setState(s => ({ ...s, filters: result.filters ?? {} }))
+      // Merge OVER current state: a toggle the user made while this load
+      // was in flight (or whose set RPC is still landing) must survive.
+      setState(s => ({ ...s, filters: { ...(result.filters ?? {}), ...s.filters } }))
     } catch {
-      setState(s => ({ ...s, filters: {} }))
+      /* keep current filters on load failure */
     }
   }, [])
 
   const saveFilters = useCallback(async (home: HomeInfo, patch: SavedFilters) => {
-    setState(s => ({ ...s, filters: { ...s.filters, ...patch } }))
-    await omtCall('ui/filters-set', { homeId: home.homeId, key: FILTERS_KEY, filters: patch }).catch(() => {})
+    // Merged bag drives BOTH the optimistic render and the wire payload
+    // (ui/filters-set replaces the whole bag); the ref avoids depending
+    // on React's async updater timing.
+    const merged = { ...filtersRef.current, ...patch }
+    filtersRef.current = merged
+    setState(s => ({ ...s, filters: merged }))
+    await omtCall('ui/filters-set', { homeId: home.homeId, key: FILTERS_KEY, filters: merged }).catch(() => {})
   }, [])
 
   const loadKnownHomes = useCallback(async () => {
@@ -154,7 +174,8 @@ export function useTreeStore() {
 
   const selectHome = useCallback(
     async (home: HomeInfo) => {
-      setState(s => ({ ...s, activeHome: home, selectedId: null, nodes: [], runs: [] }))
+      setState(s => ({ ...s, activeHome: home, selectedId: null, nodes: [], runs: [], filters: {} }))
+      filtersRef.current = {}
       await Promise.all([refreshNodes(home), refreshRuns(home), loadFilters(home)])
     },
     [refreshNodes, refreshRuns, loadFilters],
@@ -235,6 +256,7 @@ export function useTreeStore() {
 
   return {
     state,
+    loadFilters,
     loadKnownHomes,
     selectHome,
     selectNode,
