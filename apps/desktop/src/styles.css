@@ -158,10 +158,14 @@ body {
 .mono { font-family: ui-monospace, monospace; font-size: 12px; }
 .home-list { display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; }
 .home-row {
-  display: flex; gap: 10px; align-items: center; padding: 8px 12px;
+  display: flex; flex-direction: column; gap: 6px; align-items: stretch;
+  padding: 8px 12px;
   border: 1px solid var(--border); border-radius: 6px;
   background: var(--panel); color: var(--text); cursor: pointer; text-align: left;
 }
+.home-row-main { display: flex; gap: 10px; align-items: center; }
+.home-path { text-align: left; word-break: break-all; }
+.home-row-sub { display: flex; padding-left: 2px; }
 .home-row.selected { border-color: var(--accent); }
 .home-row:disabled { opacity: 0.45; cursor: not-allowed; }
 .known-section { margin-bottom: 12px; }

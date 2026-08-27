@@ -69,10 +69,13 @@ export function WorkspaceSwitcher({ homes, knownHomes, activeHome, homeDir, harn
               title={home.path}
               onClick={() => { onSelect(home); onClose() }}
             >
-              <span className="chip">{home.kind ?? 'workspace'}</span>
-              <span className="mono">{rootOf(home)}</span>
-              <span className="row-spacer" />
-              <HarnessSelect home={home} config={harnessByHome[home.homeId]} onSave={onSaveHarness} />
+              <span className="home-row-main">
+                <span className="chip">{home.kind ?? 'workspace'}</span>
+                <span className="mono home-path">{rootOf(home)}</span>
+              </span>
+              <span className="home-row-sub">
+                <HarnessSelect home={home} config={harnessByHome[home.homeId]} onSave={onSaveHarness} />
+              </span>
             </button>
           ))}
         </div>

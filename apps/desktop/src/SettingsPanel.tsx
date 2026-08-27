@@ -82,10 +82,13 @@ export function SettingsPanel({ homes, knownHomes, homeDir, harnessByHome, onSav
               className={`home-row${activeHome?.homeId === home.homeId ? ' selected' : ''}`}
               onClick={() => onSelectHome(home)}
             >
-              <span className="chip">{home.kind ?? 'workspace'}</span>
-              <span className="mono">{workspaceRootOf(home.path, homeDir, home.name ?? home.homeId)}</span>
-              <span className="row-spacer" />
-              <HarnessSelect home={home} config={harnessByHome[home.homeId]} onSave={onSaveHarness} />
+              <span className="home-row-main">
+                <span className="chip">{home.kind ?? 'workspace'}</span>
+                <span className="mono home-path">{workspaceRootOf(home.path, homeDir, home.name ?? home.homeId)}</span>
+              </span>
+              <span className="home-row-sub">
+                <HarnessSelect home={home} config={harnessByHome[home.homeId]} onSave={onSaveHarness} />
+              </span>
             </button>
           ))}
         </div>
