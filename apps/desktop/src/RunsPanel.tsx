@@ -30,7 +30,7 @@ export function RunsPanel({ home, runs, fetchRun, onChanged }: Props) {
 
   const control = async (runId: string, action: string) => {
     try {
-      await omtCall('run/control', { homeId: home.homeId, id: runId, action })
+      await omtCall('run/control', { homeId: home.homeId, runId, action })
       setBanner(null)
       await open(runId)
       onChanged()

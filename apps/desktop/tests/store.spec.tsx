@@ -286,3 +286,34 @@ describe('线上字段归一化（nodeId → id）', () => {
     unmount()
   })
 })
+
+describe('RPC 参数契约（nodeId/runId/changes）', () => {
+  beforeEach(() => invokeMock.mockReset())
+
+  it('updateNode posts nodeId + changes + top-level expectedRevision', async () => {
+    invokeMock.mockResolvedValue({})
+    const { useTreeStore } = await import('../src/store')
+    const { renderHook, act } = await import('@testing-library/react')
+    const { result, unmount } = renderHook(() => useTreeStore())
+    const home = { homeId: 'h1', kind: 'workspace', path: '/tmp/ws/.omt' }
+    await act(async () => {
+      await result.current.selectHome(home)
+    })
+    let updateError: string | null = null
+    await act(async () => {
+      updateError = await result.current.updateNode('TICKET-0001', { status: 'done' }, 3)
+    })
+    expect(updateError).toBeNull()
+    const call = invokeMock.mock.calls.find(
+      c => c[0] === 'omt_call' && (c[1] as { method: string }).method === 'node/update',
+    )
+    expect(call).toBeTruthy()
+    expect((call![1] as { params: Record<string, unknown> }).params).toMatchObject({
+      homeId: 'h1',
+      nodeId: 'TICKET-0001',
+      changes: { status: 'done' },
+      expectedRevision: 3,
+    })
+    unmount()
+  })
+})

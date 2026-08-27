@@ -68,9 +68,14 @@ export function useTreeStore() {
   // Synchronous mirror of state.filters: saveFilters must compute the
   // merged bag WITHOUT relying on React's async setState updater.
   const filtersRef = useRef<SavedFilters>({})
+  // Same stale-closure guard for activeHome: imperative actions
+  // (updateNode/fetchRun) must read the LATEST home, not the render
+  // frame their closure captured.
+  const activeHomeRef = useRef<HomeInfo | null>(null)
   useEffect(() => {
     filtersRef.current = state.filters
-  }, [state.filters])
+    activeHomeRef.current = state.activeHome
+  }, [state.filters, state.activeHome])
 
   const refreshHomes = useCallback(async () => {
     try {
@@ -80,15 +85,20 @@ export function useTreeStore() {
       void loadKnownHomes()
       if (result.homeDir !== undefined) setState(s => ({ ...s, homeDir: result.homeDir }))
       setState(s => {
-        const keep = s.activeHome && homes.some(h => h.homeId === s.activeHome!.homeId) ? s.activeHome : undefined
-        const next = keep ?? homes[0] ?? null
+        // A homes refresh must NEVER unset an existing selection — a
+        // transiently incomplete list (in-flight boot, declare still
+        // landing) would otherwise wipe the user's active home. Only
+        // auto-pick when nothing is selected yet.
+        const next = s.activeHome ?? homes[0] ?? null
+        const autoPicking = s.activeHome === null && next !== null
+        if (next !== s.activeHome) activeHomeRef.current = next
         return {
           ...s,
           homes,
           activeHome: next,
-          // Switching to a DIFFERENT home drops the previous home's bag so
-          // the load below adopts the new home's persisted filters.
-          filters: next && keep ? s.filters : {},
+          // Fresh auto-pick starts with an empty bag; the load below
+          // adopts the home's persisted filters.
+          filters: autoPicking ? {} : s.filters,
           loading: false,
           error: null,
         }
@@ -187,6 +197,7 @@ export function useTreeStore() {
     async (home: HomeInfo) => {
       setState(s => ({ ...s, activeHome: home, selectedId: null, nodes: [], runs: [], filters: {} }))
       filtersRef.current = {}
+      activeHomeRef.current = home
       await Promise.all([refreshNodes(home), refreshRuns(home), loadFilters(home)])
     },
     [refreshNodes, refreshRuns, loadFilters],
@@ -276,19 +287,22 @@ export function useTreeStore() {
     refreshHomes,
     refreshNodes,
     fetchRun: (runId: string) =>
-      state.activeHome
-        ? omtCall<RunDetail>('run/get', { homeId: state.activeHome.homeId, id: runId })
+      activeHomeRef.current
+        ? omtCall<RunDetail>('run/get', { homeId: activeHomeRef.current.homeId, runId })
         : Promise.reject(new Error('no active home')),
     updateNode: async (id: string, patch: Record<string, unknown>, revision?: number) => {
-      if (!state.activeHome) throw new Error('no active home')
+      const home = activeHomeRef.current
+      if (!home) return 'no active home'
       try {
+        // Wire contract: nodeId + changes object; expectedRevision is a
+        // top-level optimistic-concurrency gate (dispatch.rs).
         await omtCall('node/update', {
-          homeId: state.activeHome.homeId,
-          id,
-          ...patch,
+          homeId: home.homeId,
+          nodeId: id,
+          changes: patch,
           ...(revision !== undefined ? { expectedRevision: revision } : {}),
         })
-        await refreshNodes(state.activeHome)
+        await refreshNodes(home)
         return null
       } catch (error) {
         return presentError(error)
