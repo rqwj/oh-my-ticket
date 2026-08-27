@@ -23,13 +23,12 @@ export function App() {
   return (
     <main className="app-shell">
       <nav className="top-bar">
-        <strong>oh-my-ticket</strong>
-        <span className="home-name">{state.activeHome?.name ?? state.activeHome?.path ?? ''}</span>
-        <div className="view-switch">
-          <button className={`chip${view === 'detail' ? ' active' : ''}`} onClick={() => setView('detail')}>详情</button>
-          <button className={`chip${view === 'runs' ? ' active' : ''}`} onClick={() => setView('runs')}>Runs</button>
-          <button className={`chip${view === 'settings' ? ' active' : ''}`} onClick={() => setView('settings')}>设置</button>
+        <div className="tab-strip">
+          <button className={`tab${view === 'detail' ? ' active' : ''}`} onClick={() => setView('detail')}>Tickets</button>
+          <button className={`tab${view === 'runs' ? ' active' : ''}`} onClick={() => setView('runs')}>Runs</button>
+          <button className={`tab${view === 'settings' ? ' active' : ''}`} onClick={() => setView('settings')}>设置</button>
         </div>
+        <span className="home-name">{state.activeHome?.name ?? state.activeHome?.path ?? ''}</span>
       </nav>
       {state.error && <p className="error-banner">{state.error}</p>}
       <div className="content">

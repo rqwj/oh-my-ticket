@@ -137,3 +137,13 @@ describe('declare flow', () => {
     expect(error).toContain('升级 daemon')
   })
 })
+
+describe('添加 workspace 路径解析', () => {
+  it('picked .omt dir used as-is; workspace root resolves to <root>/.omt', async () => {
+    const { resolveHomeFromPickedDir } = await import('../src/workspacePath')
+    expect(resolveHomeFromPickedDir('/repo/proj/.omt')).toBe('/repo/proj/.omt')
+    expect(resolveHomeFromPickedDir('/repo/proj/.omt/')).toBe('/repo/proj/.omt')
+    expect(resolveHomeFromPickedDir('/repo/proj')).toBe('/repo/proj/.omt')
+    expect(resolveHomeFromPickedDir('/repo/proj/')).toBe('/repo/proj/.omt')
+  })
+})

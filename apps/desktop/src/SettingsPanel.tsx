@@ -4,9 +4,11 @@
  * include the admin family (AE12: no grant → no render).
  */
 import { useEffect, useState } from 'react'
+import { open as openDialog } from '@tauri-apps/plugin-dialog'
 import { daemonStatus, omtCall, type DaemonStatus } from './bridge'
 import type { HomeInfo } from './types'
 import type { KnownHome } from './store'
+import { NOT_A_WORKSPACE_HINT, resolveHomeFromPickedDir } from './workspacePath'
 
 interface Props {
   homes: HomeInfo[]
@@ -18,9 +20,9 @@ interface Props {
 
 export function SettingsPanel({ homes, knownHomes, activeHome, onSelectHome, onDeclare }: Props) {
   const [status, setStatus] = useState<DaemonStatus | null>(null)
-  const [declarePath, setDeclarePath] = useState('')
   const [declareMessage, setDeclareMessage] = useState<string | null>(null)
   const [isAdmin, setIsAdmin] = useState(false)
+  const [picking, setPicking] = useState(false)
 
   useEffect(() => {
     void daemonStatus().then(setStatus).catch(() => {})
@@ -31,12 +33,24 @@ export function SettingsPanel({ homes, knownHomes, activeHome, onSelectHome, onD
       .catch(error => setIsAdmin(!String(error).includes('FORBIDDEN')))
   }, [activeHome?.homeId])
 
-  const declare = async () => {
-    const path = declarePath.trim()
-    if (!path) return
-    const error = await onDeclare(path)
-    setDeclareMessage(error ?? `已收录 ${path}`)
-    if (!error) setDeclarePath('')
+  const declare = async (homePath: string) => {
+    const error = await onDeclare(homePath)
+    if (error !== null && (error.includes('不存在') || error.includes('unreadable') || error.includes('not a directory') || error.includes('INVALID_INPUT'))) {
+      setDeclareMessage(NOT_A_WORKSPACE_HINT)
+      return
+    }
+    setDeclareMessage(error ?? `已添加 ${homePath}`)
+  }
+
+  const pickWorkspace = async () => {
+    setPicking(true)
+    try {
+      const picked = await openDialog({ directory: true, multiple: false, title: '选择要添加的 workspace 目录' })
+      if (typeof picked !== 'string') return // 用户取消
+      await declare(resolveHomeFromPickedDir(picked))
+    } finally {
+      setPicking(false)
+    }
   }
 
   return (
@@ -55,7 +69,7 @@ export function SettingsPanel({ homes, knownHomes, activeHome, onSelectHome, onD
         )}
       </section>
       <section>
-        <h3>Homes</h3>
+        <h3>Workspaces</h3>
         <div className="home-list">
           {homes.map(home => (
             <button
@@ -70,7 +84,7 @@ export function SettingsPanel({ homes, knownHomes, activeHome, onSelectHome, onD
         </div>
         {knownHomes.filter(k => !k.open).length > 0 && (
           <div className="known-section">
-            <h4>已知未开（点击收录）</h4>
+            <h4>已知未开（点击即添加）</h4>
             {knownHomes.filter(k => !k.open).map(known => (
               <button
                 key={known.path}
@@ -87,12 +101,9 @@ export function SettingsPanel({ homes, knownHomes, activeHome, onSelectHome, onD
           </div>
         )}
         <div className="declare-form">
-          <input
-            placeholder="收录新 home 目录路径（含 .omt）…"
-            value={declarePath}
-            onChange={e => setDeclarePath(e.target.value)}
-          />
-          <button className="chip active" onClick={() => void declare()}>收录</button>
+          <button className="chip active" disabled={picking} onClick={() => void pickWorkspace()}>
+            {picking ? '选择中…' : '＋ 添加 workspace…'}
+          </button>
         </div>
         {declareMessage && <p className="info-banner">{declareMessage}</p>}
       </section>

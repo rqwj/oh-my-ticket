@@ -14,6 +14,7 @@ use state::SharedSession;
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(SharedSession::new())
         .invoke_handler(tauri::generate_handler![
             rpc_bridge::omt_call,
