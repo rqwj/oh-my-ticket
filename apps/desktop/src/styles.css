@@ -166,7 +166,9 @@ body {
 .home-row-main { display: flex; gap: 10px; align-items: center; }
 .home-path { text-align: left; word-break: break-all; }
 .home-row-sub { display: flex; padding-left: 2px; }
-.home-row.selected { border-color: var(--accent); }
+.home-row:hover { background: var(--panel-raised); border-color: var(--muted); }
+.home-row.selected { border-color: var(--accent); background: rgba(88, 166, 255, 0.08); }
+.row-check { margin-left: auto; color: var(--accent); font-weight: 700; font-size: 14px; }
 .home-row:disabled { opacity: 0.45; cursor: not-allowed; }
 .known-section { margin-bottom: 12px; }
 .known-section h4 { margin: 0 0 6px; font-size: 12px; color: var(--muted); font-weight: 500; }

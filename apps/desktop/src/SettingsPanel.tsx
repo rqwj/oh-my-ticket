@@ -85,6 +85,7 @@ export function SettingsPanel({ homes, knownHomes, homeDir, harnessByHome, onSav
               <span className="home-row-main">
                 <span className="chip">{home.kind ?? 'workspace'}</span>
                 <span className="mono home-path">{workspaceRootOf(home.path, homeDir, home.name ?? home.homeId)}</span>
+                {activeHome?.homeId === home.homeId && <span className="row-check">✓</span>}
               </span>
               <span className="home-row-sub">
                 <HarnessSelect home={home} config={harnessByHome[home.homeId]} onSave={onSaveHarness} />

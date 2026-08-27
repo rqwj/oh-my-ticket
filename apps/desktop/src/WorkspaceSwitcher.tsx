@@ -72,6 +72,7 @@ export function WorkspaceSwitcher({ homes, knownHomes, activeHome, homeDir, harn
               <span className="home-row-main">
                 <span className="chip">{home.kind ?? 'workspace'}</span>
                 <span className="mono home-path">{rootOf(home)}</span>
+                {activeHome?.homeId === home.homeId && <span className="row-check">✓</span>}
               </span>
               <span className="home-row-sub">
                 <HarnessSelect home={home} config={harnessByHome[home.homeId]} onSave={onSaveHarness} />
