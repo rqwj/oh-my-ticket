@@ -23,6 +23,7 @@ export interface KnownHome {
 export interface TreeState {
   homes: HomeInfo[]
   knownHomes: KnownHome[]
+  homeDir?: string
   activeHome: HomeInfo | null
   nodes: OmtNode[]
   selectedId: string | null
@@ -68,9 +69,10 @@ export function useTreeStore() {
   const refreshHomes = useCallback(async () => {
     try {
       // Handshake projection of open homes (pull-based freshness, v1).
-      const result = await invoke<{ homes?: HomeInfo[] }>('daemon_homes')
+      const result = await invoke<{ homes?: HomeInfo[]; homeDir?: string }>('daemon_homes')
       const homes = result.homes ?? []
       void loadKnownHomes()
+      if (result.homeDir !== undefined) setState(s => ({ ...s, homeDir: result.homeDir }))
       setState(s => ({
         ...s,
         homes,

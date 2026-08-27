@@ -9,16 +9,18 @@ import { daemonStatus, omtCall, type DaemonStatus } from './bridge'
 import type { HomeInfo } from './types'
 import type { KnownHome } from './store'
 import { NOT_A_WORKSPACE_HINT, resolveHomeFromPickedDir } from './workspacePath'
+import { workspaceRootOf } from './homePath'
 
 interface Props {
   homes: HomeInfo[]
   knownHomes: KnownHome[]
+  homeDir?: string
   activeHome: HomeInfo | null
   onSelectHome: (home: HomeInfo) => void
   onDeclare: (path: string) => Promise<string | null>
 }
 
-export function SettingsPanel({ homes, knownHomes, activeHome, onSelectHome, onDeclare }: Props) {
+export function SettingsPanel({ homes, knownHomes, homeDir, activeHome, onSelectHome, onDeclare }: Props) {
   const [status, setStatus] = useState<DaemonStatus | null>(null)
   const [declareMessage, setDeclareMessage] = useState<string | null>(null)
   const [isAdmin, setIsAdmin] = useState(false)
@@ -78,7 +80,7 @@ export function SettingsPanel({ homes, knownHomes, activeHome, onSelectHome, onD
               onClick={() => onSelectHome(home)}
             >
               <span className="chip">{home.kind ?? 'workspace'}</span>
-              <span>{home.name ?? home.path ?? home.homeId}</span>
+              <span className="mono">{workspaceRootOf(home.path, homeDir, home.name ?? home.homeId)}</span>
             </button>
           ))}
         </div>
@@ -94,7 +96,7 @@ export function SettingsPanel({ homes, knownHomes, activeHome, onSelectHome, onD
                 onClick={() => void onDeclare(known.path).then(err => setDeclareMessage(err ?? `已收录 ${known.name}`))}
               >
                 <span className="chip">{known.kind}</span>
-                <span>{known.name}</span>
+                <span className="mono">{workspaceRootOf(known.path, homeDir, known.name)}</span>
                 {known.missing && <span className="chip">已缺失</span>}
               </button>
             ))}

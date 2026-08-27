@@ -4,6 +4,8 @@
  * semantics align with the DSH surface.
  */
 import { useCallback, useState } from 'react'
+import { WorkspaceSwitcher } from './WorkspaceSwitcher'
+import { workspaceRootOf } from './homePath'
 import { useTreeStore } from './store'
 import { TreePanel } from './TreePanel'
 import { DetailPanel } from './DetailPanel'
@@ -26,6 +28,7 @@ export function App() {
   const { state } = store
   const [view, setView] = useState<CenterView>('detail')
   const [treeWidth, setTreeWidth] = useState(initialTreeWidth)
+  const [switcherOpen, setSwitcherOpen] = useState(false)
 
   // Drag-to-resize the tree/center splitter: pointer captured on the
   // divider, width clamped 240–720px, persisted across launches.
@@ -56,7 +59,9 @@ export function App() {
           <button className={`tab${view === 'runs' ? ' active' : ''}`} onClick={() => setView('runs')}>Runs</button>
           <button className={`tab${view === 'settings' ? ' active' : ''}`} onClick={() => setView('settings')}>设置</button>
         </div>
-        <span className="home-name">{state.activeHome?.name ?? state.activeHome?.path ?? ''}</span>
+        <button className="home-name home-switch-btn" title="切换 workspace" onClick={() => setSwitcherOpen(true)}>
+          {state.activeHome ? workspaceRootOf(state.activeHome.path, state.homeDir, state.activeHome.name ?? '') : '选择 workspace'}
+        </button>
       </nav>
       {state.error && <p className="error-banner">{state.error}</p>}
       <div className="content">
@@ -90,6 +95,7 @@ export function App() {
             <SettingsPanel
               homes={state.homes}
               knownHomes={state.knownHomes}
+              homeDir={state.homeDir}
               activeHome={state.activeHome}
               onSelectHome={home => { void store.selectHome(home); setView('detail') }}
               onDeclare={store.declareHome}
@@ -97,6 +103,17 @@ export function App() {
           )}
         </section>
       </div>
+      {switcherOpen && (
+        <WorkspaceSwitcher
+          homes={state.homes}
+          knownHomes={state.knownHomes}
+          activeHome={state.activeHome}
+          homeDir={state.homeDir}
+          onSelect={home => void store.selectHome(home)}
+          onDeclare={store.declareHome}
+          onClose={() => setSwitcherOpen(false)}
+        />
+      )}
     </main>
   )
 }

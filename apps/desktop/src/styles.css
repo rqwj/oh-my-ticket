@@ -167,3 +167,23 @@ body {
 .known-section h4 { margin: 0 0 6px; font-size: 12px; color: var(--muted); font-weight: 500; }
 .known-section .home-row { margin-bottom: 4px; }
 .declare-form { display: flex; gap: 8px; }
+
+/* Workspace 切换弹窗 */
+.home-switch-btn {
+  border: none; background: transparent; color: var(--muted);
+  font-size: 12px; cursor: pointer; padding: 4px 8px; border-radius: 6px;
+  font-family: ui-monospace, monospace;
+}
+.home-switch-btn:hover { background: var(--panel-raised); color: var(--text); }
+.modal-overlay {
+  position: fixed; inset: 0; background: rgba(0, 0, 0, 0.5);
+  display: flex; align-items: flex-start; justify-content: center;
+  padding-top: 12vh; z-index: 100;
+}
+.modal-panel {
+  width: 560px; max-width: 90vw; max-height: 70vh; overflow-y: auto;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+  padding: 16px;
+}
+.modal-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.modal-header h3 { margin: 0; font-size: 15px; }

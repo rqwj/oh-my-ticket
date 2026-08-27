@@ -53,7 +53,10 @@ pub fn daemon_status() -> Result<daemon::DaemonStatus, String> {
 #[tauri::command]
 pub fn daemon_homes(shared: State<'_, SharedSession>) -> Result<serde_json::Value, String> {
     with_session(&shared, |session| {
-        Ok(serde_json::json!({ "homes": session.enrollment.handshake["homes"].clone() }))
+        Ok(serde_json::json!({
+            "homes": session.enrollment.handshake["homes"].clone(),
+            "homeDir": std::env::var("HOME").unwrap_or_default(),
+        }))
     })
 }
 

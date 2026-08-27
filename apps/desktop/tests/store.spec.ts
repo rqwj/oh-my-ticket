@@ -147,3 +147,13 @@ describe('添加 workspace 路径解析', () => {
     expect(resolveHomeFromPickedDir('/repo/proj/')).toBe('/repo/proj/.omt')
   })
 })
+
+describe('workspace 根路径显示', () => {
+  it('strips /.omt and compresses the home dir prefix', async () => {
+    const { workspaceRootOf } = await import('../src/homePath')
+    expect(workspaceRootOf('/Users/robertq/work/proj/.omt', '/Users/robertq', 'x')).toBe('~/work/proj')
+    expect(workspaceRootOf('/Users/robertq/.omt', '/Users/robertq', 'x')).toBe('~')
+    expect(workspaceRootOf('/opt/other/.omt', '/Users/robertq', 'x')).toBe('/opt/other')
+    expect(workspaceRootOf(undefined, '/Users/robertq', 'fallback')).toBe('fallback')
+  })
+})
