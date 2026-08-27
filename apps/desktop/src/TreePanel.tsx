@@ -59,6 +59,8 @@ function matches(node: OmtNode, filters: SavedFilters): boolean {
 function sortSiblings(nodes: OmtNode[], sortOrder?: string): OmtNode[] {
   if (sortOrder === 'priority-desc') return [...nodes].sort((a, b) => b.priority - a.priority)
   if (sortOrder === 'priority-asc') return [...nodes].sort((a, b) => a.priority - b.priority)
+  if (sortOrder === 'id-asc') return [...nodes].sort((a, b) => a.id.localeCompare(b.id))
+  if (sortOrder === 'id-desc') return [...nodes].sort((a, b) => b.id.localeCompare(a.id))
   return nodes
 }
 
@@ -197,7 +199,16 @@ export function TreePanel({ nodes, filters, recentIds, selectedId, onSelect, onF
           </button>
         </div>
         <div className="chip-row sort-row">
-          <span className="sort-anchor"># ID</span>
+          <button
+            className={`chip sort-anchor${filters.sortOrder === 'id-asc' || filters.sortOrder === 'id-desc' ? ' active' : ''}`}
+            title="按 ID 排序（再点切换升/降）"
+            onClick={() => {
+              const next = filters.sortOrder === 'id-asc' ? 'id-desc' : 'id-asc'
+              onFilters({ sortOrder: next })
+            }}
+          >
+            # ID{filters.sortOrder === 'id-asc' ? ' ↑' : filters.sortOrder === 'id-desc' ? ' ↓' : ''}
+          </button>
           <span className="chip-sep" />
           {SORTS.map(sort => (
             <button

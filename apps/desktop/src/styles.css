@@ -55,7 +55,7 @@ body {
 .chip-row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
 .chip-sep { width: 1px; height: 16px; background: var(--border); margin: 0 2px; }
 .sort-row { padding-top: 2px; }
-.sort-anchor { color: var(--text); font-weight: 600; font-size: 12px; padding: 2px 8px; border: 1px solid var(--border); border-radius: 999px; }
+.sort-anchor { font-weight: 600; }
 
 .chip {
   display: inline-flex; align-items: center; gap: 5px;
