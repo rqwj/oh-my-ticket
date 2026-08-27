@@ -80,7 +80,13 @@ export function App() {
         <div className="splitter" onPointerDown={startDrag} role="separator" aria-orientation="vertical" />
         <section className="center-pane">
           {view === 'detail' && state.activeHome && state.selectedId && (
-            <DetailPanel home={state.activeHome} nodeId={state.selectedId} onUpdated={store.updateNode} />
+            <DetailPanel
+              home={state.activeHome}
+              nodeId={state.selectedId}
+              onUpdated={store.updateNode}
+              onSelect={store.selectNode}
+              onChanged={() => state.activeHome && void store.refreshNodes(state.activeHome)}
+            />
           )}
           {view === 'detail' && !state.selectedId && <p className="empty-hint">从左侧选择一个 ticket</p>}
           {view === 'runs' && state.activeHome && (

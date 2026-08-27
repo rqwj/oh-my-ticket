@@ -317,3 +317,53 @@ describe('RPC 参数契约（nodeId/runId/changes）', () => {
     unmount()
   })
 })
+
+describe('MarkdownText 渲染', () => {
+  it('renders headings, bullets, bold, code spans and fences', async () => {
+    const { render } = await import('@testing-library/react')
+    const { MarkdownText } = await import('../src/MarkdownText')
+    const { container } = render(
+      <MarkdownText text={'## 总体目标\n\n为 **端到端** 结构测试提供 `omt` 样例：\n\n- 邮件通知\n- 站内消息\n\n```sh\nomt doctor\n```'} />,
+    )
+    expect(container.querySelector('h2')?.textContent).toBe('总体目标')
+    expect(container.querySelectorAll('li')).toHaveLength(2)
+    expect(container.querySelector('strong')?.textContent).toBe('端到端')
+    expect(container.querySelector('.md-fence')?.textContent).toContain('omt doctor')
+    expect(container.querySelector('.md-code')?.textContent).toBe('omt')
+  })
+})
+
+describe('详情页线上契约（顶层 body + children summaries）', () => {
+  beforeEach(() => invokeMock.mockReset())
+
+  it('reads body from the TOP-LEVEL field and renders children chips', async () => {
+    invokeMock.mockImplementation((cmd: string, args?: { method?: string }) => {
+      if (cmd === 'omt_call' && args?.method === 'node/get') {
+        return Promise.resolve({
+          node: { nodeId: 'EPIC-0005', type: 'epic', title: '通知中心', status: 'open', priority: 0, revision: 2, createdAt: '2026-08-20T00:00:00Z', updatedAt: '2026-08-21T00:00:00Z' },
+          children: [
+            { nodeId: 'STORY-0018', type: 'story', title: '邮件通知能力', status: 'open' },
+            { nodeId: 'STORY-0019', type: 'story', title: '站内消息能力', status: 'done' },
+          ],
+          body: '## 总体目标\n\n样例正文',
+        })
+      }
+      return Promise.resolve({})
+    })
+    const { render, screen, waitFor } = await import('@testing-library/react')
+    const { DetailPanel } = await import('../src/DetailPanel')
+    render(
+      <DetailPanel
+        home={{ homeId: 'h1', kind: 'workspace', path: '/tmp/ws/.omt' }}
+        nodeId="EPIC-0005"
+        onUpdated={() => Promise.resolve(null)}
+        onSelect={() => {}}
+        onChanged={() => {}}
+      />,
+    )
+    await waitFor(() => expect(screen.queryByText('总体目标')).toBeTruthy())
+    expect(screen.queryByText('STORY-0018 邮件通知能力')).toBeTruthy()
+    expect(screen.queryByText('STORY-0019 站内消息能力')).toBeTruthy()
+    expect(screen.queryByText(/Created .* · Updated .*/)).toBeTruthy()
+  })
+})
