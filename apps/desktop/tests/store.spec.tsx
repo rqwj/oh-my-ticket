@@ -157,3 +157,40 @@ describe('workspace 根路径显示', () => {
     expect(workspaceRootOf(undefined, '/Users/robertq', 'fallback')).toBe('fallback')
   })
 })
+
+describe('归档过滤（线上 archived 布尔字段）', () => {
+  it('archived nodes hide by default and show when the Archived chip engages', async () => {
+    // The wire shape has archived as a SEPARATE boolean (status keeps its
+    // lifecycle value) — filtering on status==='archived' never matches.
+    const { render, screen } = await import('@testing-library/react')
+    const { TreePanel } = await import('../src/TreePanel')
+    const nodes = [
+      { id: 'T-1', type: 'ticket' as const, title: '活跃票据', status: 'open' as const, priority: 0, archived: false },
+      { id: 'T-2', type: 'ticket' as const, title: '归档票据', status: 'done' as const, priority: 0, archived: true },
+    ]
+    const { rerender } = render(
+      <TreePanel nodes={nodes} filters={{}} recentIds={[]} selectedId={null} onSelect={() => {}} onFilters={() => {}} />,
+    )
+    expect(screen.queryByText('活跃票据')).toBeTruthy()
+    expect(screen.queryByText('归档票据')).toBeNull() // hidden by default
+
+    rerender(
+      <TreePanel nodes={nodes} filters={{ showArchived: true }} recentIds={[]} selectedId={null} onSelect={() => {}} onFilters={() => {}} />,
+    )
+    expect(screen.queryByText('归档票据')).toBeTruthy() // visible when engaged
+  })
+
+  it('# ID toggle renders node ids only when showId is on', async () => {
+    const { render, screen } = await import('@testing-library/react')
+    const { TreePanel } = await import('../src/TreePanel')
+    const nodes = [{ id: 'TICKET-0042', type: 'ticket' as const, title: '示例', status: 'open' as const, priority: 0 }]
+    const { rerender } = render(
+      <TreePanel nodes={nodes} filters={{}} recentIds={[]} selectedId={null} onSelect={() => {}} onFilters={() => {}} />,
+    )
+    expect(screen.queryByText('TICKET-0042')).toBeNull()
+    rerender(
+      <TreePanel nodes={nodes} filters={{ showId: true }} recentIds={[]} selectedId={null} onSelect={() => {}} onFilters={() => {}} />,
+    )
+    expect(screen.queryByText('TICKET-0042')).toBeTruthy()
+  })
+})

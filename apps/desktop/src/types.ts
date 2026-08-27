@@ -17,6 +17,9 @@ export interface OmtNode {
   parentId?: string
   revision?: number
   path?: string
+  /** 线上契约：archived 是独立布尔（status 保持 open/done 等生命周期值，
+   *  不存在 status:'archived'）——归档过滤与呈现必须以本字段为准。 */
+  archived?: boolean
 }
 
 export interface HomeInfo {

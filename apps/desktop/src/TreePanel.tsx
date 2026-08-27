@@ -5,7 +5,7 @@
  * 数据为递归 node/tree 投影；过滤排序客户端执行，filter bag 持久化在
  * `tauri:ui` 键（KD3）。
  */
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import type { OmtNode, SavedFilters } from './types'
 import { STATUS_COLORS } from './types'
 
@@ -52,7 +52,7 @@ function matches(node: OmtNode, filters: SavedFilters): boolean {
   if (filters.types && filters.types.length > 0 && !filters.types.includes(node.type)) return false
   if (filters.statuses && filters.statuses.length > 0 && !filters.statuses.includes(node.status)) return false
   if (filters.priorities && filters.priorities.length > 0 && !filters.priorities.includes(node.priority)) return false
-  if (!filters.showArchived && node.status === 'archived') return false
+  if (!filters.showArchived && node.archived) return false
   return true
 }
 
@@ -95,8 +95,13 @@ function NodeRow({ node, depth, filters, selectedId, collapsed, onToggle, onSele
           {children.length > 0 ? (isCollapsed ? '▸' : '▾') : ''}
         </span>
         <span className="type-badge" style={{ background: meta.color }}>{meta.badge}</span>
+        <span
+          className="status-dot"
+          title={node.archived ? 'archived' : node.status}
+          style={{ background: node.archived ? '#6e7681' : (STATUS_COLORS[node.status] ?? '#8b949e') }}
+        />
         {filters.showId && <span className="node-id">{node.id}</span>}
-        <span className="node-title">{node.title}</span>
+        <span className={`node-title${node.archived ? ' archived' : ''}`}>{node.title}</span>
         {node.priority > 0 && <span className={`prio-tag p${node.priority}`}>P{node.priority}</span>}
       </div>
       {!isCollapsed &&
@@ -119,6 +124,8 @@ function toggleInList<T>(list: T[] | undefined, value: T, all: readonly T[]): T[
 
 export function TreePanel({ nodes, filters, recentIds, selectedId, onSelect, onFilters }: Props) {
   const [query, setQuery] = useState(filters.query ?? '')
+  // Persisted bag loads asynchronously after mount — adopt its query.
+  useEffect(() => setQuery(filters.query ?? ''), [filters.query])
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set())
   const roots = useMemo(
     () => sortSiblings(nodes.filter(n => matches(n, filters) || hasMatchingDescendant(n, filters)), filters.sortOrder),
