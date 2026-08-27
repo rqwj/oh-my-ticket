@@ -55,6 +55,45 @@ describe('bag key scoping (KD3/R4)', () => {
   })
 })
 
+describe('known-homes picker data', () => {
+  beforeEach(() => invokeMock.mockReset())
+
+  it('home/list-known loads into state; missing method degrades to empty (pre-list-known daemon)', async () => {
+    invokeMock.mockImplementation((cmd: string, args?: { method?: string }) => {
+      if (cmd === 'daemon_homes') return Promise.resolve({ homes: [] })
+      if (cmd === 'omt_call' && args?.method === 'home/list-known') {
+        return Promise.resolve({
+          homes: [
+            { path: '/tmp/a/.omt', name: 'a', kind: 'workspace', open: false, missing: false },
+            { path: '/tmp/b/.omt', name: 'b', kind: 'workspace', open: false, missing: true },
+          ],
+        })
+      }
+      return Promise.resolve({})
+    })
+    const { useTreeStore } = await import('../src/store')
+    const { renderHook, act } = await import('@testing-library/react')
+    const { result } = renderHook(() => useTreeStore())
+    await act(async () => {
+      await result.current.loadKnownHomes()
+    })
+    expect(result.current.state.knownHomes).toHaveLength(2)
+    expect(result.current.state.knownHomes[1].missing).toBe(true)
+
+    // Old daemon: method unknown → empty list, no crash.
+    invokeMock.mockImplementation((cmd: string, args?: { method?: string }) => {
+      if (cmd === 'omt_call' && args?.method === 'home/list-known') {
+        return Promise.reject(new Error('NOT_FOUND: kind=method'))
+      }
+      return Promise.resolve({})
+    })
+    await act(async () => {
+      await result.current.loadKnownHomes()
+    })
+    expect(result.current.state.knownHomes).toEqual([])
+  })
+})
+
 describe('declare flow', () => {
   beforeEach(() => invokeMock.mockReset())
 

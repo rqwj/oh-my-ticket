@@ -45,6 +45,16 @@ omt-daemon 的 JSON-RPC over UDS 协议的 surface-facing 要点。Schema 为唯
 - recent：**唯一跨面共享键 `'recent'`**（KD3 特例）——所有 surface 读写
   同一份最近列表；旧的 per-session 键成为孤儿。
 
+## known-homes 目录（home/list-known）
+
+runtime 级 SQLite（`<runtime>/known-homes.db`）持久化 daemon 曾打开或
+declare 过的每个目录，跨代际存活。持久键是 **canonical 路径**——homeId
+存于 home 自身库内，同路径重开保持不变（仅在库被抹除重建时变化），故
+`lastHomeId` 仅作信息展示。每个条目实时标注 `open`（当前已开，可直接
+切换）与 `missing`（磁盘探测失败——目录被移动/删除/卸载；条目永不自动
+清除）。桌面设置页据此渲染「已知未开」区，点击即 declare 切换。adapter_only
+分类：mcp 凭据无 home 族被拒（R7）。
+
 ## homes 列表新鲜度契约（拉取式）
 
 v1 无跨面 home 变更推送信号：桌面端聚焦窗口时重新列出 open homes

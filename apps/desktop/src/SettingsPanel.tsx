@@ -6,15 +6,17 @@
 import { useEffect, useState } from 'react'
 import { daemonStatus, omtCall, type DaemonStatus } from './bridge'
 import type { HomeInfo } from './types'
+import type { KnownHome } from './store'
 
 interface Props {
   homes: HomeInfo[]
+  knownHomes: KnownHome[]
   activeHome: HomeInfo | null
   onSelectHome: (home: HomeInfo) => void
   onDeclare: (path: string) => Promise<string | null>
 }
 
-export function SettingsPanel({ homes, activeHome, onSelectHome, onDeclare }: Props) {
+export function SettingsPanel({ homes, knownHomes, activeHome, onSelectHome, onDeclare }: Props) {
   const [status, setStatus] = useState<DaemonStatus | null>(null)
   const [declarePath, setDeclarePath] = useState('')
   const [declareMessage, setDeclareMessage] = useState<string | null>(null)
@@ -66,6 +68,24 @@ export function SettingsPanel({ homes, activeHome, onSelectHome, onDeclare }: Pr
             </button>
           ))}
         </div>
+        {knownHomes.filter(k => !k.open).length > 0 && (
+          <div className="known-section">
+            <h4>已知未开（点击收录）</h4>
+            {knownHomes.filter(k => !k.open).map(known => (
+              <button
+                key={known.path}
+                className="home-row"
+                disabled={known.missing}
+                title={known.missing ? '目录已不存在（被移动/删除）' : known.path}
+                onClick={() => void onDeclare(known.path).then(err => setDeclareMessage(err ?? `已收录 ${known.name}`))}
+              >
+                <span className="chip">{known.kind}</span>
+                <span>{known.name}</span>
+                {known.missing && <span className="chip">已缺失</span>}
+              </button>
+            ))}
+          </div>
+        )}
         <div className="declare-form">
           <input
             placeholder="收录新 home 目录路径（含 .omt）…"

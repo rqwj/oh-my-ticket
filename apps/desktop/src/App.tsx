@@ -59,6 +59,7 @@ export function App() {
           {view === 'settings' && (
             <SettingsPanel
               homes={state.homes}
+              knownHomes={state.knownHomes}
               activeHome={state.activeHome}
               onSelectHome={home => { void store.selectHome(home); setView('detail') }}
               onDeclare={store.declareHome}

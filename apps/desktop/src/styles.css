@@ -126,3 +126,8 @@ body {
   flex: 1; padding: 6px 10px; border-radius: 6px;
   border: 1px solid var(--border); background: var(--bg); color: var(--text);
 }
+
+.known-section { margin-bottom: 12px; }
+.known-section h4 { margin: 0 0 6px; font-size: 12px; color: var(--muted); font-weight: 500; }
+.known-section .home-row { margin-bottom: 4px; }
+.home-row:disabled { opacity: 0.45; cursor: not-allowed; }

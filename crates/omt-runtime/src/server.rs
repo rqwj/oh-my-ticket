@@ -134,7 +134,14 @@ pub fn run() {
     //    pending journal entries happens inside Storage::open — readiness
     //    implies recovered. Dead-daemon markers of OUR OWN predecessor are
     //    auto-recovered first (orchestrator ruling).
-    let homes = Homes::new();
+    // Known-homes catalog (runtime-level SQLite): records every successful
+    // open/declare so surfaces can discover manageable directories across
+    // daemon generations. A catalog failure must not block boot.
+    let known = match crate::known_homes::KnownHomes::open(&runtime_dir) {
+        Ok(known) => known,
+        Err(err) => return fail(&format!("known-homes init: {}", err.message)),
+    };
+    let homes = Homes::with_known(known.clone());
     for path in &home_paths {
         if let Err(err) = homes.open(
             path.clone(),
@@ -257,6 +264,7 @@ pub fn run() {
                 let clock_c = Arc::clone(&clock);
                 let config_c = Arc::clone(&config);
                 let global_home_c = global_path.clone();
+                let known_c = known.clone();
                 let counter = Arc::clone(&live_connections);
                 std::thread::Builder::new()
                     .name("omt-conn".to_string())
@@ -269,6 +277,7 @@ pub fn run() {
                             &runtime,
                             &config_c,
                             &global_home_c,
+                            &known_c,
                         );
                         counter.fetch_sub(1, Ordering::SeqCst);
                     })
@@ -323,6 +332,8 @@ struct ConnState {
     config: Arc<DaemonConfig>,
     /// Resolved global home path (kind hint for declared homes).
     global_home: PathBuf,
+    /// Known-homes catalog handle for home/list-known.
+    known: crate::known_homes::KnownHomes,
     /// Kernel-verified peer identity for this connection (handshake input).
     peer: ipc::PeerId,
     /// In-flight request id → cancel flag ($/cancelRequest flips these).
@@ -330,6 +341,7 @@ struct ConnState {
 }
 
 #[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn serve_connection(
     stream: std::os::unix::net::UnixStream,
     registry: &Arc<auth::Registry>,
@@ -338,6 +350,7 @@ pub(crate) fn serve_connection(
     runtime_dir: &std::path::Path,
     config: &Arc<DaemonConfig>,
     global_home: &std::path::Path,
+    known: &crate::known_homes::KnownHomes,
 ) {
     // Same-user gate BEFORE any protocol exchange: cross-uid connections
     // close immediately.
@@ -379,6 +392,7 @@ pub(crate) fn serve_connection(
         runtime_dir: runtime_dir.to_path_buf(),
         config: Arc::clone(config),
         global_home: global_home.to_path_buf(),
+        known: known.clone(),
         peer,
         inflight: Arc::new(Mutex::new(std::collections::HashMap::new())),
     });
@@ -642,6 +656,12 @@ fn route_method(
         handle_declare(request, credential, state, line_tx);
         return;
     }
+    // home/list-known shares the seam: no homeId on the wire, home-family
+    // authorization checked explicitly in the handler.
+    if request.method == "home/list-known" {
+        handle_list_known(request, credential, state, line_tx);
+        return;
+    }
 
     let runtime_dir = &state.runtime_dir;
     let homes = &state.homes;
@@ -866,6 +886,68 @@ fn handle_declare(
         }
         Err(problem) => {
             log_declare_failure(problem.code, &request.params);
+            respond(line_tx, error_response_for_problem(&request.id, problem));
+        }
+    }
+}
+
+/// `home/list-known`: the runtime-dir catalog of every directory this
+/// daemon has EVER opened or declared (persisted across generations), each
+/// row annotated with its CURRENT open status and an on-disk liveness
+/// probe. Powers the desktop home picker's "known but closed" section.
+/// Home-family authorization (R7 consistency: mcp credentials refuse).
+fn handle_list_known(
+    request: jsonrpc::Request,
+    credential: &auth::Credential,
+    state: &Arc<ConnState>,
+    line_tx: &std::sync::mpsc::Sender<String>,
+) {
+    if !credential.operation_allowed(&request.method) {
+        respond(
+            line_tx,
+            error_response_for_problem(
+                &request.id,
+                auth::forbidden(
+                    "operation-not-granted",
+                    serde_json::json!({
+                        "method": request.method,
+                        "operations": credential.operations,
+                    }),
+                ),
+            ),
+        );
+        return;
+    }
+    let open_canonicals: Vec<String> = state
+        .homes
+        .list()
+        .iter()
+        .map(|home| home.canonical.display().to_string())
+        .collect();
+    match state.known.list() {
+        Ok(entries) => {
+            let homes_json: Vec<serde_json::Value> = entries
+                .iter()
+                .map(|entry| {
+                    let path_text = entry.canonical_path.display().to_string();
+                    serde_json::json!({
+                        "path": path_text,
+                        "name": entry.name,
+                        "kind": entry.kind,
+                        "lastHomeId": entry.last_home_id,
+                        "firstSeenAt": entry.first_seen_at,
+                        "lastSeenAt": entry.last_seen_at,
+                        "open": open_canonicals.contains(&path_text),
+                        "missing": !entry.canonical_path.exists(),
+                    })
+                })
+                .collect();
+            respond(
+                line_tx,
+                jsonrpc::response(&request.id, &serde_json::json!({ "homes": homes_json })),
+            );
+        }
+        Err(problem) => {
             respond(line_tx, error_response_for_problem(&request.id, problem));
         }
     }

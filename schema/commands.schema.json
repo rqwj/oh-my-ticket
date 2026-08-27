@@ -212,6 +212,36 @@
       "required": ["homeId", "requiresRehandshake"]
     },
 
+    "ListKnownHomesParams": {
+      "type": "object",
+      "description": "Method home/list-known: the runtime-dir catalog of every directory this daemon has ever opened or declared, persisted across generations (runtime-level known-homes.db — identity key is the canonical path; homeIds rotate per generation so lastHomeId is informational only). Adapter-only channel for surface home pickers; home operation family required (R7: mcp credentials refuse).",
+      "properties": {},
+      "additionalProperties": true
+    },
+    "ListKnownHomesResult": {
+      "type": "object",
+      "properties": {
+        "homes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "path": { "type": "string", "description": "Canonical filesystem path of the home directory." },
+              "name": { "type": "string" },
+              "kind": { "type": "string", "enum": ["workspace", "global"] },
+              "lastHomeId": { "type": "string", "description": "Informational only — stored inside the home database, so it is stable across daemon generations and changes only when the home store is wiped/recreated." },
+              "firstSeenAt": { "type": "string" },
+              "lastSeenAt": { "type": "string" },
+              "open": { "type": "boolean", "description": "Currently open in this daemon (switchable without declare)." },
+              "missing": { "type": "boolean", "description": "On-disk liveness probe failed (moved/deleted/unmounted). Entries are never auto-pruned." }
+            },
+            "required": ["path", "name", "kind", "lastHomeId", "firstSeenAt", "lastSeenAt", "open", "missing"]
+          }
+        }
+      },
+      "required": ["homes"]
+    },
+
     "RunCreateParams": {
       "type": "object",
       "description": "Method run/create: ordered batch of Ticket/SubTicket members; every member must belong to homeId.",

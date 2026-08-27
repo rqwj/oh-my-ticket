@@ -383,6 +383,43 @@ export interface DeclareHomeResult {
   [k: string]: unknown;
 }
 /**
+ * Method home/list-known: the runtime-dir catalog of every directory this daemon has ever opened or declared, persisted across generations (runtime-level known-homes.db — identity key is the canonical path; homeIds rotate per generation so lastHomeId is informational only). Adapter-only channel for surface home pickers; home operation family required (R7: mcp credentials refuse).
+ */
+
+/**
+ * Method home/list-known: the runtime-dir catalog of every directory this daemon has ever opened or declared, persisted across generations (runtime-level known-homes.db — identity key is the canonical path; homeIds rotate per generation so lastHomeId is informational only). Adapter-only channel for surface home pickers; home operation family required (R7: mcp credentials refuse).
+ */
+export interface ListKnownHomesParams {
+  [k: string]: unknown;
+}
+
+export interface ListKnownHomesResult {
+  homes: {
+    /**
+     * Canonical filesystem path of the home directory.
+     */
+    path: string;
+    name: string;
+    kind: "workspace" | "global";
+    /**
+     * Informational only — stored inside the home database, so it is stable across daemon generations and changes only when the home store is wiped/recreated.
+     */
+    lastHomeId: string;
+    firstSeenAt: string;
+    lastSeenAt: string;
+    /**
+     * Currently open in this daemon (switchable without declare).
+     */
+    open: boolean;
+    /**
+     * On-disk liveness probe failed (moved/deleted/unmounted). Entries are never auto-pruned.
+     */
+    missing: boolean;
+    [k: string]: unknown;
+  }[];
+  [k: string]: unknown;
+}
+/**
  * Method run/create: ordered batch of Ticket/SubTicket members; every member must belong to homeId.
  */
 

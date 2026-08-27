@@ -13,6 +13,7 @@ pub mod events;
 pub mod homes;
 pub mod ipc;
 pub mod jsonrpc;
+pub mod known_homes;
 pub mod limits;
 pub mod logging;
 pub mod mcp;

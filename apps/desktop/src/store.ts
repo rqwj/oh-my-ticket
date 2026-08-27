@@ -12,8 +12,17 @@ import type { HomeInfo, OmtNode, RunDetail, RunSummary, SavedFilters } from './t
 const FILTERS_KEY = 'tauri:ui' // KD3: surface-prefixed bag key
 const RECENT_KEY = 'recent' // KD3's single shared cross-surface key (R4)
 
+export interface KnownHome {
+  path: string
+  name: string
+  kind: string
+  open: boolean
+  missing: boolean
+}
+
 export interface TreeState {
   homes: HomeInfo[]
+  knownHomes: KnownHome[]
   activeHome: HomeInfo | null
   nodes: OmtNode[]
   selectedId: string | null
@@ -26,6 +35,7 @@ export interface TreeState {
 
 const INITIAL: TreeState = {
   homes: [],
+  knownHomes: [],
   activeHome: null,
   nodes: [],
   selectedId: null,
@@ -60,6 +70,7 @@ export function useTreeStore() {
       // Handshake projection of open homes (pull-based freshness, v1).
       const result = await invoke<{ homes?: HomeInfo[] }>('daemon_homes')
       const homes = result.homes ?? []
+      void loadKnownHomes()
       setState(s => ({
         ...s,
         homes,
@@ -70,6 +81,7 @@ export function useTreeStore() {
     } catch (error) {
       setState(s => ({ ...s, loading: false, error: presentError(error) }))
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   const refreshNodes = useCallback(async (home: HomeInfo) => {
@@ -105,6 +117,17 @@ export function useTreeStore() {
   const saveFilters = useCallback(async (home: HomeInfo, patch: SavedFilters) => {
     setState(s => ({ ...s, filters: { ...s.filters, ...patch } }))
     await omtCall('ui/filters-set', { homeId: home.homeId, key: FILTERS_KEY, filters: patch }).catch(() => {})
+  }, [])
+
+  const loadKnownHomes = useCallback(async () => {
+    try {
+      const result = await omtCall<{ homes?: KnownHome[] }>('home/list-known', {})
+      setState(s => ({ ...s, knownHomes: result.homes ?? [] }))
+    } catch {
+      // Pre-list-known daemon (method NOT_FOUND) degrades to an empty
+      // known list — the picker keeps working with open homes only.
+      setState(s => ({ ...s, knownHomes: [] }))
+    }
   }, [])
 
   const loadRecent = useCallback(async () => {
@@ -146,6 +169,7 @@ export function useTreeStore() {
         // credential's scoped grant before we re-list.
         await invoke('daemon_reconnect')
         await refreshHomes()
+        await loadKnownHomes()
         return null
       } catch (error) {
         const text = String(error)
@@ -194,6 +218,7 @@ export function useTreeStore() {
   // Boot + pull-based home freshness on window focus (v1 contract).
   useEffect(() => {
     void refreshHomes()
+    void loadKnownHomes()
     void loadRecent()
     const onFocus = () => void refreshHomes()
     window.addEventListener('focus', onFocus)
@@ -208,6 +233,7 @@ export function useTreeStore() {
 
   return {
     state,
+    loadKnownHomes,
     selectHome,
     selectNode,
     saveFilters,

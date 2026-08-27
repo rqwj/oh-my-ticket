@@ -215,6 +215,9 @@ impl OpenedHome {
 /// placeholders are structurally invisible to them.
 #[derive(Default)]
 pub struct Homes {
+    /// Known-homes catalog (runtime-dir SQLite; None in tests that don't
+    /// care). Recorded on every successful open/declare.
+    known: Option<crate::known_homes::KnownHomes>,
     /// Shared with each home actor so it can remove its own entry on exit
     /// (idle AND shutdown paths alike): quota counts only live entries and
     /// an exited home disappears from the handshake listing.
@@ -282,9 +285,33 @@ impl OpeningSlot {
 impl Homes {
     pub fn new() -> Homes {
         Homes {
+            known: None,
             inner: Arc::new(std::sync::Mutex::new(Vec::new())),
             live_actors: Arc::new(AtomicUsize::new(0)),
             opening: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Production constructor: attach the runtime-dir catalog.
+    pub fn with_known(known: crate::known_homes::KnownHomes) -> Homes {
+        Homes {
+            known: Some(known),
+            ..Homes::new()
+        }
+    }
+
+    /// Best-effort catalog write (a catalog failure must never fail a
+    /// home open — discovery data is auxiliary).
+    fn record_known(&self, opened: &OpenedHome, clock: &Arc<dyn MillisClock>) {
+        if let Some(known) = &self.known {
+            let now = omt_storage::clock::iso_from_ms(clock.now_ms());
+            let _ = known.record(
+                &opened.canonical,
+                &opened.name,
+                opened.kind.as_str(),
+                &opened.home_id,
+                &now,
+            );
         }
     }
 
@@ -353,8 +380,14 @@ impl Homes {
             })?;
 
         let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-        let opened =
-            self.open_storage_and_start(&path, canonical, kind, global_path, clock, config)?;
+        let opened = self.open_storage_and_start(
+            &path,
+            canonical,
+            kind,
+            global_path,
+            Arc::clone(&clock),
+            config,
+        )?;
 
         // Startup opens are sequential; registry insertion still lands
         // before the caller proceeds (readiness descriptor ordering).
@@ -362,6 +395,7 @@ impl Homes {
             .lock()
             .expect("homes")
             .push(std::sync::Arc::clone(&opened));
+        self.record_known(&opened, &clock);
         Ok(opened)
     }
 
@@ -469,7 +503,7 @@ impl Homes {
                     canonical.clone(),
                     kind_hint,
                     global_path,
-                    clock,
+                    Arc::clone(&clock),
                     config,
                 );
                 match outcome {
@@ -483,6 +517,7 @@ impl Homes {
                             .expect("homes-opening")
                             .remove(&canonical);
                         slot.complete(SlotOutcome::Opened(Arc::clone(&home)));
+                        self.record_known(&home, &clock);
                         Ok(home)
                     }
                     Err(problem) => {

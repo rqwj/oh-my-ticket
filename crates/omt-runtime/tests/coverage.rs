@@ -60,8 +60,8 @@ fn every_schema_action_routes_to_a_handler() {
         actions.len(),
         // U5 (R6): +1 for home/declare — bump this LOUDLY whenever the
         // canonical matrix grows so parity additions never slip in silently.
-        25,
-        "canonical matrix size (21 seed + TICKET-0130 additions + U5 declare)"
+        26,
+        "canonical matrix size (21 seed + TICKET-0130 additions + U5 declare + home/list-known)"
     );
 
     let (_ctx, mut proc, endpoint) = ready();
@@ -276,6 +276,7 @@ fn every_schema_action_routes_to_a_handler() {
             json!({ "key": "tree", "filters": { "q": "x" } }),
             "adapter",
         ),
+        ("home/list-known", "adapter_only", json!({}), "adapter"),
         (
             "ui/recent-get",
             "adapter_only",
