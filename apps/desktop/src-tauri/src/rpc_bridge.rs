@@ -52,7 +52,10 @@ fn probe_version(binary: &std::path::Path) -> Option<String> {
         .output()
         .ok()?;
     let text = String::from_utf8_lossy(&output.stdout);
-    text.lines().next().map(|line| line.trim().to_string()).filter(|line| !line.is_empty())
+    text.lines()
+        .next()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
 }
 
 /// 检测本机已安装的 agent harness（dsh / opencode）：PATH 查找 +
