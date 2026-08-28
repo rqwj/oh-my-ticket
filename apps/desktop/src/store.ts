@@ -10,6 +10,7 @@ import { omtCall, subscribeEvents, type EventEnvelope } from './bridge'
 import type { HomeInfo, OmtNode, RunDetail, RunSummary, SavedFilters } from './types'
 
 const FILTERS_KEY = 'tauri:ui' // KD3: surface-prefixed bag key
+const LAST_HOME_KEY = 'omt-desktop-last-home' // 启动恢复：最后选择的 workspace homeId
 const RECENT_KEY = 'recent' // KD3's single shared cross-surface key (R4)
 
 export interface KnownHome {
@@ -91,8 +92,13 @@ export function useTreeStore() {
         // A homes refresh must NEVER unset an existing selection — a
         // transiently incomplete list (in-flight boot, declare still
         // landing) would otherwise wipe the user's active home. Only
-        // auto-pick when nothing is selected yet.
-        const next = s.activeHome ?? homes[0] ?? null
+        // auto-pick when nothing is selected yet; the boot pick prefers
+        // the LAST-USED workspace (localStorage) over the first home.
+        const remembered = window.localStorage.getItem(LAST_HOME_KEY)
+        const next = s.activeHome
+          ?? (remembered ? homes.find(h => h.homeId === remembered) : undefined)
+          ?? homes[0]
+          ?? null
         const autoPicking = s.activeHome === null && next !== null
         if (next !== s.activeHome) activeHomeRef.current = next
         return {
@@ -238,6 +244,7 @@ export function useTreeStore() {
       setState(s => ({ ...s, activeHome: home, selectedId: null, nodes: [], runs: [], filters: {} }))
       filtersRef.current = {}
       activeHomeRef.current = home
+      window.localStorage.setItem(LAST_HOME_KEY, home.homeId)
       await Promise.all([refreshNodes(home), refreshRuns(home), loadFilters(home)])
     },
     [refreshNodes, refreshRuns, loadFilters],

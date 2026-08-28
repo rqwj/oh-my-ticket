@@ -466,3 +466,48 @@ describe('runs 线上归一化（runId → id）', () => {
     unmount()
   })
 })
+
+describe('启动恢复上次 workspace', () => {
+  beforeEach(() => {
+    invokeMock.mockReset()
+    window.localStorage.clear()
+  })
+
+  it('boot auto-picks the remembered home over the first home', async () => {
+    window.localStorage.setItem('omt-desktop-last-home', 'h2')
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === 'daemon_homes') {
+        return Promise.resolve({ homes: [{ homeId: 'h1', kind: 'global' }, { homeId: 'h2', kind: 'workspace' }], homeDir: '/tmp' })
+      }
+      return Promise.resolve({})
+    })
+    const { useTreeStore } = await import('../src/store')
+    const { renderHook, act } = await import('@testing-library/react')
+    const { result, unmount } = renderHook(() => useTreeStore())
+    // Boot effects resolve homes; the remembered home wins the auto-pick.
+    await act(async () => { await new Promise(r => setTimeout(r, 0)) })
+    expect(result.current.state.activeHome?.homeId).toBe('h2')
+    unmount()
+  })
+
+  it('selectHome records the choice; unknown remembered id falls back to first', async () => {
+    window.localStorage.setItem('omt-desktop-last-home', 'h_gone')
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === 'daemon_homes') {
+        return Promise.resolve({ homes: [{ homeId: 'h1', kind: 'global' }, { homeId: 'h2', kind: 'workspace' }], homeDir: '/tmp' })
+      }
+      return Promise.resolve({})
+    })
+    const { useTreeStore } = await import('../src/store')
+    const { renderHook, act } = await import('@testing-library/react')
+    const { result, unmount } = renderHook(() => useTreeStore())
+    await act(async () => { await new Promise(r => setTimeout(r, 0)) })
+    expect(result.current.state.activeHome?.homeId).toBe('h1') // stale id → first home
+
+    await act(async () => {
+      await result.current.selectHome({ homeId: 'h2', kind: 'workspace', path: '/tmp/b/.omt' })
+    })
+    expect(window.localStorage.getItem('omt-desktop-last-home')).toBe('h2')
+    unmount()
+  })
+})
