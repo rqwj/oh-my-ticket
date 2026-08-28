@@ -338,6 +338,10 @@ struct ConnState {
     peer: ipc::PeerId,
     /// In-flight request id → cancel flag ($/cancelRequest flips these).
     inflight: Arc<Mutex<std::collections::HashMap<serde_json::Value, Arc<AtomicBool>>>>,
+    /// Set when THIS connection's reader loop ends (EOF/error): live-event
+    /// forwarders poll it to exit instead of pinning the writer channel
+    /// (and its socket fd) forever on an idle hub subscription.
+    conn_dead: Arc<AtomicBool>,
 }
 
 #[allow(clippy::type_complexity)]
@@ -395,6 +399,7 @@ pub(crate) fn serve_connection(
         known: known.clone(),
         peer,
         inflight: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        conn_dead: Arc::new(AtomicBool::new(false)),
     });
 
     // Dispatcher thread: processes requests SEQUENTIALLY (per-connection
@@ -469,6 +474,9 @@ pub(crate) fn serve_connection(
             }
         }
     }
+    // Reader finished (EOF/error): wake live-event forwarders so their
+    // line_tx clones drop and the writer thread (and its fd) can exit.
+    state.conn_dead.store(true, Ordering::SeqCst);
     drop(line_tx); // closes the writer thread when notifications drain
 }
 
@@ -754,15 +762,27 @@ fn route_method(
     let result = if wants_subscription {
         let (sub_tx, sub_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         // Forwarder: hub pushes lines into this bounded channel; we forward
-        // into the connection's writer channel.
+        // into the connection's writer channel. The recv is TIME-BOUNDED so
+        // a dead connection is noticed even with zero hub traffic — an idle
+        // forwarder otherwise pins line_tx (and the writer fd) forever
+        // (observed as 12 leaked connections/day on long-lived daemons).
         let forward_tx = line_tx.clone();
+        let conn_dead = Arc::clone(&state.conn_dead);
         std::thread::Builder::new()
             .name("omt-events".to_string())
-            .spawn(move || {
-                for line in sub_rx {
-                    if forward_tx.send(line).is_err() {
-                        break;
+            .spawn(move || loop {
+                match sub_rx.recv_timeout(std::time::Duration::from_millis(250)) {
+                    Ok(line) => {
+                        if forward_tx.send(line).is_err() {
+                            break;
+                        }
                     }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        if conn_dead.load(Ordering::SeqCst) {
+                            break;
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             })
             .ok();

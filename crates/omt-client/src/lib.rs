@@ -233,6 +233,18 @@ impl Client {
         )
     }
 
+    /// Wrap an already-connected stream (test seams and callers that own
+    /// their connect logic).
+    #[cfg(unix)]
+    pub fn from_stream(stream: std::os::unix::net::UnixStream) -> Client {
+        Client {
+            stream,
+            next_id: 0,
+            token: String::new(),
+            cancel_check: None,
+        }
+    }
+
     /// The credential token minted by the last successful enrollment.
     pub fn token(&self) -> &str {
         &self.token
