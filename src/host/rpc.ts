@@ -29,7 +29,7 @@
 import { z } from 'zod'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-client-connection'
-import type { RpcResult } from '@deepseek-ai/dsh-host-apiproxy/api'
+import type { ConnectionRpcResult as RpcResult } from '@deepseek-ai/dsh-client-connection'
 import type { AgentsLike } from './agents-like.ts'
 import { pluginUserMessage } from './messages.ts'
 import {
@@ -597,7 +597,7 @@ export function registerOmtRpc(ctx: Context, service: OmtService, recent?: Recen
       if (error instanceof OmtError) return failure(`${error.code}: ${error.message}`)
       throw error
     }
-  }, { authority: 'loopback' })
+  })
 }
 
 /**

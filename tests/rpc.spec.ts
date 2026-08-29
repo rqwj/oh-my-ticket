@@ -16,7 +16,7 @@ type Handler = (endpoint: string, payload: unknown, signal: AbortSignal) => Prom
 let fixture: RuntimeFixture
 let service: OmtService
 let handler: Handler
-let capturedAuthority: string | undefined
+let capturedChannels: string[] = []
 
 beforeEach(async () => {
   fixture = await createRuntimeFixture({ label: 'rpc' })
@@ -24,9 +24,11 @@ beforeEach(async () => {
   const stubCtx = {
     connection: {
       rpc: {
-        handle(_channel: string, h: Handler, options: { authority: string }) {
+        // dsh 0.1.2: handle(channel, handler) — per-channel authority options
+        // are gone; request trust is owned by the connection transport.
+        handle(channel: string, h: Handler) {
+          capturedChannels.push(channel)
           handler = h
-          capturedAuthority = options.authority
         },
       },
     },
@@ -42,8 +44,8 @@ afterEach(async () => {
   await fixture.stop()
 })
 
-it('registers the channel with loopback authority', () => {
-  expect(capturedAuthority).toBe('loopback')
+it('registers the /omt channel on the connection rpc', () => {
+  expect(capturedChannels).toContain('/omt')
 })
 
 it('tree returns the assembled forest', async () => {
