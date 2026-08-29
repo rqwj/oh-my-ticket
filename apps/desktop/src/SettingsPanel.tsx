@@ -4,8 +4,16 @@
  * include the admin family (AE12: no grant → no render).
  */
 import { useEffect, useState } from 'react'
-import { open as openDialog } from '@tauri-apps/plugin-dialog'
-import { daemonStatus, omtCall, type DaemonStatus } from './bridge'
+import { ask, open as openDialog } from '@tauri-apps/plugin-dialog'
+import {
+  appVersion,
+  checkoutValid,
+  daemonStatus,
+  harnessDetect,
+  installDshPlugin,
+  omtCall,
+  type DaemonStatus,
+} from './bridge'
 import type { HomeInfo } from './types'
 import type { KnownHome } from './store'
 import { NOT_A_WORKSPACE_HINT, resolveHomeFromPickedDir } from './workspacePath'
@@ -28,6 +36,8 @@ export function SettingsPanel({ homes, knownHomes, homeDir, harnessByHome, onSav
   const [declareMessage, setDeclareMessage] = useState<string | null>(null)
   const [isAdmin, setIsAdmin] = useState(false)
   const [picking, setPicking] = useState(false)
+  const [installing, setInstalling] = useState(false)
+  const [installMessage, setInstallMessage] = useState<string | null>(null)
 
   useEffect(() => {
     void daemonStatus().then(setStatus).catch(() => {})
@@ -58,6 +68,51 @@ export function SettingsPanel({ homes, knownHomes, homeDir, harnessByHome, onSav
     }
   }
 
+  /**
+   * 「安装 DSH 插件」流程：先探测全局 dsh；未装则弹窗问是否走 dsh 开发
+   * 环境（源码 checkout）——拒绝即收场，接受则选目录并校验。安装包版本
+   * 与桌面 app 版本 lockstep（统一版本号），重启 dsh web 后生效。
+   */
+  const installPlugin = async () => {
+    setInstalling(true)
+    setInstallMessage(null)
+    try {
+      const version = await appVersion()
+      const detected = await harnessDetect('dsh')
+      let mode: 'global' | 'dev' = 'global'
+      let checkoutDir: string | undefined
+      if (!detected.installed) {
+        const useDev = await ask('未检测到全局安装的 dsh。是否使用 dsh 开发环境（源码 checkout）安装插件？', {
+          title: '未检测到 dsh',
+          kind: 'info',
+          okLabel: '是',
+          cancelLabel: '否',
+        })
+        if (!useDev) return // 用户选择「否」→ 关闭弹窗收场
+        const picked = await openDialog({ directory: true, multiple: false, title: '选择 dsh 开发环境目录（deepseek-harness checkout）' })
+        if (typeof picked !== 'string') return // 用户取消选目录
+        const valid = await checkoutValid(picked)
+        if (!valid.valid) {
+          setInstallMessage('所选目录不是 dsh 开发环境（缺 pnpm-workspace.yaml / apps / packages）')
+          return
+        }
+        mode = 'dev'
+        checkoutDir = picked
+      }
+      setInstallMessage(`安装中… oh-my-ticket@${version}（${mode === 'global' ? '全局 dsh' : '开发模式'}）`)
+      const result = await installDshPlugin({ mode, checkoutDir, packageName: 'oh-my-ticket', version })
+      setInstallMessage(
+        result.ok
+          ? `已安装 oh-my-ticket@${version} 到 dsh「web」profile（${mode === 'global' ? '全局 dsh' : '开发模式'}）。重启 dsh web 后生效。`
+          : `安装失败：${result.output || '命令非零退出'}`,
+      )
+    } catch (error) {
+      setInstallMessage(`安装失败：${String(error)}`)
+    } finally {
+      setInstalling(false)
+    }
+  }
+
   return (
     <div className="settings-panel">
       <section>
@@ -72,6 +127,19 @@ export function SettingsPanel({ homes, knownHomes, homeDir, harnessByHome, onSav
         ) : (
           <p className="empty-hint">读取中…</p>
         )}
+      </section>
+      <section>
+        <div className="section-header">
+          <h3>DSH 集成</h3>
+          <button className="chip active" disabled={installing} onClick={() => void installPlugin()}>
+            {installing ? '安装中…' : '安装 DSH 插件…'}
+          </button>
+        </div>
+        <p className="empty-hint">
+          把 oh-my-ticket 插件装进本机 dsh（web profile）。版本与本桌面 app 保持一致；
+          未装全局 dsh 时可改用 dsh 源码开发环境安装。
+        </p>
+        {installMessage && <p className="info-banner">{installMessage}</p>}
       </section>
       <section>
         <div className="section-header">
