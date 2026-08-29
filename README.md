@@ -1,9 +1,9 @@
 # Oh-My-Ticket (OMT)
 
-![version](https://img.shields.io/badge/version-0.4.1-blue)
-![tests](https://img.shields.io/badge/tests-344%20passing-brightgreen)
+![version](https://img.shields.io/badge/version-0.6.0-blue)
+![tests](https://img.shields.io/badge/tests-314%20passing-brightgreen)
 ![platform](https://img.shields.io/badge/platform-DeepSeek%20Harness-purple)
-![dsh](https://img.shields.io/badge/DeepSeek%20Harness%20tested-0.1.1--rc.1-blue)
+![dsh](https://img.shields.io/badge/DeepSeek%20Harness%20tested-0.1.2--alpha.1-blue)
 
 **DSH 的 ticket 管理插件**：`Epic → Story → [SubStory] → Ticket → [SubTicket]` 五级任务体系，
 SQLite 存元数据与层级关系，Markdown 存正文。ticket 随项目走（`.omt/` 目录可直接进 git），

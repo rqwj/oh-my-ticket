@@ -1,6 +1,6 @@
 {
   "name": "oh-my-ticket",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "description": "DSH ticket management plugin: Epic/Story/Ticket hierarchy backed by SQLite + Markdown",
   "license": "MIT",
   "type": "module",
@@ -34,14 +34,16 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "gen": "node scripts/gen-bindings.mjs",
-    "build:daemon": "node scripts/build-daemon.mjs"
+    "build:daemon": "node scripts/build-daemon.mjs",
+    "sync-version": "node scripts/sync-version.mjs"
   },
   "devDependencies": {
     "@omt/client-ts": "link:./packages/client-ts",
     "@deepseek-ai/cordis": "link:./.dsh-checkout/vendor/cordis",
+    "@deepseek-ai/cosmokit": "link:./.dsh-checkout/vendor/cosmokit",
     "@deepseek-ai/dsh-client-connection": "link:./.dsh-checkout/packages/client/connection",
+    "@deepseek-ai/dsh-client-store": "link:./.dsh-checkout/packages/client/store",
     "@deepseek-ai/dsh-client-ui-input-trigger": "link:./.dsh-checkout/packages/client/ui-input-trigger",
-    "@deepseek-ai/dsh-host-apiproxy": "link:./.dsh-checkout/packages/host/apiproxy",
     "@deepseek-ai/dsh-skill": "link:./.dsh-checkout/packages/skill/skill",
     "@deepseek-ai/dsh-tools": "link:./.dsh-checkout/packages/core/tools",
     "@deepseek-ai/schemastery": "link:./.dsh-checkout/vendor/schemastery",

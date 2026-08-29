@@ -7,10 +7,13 @@ members = ["crates/*", "apps/desktop/src-tauri"]
 
 [workspace.package]
 # U1 (KTD1/R22): the unified product version. All four crates inherit via
-# `version.workspace = true`; the npm root package keeps its own SemVer line
-# and declares a runtime compatibility floor separately (see
-# docs/runtime/config.md and the distribution docs).
-version = "0.2.0"
+# `version.workspace = true`. As of the 2026-08 unification the version is
+# LOCKSTEP across every surface — the npm root package (DSH plugin), the
+# desktop app (package.json + tauri.conf.json) and these crates all carry
+# the SAME number. `pnpm sync-version` (scripts/sync-version.mjs) rewrites
+# every consumer from this canonical line, and the desktop「安装 DSH 插件」
+# flow installs `oh-my-ticket@<this version>` so surfaces never drift.
+version = "0.6.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/deepseek-ai/oh-my-ticket"

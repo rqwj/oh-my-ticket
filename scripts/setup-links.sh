@@ -28,10 +28,11 @@ CHECKOUT="$(cd "$CHECKOUT" && pwd)"
 # packages referenced from package.json.
 for sub in \
   vendor/cordis \
+  vendor/cosmokit \
   vendor/schemastery \
   packages/client/connection \
+  packages/client/store \
   packages/client/ui-input-trigger \
-  packages/host/apiproxy \
   packages/skill/skill \
   packages/core/tools; do
   if [[ ! -d "$CHECKOUT/$sub" ]]; then

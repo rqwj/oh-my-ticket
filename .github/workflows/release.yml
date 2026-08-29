@@ -1,9 +1,15 @@
 # Release pipeline (plan U11 / R19, KD1, KD5, R21): a pushed v* tag produces
-# the trusted binary facts source on GitHub Releases — macOS arm64 binaries
-# as tar.gz + SHA256SUMS (job 1), the Tauri desktop bundle .app/.dmg
-# (job 2; no-op until the U8 scaffold lands at apps/desktop), and npm
-# platform packages filled from the same release artifacts (job 3; no-op
-# until U13 adds templates under npm/platform-packages/).
+# the trusted facts on GitHub Releases AND the npm distribution surfaces —
+# macOS arm64 binaries as tar.gz + SHA256SUMS (job 1), the Tauri desktop
+# bundle .app/.dmg (job 2), npm platform packages filled from the same
+# release artifacts (job 3), and the oh-my-ticket DSH plugin package built
+# from a pinned deepseek-harness checkout, attached to the release and
+# published (job 4).
+#
+# Version lockstep (KTD1 unification): the tag, the Cargo workspace version
+# and every package.json / tauri.conf.json carry the SAME number — jobs 1
+# and 4 both verify it; `pnpm sync-version` is the single entry point that
+# keeps them aligned.
 #
 # Supply-chain hygiene (KTD8): third-party actions are referenced by tag for
 # bootstrap; policy is to pin every third-party action to an immutable commit
@@ -238,3 +244,96 @@ jobs:
             [ -d "$pkg_dir" ] || continue
             (cd "$pkg_dir" && npm publish --access public)
           done
+
+  npm-dsh-plugin:
+    name: npm package (DSH plugin)
+    runs-on: ubuntu-latest
+    needs: binary-assets # the Release exists by then — the tgz joins its assets
+    permissions:
+      contents: write # attach the packed tgz to the GitHub Release
+    env:
+      # Same skip philosophy as job 3 (KTD5): without the token the job still
+      # builds, packs and attaches — only publishing is skipped, with notice.
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+      # The plugin build inlines @deepseek-ai/* SOURCES from a deepseek-harness
+      # checkout (devDependencies link into .dsh-checkout/). CI pins that
+      # build dependency by tag; override via the DSH_CHECKOUT_REF repository
+      # variable when the plugin must track a newer harness.
+      DSH_CHECKOUT_REF: ${{ vars.DSH_CHECKOUT_REF || 'v0.1.2-alpha.1' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Version lockstep gate (KTD1): tag == Cargo workspace == plugin package.
+      - name: Verify tag matches product version
+        run: |
+          version="$(bash scripts/assemble-release-archive.sh --print-version)"
+          pkg="$(node -p "require('./package.json').version")"
+          if [ "v${version}" != "${GITHUB_REF_NAME}" ] || [ "${pkg}" != "${version}" ]; then
+            echo "::error::version lockstep broken — tag ${GITHUB_REF_NAME}, workspace v${version}, plugin package ${pkg}; run pnpm sync-version and re-tag"
+            exit 1
+          fi
+          echo "tag ok: ${GITHUB_REF_NAME} == workspace v${version} == plugin ${pkg}"
+
+      # Cloned directly INTO .dsh-checkout so the link: devDependencies resolve
+      # without the setup symlink. The checkout is a bare clone (no install) —
+      # safe because the build's runtime import closure (dsh-tools →
+      # schemastery → cosmokit, @omt/client-ts → node builtins) resolves
+      # entirely from THIS repo's node_modules; the cosmokit link above is
+      # what keeps that true.
+      - name: Check out pinned deepseek-harness (build-time source dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: deepseek-ai/deepseek-harness
+          ref: ${{ env.DSH_CHECKOUT_REF }}
+          path: .dsh-checkout
+          persist-credentials: false
+
+      # pnpm test auto-builds the debug daemon through the fixture (cargo),
+      # so the unit suite doubles as a compile gate on the release tag.
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org/
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Unit tests (fixture auto-builds the debug daemon via cargo)
+        run: pnpm test
+
+      - name: Build host + client bundles
+        run: pnpm build
+
+      - name: Pack and verify contents
+        run: |
+          npm pack
+          tgz="oh-my-ticket-$(node -p "require('./package.json').version").tgz"
+          test -f "$tgz"
+          for entry in package/lib/index.js package/lib/client.js package/cordis.patch.yml; do
+            tar -tzf "$tgz" "$entry" >/dev/null || { echo "::error::$entry missing from $tgz"; exit 1; }
+          done
+          echo "packed $tgz"
+
+      - name: Attach package to the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: oh-my-ticket-*.tgz
+          fail_on_unmatched_files: true
+
+      - name: Notice — publish skipped (NPM_TOKEN unset)
+        if: env.NPM_TOKEN == ''
+        run: echo "::notice::NPM_TOKEN is not configured — npm publish skipped cleanly; build, tests, pack and release attachment above still ran"
+
+      - name: Publish the DSH plugin package
+        if: env.NPM_TOKEN != ''
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish
