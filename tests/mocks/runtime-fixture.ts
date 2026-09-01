@@ -152,6 +152,9 @@ export async function createRuntimeFixture(options: RuntimeFixtureOptions = {}):
   const service = new OmtService({
     runtimeDir: daemon.runtimeDir,
     name: `oh-my-ticket-test-${process.pid}`,
+    // The fixture owns the daemon lifecycle (spawn/restart/stop); the
+    // service must never win a respawn race with a home-less daemon.
+    noSpawn: true,
   })
   await service.ready()
 

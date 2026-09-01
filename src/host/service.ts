@@ -130,6 +130,16 @@ export interface OmtServiceOptions {
   readonly daemonPath?: string
   /** Extra spawn args (e.g. ['--home', path]). */
   readonly daemonArgs?: readonly string[]
+  /**
+   * Connect-only mode (client noSpawn): never spawn a daemon — poll the
+   * descriptor until one appears. REQUIRED in test fixtures that own the
+   * daemon lifecycle: on a restart the service's discover-or-spawn would
+   * otherwise race the fixture's respawn, and the service's spawn carries
+   * NO --home (it only knows the runtime dir) — if it wins the bootstrap
+   * election, the fixture's daemon exits DAEMON_PRESENT and the surviving
+   * daemon serves an EMPTY registry ("home not opened" forever).
+   */
+  readonly noSpawn?: boolean
   /** Handshake client name. */
   readonly name?: string
   /** Per-request timeout ms forwarded to the transport. */
@@ -381,6 +391,7 @@ export class OmtService {
       daemonPath: options.daemonPath,
       daemonArgs: options.daemonArgs !== undefined ? [...options.daemonArgs] : undefined,
       requestTimeoutMs: options.requestTimeoutMs,
+      noSpawn: options.noSpawn,
       reconnect: { initialDelayMs: 100, maxDelayMs: 5_000 },
       // TICKET-0131: a daemon generation change mints new home ids; rebuild
       // registry + subscriptions from the fresh handshake automatically.

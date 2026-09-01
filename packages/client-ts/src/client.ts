@@ -202,7 +202,6 @@ export class OmtClient {
 
     const existing = await OmtClient.discover(runtimeDir)
     if (existing) return existing
-    if (options.noSpawn) throw new Error('no live omt-daemon found (noSpawn mode)')
 
     const before = OmtClient.readDescriptor(runtimeDir)
     // Resolve the spawn binary lazily: when a descriptor already exists but
@@ -212,11 +211,19 @@ export class OmtClient {
     // attempt errored. Only with NO descriptor at all is the resolution
     // failure terminal (there is nothing to wait for).
     let binary: string | undefined
-    try {
-      binary = resolveDaemonBinary({ explicit: options.daemonPath }).path
-    } catch (error) {
-      if (before === undefined) throw error
+    if (options.noSpawn === true) {
+      // Connect-only: never spawn a competitor — fall through to the same
+      // descriptor poll and wait for someone else's daemon (test fixtures
+      // own the lifecycle; a racing spawn would carry no --home and could
+      // win the bootstrap election with an empty home registry).
       binary = undefined
+    } else {
+      try {
+        binary = resolveDaemonBinary({ explicit: options.daemonPath }).path
+      } catch (error) {
+        if (before === undefined) throw error
+        binary = undefined
+      }
     }
     if (binary !== undefined) {
       const child = spawn(binary, [...(options.daemonArgs ?? []), '--runtime-dir', runtimeDir], {
@@ -248,7 +255,9 @@ export class OmtClient {
       await sleep(100)
     }
     throw new Error(
-      `spawned omt-daemon (${binary ?? 'unresolved — polled existing descriptor'}) produced no live descriptor within 10s (runtime dir: ${runtimeDir})`,
+      options.noSpawn === true
+        ? `noSpawn: no live omt-daemon descriptor within 10s (runtime dir: ${runtimeDir})`
+        : `spawned omt-daemon (${binary ?? 'unresolved — polled existing descriptor'}) produced no live descriptor within 10s (runtime dir: ${runtimeDir})`,
     )
   }
 
