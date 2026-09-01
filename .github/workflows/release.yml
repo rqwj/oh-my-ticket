@@ -34,7 +34,7 @@ jobs:
     permissions:
       contents: write # attach assets to the GitHub Release
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Verify tag matches workspace version (KTD1)
         run: |
@@ -61,7 +61,7 @@ jobs:
           tar -xzf dist/release/*.tar.gz -C "$smoke"
           "$smoke"/*/omt --version
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: release-binaries-${{ github.ref_name }}
           path: |
@@ -70,7 +70,7 @@ jobs:
           if-no-files-found: error
 
       - name: Attach assets to GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
           files: |
@@ -85,7 +85,7 @@ jobs:
     permissions:
       contents: write # tauri-action uploads bundles to the same Release
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Signing/notarization is opt-in (KTD5). The secrets MUST NOT be passed
       # through job env directly: an unset secret expands to an EMPTY STRING,
@@ -114,7 +114,7 @@ jobs:
 
       # KD5/R12: the desktop sidecar embeds exactly this Release's daemon
       # build, staged under the externalBin target-triple name.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           name: release-binaries-${{ github.ref_name }}
           path: dist/release
@@ -164,7 +164,7 @@ jobs:
       # with an explicit notice — nothing hard-fails on the missing secret.
       NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # U13 ratification: no workspace install here — template filling,
       # npm pack verification, and publishing are pure npm CLI work, and a
@@ -179,7 +179,7 @@ jobs:
 
       # Same-source binaries as job1 (KD5): download its artifact, verify the
       # checksums, then fill every package template with its triple's binaries.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           name: release-binaries-${{ github.ref_name }}
           path: dist/release
@@ -254,7 +254,7 @@ jobs:
       # builds, packs and attaches — only publishing is skipped, with notice.
       NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Version lockstep gate (KTD1): tag == Cargo workspace == plugin package.
       - name: Verify tag matches product version
@@ -307,7 +307,7 @@ jobs:
           echo "packed $tgz"
 
       - name: Attach package to the GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
           files: oh-my-ticket-*.tgz

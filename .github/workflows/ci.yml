@@ -28,7 +28,7 @@ jobs:
     # (glib/webkit2gtk system deps), and the product ships macOS binaries only.
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -64,7 +64,7 @@ jobs:
     name: node (typecheck · test)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # Toolchain for the runtime-fixture daemon build path
       # (scripts/build-daemon.mjs → cargo build -p omt-runtime).
       - uses: dtolnay/rust-toolchain@stable
