@@ -149,7 +149,7 @@ jobs:
 
   npm-platform-packages:
     name: npm platform packages
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     needs: binary-assets
     # Active since U13 landed the platform-package templates under
     # npm/platform-packages/ (R21: packages are a thin DSH fallback filled
@@ -194,26 +194,21 @@ jobs:
           else
             (cd dist/release && shasum -a 256 -c SHA256SUMS)
           fi
-          dir_to_triple() {
-            case "$1" in
-              darwin-arm64) echo aarch64-apple-darwin ;;
-              darwin-x64)   echo x86_64-apple-darwin ;;
-              linux-arm64)  echo aarch64-unknown-linux-gnu ;;
-              linux-x64)    echo x86_64-unknown-linux-gnu ;;
-              *)            echo "" ;;
-            esac
-          }
+          # macOS-only release matrix: fill ONLY darwin-arm64 (the sole
+          # archive binary-assets produces). Other templates stay templates
+          # until their triples join the matrix — shipping them unfilled
+          # would publish empty packages, so every loop below skips them.
+          FILLED=""
           for pkg_dir in npm/platform-packages/*/; do
             [ -d "$pkg_dir" ] || continue
             name="$(basename "$pkg_dir")"
-            triple="$(dir_to_triple "$name")"
-            if [ -z "$triple" ]; then
-              echo "::error::platform package dir '$name' not in dir_to_triple mapping — extend it in release.yml"
-              exit 1
+            if [ "$name" != "darwin-arm64" ]; then
+              echo "::notice::skipping $name — no archive in this release matrix (macOS arm64 only)"
+              continue
             fi
-            src="$work/extracted/omt-${triple}-v${version}"
+            src="$work/extracted/omt-aarch64-apple-darwin-v${version}"
             if [ ! -d "$src" ]; then
-              echo "::error::no release archive for triple ${triple} (package ${name}); the build matrix must cover every packaged triple"
+              echo "::error::no release archive for aarch64-apple-darwin (package ${name}); the build matrix must cover every packaged triple"
               exit 1
             fi
             mkdir -p "${pkg_dir}bin"
@@ -221,14 +216,15 @@ jobs:
             # Platform packages carry this tag's product version (R22 dual
             # track: npm root package stays independent).
             (cd "$pkg_dir" && npm version "$version" --allow-same-version --no-git-tag-version)
-            echo "filled ${name} ← ${triple}"
+            FILLED="${FILLED} ${name}"
+            echo "filled ${name} ← aarch64-apple-darwin"
           done
+          echo "$FILLED" > .filled-packages
 
       - name: Verify package contents (npm pack --dry-run)
         run: |
-          for pkg_dir in npm/platform-packages/*/; do
-            [ -d "$pkg_dir" ] || continue
-            (cd "$pkg_dir" && npm pack --dry-run)
+          for name in $(cat .filled-packages); do
+            (cd "npm/platform-packages/${name}" && npm pack --dry-run)
           done
 
       - name: Notice — publish skipped (NPM_TOKEN unset)
@@ -240,14 +236,13 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          for pkg_dir in npm/platform-packages/*/; do
-            [ -d "$pkg_dir" ] || continue
-            (cd "$pkg_dir" && npm publish --access public)
+          for name in $(cat .filled-packages); do
+            (cd "npm/platform-packages/${name}" && npm publish --access public)
           done
 
   npm-dsh-plugin:
     name: npm package (DSH plugin)
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     needs: binary-assets # the Release exists by then — the tgz joins its assets
     permissions:
       contents: write # attach the packed tgz to the GitHub Release

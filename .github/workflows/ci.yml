@@ -24,7 +24,9 @@ permissions:
 jobs:
   rust:
     name: rust (fmt · clippy · test)
-    runs-on: ubuntu-latest
+    # macOS-only project: Linux runners cannot build the Tauri desktop crate
+    # (glib/webkit2gtk system deps), and the product ships macOS binaries only.
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -39,7 +41,7 @@ jobs:
 
   node:
     name: node (typecheck · test)
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     env:
       # Same pinned harness as release.yml's npm-dsh-plugin job — the
       # @deepseek-ai/* devDependencies link into .dsh-checkout/, which must
