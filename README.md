@@ -91,13 +91,19 @@ run 批次纪律（创建/认领/报告/续跑响应）。
 ## 📦 安装
 
 ```sh
-# 本仓库构建并打包（首次需先链接 DSH checkout，见「开发」一节）：
-pnpm install && pnpm build && npm pack    # → oh-my-ticket-0.4.1.tgz
+# 本仓库构建并打包：
+pnpm install && pnpm build && npm pack    # → dsh-oh-my-ticket-0.6.1.tgz
 
 # 安装进目标 DSH profile（profile 的 dsh.profile.bundles 依次为）：
-#   @deepseek-ai/dsh-base, @deepseek-ai/dsh-web-app, oh-my-ticket
-pnpm dsh plugin --profile <profile> add /path/to/oh-my-ticket-0.4.1.tgz
+#   @deepseek-ai/dsh-base, @deepseek-ai/dsh-web-app, dsh-oh-my-ticket
+pnpm dsh plugin --profile <profile> add /path/to/dsh-oh-my-ticket-0.6.1.tgz
+
+# 或直接从 npm 安装已发布版本：
+pnpm dsh plugin --profile <profile> add dsh-oh-my-ticket@0.6.1
 ```
+
+daemon 二进制随主包以 optionalDependency 自动带入（`@oh-my-ticket/darwin-arm64`），
+也可经 brew / install.sh / GitHub Release 独立获取。
 
 在工作区根目录 `mkdir .omt` 即可让该项目拥有独立的 ticket 库（随项目进 git）。
 安装/升级后需重启 `dsh web` 进程，新版本的工具与 UI 才会生效。

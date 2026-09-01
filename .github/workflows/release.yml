@@ -246,7 +246,12 @@ jobs:
   npm-dsh-plugin:
     name: npm package (DSH plugin)
     runs-on: macos-latest
-    needs: binary-assets # the Release exists by then — the tgz joins its assets
+    # Serialize AFTER the platform package publish: the plugin pins
+    # @oh-my-ticket/darwin-arm64@<same version> as an optionalDependency, and
+    # publishing it before its daemon exists on npm would let consumers
+    # silently skip the optional dep in the race window. Failure coupling is
+    # deliberate — never ship a plugin whose pinned daemon is missing.
+    needs: npm-platform-packages
     permissions:
       contents: write # attach the packed tgz to the GitHub Release
     env:
@@ -299,7 +304,7 @@ jobs:
       - name: Pack and verify contents
         run: |
           npm pack
-          tgz="oh-my-ticket-$(node -p "require('./package.json').version").tgz"
+          tgz="dsh-oh-my-ticket-$(node -p "require('./package.json').version").tgz"
           test -f "$tgz"
           for entry in package/lib/index.js package/lib/client.js package/cordis.patch.yml; do
             tar -tzf "$tgz" "$entry" >/dev/null || { echo "::error::$entry missing from $tgz"; exit 1; }
@@ -310,7 +315,7 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
-          files: oh-my-ticket-*.tgz
+          files: dsh-oh-my-ticket-*.tgz
           fail_on_unmatched_files: true
 
       - name: Notice — publish skipped (NPM_TOKEN unset)

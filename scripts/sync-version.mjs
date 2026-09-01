@@ -56,8 +56,32 @@ function syncJson(path) {
   console.log(`  ${path} → ${canonical}`)
 }
 
+/**
+ * The root package pins its platform-package optionalDependencies to the
+ * SAME canonical version (lockstep: the daemon users pull alongside the
+ * plugin must match the plugin's release). Rewrite every @oh-my-ticket/*
+ * entry in place; no-op when the field is absent.
+ */
+function syncOptionalDeps() {
+  const full = join(root, 'package.json')
+  const pkg = JSON.parse(readFileSync(full, 'utf8'))
+  const optional = pkg.optionalDependencies ?? {}
+  let touched = false
+  for (const name of Object.keys(optional)) {
+    if (name.startsWith('@oh-my-ticket/')) {
+      optional[name] = canonical
+      touched = true
+    }
+  }
+  if (touched) {
+    writeFileSync(full, JSON.stringify(pkg, null, 2) + '\n')
+    console.log(`  package.json optionalDependencies → ${canonical}`)
+  }
+}
+
 console.log(`canonical version: ${canonical} (Cargo.toml [workspace.package])`)
 syncJson('package.json')
 syncJson('apps/desktop/package.json')
 syncJson(join('apps', 'desktop', 'src-tauri', 'tauri.conf.json'))
+syncOptionalDeps()
 console.log('lockstep OK')

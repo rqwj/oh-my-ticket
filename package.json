@@ -1,6 +1,6 @@
 {
-  "name": "oh-my-ticket",
-  "version": "0.6.0",
+  "name": "dsh-oh-my-ticket",
+  "version": "0.6.1",
   "description": "DSH ticket management plugin: Epic/Story/Ticket hierarchy backed by SQLite + Markdown",
   "license": "MIT",
   "type": "module",
@@ -35,6 +35,9 @@
     "gen": "node scripts/gen-bindings.mjs",
     "build:daemon": "node scripts/build-daemon.mjs",
     "sync-version": "node scripts/sync-version.mjs"
+  },
+  "optionalDependencies": {
+    "@oh-my-ticket/darwin-arm64": "0.6.1"
   },
   "devDependencies": {
     "@omt/client-ts": "link:./packages/client-ts",

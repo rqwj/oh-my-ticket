@@ -199,9 +199,16 @@ async function pathB() {
 function rootInvariants() {
   console.log('\n[C] root package integrity')
   const pkg = JSON.parse(execFileSync('cat', [join(REPO, 'package.json')], { encoding: 'utf8' }))
+  // optionalDependencies pin the platform package to the CANONICAL product
+  // version (lockstep; sync-version.mjs owns the value). pnpm/npm tolerate a
+  // not-yet-published optional pin in every install mode, so installs stay
+  // hermetic while consumers auto-pull the daemon once it exists on npm.
+  const cargo = execFileSync('grep', ['-m1', '^version = ', join(REPO, 'Cargo.toml')], { encoding: 'utf8' })
+  const canonical = cargo.match(/version = "([^"]+)"/)?.[1]
   check(
-    'root package.json carries NO optionalDependencies until the first platform publish (frozen-lockfile parity)',
-    pkg.optionalDependencies === undefined,
+    'optionalDependencies pins @oh-my-ticket/darwin-arm64 to the canonical version',
+    pkg.optionalDependencies?.['@oh-my-ticket/darwin-arm64'] === canonical,
+    `${pkg.optionalDependencies?.['@oh-my-ticket/darwin-arm64']} !== ${canonical}`,
   )
   const packEnv = { ...process.env, npm_config_cache: mkdtempSync(join(tmpdir(), 'omt-npm-cache-')) }
   const packList = execFileSync('npm', ['pack', '--dry-run', '--json'], {
