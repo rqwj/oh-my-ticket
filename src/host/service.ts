@@ -635,20 +635,33 @@ export class OmtService {
     try {
       return await this.client.call<T>(method, params, hooks)
     } catch (error) {
-      // Post-restart convergence window: the daemon is up but this session's
-      // credential scope predates a re-opened home (details.requiresRehandshake).
-      // Generalize the declare flow's remedy (KTD3) THROUGH the shared heal:
-      // refreshAfterGenerationChange is cooldown-guarded and shares in-flight
-      // reconnects, so a burst of windowed failures triggers ONE re-handshake,
-      // never reconnection churn. The daemon rejects BEFORE executing
-      // anything, so the retry is effect-safe for reads and writes alike.
+      // Post-restart convergence window: the daemon is reachable but its
+      // open-homes registry hasn't finished re-opening the home yet
+      // (details.requiresRehandshake). The registry gate is
+      // SESSION-INDEPENDENT, so once it converges the SAME call succeeds
+      // without a new handshake — poll the call with backoff, bounded by a
+      // deadline so ghosts still fail. The daemon rejects BEFORE executing,
+      // so call retries are effect-safe for reads and writes alike.
       if (this.isRehandshakeProblem(error)) {
+        const homeId = (error.details as { id?: string } | null)?.id
+        // Never-learned ids fail fast: real bugs stay loud, no churn.
+        if (homeId === undefined || !this.knownHomeIds.has(homeId)) throw error
+        // One shared heal re-syncs our runtime view first…
         try {
           await this.refreshAfterGenerationChange()
         } catch {
           throw error // heal failed (daemon still down): surface the original
         }
-        return await this.client.call<T>(method, params, hooks)
+        // …then poll until the daemon's registry converges.
+        const deadline = Date.now() + 8_000
+        for (;;) {
+          try {
+            return await this.client.call<T>(method, params, hooks)
+          } catch (retryError) {
+            if (!this.isRehandshakeProblem(retryError) || Date.now() > deadline) throw retryError
+            await new Promise(resolve => setTimeout(resolve, 250))
+          }
+        }
       }
       const staleId = this.staleHomeIdProblem(error)
       if (staleId === undefined || !this.knownHomeIds.has(staleId)) throw error
@@ -667,8 +680,8 @@ export class OmtService {
     }
   }
 
-  /** NOT_FOUND problems the daemon marks as fixable by re-handshaking. */
-  private isRehandshakeProblem(error: unknown): boolean {
+  /** NOT_FOUND problems the daemon marks as convergent (safe to poll-retry). */
+  private isRehandshakeProblem(error: unknown): error is OmtProtocolError {
     return (
       error instanceof OmtProtocolError &&
       (error.details as { requiresRehandshake?: boolean } | null)?.requiresRehandshake === true
