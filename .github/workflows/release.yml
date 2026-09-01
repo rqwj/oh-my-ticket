@@ -84,25 +84,32 @@ jobs:
     needs: binary-assets
     permissions:
       contents: write # tauri-action uploads bundles to the same Release
-    env:
-      # Signing/notarization is opt-in (KTD5): when these secrets are absent,
-      # tauri-bundler skips identity signing and notarization natively and
-      # ships an ad-hoc-signed bundle. Nothing here hard-fails on unset
-      # secrets — Gatekeeper caveats for unsigned downloads are documented in
-      # docs/runtime/distribution.md.
-      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-      APPLE_ID: ${{ secrets.APPLE_ID }}
-      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Report signing mode
+      # Signing/notarization is opt-in (KTD5). The secrets MUST NOT be passed
+      # through job env directly: an unset secret expands to an EMPTY STRING,
+      # and tauri-bundler treats a present-but-empty APPLE_SIGNING_IDENTITY as
+      # an explicit identity (codesign: "no identity found"). Only a fully
+      # ABSENT variable triggers the bundler's ad-hoc path, so inject via
+      # $GITHUB_ENV solely when the identity is non-empty.
+      - name: Configure signing mode
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          if [ -z "${APPLE_SIGNING_IDENTITY}" ]; then
-            echo "APPLE_SIGNING_IDENTITY unset → bundler signs ad-hoc / skips notarization"
-          else
+          if [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
             echo "signing identity present → inside-out re-sign + notarization enabled"
+            {
+              echo "APPLE_SIGNING_IDENTITY=${APPLE_SIGNING_IDENTITY}"
+              echo "APPLE_ID=${APPLE_ID}"
+              echo "APPLE_PASSWORD=${APPLE_PASSWORD}"
+              echo "APPLE_TEAM_ID=${APPLE_TEAM_ID}"
+            } >> "$GITHUB_ENV"
+          else
+            echo "no identity secret → bundler signs ad-hoc, notarization skipped"
           fi
 
       # KD5/R12: the desktop sidecar embeds exactly this Release's daemon
