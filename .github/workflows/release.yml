@@ -82,8 +82,6 @@ jobs:
     name: desktop bundle (.app/.dmg)
     runs-on: macos-latest
     needs: binary-assets
-    # No-op until the Tauri scaffold (U8) creates apps/desktop.
-    if: hashFiles('apps/desktop/src-tauri/tauri.conf.json') != ''
     permissions:
       contents: write # tauri-action uploads bundles to the same Release
     env:
@@ -151,10 +149,8 @@ jobs:
     name: npm platform packages
     runs-on: macos-latest
     needs: binary-assets
-    # Active since U13 landed the platform-package templates under
-    # npm/platform-packages/ (R21: packages are a thin DSH fallback filled
-    # from Release artifacts).
-    if: hashFiles('npm/platform-packages/**') != ''
+    # Fills the platform-package templates under npm/platform-packages/
+    # (R21: packages are a thin DSH fallback filled from Release artifacts).
     env:
       # Same skip philosophy as code signing (KTD5): without the token the job
       # still fills and pack-verifies every package, then skips publishing
