@@ -1,0 +1,24 @@
+{
+  "meta": {
+    "name": "archive-read-only-restore",
+    "source": "tests/archived.spec.ts#archived nodes reject content changes; restore unlocks them",
+    "description": "Archived nodes seal every content change behind ARCHIVED_READONLY (subdivided); archived:false is the only accepted change and unlocks edits again."
+  },
+  "operations": [
+    { "op": "create", "params": { "type": "epic", "title": "用户体系" } },
+    { "op": "update", "params": { "id": "EPIC-0001", "archived": true } },
+    { "op": "update", "params": { "id": "EPIC-0001", "status": "done" }, "label": "sealedStatus" },
+    { "op": "update", "params": { "id": "EPIC-0001", "append": "x" }, "label": "sealedAppend" },
+    { "op": "update", "params": { "id": "EPIC-0001", "title": "改名" }, "label": "sealedTitle" },
+    { "op": "update", "params": { "id": "EPIC-0001", "archived": false }, "label": "restored" },
+    { "op": "update", "params": { "id": "EPIC-0001", "status": "done" }, "label": "editAfterRestore" },
+    { "op": "getNode", "params": { "id": "EPIC-0001" }, "label": "final" }
+  ],
+  "invariants": [
+    { "expect": "matches", "op": "sealedStatus", "path": "error", "value": { "code": "ARCHIVED_READONLY", "details": { "nodeId": "EPIC-0001", "operation": "update" } } },
+    { "expect": "matches", "op": "sealedAppend", "path": "error", "value": { "code": "ARCHIVED_READONLY", "details": { "operation": "update" } } },
+    { "expect": "matches", "op": "sealedTitle", "path": "error", "value": { "code": "ARCHIVED_READONLY", "details": { "operation": "update" } } },
+    { "expect": "equals", "op": "restored", "path": "archived", "value": false },
+    { "expect": "equals", "op": "final", "path": "status", "value": "done" }
+  ]
+}

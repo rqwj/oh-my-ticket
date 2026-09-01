@@ -1,0 +1,36 @@
+{
+  "meta": {
+    "name": "claim-skips-archived-drains",
+    "source": "tests/run-core.spec.ts#archived members > claim skips archived members and derives the terminal state when the queue drains",
+    "description": "Claiming past an archived member marks it skipped inside the claim transaction; a run whose only member is archived claims nothing and completes."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "批量" },
+      { "type": "story", "title": "批次", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "任务1", "parentId": "STORY-0001" },
+      { "type": "ticket", "title": "任务2", "parentId": "STORY-0001" },
+      { "type": "ticket", "title": "任务3", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "createRun", "params": { "nodeIds": ["TICKET-0001", "TICKET-0002"] } },
+    { "op": "update", "params": { "id": "TICKET-0002", "archived": true } },
+    { "op": "startRun", "params": { "id": "RUN-0001" } },
+    { "op": "claimRunItem", "params": { "runId": "RUN-0001", "executorSessionId": "sess-1" }, "label": "claimed" },
+    { "op": "getRunItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0002" }, "label": "skippedMember" },
+    { "op": "createRun", "params": { "nodeIds": ["TICKET-0003"] }, "label": "solo" },
+    { "op": "update", "params": { "id": "TICKET-0003", "archived": true } },
+    { "op": "startRun", "params": { "id": "RUN-0002" } },
+    { "op": "claimRunItem", "params": { "runId": "RUN-0002", "executorSessionId": "sess-1" }, "label": "soloClaim" },
+    { "op": "getRunItem", "params": { "runId": "RUN-0002", "nodeId": "TICKET-0003" }, "label": "soloItem" },
+    { "op": "getRun", "params": { "id": "RUN-0002" }, "label": "soloRun" }
+  ],
+  "invariants": [
+    { "expect": "equals", "op": "claimed", "path": "node_id", "value": "TICKET-0001" },
+    { "expect": "equals", "op": "skippedMember", "path": "state", "value": "skipped" },
+    { "expect": "equals", "op": "soloClaim", "value": null },
+    { "expect": "equals", "op": "soloItem", "path": "state", "value": "skipped" },
+    { "expect": "equals", "op": "soloRun", "path": "status", "value": "completed" }
+  ]
+}

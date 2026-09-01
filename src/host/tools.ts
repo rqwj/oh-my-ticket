@@ -1,17 +1,29 @@
 /**
- * Model-facing OMT tools: thin wrappers over OmtCore registered through
- * ctx.tools. Canonical values stay programmatic (node objects / counts);
+ * Model-facing OMT tools: thin wrappers over the OMT runtime service
+ * (OmtService → omt-daemon RPC) registered through ctx.tools. Names,
+ * descriptions, parameter/output schemas, and renderer output are identical
+ * to the pre-daemon tool layer (R13). Canonical values stay programmatic;
  * output.render produces the model-facing Chinese text. OmtError throws
  * surface to the model as isError results, which is the intended channel
  * for hierarchy violations and unknown ids.
  */
 import type { Context } from '@deepseek-ai/cordis'
 import { defineTool, type ToolRunContext } from '@deepseek-ai/dsh-tools'
-import { RUN_REPORT_OUTCOMES, type LineageContent, type OmtCore, type ReindexResult, type ReportResult, type ShowResult } from './core.ts'
-import type { OmtCorePool } from './pool.ts'
+import type { HomeRef, ClaimContextValue, OmtService } from './service.ts'
 import { endsExecution, lineageOfHeader, type RunningRegistry } from './running.ts'
-import { stripChildrenBlock } from './markdown.ts'
-import { isRunItemStalled, NODE_TYPES, RUN_ITEM_STATES, RUN_STATUSES, STATUSES, type OmtNode, type OmtRun, type OmtRunItem } from './types.ts'
+import {
+  isRunItemStalled,
+  NODE_TYPES,
+  RUN_ITEM_STATES,
+  RUN_REPORT_OUTCOMES,
+  RUN_STATUSES,
+  STATUSES,
+  type OmtNode,
+  type OmtRun,
+  type OmtRunItem,
+  type ReindexResult,
+  type RunReportOutcome,
+} from './types.ts'
 
 const NODE_SCHEMA = {
   type: 'object',
@@ -59,34 +71,6 @@ function renderNodeLine(node: NodeValue): string {
   return `- ${node.id} [${node.type} · ${node.status}] ${node.title}（${node.path}）`
 }
 
-/** Ancestor-body budget for one claim; the current executable body is never truncated here. */
-export const RUN_CLAIM_ANCESTOR_CONTEXT_MAX_BYTES = 16 * 1024
-
-interface ClaimContextNodeValue {
-  node: NodeValue
-  body: string
-  truncated: boolean
-  original_bytes: number
-  included_bytes: number
-}
-
-interface ClaimContextReadErrorValue {
-  node: NodeValue
-  error: string
-}
-
-interface ClaimContextValue {
-  ancestor_budget_bytes: number
-  ancestor_used_bytes: number
-  truncated: boolean
-  ancestors: ClaimContextNodeValue[]
-  read_errors: ClaimContextReadErrorValue[]
-  current: {
-    node: NodeValue
-    body: string
-  }
-}
-
 const CLAIM_CONTEXT_NODE_SCHEMA = {
   type: 'object',
   additionalProperties: false,
@@ -131,65 +115,13 @@ const CLAIM_CONTEXT_SCHEMA = {
   },
 } as const
 
-function truncateUtf8(text: string, maxBytes: number): string {
-  if (maxBytes <= 0) return ''
-  const bytes = Buffer.from(text, 'utf8')
-  if (bytes.byteLength <= maxBytes) return text
-  return bytes.subarray(0, maxBytes).toString('utf8').replace(/\uFFFD+$/u, '')
-}
-
-/**
- * Read the live user-owned lineage after a claim. Allocation walks nearest
- * parent first, then the result is restored to root→leaf presentation order.
- */
-async function buildClaimContext(core: OmtCore, node: OmtNode): Promise<ClaimContextValue> {
-  const lineage = await core.readLineage(node.id)
-  const current = lineage.at(-1)
-  if (current === undefined) throw new Error(`节点 ${node.id} 没有可读取的执行上下文`)
-  if (current.body === undefined) throw new Error(current.error)
-
-  const ancestorLineage = lineage.slice(0, -1)
-  const readErrors: ClaimContextReadErrorValue[] = ancestorLineage.flatMap(entry =>
-    entry.error === undefined ? [] : [{ node: nodeValue(entry.node), error: entry.error }])
-  const closestFirst = ancestorLineage
-    .filter((entry): entry is Extract<LineageContent, { body: string }> => entry.body !== undefined)
-    .reverse()
-
-  let remaining = RUN_CLAIM_ANCESTOR_CONTEXT_MAX_BYTES
-  let usedBytes = 0
-  const allocatedClosestFirst = closestFirst.map((entry): ClaimContextNodeValue => {
-    const originalBytes = Buffer.byteLength(entry.body, 'utf8')
-    const allowance = remaining
-    const body = truncateUtf8(entry.body, allowance)
-    const includedBytes = Buffer.byteLength(body, 'utf8')
-    const truncated = includedBytes < originalBytes
-    usedBytes += includedBytes
-    // Once a nearer ancestor consumes its allowance, do not leak a partial
-    // UTF-8 codepoint's spare bytes to a more distant ancestor.
-    remaining = truncated ? 0 : remaining - includedBytes
-    return {
-      node: nodeValue(entry.node),
-      body,
-      truncated,
-      original_bytes: originalBytes,
-      included_bytes: includedBytes,
-    }
-  })
-
-  return {
-    ancestor_budget_bytes: RUN_CLAIM_ANCESTOR_CONTEXT_MAX_BYTES,
-    ancestor_used_bytes: usedBytes,
-    truncated: allocatedClosestFirst.some(entry => entry.truncated),
-    ancestors: allocatedClosestFirst.reverse(),
-    read_errors: readErrors,
-    current: {
-      node: nodeValue(current.node),
-      body: current.body,
-    },
-  }
-}
-
-function renderContextNode(entry: ClaimContextNodeValue): string {
+function renderContextNode(entry: {
+  node: NodeValue
+  body: string
+  truncated: boolean
+  original_bytes: number
+  included_bytes: number
+}): string {
   const body = entry.body === '' ? '（空）' : entry.body
   const truncation = entry.truncated
     ? `\n\n[上下文已截断：原始 ${entry.original_bytes} 字节，本次保留 ${entry.included_bytes} 字节]`
@@ -306,6 +238,7 @@ function runValue(run: OmtRun): RunValue {
 }
 
 function runItemValue(item: OmtRunItem, title?: string): RunItemValue {
+  const joined = title ?? item.title
   return {
     run_id: item.run_id,
     node_id: item.node_id,
@@ -317,7 +250,7 @@ function runItemValue(item: OmtRunItem, title?: string): RunItemValue {
     ...(isRunItemStalled(item) ? { stalled: true } : {}),
     ...(item.started_at !== undefined ? { started_at: item.started_at } : {}),
     ...(item.finished_at !== undefined ? { finished_at: item.finished_at } : {}),
-    ...(title !== undefined ? { title } : {}),
+    ...(joined !== undefined ? { title: joined } : {}),
   }
 }
 
@@ -335,7 +268,8 @@ function renderItemLine(item: RunItemValue): string {
   return parts.join('')
 }
 
-function renderShow(result: ShowResult): string {
+/** Render a show result (body arrives children-stripped from the daemon view). */
+function renderShow(result: { node: NodeValue; parent?: NodeValue; children: NodeValue[]; body: string }): string {
   const { node, parent, children, body } = result
   const header = [
     `# ${node.id} ${node.title}`,
@@ -348,21 +282,11 @@ function renderShow(result: ShowResult): string {
     `- 创建: ${node.created_at}`,
     `- 更新: ${node.updated_at}`,
   ].join('\n')
-  const userBody = stripChildrenBlock(body)
+  const userBody = body
   const childLines = children.length > 0
     ? children.map(child => `- ${child.id} [${child.type} · ${child.status}] ${child.title}`).join('\n')
     : '（无子节点）'
   return `${header}\n\n## 正文\n\n${userBody === '' ? '（空）' : userBody}\n\n## 子节点\n\n${childLines}`
-}
-
-/** Resolve the workspace-routed core for one execution (global fallback). */
-function coreOf(pool: OmtCorePool, exec: ToolRunContext) {
-  return pool.coreFor(exec.agent?.session.header.cwd)
-}
-
-/** Resolve the core owning a run id (caller's workspace disambiguates). */
-function runCoreOf(pool: OmtCorePool, exec: ToolRunContext, id: string) {
-  return pool.coreForRun(id, exec.agent?.session.header.cwd)
 }
 
 /** Structural ctx.userQuestions face (UI-backed ask service). */
@@ -383,20 +307,20 @@ const WORKSPACE_LABEL = '当前工作区（随项目存储）'
 const GLOBAL_LABEL = '全局（所有项目共享）'
 
 /**
- * Resolve the create target core. Children always land in their parent's
+ * Resolve the create target home. Children always land in their parent's
  * home; root epics honor an explicit scope, then ask the user (UI-backed),
  * then fall back to the automatic rule when no answerer is available.
  */
-async function coreForCreate(
-  pool: OmtCorePool,
+async function homeForCreate(
+  service: OmtService,
   userQuestions: UserQuestionsLike | undefined,
   exec: ToolRunContext,
   args: { type: string; title: string; parentId?: string; scope?: 'workspace' | 'global' },
-): Promise<OmtCore> {
+): Promise<HomeRef> {
   const cwd = exec.agent?.session.header.cwd
-  if (args.parentId !== undefined) return pool.coreForNode(args.parentId, cwd)
-  if (args.scope !== undefined) return pool.coreForScope(cwd, args.scope)
-  if (cwd === undefined || userQuestions === undefined) return pool.coreFor(cwd)
+  if (args.parentId !== undefined) return (await service.resolveNodeHome(args.parentId, cwd)).home
+  if (args.scope !== undefined) return service.homeForScope(cwd, args.scope)
+  if (cwd === undefined || userQuestions === undefined) return service.homeFor(cwd)
   try {
     const answer = await userQuestions.ask({
       questions: [{
@@ -405,28 +329,28 @@ async function coreForCreate(
         question: `Epic「${args.title}」创建到哪里？`,
         options: [
           { label: WORKSPACE_LABEL, description: `${cwd}/.omt（ticket 随项目走，可进 git）` },
-          { label: GLOBAL_LABEL, description: `${pool.globalHome}（所有工作区共享）` },
+          { label: GLOBAL_LABEL, description: `${service.globalHome().path ?? service.globalHome().homeId}（所有工作区共享）` },
         ],
       }],
       agent: exec.agent,
       signal: exec.signal,
     })
     const selected = answer.answers.find(item => item.id === 'scope')?.selected[0]
-    if (selected === WORKSPACE_LABEL) return pool.coreForScope(cwd, 'workspace')
-    if (selected === GLOBAL_LABEL) return pool.coreForScope(cwd, 'global')
-    return pool.coreFor(cwd)
+    if (selected === WORKSPACE_LABEL) return service.homeForScope(cwd, 'workspace')
+    if (selected === GLOBAL_LABEL) return service.homeForScope(cwd, 'global')
+    return service.homeFor(cwd)
   } catch {
     // No UI provider / not a live agent / aborted: automatic rule applies.
-    return pool.coreFor(cwd)
+    return service.homeFor(cwd)
   }
 }
 
-/** Register all omt_* tools; executes route to the workspace's OMT home. */
+/** Register all omt_* tools; executes route through the runtime service. */
 export function registerOmtTools(
   ctx: Context,
-  pool: OmtCorePool,
+  service: OmtService,
   touch?: (sessionId: string | undefined, id: string) => void,
-  changed?: (home: string) => void,
+  changed?: (homeId: string) => void,
   running?: RunningRegistry,
 ): void {
   const userQuestions = (ctx as unknown as { userQuestions?: UserQuestionsLike }).userQuestions
@@ -465,21 +389,16 @@ export function registerOmtTools(
       render: (_args, value: NodeValue) => [{ type: 'text', text: `已创建节点：\n${renderNodeLine(value)}` }],
     },
     async execute(args, exec) {
-      const cwd = exec.agent?.session.header.cwd
-      const core = await coreForCreate(pool, userQuestions, exec, args)
-      // Pool-wide unique id: syncs counters across homes so bare ids never
-      // collide between the global and workspace homes.
-      const id = await pool.allocateId(args.type, cwd, core.home !== pool.globalHome)
-      const created = await core.create({
+      const home = await homeForCreate(service, userQuestions, exec, args)
+      const created = await service.createNode(home, {
         type: args.type,
         title: args.title,
         parentId: args.parentId,
         body: args.body,
         priority: args.priority,
-        id,
       })
       touch?.(sessionOf(exec), created.id)
-      changed?.(core.home)
+      changed?.(home.homeId)
       return nodeValue(created)
     },
   }))
@@ -502,8 +421,9 @@ export function registerOmtTools(
       }],
     },
     async execute(args, exec) {
-      const core = await coreOf(pool, exec)
-      return core.list({ type: args.type, status: args.status, query: args.query }).map(nodeValue)
+      const home = await service.homeFor(exec.agent?.session.header.cwd)
+      const nodes = await service.listNodes(home, { type: args.type, status: args.status, query: args.query })
+      return nodes.map(nodeValue)
     },
   }))
 
@@ -526,18 +446,12 @@ export function registerOmtTools(
       },
       render: (_args, value: { node: NodeValue; parent?: NodeValue; children: NodeValue[]; body: string }) => [{
         type: 'text',
-        text: renderShow({
-          node: value.node as unknown as OmtNode,
-          parent: value.parent as unknown as OmtNode | undefined,
-          children: value.children as unknown as OmtNode[],
-          body: value.body,
-        }),
+        text: renderShow(value),
       }],
     },
     async execute(args, exec) {
-      const core = await pool.coreForNode(args.id, exec.agent?.session.header.cwd)
       touch?.(sessionOf(exec), args.id)
-      const result = await core.show(args.id)
+      const result = await service.showNode(args.id, exec.agent?.session.header.cwd)
       return {
         node: nodeValue(result.node),
         ...(result.parent !== undefined ? { parent: nodeValue(result.parent) } : {}),
@@ -570,10 +484,9 @@ export function registerOmtTools(
       if ([args.title, args.status, args.archived, args.priority, args.body, args.append].every(v => v === undefined)) {
         throw new Error('omt_update 至少需要一项变更（title/status/archived/priority/body/append）')
       }
-      const core = await pool.coreForNode(args.id, exec.agent?.session.header.cwd)
       touch?.(sessionOf(exec), args.id)
       trackRunning(exec, args.id, args.status, args.archived)
-      const updated = await core.update({
+      const { node, home } = await service.updateNode({
         id: args.id,
         title: args.title,
         status: args.status,
@@ -581,12 +494,9 @@ export function registerOmtTools(
         priority: args.priority,
         body: args.body,
         append: args.append,
-        // Passive observation (TICKET-0061) rides on core.update; the session
-        // becomes the executor of any item this change dispatches.
-        executorSessionId: sessionOf(exec),
-      })
-      changed?.(core.home)
-      return nodeValue(updated)
+      }, { cwd: exec.agent?.session.header.cwd, sessionId: sessionOf(exec) })
+      changed?.(home.homeId)
+      return nodeValue(node)
     },
   }))
 
@@ -602,15 +512,10 @@ export function registerOmtTools(
       render: (_args, value: NodeValue) => [{ type: 'text', text: `已移动节点：\n${renderNodeLine(value)}` }],
     },
     async execute(args, exec) {
-      const cwd = exec.agent?.session.header.cwd
-      const core = await pool.coreForNode(args.id, cwd)
-      if (core.getNode(args.newParentId) === undefined) {
-        throw new Error('omt_move 不支持跨 home 移动（节点与目标父节点不在同一个 OMT home）')
-      }
-      const moved = await core.move(args.id, args.newParentId)
+      const moved = await service.moveNode(args.id, args.newParentId, exec.agent?.session.header.cwd)
       touch?.(sessionOf(exec), args.id)
-      changed?.(core.home)
-      return nodeValue(moved)
+      changed?.(moved.home.homeId)
+      return nodeValue(moved.node)
     },
   }))
 
@@ -636,9 +541,9 @@ export function registerOmtTools(
       }],
     },
     async execute(_args, exec) {
-      const core = await coreOf(pool, exec)
-      const result = await core.reindex()
-      changed?.(core.home)
+      const home = await service.homeFor(exec.agent?.session.header.cwd)
+      const result = await service.reindex(home)
+      changed?.(home.homeId)
       return result
     },
   }))
@@ -646,8 +551,8 @@ export function registerOmtTools(
   // ── run tools (EPIC-0003 / STORY-0011) ─────────────────────────────────
   // Runs live in exactly one home (single-home membership rule). create
   // routes by member ownership; id-addressed tools resolve the owning home
-  // via pool.coreForRun (run ids count per home, so the caller's workspace
-  // context disambiguates, exactly like node ids).
+  // via service.resolveRunHome (run ids count per home, so the caller's
+  // workspace context disambiguates, exactly like node ids).
 
   ctx.tools.register(defineTool({
     name: 'omt_run_create',
@@ -687,18 +592,18 @@ export function registerOmtTools(
       const cwd = exec.agent?.session.header.cwd
       // Single-home rule (decision 2): every member must resolve to the
       // same owning home — resolve by ownership, not by caller cwd.
-      // Membership itself is validated by core.createRun (requireNode).
-      let core: OmtCore | undefined
-      for (const { rootId, core: owner } of await pool.ownerCores(args.nodeIds, cwd)) {
-        core ??= owner
-        if (owner.home !== core.home) {
-          throw new Error(`omt_run_create 的成员必须同属一个 OMT home（${rootId} 属于 ${owner.home}，与 ${core.home} 不同）`)
+      let home: HomeRef | undefined
+      for (const rootId of args.nodeIds) {
+        const owner = (await service.resolveNodeHome(rootId, cwd)).home
+        home ??= owner
+        if (owner.homeId !== home.homeId) {
+          throw new Error(`omt_run_create 的成员必须同属一个 OMT home（${rootId} 属于 ${owner.homeId}，与 ${home.homeId} 不同）`)
         }
       }
-      core ??= await pool.coreFor(cwd)
-      const run = await core.createRun({ title: args.title, config: args.config, nodeIds: args.nodeIds })
-      changed?.(core.home)
-      return { run: runValue(run), items: core.runItems(run.id).map(item => runItemValue(item)) }
+      home ??= await service.homeFor(cwd)
+      const created = await service.createRun(home, { title: args.title, config: args.config, nodeIds: args.nodeIds })
+      changed?.(home.homeId)
+      return { run: runValue(created.run), items: created.items.map(item => runItemValue(item)) }
     },
   }))
 
@@ -735,16 +640,9 @@ export function registerOmtTools(
       }],
     },
     async execute(args, exec) {
-      const core = await coreOf(pool, exec)
-      return core.listRuns({ status: args.status }).map(run => {
-        const progress: Record<string, number> = { total: 0, ...Object.fromEntries(RUN_ITEM_STATES.map(state => [state, 0])) }
-        // One GROUP BY per run (runs come from listRuns, so no re-validation).
-        for (const { state, count } of core.runItemStateCounts(run.id)) {
-          progress.total += count
-          progress[state] = count
-        }
-        return { run: runValue(run), progress }
-      })
+      const home = await service.homeFor(exec.agent?.session.header.cwd)
+      const summaries = await service.listRunSummaries(home, args.status)
+      return summaries.map(({ run, progress }) => ({ run: runValue(run), progress }))
     },
   }))
 
@@ -769,10 +667,14 @@ export function registerOmtTools(
       }],
     },
     async execute(args, exec) {
-      const core = await runCoreOf(pool, exec, args.id)
-      // runItems throws NOT_FOUND for unknown runs (consistent error path).
-      const items = core.runItems(args.id).map(item => runItemValue(item, core.getNode(item.node_id)?.title))
-      return { run: runValue(core.requireRun(args.id)), items }
+      const home = await service.resolveRunHome(args.id, exec.agent?.session.header.cwd)
+      // fetchRun throws NOT_FOUND for unknown runs (consistent error path);
+      // item titles arrive joined from the daemon detail view.
+      const snapshot = await service.fetchRun(home, args.id)
+      return {
+        run: runValue(snapshot.run),
+        items: snapshot.items.map(item => runItemValue(item)),
+      }
     },
   }))
 
@@ -803,37 +705,18 @@ export function registerOmtTools(
       }],
     },
     async execute(args, exec) {
-      const core = await runCoreOf(pool, exec, args.id)
-      let run: OmtRun | undefined
-      let item: OmtRunItem | undefined
-      switch (args.action as string) {
-        case 'start':
-          run = await core.startRun(args.id)
-          break
-        case 'pause':
-          run = await core.pauseRun(args.id)
-          break
-        case 'resume':
-          run = await core.resumeRun(args.id)
-          break
-        case 'cancel':
-          run = await core.cancelRun(args.id)
-          break
-        case 'retry':
-          if (args.nodeId === undefined) throw new Error('omt_run_control retry 需要 nodeId（指定要重试的成员）')
-          item = await core.retryItem(args.id, args.nodeId)
-          break
-        case 'remove':
-          if (args.nodeId === undefined) throw new Error('omt_run_control remove 需要 nodeId（指定要移除的成员）')
-          await core.removeRunItem(args.id, args.nodeId)
-          break
-        default:
-          throw new Error(`omt_run_control 不支持的动作: ${String(args.action)}（start/pause/resume/cancel/retry/remove）`)
+      const home = await service.resolveRunHome(args.id, exec.agent?.session.header.cwd)
+      if ((args.action === 'retry' || args.action === 'remove') && args.nodeId === undefined) {
+        throw new Error(`omt_run_control ${String(args.action)} 需要 nodeId（指定要${args.action === 'retry' ? '重试' : '移除'}的成员）`)
       }
-      changed?.(core.home)
+      if (args.action !== 'start' && args.action !== 'pause' && args.action !== 'resume' && args.action !== 'cancel' && args.action !== 'retry' && args.action !== 'remove') {
+        throw new Error(`omt_run_control 不支持的动作: ${String(args.action)}（start/pause/resume/cancel/retry/remove）`)
+      }
+      const result = await service.controlRun(home, args.id, args.action, args.nodeId)
+      changed?.(home.homeId)
       return {
-        run: runValue(run ?? core.requireRun(args.id)),
-        ...(item !== undefined ? { item: runItemValue(item, core.getNode(item.node_id)?.title) } : {}),
+        run: runValue(result.run),
+        ...(result.item !== undefined ? { item: runItemValue(result.item) } : {}),
       }
     },
   }))
@@ -887,29 +770,17 @@ export function registerOmtTools(
       if (sessionId === undefined) {
         throw new Error('omt_run_claim 需要执行者会话：agent-less 调用不可认领（无从绑定 executor）')
       }
-      const core = await runCoreOf(pool, exec, args.id)
-      const item = await core.claimRunItem(args.id, sessionId)
-      changed?.(core.home)
-      if (item === undefined) return { run_id: args.id, claimed: false }
-      const node = core.getNode(item.node_id)
-      let context: ClaimContextValue | undefined
-      let contextError: string | undefined
-      if (node !== undefined) {
-        try {
-          context = await buildClaimContext(core, node)
-        } catch (error) {
-          contextError = String((error as Error).message ?? error)
-        }
-      } else {
-        contextError = `已认领成员 ${item.node_id}，但节点元数据不存在`
-      }
+      const home = await service.resolveRunHome(args.id, exec.agent?.session.header.cwd)
+      const outcome = await service.claimItem(home, args.id, sessionId)
+      changed?.(home.homeId)
+      if (!outcome.claimed || outcome.item === undefined) return { run_id: args.id, claimed: false }
       return {
         run_id: args.id,
         claimed: true,
-        item: runItemValue(item, node?.title),
-        ...(node !== undefined ? { ticket: nodeValue(node) } : {}),
-        ...(context !== undefined ? { context } : {}),
-        ...(contextError !== undefined ? { context_error: contextError } : {}),
+        item: runItemValue(outcome.item, outcome.ticket?.title),
+        ...(outcome.ticket !== undefined ? { ticket: nodeValue(outcome.ticket) } : {}),
+        ...(outcome.context !== undefined ? { context: outcome.context } : {}),
+        ...(outcome.context_error !== undefined ? { context_error: outcome.context_error } : {}),
       }
     },
   }))
@@ -942,14 +813,20 @@ export function registerOmtTools(
       }],
     },
     async execute(args, exec) {
-      const core = await runCoreOf(pool, exec, args.id)
-      const result: ReportResult = await core.reportRunItem(args.id, args.nodeId, args.outcome, args.note)
+      const home = await service.resolveRunHome(args.id, exec.agent?.session.header.cwd)
+      const result = await service.reportItem(
+        home,
+        args.id,
+        args.nodeId,
+        args.outcome as RunReportOutcome,
+        args.note,
+      )
       // A report concludes the current execution: clear the running mark
       // (failed keeps the ticket in_progress; a retry re-marks it).
       running?.stop(args.nodeId)
-      changed?.(core.home)
+      changed?.(result.homeId)
       return {
-        run: runValue(core.requireRun(args.id)),
+        run: runValue(result.run),
         item: runItemValue(result.item, result.node.title),
         node: nodeValue(result.node),
       }

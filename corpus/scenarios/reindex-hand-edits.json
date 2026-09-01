@@ -1,0 +1,28 @@
+{
+  "meta": {
+    "name": "reindex-hand-edits",
+    "source": "tests/core.spec.ts#reindex > picks up hand-edited frontmatter and drops illegal relations",
+    "description": "Reindex treats files as the content authority: hand-set status is picked up; an illegal hand-made parent link is dropped (skipped) and the story returns to root level."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "用户体系" },
+      { "type": "story", "title": "登录", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "登录接口", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "readFile", "params": { "path": "tickets/EPIC-0001-用户体系/STORY-0001-登录/TICKET-0001-登录接口/ticket.md" }, "label": "ticketRaw" },
+    { "op": "writeFile", "params": { "path": "tickets/EPIC-0001-用户体系/STORY-0001-登录/TICKET-0001-登录接口/ticket.md", "text": "---\nid: TICKET-0001\ntype: ticket\ntitle: 登录接口\nstatus: done\npriority: 0\nparent: STORY-0001\ncreated_at: t\nupdated_at: t\n---\n\n## 正文\n" } },
+    { "op": "writeFile", "params": { "path": "tickets/EPIC-0001-用户体系/STORY-0001-登录/story.md", "text": "---\nid: STORY-0001\ntype: story\ntitle: 登录\nstatus: open\npriority: 0\nparent: TICKET-0001\ncreated_at: t\nupdated_at: t\n---\n\n## 子节点\n\n- [TICKET-0001 登录接口](TICKET-0001-登录接口/ticket.md) — open\n" } },
+    { "op": "reindex", "label": "result" },
+    { "op": "show", "params": { "id": "TICKET-0001" }, "label": "shown" },
+    { "op": "tree", "label": "forest" }
+  ],
+  "invariants": [
+    { "expect": "gte", "op": "result", "path": "skipped", "value": 1 },
+    { "expect": "equals", "op": "shown", "path": "node.status", "value": "done" },
+    { "expect": "contains", "op": "forest", "value": { "id": "STORY-0001" } },
+    { "expect": "contains", "op": "forest", "value": { "id": "EPIC-0001" } }
+  ]
+}

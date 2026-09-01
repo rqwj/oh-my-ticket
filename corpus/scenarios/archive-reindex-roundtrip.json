@@ -1,0 +1,17 @@
+{
+  "meta": {
+    "name": "archive-reindex-roundtrip",
+    "source": "tests/archived.spec.ts#reindex round-trips the archived flag through frontmatter",
+    "description": "The archived flag round-trips disk → index during reindex without disturbing the lifecycle status."
+  },
+  "operations": [
+    { "op": "create", "params": { "type": "epic", "title": "用户体系" } },
+    { "op": "update", "params": { "id": "EPIC-0001", "status": "done", "archived": true } },
+    { "op": "reindex" },
+    { "op": "getNode", "params": { "id": "EPIC-0001" }, "label": "node" }
+  ],
+  "invariants": [
+    { "expect": "equals", "op": "node", "path": "archived", "value": true },
+    { "expect": "equals", "op": "node", "path": "status", "value": "done" }
+  ]
+}

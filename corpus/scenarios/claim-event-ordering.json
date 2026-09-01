@@ -1,0 +1,94 @@
+{
+  "meta": {
+    "name": "claim-event-ordering",
+    "source": "tests/run-core.spec.ts#claim events > claimRunItem emits pending→running; surfaces archived-member skips first",
+    "description": "The core-side event stream (consumed by SSE/notify) emits [pending→skipped] for drained members BEFORE the claimed item's [pending→running]. recordEvents captures item events (node_id, from, to).",
+    "recordEvents": true
+  },
+  "operations": [
+    {
+      "op": "create",
+      "params": {
+        "type": "epic",
+        "title": "批量"
+      }
+    },
+    {
+      "op": "create",
+      "params": {
+        "type": "story",
+        "title": "批次",
+        "parentId": "EPIC-0001"
+      }
+    },
+    {
+      "op": "create",
+      "params": {
+        "type": "ticket",
+        "title": "任务1",
+        "parentId": "STORY-0001"
+      }
+    },
+    {
+      "op": "create",
+      "params": {
+        "type": "ticket",
+        "title": "任务2",
+        "parentId": "STORY-0001"
+      }
+    },
+    {
+      "op": "createRun",
+      "params": {
+        "nodeIds": [
+          "TICKET-0001",
+          "TICKET-0002"
+        ]
+      }
+    },
+    {
+      "op": "update",
+      "params": {
+        "id": "TICKET-0002",
+        "archived": true
+      }
+    },
+    {
+      "op": "startRun",
+      "params": {
+        "id": "RUN-0001"
+      }
+    },
+    {
+      "op": "claimRunItem",
+      "params": {
+        "runId": "RUN-0001",
+        "executorSessionId": "sess-1"
+      },
+      "label": "claimed"
+    }
+  ],
+  "invariants": [
+    {
+      "expect": "equals",
+      "op": "claimed",
+      "path": "node_id",
+      "value": "TICKET-0001"
+    },
+    {
+      "expect": "itemEvents",
+      "value": [
+        [
+          "TICKET-0002",
+          "pending",
+          "skipped"
+        ],
+        [
+          "TICKET-0001",
+          "pending",
+          "running"
+        ]
+      ]
+    }
+  ]
+}

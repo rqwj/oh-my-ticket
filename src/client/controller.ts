@@ -4,7 +4,7 @@
  * through the inject hooks compartment; the details-panel shadow is attached
  * by index.ts through attachDetailsShadow (dynamic register/dispose).
  */
-import { createSnapshotStore, type SnapshotStore } from '@deepseek-ai/dsh-client-runtime/client'
+import { createSnapshotStore, type SnapshotStore } from '@deepseek-ai/dsh-client-store'
 import type { RpcCaller } from './trigger/source.ts'
 import type { FloatPos, FloatSize } from './float-geometry.ts'
 import type { RunControlCommand } from './run-view.ts'

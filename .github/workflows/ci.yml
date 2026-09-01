@@ -1,0 +1,85 @@
+# Minimal CI gate (plan U11): fmt/clippy/test for the Rust workspace plus
+# typecheck/test for the npm side. Deliberately kept minimal — it is the
+# canary prerequisite (U15), not a distribution surface.
+#
+# Supply-chain hygiene (KTD8): third-party actions are referenced by tag for
+# bootstrap; policy is to pin every third-party action to an immutable commit
+# SHA before stable distribution use. No curl|bash steps anywhere;
+# permissions are least-privilege per workflow.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: rust (fmt · clippy · test)
+    # macOS-only project: Linux runners cannot build the Tauri desktop crate
+    # (glib/webkit2gtk system deps), and the product ships macOS binaries only.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      # The yaml_differential suite shells out to scripts/gen-yaml-goldens.mjs
+      # (Rust vs TypeScript serialization parity) — it needs the repo's npm
+      # dependencies installed, which the node job's runner never shares.
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+      # tauri-build validates the externalBin resource path at COMPILE time,
+      # but the sidecar is a build artifact that never enters the repo — a
+      # fresh clone has nothing at binaries/. Build the daemon and stage it
+      # under the target-triple name before clippy/test compile the desktop
+      # crate.
+      - name: Stage desktop sidecar for tauri-build
+        run: |
+          cargo build -p omt-runtime --bin omt-daemon
+          mkdir -p apps/desktop/src-tauri/binaries
+          cp target/debug/omt-daemon apps/desktop/src-tauri/binaries/omt-daemon-aarch64-apple-darwin
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo test
+        run: cargo test --workspace
+
+  node:
+    name: node (typecheck · test)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Toolchain for the runtime-fixture daemon build path
+      # (scripts/build-daemon.mjs → cargo build -p omt-runtime).
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      # Prebuild the debug daemon OUTSIDE the test hooks: on a fresh runner
+      # the runtime fixture would otherwise run this minute-scale cargo
+      # build inside a 10 s hookTimeout, and the concurrent build starves
+      # sibling workers' daemon-event windows.
+      - run: pnpm build:daemon
+      - run: pnpm test

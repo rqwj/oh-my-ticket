@@ -1,0 +1,25 @@
+{
+  "meta": {
+    "name": "search-title-body",
+    "source": "tests/core.spec.ts#search > finds nodes by title and body keywords",
+    "description": "Content search covers titles and appended body text; unknown keywords return nothing."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "用户体系" },
+      { "type": "story", "title": "登录", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "登录接口", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "update", "params": { "id": "TICKET-0001", "append": "支持 OAuth 授权码模式" } },
+    { "op": "list", "params": { "query": "登录" }, "label": "byTitle" },
+    { "op": "list", "params": { "query": "OAuth" }, "label": "byBody" },
+    { "op": "list", "params": { "query": "不存在的词" }, "label": "none" }
+  ],
+  "invariants": [
+    { "expect": "contains", "op": "byTitle", "value": { "id": "STORY-0001" } },
+    { "expect": "contains", "op": "byBody", "value": { "id": "TICKET-0001" } },
+    { "expect": "length", "op": "none", "value": 0 }
+  ]
+}

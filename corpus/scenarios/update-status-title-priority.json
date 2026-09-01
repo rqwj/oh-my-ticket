@@ -1,0 +1,24 @@
+{
+  "meta": {
+    "name": "update-status-title-priority",
+    "source": "tests/core.spec.ts#update > updates status/title/priority across db, frontmatter, and parent listing",
+    "description": "A content update lands in the SQLite row, the file frontmatter, and the parent's managed children list."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "用户体系" },
+      { "type": "story", "title": "登录", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "登录接口", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "update", "params": { "id": "TICKET-0001", "title": "登录接口 v2", "status": "in_progress", "priority": 1 }, "label": "updated" }
+  ],
+  "invariants": [
+    { "expect": "equals", "op": "updated", "path": "status", "value": "in_progress" },
+    { "expect": "fileContains", "file": "tickets/EPIC-0001-用户体系/STORY-0001-登录/TICKET-0001-登录接口/ticket.md", "text": "title: 登录接口 v2" },
+    { "expect": "fileContains", "file": "tickets/EPIC-0001-用户体系/STORY-0001-登录/TICKET-0001-登录接口/ticket.md", "text": "status: in_progress" },
+    { "expect": "fileContains", "file": "tickets/EPIC-0001-用户体系/STORY-0001-登录/TICKET-0001-登录接口/ticket.md", "text": "priority: 1" },
+    { "expect": "fileContains", "file": "tickets/EPIC-0001-用户体系/STORY-0001-登录/story.md", "text": "- [TICKET-0001 登录接口 v2]" }
+  ]
+}

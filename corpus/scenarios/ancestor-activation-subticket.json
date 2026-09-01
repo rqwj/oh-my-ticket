@@ -1,0 +1,26 @@
+{
+  "meta": {
+    "name": "ancestor-activation-subticket",
+    "source": "tests/core.spec.ts#ancestor activation > activates through the parent ticket for subtickets",
+    "description": "Subticket activation walks through its parent ticket up to the epic."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "用户体系" },
+      { "type": "story", "title": "登录", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "登录接口", "parentId": "STORY-0001" },
+      { "type": "subticket", "title": "参数校验", "parentId": "TICKET-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "update", "params": { "id": "SUBTICKET-0001", "status": "in_progress" } },
+    { "op": "getNode", "params": { "id": "EPIC-0001" }, "label": "epic" },
+    { "op": "getNode", "params": { "id": "STORY-0001" }, "label": "story" },
+    { "op": "getNode", "params": { "id": "TICKET-0001" }, "label": "ticket" }
+  ],
+  "invariants": [
+    { "expect": "equals", "op": "epic", "path": "status", "value": "in_progress" },
+    { "expect": "equals", "op": "story", "path": "status", "value": "in_progress" },
+    { "expect": "equals", "op": "ticket", "path": "status", "value": "in_progress" }
+  ]
+}

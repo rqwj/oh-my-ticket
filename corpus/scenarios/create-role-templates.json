@@ -1,0 +1,40 @@
+{
+  "meta": {
+    "name": "create-role-templates",
+    "source": "tests/core.spec.ts#create > uses role-specific templates that encode hierarchy content boundaries",
+    "description": "Each node type starts with its role-specific section template (epic/story/substory/ticket/subticket). Byte-exact templates are locked separately by serialization goldens; the corpus pins the section inventory."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "平台能力" },
+      { "type": "story", "title": "批量执行", "parentId": "EPIC-0001" },
+      { "type": "substory", "title": "失败恢复", "parentId": "STORY-0001" },
+      { "type": "ticket", "title": "重试入口", "parentId": "STORY-0001" },
+      { "type": "subticket", "title": "错误提示", "parentId": "TICKET-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "show", "params": { "id": "EPIC-0001" }, "label": "epic" },
+    { "op": "show", "params": { "id": "STORY-0001" }, "label": "story" },
+    { "op": "show", "params": { "id": "SUBSTORY-0001" }, "label": "substory" },
+    { "op": "show", "params": { "id": "TICKET-0001" }, "label": "ticket" },
+    { "op": "show", "params": { "id": "SUBTICKET-0001" }, "label": "subticket" }
+  ],
+  "invariants": [
+    { "expect": "contains", "op": "epic", "path": "body", "value": "## 总体目标" },
+    { "expect": "contains", "op": "epic", "path": "body", "value": "## 范围" },
+    { "expect": "contains", "op": "epic", "path": "body", "value": "## 非范围" },
+    { "expect": "contains", "op": "epic", "path": "body", "value": "## 全局约束" },
+    { "expect": "contains", "op": "epic", "path": "body", "value": "## 成功标准" },
+    { "expect": "contains", "op": "story", "path": "body", "value": "## 能力结果" },
+    { "expect": "contains", "op": "story", "path": "body", "value": "## 使用者或调用方" },
+    { "expect": "contains", "op": "story", "path": "body", "value": "## 共享规则与约束" },
+    { "expect": "contains", "op": "story", "path": "body", "value": "## 验收标准" },
+    { "expect": "contains", "op": "substory", "path": "body", "value": "## 能力结果" },
+    { "expect": "contains", "op": "ticket", "path": "body", "value": "## 交付结果" },
+    { "expect": "contains", "op": "ticket", "path": "body", "value": "## 工作范围" },
+    { "expect": "contains", "op": "ticket", "path": "body", "value": "## 依赖" },
+    { "expect": "contains", "op": "ticket", "path": "body", "value": "## 进度记录" },
+    { "expect": "contains", "op": "subticket", "path": "body", "value": "## 交付结果" }
+  ]
+}

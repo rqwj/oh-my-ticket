@@ -1,0 +1,32 @@
+{
+  "meta": {
+    "name": "replay-clears-stall",
+    "source": "tests/run-core.spec.ts#boundary semantics > replay clears the nudge budget: a replayed item is no longer stalled",
+    "description": "Exhausting the continuation-nudge budget marks the pending item stalled (derived convention); reopening the ticket (done → open) replays the item with a fresh budget."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "批量" },
+      { "type": "story", "title": "批次", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "任务1", "parentId": "STORY-0001" },
+      { "type": "ticket", "title": "任务2", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "createRun", "params": { "nodeIds": ["TICKET-0001", "TICKET-0002"] } },
+    { "op": "startRun", "params": { "id": "RUN-0001" } },
+    { "op": "nudge", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "count": 3 } },
+    { "op": "stallCheck", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001" }, "label": "stalledBefore" },
+    { "op": "update", "params": { "id": "TICKET-0001", "status": "done" } },
+    { "op": "update", "params": { "id": "TICKET-0001", "status": "open" } },
+    { "op": "getRunItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001" }, "label": "replayed" },
+    { "op": "stallCheck", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001" }, "label": "stalledAfter" }
+  ],
+  "invariants": [
+    { "expect": "equals", "op": "stalledBefore", "path": "stalled", "value": true },
+    { "expect": "equals", "op": "replayed", "path": "state", "value": "pending" },
+    { "expect": "equals", "op": "replayed", "path": "nudge_count", "value": 0 },
+    { "expect": "notDefined", "op": "replayed", "path": "nudged_at" },
+    { "expect": "equals", "op": "stalledAfter", "path": "stalled", "value": false }
+  ]
+}

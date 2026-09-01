@@ -1,0 +1,19 @@
+{
+  "name": "@oh-my-ticket/linux-x64",
+  "version": "0.0.0-semantically-released",
+  "description": "Linux x64 (x86_64-unknown-linux-gnu) omt-daemon + omt binaries for oh-my-ticket — DSH adapter fallback channel; filled from GitHub Releases by CI.",
+  "license": "MIT",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "bin": {
+    "omt-daemon": "bin/omt-daemon",
+    "omt": "bin/omt"
+  },
+  "files": [
+    "bin"
+  ]
+}

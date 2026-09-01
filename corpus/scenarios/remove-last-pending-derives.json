@@ -1,0 +1,31 @@
+{
+  "meta": {
+    "name": "remove-last-pending-derives",
+    "source": "tests/run-core.spec.ts#terminal derivation > removing the last pending item after the rest finished derives completed",
+    "description": "Membership removal can complete a run: dropping the final non-final item leaves only final states, so the terminal state derives."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "批量" },
+      { "type": "story", "title": "批次", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "任务1", "parentId": "STORY-0001" },
+      { "type": "ticket", "title": "任务2", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "createRun", "params": { "nodeIds": ["TICKET-0001", "TICKET-0002"] } },
+    { "op": "startRun", "params": { "id": "RUN-0001" } },
+    { "op": "claimRunItem", "params": { "runId": "RUN-0001", "executorSessionId": "sess-1" } },
+    { "op": "reportRunItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "outcome": "done" } },
+    { "op": "getRun", "params": { "id": "RUN-0001" }, "label": "beforeRemoval" },
+    { "op": "removeRunItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0002" } },
+    { "op": "getRun", "params": { "id": "RUN-0001" }, "label": "finished" },
+    { "op": "getRunItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0002" }, "label": "gone" }
+  ],
+  "invariants": [
+    { "expect": "equals", "op": "beforeRemoval", "path": "status", "value": "running" },
+    { "expect": "equals", "op": "finished", "path": "status", "value": "completed" },
+    { "expect": "defined", "op": "finished", "path": "finished_at" },
+    { "expect": "equals", "op": "gone", "value": null }
+  ]
+}

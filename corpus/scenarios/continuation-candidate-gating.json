@@ -1,0 +1,43 @@
+{
+  "meta": {
+    "name": "continuation-candidate-gating",
+    "source": "tests/idle-hook.spec.ts (core-visible half) — which runs/items are continuation candidates",
+    "description": "continuationCandidates(session): RUNNING + autoContinue + session owns an item → next pending item in position order. Paused runs gate out; autoContinue=false gates out; non-executors get nothing; no pending left gets nothing."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "批量" },
+      { "type": "story", "title": "批次", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "任务1", "parentId": "STORY-0001" },
+      { "type": "ticket", "title": "任务2", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "createRun", "params": { "nodeIds": ["TICKET-0001", "TICKET-0002"] } },
+    { "op": "startRun", "params": { "id": "RUN-0001" } },
+    { "op": "claimRunItem", "params": { "runId": "RUN-0001", "executorSessionId": "s1" } },
+    { "op": "reportRunItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "outcome": "done" } },
+    { "op": "continuationCandidates", "params": { "sessionId": "s1" }, "label": "candidate" },
+    { "op": "pauseRun", "params": { "id": "RUN-0001" } },
+    { "op": "continuationCandidates", "params": { "sessionId": "s1" }, "label": "pausedNone" },
+    { "op": "resumeRun", "params": { "id": "RUN-0001" } },
+    { "op": "continuationCandidates", "params": { "sessionId": "s2" }, "label": "strangerNone" },
+    { "op": "claimRunItem", "params": { "runId": "RUN-0001", "executorSessionId": "s1" } },
+    { "op": "reportRunItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0002", "outcome": "done" } },
+    { "op": "continuationCandidates", "params": { "sessionId": "s1" }, "label": "drainedNone" },
+    { "op": "createRun", "params": { "config": { "autoContinue": false }, "nodeIds": ["TICKET-0001"] }, "label": "manualRun" },
+    { "op": "startRun", "params": { "id": "RUN-0002" } },
+    { "op": "claimRunItem", "params": { "runId": "RUN-0002", "executorSessionId": "s3" } },
+    { "op": "reportRunItem", "params": { "runId": "RUN-0002", "nodeId": "TICKET-0001", "outcome": "blocked" } },
+    { "op": "update", "params": { "id": "TICKET-0001", "status": "open" } },
+    { "op": "continuationCandidates", "params": { "sessionId": "s3" }, "label": "manualNone" }
+  ],
+  "invariants": [
+    { "expect": "length", "op": "candidate", "value": 1 },
+    { "expect": "equals", "op": "candidate", "path": "0.item.node_id", "value": "TICKET-0002" },
+    { "expect": "equals", "op": "pausedNone", "value": [] },
+    { "expect": "equals", "op": "strangerNone", "value": [] },
+    { "expect": "equals", "op": "drainedNone", "value": [] },
+    { "expect": "equals", "op": "manualNone", "value": [] }
+  ]
+}

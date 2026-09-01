@@ -1,0 +1,41 @@
+{
+  "meta": {
+    "name": "add-members-gates",
+    "source": "tests/run-core.spec.ts#addRunMembers > rejects terminal runs and interrupted runs; rejects archived and unknown members",
+    "description": "Terminal/interrupted runs refuse members with run-not-active details (interrupted needs human resume); archived members are ARCHIVED_READONLY; unknown ids NOT_FOUND; a rejected batch leaves prior adds standing."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "批量" },
+      { "type": "story", "title": "批次", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "任务1", "parentId": "STORY-0001" },
+      { "type": "ticket", "title": "任务2", "parentId": "STORY-0001" },
+      { "type": "ticket", "title": "任务3", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "createRun", "params": { "nodeIds": ["TICKET-0001"] } },
+    { "op": "cancelRun", "params": { "id": "RUN-0001" } },
+    { "op": "addRunMembers", "params": { "runId": "RUN-0001", "members": [{ "nodeId": "TICKET-0002" }] }, "label": "terminalGate" },
+    { "op": "createRun", "params": { "nodeIds": ["TICKET-0001", "TICKET-0002"] } },
+    { "op": "startRun", "params": { "id": "RUN-0002" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0002", "nodeId": "TICKET-0001", "to": "running", "executorSessionId": "sess-dead" } },
+    { "op": "sweep", "label": "swept" },
+    { "op": "getRun", "params": { "id": "RUN-0002" }, "label": "interruptedRun" },
+    { "op": "addRunMembers", "params": { "runId": "RUN-0002", "members": [{ "nodeId": "TICKET-0003" }] }, "label": "interruptedGate" },
+    { "op": "createRun", "params": { "nodeIds": ["TICKET-0001"] } },
+    { "op": "update", "params": { "id": "TICKET-0002", "archived": true } },
+    { "op": "addRunMembers", "params": { "runId": "RUN-0003", "members": [{ "nodeId": "TICKET-0002" }] }, "label": "archivedGate" },
+    { "op": "addRunMembers", "params": { "runId": "RUN-0003", "members": [{ "nodeId": "TICKET-9999" }] }, "label": "unknownGate" },
+    { "op": "runItems", "params": { "runId": "RUN-0003" }, "label": "unwedged" }
+  ],
+  "invariants": [
+    { "expect": "matches", "op": "terminalGate", "path": "error", "value": { "code": "CONFLICT", "details": { "rule": "run-not-active", "runStatus": "canceled" } } },
+    { "expect": "equals", "op": "interruptedRun", "path": "status", "value": "interrupted" },
+    { "expect": "matches", "op": "interruptedGate", "path": "error", "value": { "code": "CONFLICT", "details": { "rule": "run-not-active", "runStatus": "interrupted" } } },
+    { "expect": "matches", "op": "archivedGate", "path": "error", "value": { "code": "ARCHIVED_READONLY", "details": { "nodeId": "TICKET-0002", "operation": "run-membership" } } },
+    { "expect": "matches", "op": "unknownGate", "path": "error", "value": { "code": "NOT_FOUND", "details": { "kind": "node", "id": "TICKET-9999" } } },
+    { "expect": "equals", "op": "unwedged", "path": "0.node_id", "value": "TICKET-0001" },
+    { "expect": "length", "op": "unwedged", "value": 1 }
+  ]
+}

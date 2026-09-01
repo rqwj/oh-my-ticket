@@ -1,0 +1,18 @@
+{
+  "meta": {
+    "name": "archive-preserves-status",
+    "source": "tests/archived.spec.ts#archiving preserves the lifecycle status and writes the frontmatter flag",
+    "description": "Archive is a separate dimension from the lifecycle status: in_progress survives archiving and the frontmatter carries both."
+  },
+  "operations": [
+    { "op": "create", "params": { "type": "epic", "title": "用户体系" } },
+    { "op": "update", "params": { "id": "EPIC-0001", "status": "in_progress" } },
+    { "op": "update", "params": { "id": "EPIC-0001", "archived": true }, "label": "archived" }
+  ],
+  "invariants": [
+    { "expect": "equals", "op": "archived", "path": "archived", "value": true },
+    { "expect": "equals", "op": "archived", "path": "status", "value": "in_progress" },
+    { "expect": "fileContains", "file": "tickets/EPIC-0001-用户体系/epic.md", "text": "archived: true" },
+    { "expect": "fileContains", "file": "tickets/EPIC-0001-用户体系/epic.md", "text": "status: in_progress" }
+  ]
+}

@@ -1,6 +1,6 @@
 /**
- * Test double for the '@deepseek-ai/dsh-client-runtime/client' platform
- * module (answered by the loader table in the browser; aliased here so the
+ * Test double for the '@deepseek-ai/dsh-client-store' platform
+ * module (answered by the loader table at runtime; aliased here so the
  * controller's snapshot stores run under plain node).
  */
 export interface ObservableSnapshot<T> {

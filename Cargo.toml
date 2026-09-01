@@ -1,0 +1,43 @@
+# Cargo workspace root (R16): hosts the Rust crates alongside the existing
+# root npm package (`oh-my-ticket`). The npm package remains untouched at the
+# repository root; everything under crates/ belongs to the Rust side.
+[workspace]
+resolver = "2"
+members = ["crates/*", "apps/desktop/src-tauri"]
+
+[workspace.package]
+# U1 (KTD1/R22): the unified product version. All four crates inherit via
+# `version.workspace = true`. As of the 2026-08 unification the version is
+# LOCKSTEP across every surface — the npm root package (DSH plugin), the
+# desktop app (package.json + tauri.conf.json) and these crates all carry
+# the SAME number. `pnpm sync-version` (scripts/sync-version.mjs) rewrites
+# every consumer from this canonical line, and the desktop「安装 DSH 插件」
+# flow installs `oh-my-ticket@<this version>` so surfaces never drift.
+version = "0.6.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/deepseek-ai/oh-my-ticket"
+
+# U1 (R22): release profile tuned for distributable binaries — stripped
+# symbols, thin LTO, single codegen unit for size.
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# U4 storage stack (KTD3/KTD8): bundled SQLite so no system dependency exists,
+# kernel advisory file locks (fs4, guard-free flock on the lock fd) for the
+# daemon home-ownership layer, SHA-256 for journal before/after content
+# hashes, OS entropy for lock tokens / home ids. The backup feature enables
+# the SQLite online backup API behind whole-home bundles (U4c).
+rusqlite = { version = "0.37", features = ["bundled", "backup"] }
+fs4 = "1"
+sha2 = "0.10"
+getrandom = "0.3"
+tempfile = { version = "3" }
+# U5 runtime plane (KTD1/KTD9): unix domain socket peer credentials
+# (SO_PEERCRED / LOCAL_PEERCRED) and signal-masked SIGTERM/SIGINT handling.
+libc = "0.2"

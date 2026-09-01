@@ -1,0 +1,25 @@
+{
+  "meta": {
+    "name": "run-create-archived-member",
+    "source": "tests/run-core.spec.ts#createRun > rejects archived members up front",
+    "description": "Archived members are refused with ARCHIVED_READONLY (subdivided) because they could never accept a report; restoring unblocks creation."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "批量" },
+      { "type": "story", "title": "批次", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "任务1", "parentId": "STORY-0001" },
+      { "type": "ticket", "title": "任务2", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "update", "params": { "id": "TICKET-0001", "archived": true } },
+    { "op": "createRun", "params": { "nodeIds": ["TICKET-0001", "TICKET-0002"] }, "label": "withArchived" },
+    { "op": "update", "params": { "id": "TICKET-0001", "archived": false } },
+    { "op": "createRun", "params": { "nodeIds": ["TICKET-0001", "TICKET-0002"] }, "label": "restored" }
+  ],
+  "invariants": [
+    { "expect": "matches", "op": "withArchived", "path": "error", "value": { "code": "ARCHIVED_READONLY", "details": { "nodeId": "TICKET-0001", "operation": "run-membership" } } },
+    { "expect": "equals", "op": "restored", "path": "status", "value": "pending" }
+  ]
+}

@@ -1,9 +1,9 @@
 # Oh-My-Ticket (OMT)
 
-![version](https://img.shields.io/badge/version-0.4.1-blue)
-![tests](https://img.shields.io/badge/tests-344%20passing-brightgreen)
+![version](https://img.shields.io/badge/version-0.6.0-blue)
+![tests](https://img.shields.io/badge/tests-314%20passing-brightgreen)
 ![platform](https://img.shields.io/badge/platform-DeepSeek%20Harness-purple)
-![dsh](https://img.shields.io/badge/DeepSeek%20Harness%20tested-0.1.1--rc.1-blue)
+![dsh](https://img.shields.io/badge/DeepSeek%20Harness%20tested-0.1.2--alpha.3-blue)
 
 **DSH 的 ticket 管理插件**：`Epic → Story → [SubStory] → Ticket → [SubTicket]` 五级任务体系，
 SQLite 存元数据与层级关系，Markdown 存正文。ticket 随项目走（`.omt/` 目录可直接进 git），
@@ -84,6 +84,10 @@ run 机制支持把一批 ticket 交给模型批量执行，全程有状态机�
 内嵌两个 skill：`omt` 教 ticket 体系操作规范与状态流转约定，`omt-runs` 教
 run 批次纪律（创建/认领/报告/续跑响应）。
 
+运行时配置（home / runtime dir）的解析契约见
+[docs/runtime/config.md](docs/runtime/config.md)——参数 > 环境变量 >
+默认值，多端一致，由跨层 parity 测试锁定。
+
 ## 📦 安装
 
 ```sh
@@ -100,25 +104,18 @@ pnpm dsh plugin --profile <profile> add /path/to/oh-my-ticket-0.4.1.tgz
 
 ## 🛠 开发
 
-### 首次设置：链接本地 DSH checkout
+### 安装依赖
 
-`@deepseek-ai/*` 依赖未发布到 npm，`package.json` 通过 `link:./.dsh-checkout/...`
-引用本机的 deepseek-harness 源码。克隆仓库后，先运行 setup 脚本创建符号链接：
+`@deepseek-ai/*` 依赖自 0.1.2-alpha.x 起已发布到 npm，克隆仓库后直接：
 
 ```sh
-# 方式一：参数传入 DSH checkout 路径
-pnpm run setup /path/to/deepseek-harness
-
-# 方式二：环境变量
-DSH_CHECKOUT=/path/to/deepseek-harness pnpm run setup
-
-# 然后正常安装依赖
 pnpm install
 ```
 
-脚本会校验目标目录确实是 deepseek-harness checkout（检查 `vendor/cordis`、
-`packages/*` 等子目录是否存在），然后在仓库根目录创建 `.dsh-checkout`
-符号链接。该链接已 gitignore，只存在于本机，不含任何机器特定路径。
+host 半构建会把 `dsh-tools` / `schemastery` / `cosmokit` 内联进 `lib/index.js`
+（发布包自包含，运行时不再解析任何 `@deepseek-ai/*`）；浏览器半的
+`ui-primitives` / `ui-slots` 是运行时外部依赖（模块表提供），不安装、
+类型由 `src/client/externals.d.ts` 的结构化声明提供。
 
 ### 日常开发
 
@@ -126,7 +123,8 @@ pnpm install
 pnpm build        # lib/index.js（host 半）+ lib/client.js（浏览器半）
 pnpm watch        # 增量重建
 pnpm typecheck    # tsc --noEmit
-pnpm test         # vitest（344 例）
+pnpm test         # vitest（314 例）
+pnpm sync-version 0.6.1   # 统一升级四端版本号（Cargo.toml 为权威源）
 ```
 
 ### 仓库结构

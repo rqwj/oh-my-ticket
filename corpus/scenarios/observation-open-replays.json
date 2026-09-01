@@ -1,0 +1,33 @@
+{
+  "meta": {
+    "name": "observation-open-replays",
+    "source": "tests/run-core.spec.ts#boundary semantics replay-clears-stall (decision 11 via bare update)",
+    "description": "open over done/blocked items replays them to pending through passive observation — but ONLY while the run is still active (a fully-final run derives its terminal state and accepts no replays), so this scenario keeps a third item pending."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "批量" },
+      { "type": "story", "title": "批次", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "任务1", "parentId": "STORY-0001" },
+      { "type": "ticket", "title": "任务2", "parentId": "STORY-0001" },
+      { "type": "ticket", "title": "任务3", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "createRun", "params": { "nodeIds": ["TICKET-0001", "TICKET-0002", "TICKET-0003"] } },
+    { "op": "startRun", "params": { "id": "RUN-0001" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "to": "done" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0002", "to": "blocked" } },
+    { "op": "update", "params": { "id": "TICKET-0001", "status": "open" } },
+    { "op": "update", "params": { "id": "TICKET-0002", "status": "open" } },
+    { "op": "getRunItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001" }, "label": "replayedA" },
+    { "op": "getRunItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0002" }, "label": "replayedB" },
+    { "op": "getRun", "params": { "id": "RUN-0001" }, "label": "runStillActive" }
+  ],
+  "invariants": [
+    { "expect": "equals", "op": "replayedA", "path": "state", "value": "pending" },
+    { "expect": "notDefined", "op": "replayedA", "path": "finished_at" },
+    { "expect": "equals", "op": "replayedB", "path": "state", "value": "pending" },
+    { "expect": "equals", "op": "runStillActive", "path": "status", "value": "running" }
+  ]
+}

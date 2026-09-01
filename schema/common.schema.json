@@ -1,0 +1,327 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://omt.dev/schemas/v1/common.schema.json",
+  "title": "OMT protocol common definitions (v1)",
+  "description": "Shared vocabulary for the OMT JSON-RPC protocol. Wire fields are camelCase; enum values keep the domain's snake_case spelling (in_progress, awaiting_confirmation, ...). Wire objects deliberately do NOT set additionalProperties:false so that additive changes are tolerated by older peers.",
+  "$defs": {
+    "HomeId": {
+      "type": "string",
+      "pattern": "^h_[a-z0-9]{6,}$",
+      "description": "Stable public identifier of one OMT home. Every public reference in the protocol must be qualified with a HomeId (R4). Bare filesystem/workspace paths are DSH-adapter compatibility inputs and are resolved to a HomeId before anything crosses the wire."
+    },
+    "NodeId": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z0-9]*-[0-9]+$",
+      "description": "Ticket node identifier within one home, e.g. TICKET-0001, EPIC-0003."
+    },
+    "RunId": {
+      "type": "string",
+      "pattern": "^RUN-[0-9]+$",
+      "description": "Run identifier within one home, e.g. RUN-0001."
+    },
+    "Revision": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Optimistic-concurrency revision counter of a node or run."
+    },
+    "Iso8601Time": {
+      "type": "string",
+      "format": "date-time",
+      "description": "UTC timestamp in ISO 8601 / RFC 3339 form."
+    },
+    "ProtocolVersion": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+$",
+      "description": "Protocol version as MAJOR.MINOR. Peers agree on the highest shared MAJOR; a request whose MAJOR is not supported fails with problem code UNSUPPORTED_PROTOCOL."
+    },
+    "QualifiedNodeRef": {
+      "type": "object",
+      "description": "A node reference qualified by its owning home (R4).",
+      "properties": {
+        "homeId": { "$ref": "#/$defs/HomeId" },
+        "nodeId": { "$ref": "#/$defs/NodeId" }
+      },
+      "required": ["homeId", "nodeId"]
+    },
+    "QualifiedRunRef": {
+      "type": "object",
+      "description": "A run reference qualified by its owning home (R4).",
+      "properties": {
+        "homeId": { "$ref": "#/$defs/HomeId" },
+        "runId": { "$ref": "#/$defs/RunId" }
+      },
+      "required": ["homeId", "runId"]
+    },
+    "NodeType": {
+      "type": "string",
+      "enum": ["epic", "story", "substory", "ticket", "subticket"],
+      "description": "Ticket hierarchy node type. Hierarchy rules: epic→story, story→substory|ticket, substory→ticket, ticket→subticket; only epic may be a root."
+    },
+    "NodeStatus": {
+      "type": "string",
+      "enum": ["open", "in_progress", "done", "blocked", "skipped"],
+      "description": "Ticket workflow status. Archived is an independent read-only dimension carried beside the status."
+    },
+    "Archived": {
+      "type": "boolean",
+      "description": "Read-only archival dimension: archived nodes are frozen and excluded from runs."
+    },
+    "Priority": {
+      "type": "integer",
+      "description": "Sort priority; lower numbers sort earlier. Default 0."
+    },
+    "CreateScope": {
+      "type": "string",
+      "enum": ["workspace", "global"],
+      "description": "Where a root epic is created: the workspace (.omt/) home or the global per-user home. Only meaningful when parentId is absent."
+    },
+    "RunStatus": {
+      "type": "string",
+      "enum": ["pending", "running", "paused", "completed", "completed_with_failures", "canceled", "interrupted"],
+      "description": "Lifecycle state of a run batch."
+    },
+    "RunItemState": {
+      "type": "string",
+      "enum": ["pending", "running", "done", "failed", "blocked", "skipped", "interrupted", "awaiting_confirmation"],
+      "description": "Lifecycle state of one run member item."
+    },
+    "RunReportOutcome": {
+      "type": "string",
+      "enum": ["done", "failed", "blocked", "skipped"],
+      "description": "Executor-reported outcome for one claimed run item."
+    },
+    "RunControlAction": {
+      "type": "string",
+      "enum": ["start", "pause", "resume", "cancel", "retry", "remove"],
+      "description": "Run lifecycle control. retry/remove additionally require nodeId to name the target member."
+    },
+    "ActionParity": {
+      "type": "string",
+      "enum": ["agent_available", "adapter_only", "human_administrative"],
+      "description": "Action-parity classification (R22): agent_available actions expose identical qualified context on every consumer including MCP; adapter_only actions exist for a specific adapter channel (e.g. DSH UI bags); human_administrative actions are maintenance/administration reserved for humans via CLI/desktop."
+    },
+    "ProblemCode": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z0-9_]+$",
+      "description": "Stable machine-readable error code (R5). Open vocabulary: new codes may be added as long as they match the pattern; clients must treat unknown codes as their nearest coarse ancestor. See problems.schema.json for the seeded registry."
+    },
+    "ProblemDetails": {
+      "type": "object",
+      "description": "Machine-readable structured details of a problem (R5). Free-form object; each registry entry documents its own shape.",
+      "additionalProperties": true
+    },
+    "Problem": {
+      "type": "object",
+      "description": "Structured problem carried in JSON-RPC error data (R5). message is diagnostic text only — assertions must key on code and details.",
+      "properties": {
+        "code": { "$ref": "#/$defs/ProblemCode" },
+        "details": { "$ref": "#/$defs/ProblemDetails" },
+        "message": { "type": "string", "description": "Human-readable diagnostic text. Not part of the contract surface." }
+      },
+      "required": ["code", "details"]
+    },
+    "NodeSummary": {
+      "type": "object",
+      "description": "Lightweight qualified view of a ticket node.",
+      "properties": {
+        "homeId": { "$ref": "#/$defs/HomeId" },
+        "nodeId": { "$ref": "#/$defs/NodeId" },
+        "type": { "$ref": "#/$defs/NodeType" },
+        "title": { "type": "string" },
+        "status": { "$ref": "#/$defs/NodeStatus" },
+        "archived": { "$ref": "#/$defs/Archived" },
+        "priority": { "$ref": "#/$defs/Priority" }
+      },
+      "required": ["homeId", "nodeId", "type", "title", "status", "archived", "priority"]
+    },
+    "NodeView": {
+      "type": "object",
+      "description": "Full qualified view of a ticket node as persisted.",
+      "properties": {
+        "homeId": { "$ref": "#/$defs/HomeId" },
+        "nodeId": { "$ref": "#/$defs/NodeId" },
+        "type": { "$ref": "#/$defs/NodeType" },
+        "title": { "type": "string" },
+        "status": { "$ref": "#/$defs/NodeStatus" },
+        "archived": { "$ref": "#/$defs/Archived" },
+        "priority": { "$ref": "#/$defs/Priority" },
+        "path": { "type": "string", "description": "Markdown file path relative to the home root." },
+        "revision": { "$ref": "#/$defs/Revision" },
+        "createdAt": { "$ref": "#/$defs/Iso8601Time" },
+        "updatedAt": { "$ref": "#/$defs/Iso8601Time" }
+      },
+      "required": ["homeId", "nodeId", "type", "title", "status", "archived", "priority", "path", "revision", "createdAt", "updatedAt"]
+    },
+    "TreeNode": {
+      "type": "object",
+      "description": "Recursive tree projection: a node summary plus its ordered subtree.",
+      "properties": {
+        "homeId": { "$ref": "#/$defs/HomeId" },
+        "nodeId": { "$ref": "#/$defs/NodeId" },
+        "type": { "$ref": "#/$defs/NodeType" },
+        "title": { "type": "string" },
+        "status": { "$ref": "#/$defs/NodeStatus" },
+        "archived": { "$ref": "#/$defs/Archived" },
+        "priority": { "$ref": "#/$defs/Priority" },
+        "children": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/TreeNode" }
+        }
+      },
+      "required": ["homeId", "nodeId", "type", "title", "status", "archived", "priority", "children"]
+    },
+    "Progress": {
+      "type": "object",
+      "description": "Member-state counts of a run. One key per RunItemState plus total.",
+      "properties": {
+        "total": { "type": "integer", "minimum": 0 },
+        "pending": { "type": "integer", "minimum": 0 },
+        "running": { "type": "integer", "minimum": 0 },
+        "done": { "type": "integer", "minimum": 0 },
+        "failed": { "type": "integer", "minimum": 0 },
+        "blocked": { "type": "integer", "minimum": 0 },
+        "skipped": { "type": "integer", "minimum": 0 },
+        "interrupted": { "type": "integer", "minimum": 0 },
+        "awaitingConfirmation": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["total", "pending", "running", "done", "failed", "blocked", "skipped", "interrupted", "awaitingConfirmation"]
+    },
+    "RunConfig": {
+      "type": "object",
+      "description": "Execution configuration of a run; omitted keys take documented defaults (stopOnFailure=false, autoContinue=true, autoVerify=false, concurrency=1).",
+      "properties": {
+        "stopOnFailure": { "type": "boolean" },
+        "autoContinue": { "type": "boolean" },
+        "autoVerify": { "type": "boolean" },
+        "concurrency": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "RunView": {
+      "type": "object",
+      "description": "Full qualified view of a run with derived progress.",
+      "properties": {
+        "homeId": { "$ref": "#/$defs/HomeId" },
+        "runId": { "$ref": "#/$defs/RunId" },
+        "title": { "type": "string" },
+        "status": { "$ref": "#/$defs/RunStatus" },
+        "config": { "$ref": "#/$defs/RunConfig" },
+        "progress": { "$ref": "#/$defs/Progress" },
+        "stalledCount": { "type": "integer", "minimum": 0, "description": "Pending items whose continuation-nudge budget is exhausted." },
+        "createdAt": { "$ref": "#/$defs/Iso8601Time" },
+        "finishedAt": { "$ref": "#/$defs/Iso8601Time" }
+      },
+      "required": ["homeId", "runId", "status", "config", "progress", "stalledCount", "createdAt"]
+    },
+    "RunItemView": {
+      "type": "object",
+      "description": "Qualified view of one run member item.",
+      "properties": {
+        "homeId": { "$ref": "#/$defs/HomeId" },
+        "runId": { "$ref": "#/$defs/RunId" },
+        "nodeId": { "$ref": "#/$defs/NodeId" },
+        "position": { "type": "integer", "minimum": 0 },
+        "state": { "$ref": "#/$defs/RunItemState" },
+        "attempts": { "type": "integer", "minimum": 0 },
+        "executorActor": { "type": "string", "description": "Actor namespace of the executor holding/last-holding this item." },
+        "lastError": { "type": "string" },
+        "stalled": { "type": "boolean", "description": "Derived: pending item whose continuation-nudge budget is exhausted." },
+        "startedAt": { "$ref": "#/$defs/Iso8601Time" },
+        "finishedAt": { "$ref": "#/$defs/Iso8601Time" },
+        "title": { "type": "string", "description": "Joined node title (present in detail views)." }
+      },
+      "required": ["homeId", "runId", "nodeId", "position", "state", "attempts"]
+    },
+    "RunLink": {
+      "type": "object",
+      "description": "A non-terminal run holding a given ticket, as embedded in NodeDetail.",
+      "properties": {
+        "homeId": { "$ref": "#/$defs/HomeId" },
+        "runId": { "$ref": "#/$defs/RunId" },
+        "title": { "type": "string" },
+        "status": { "$ref": "#/$defs/RunStatus" },
+        "itemState": { "$ref": "#/$defs/RunItemState" },
+        "progress": { "$ref": "#/$defs/Progress" }
+      },
+      "required": ["homeId", "runId", "status", "itemState", "progress"]
+    },
+    "LeaseGrant": {
+      "type": "object",
+      "description": "Fenced execution lease returned by a successful claim (R10). Reports must echo the token; expiry demotes the claim.",
+      "properties": {
+        "token": { "type": "string", "minLength": 16 },
+        "attempt": { "type": "integer", "minimum": 1 },
+        "principal": { "type": "string" },
+        "expiresAt": { "$ref": "#/$defs/Iso8601Time" }
+      },
+      "required": ["token", "attempt", "expiresAt"]
+    },
+    "ClaimContextEntry": {
+      "type": "object",
+      "description": "One read-only ancestor body included in claim context under the byte budget.",
+      "properties": {
+        "node": { "$ref": "#/$defs/NodeSummary" },
+        "body": { "type": "string" },
+        "truncated": { "type": "boolean" },
+        "originalBytes": { "type": "integer", "minimum": 0 },
+        "includedBytes": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["node", "body", "truncated", "originalBytes", "includedBytes"]
+    },
+    "ClaimContext": {
+      "type": "object",
+      "description": "Read-only execution context delivered with a claim: current item body plus budgeted ancestor background.",
+      "properties": {
+        "ancestorBudgetBytes": { "type": "integer", "minimum": 0 },
+        "ancestorUsedBytes": { "type": "integer", "minimum": 0 },
+        "truncated": { "type": "boolean" },
+        "ancestors": { "type": "array", "items": { "$ref": "#/$defs/ClaimContextEntry" } },
+        "readErrors": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "node": { "$ref": "#/$defs/NodeSummary" },
+              "error": { "type": "string" }
+            },
+            "required": ["node", "error"]
+          }
+        },
+        "current": {
+          "type": "object",
+          "properties": {
+            "node": { "$ref": "#/$defs/NodeSummary" },
+            "body": { "type": "string" }
+          },
+          "required": ["node", "body"]
+        }
+      },
+      "required": ["ancestorBudgetBytes", "ancestorUsedBytes", "truncated", "ancestors", "readErrors", "current"]
+    },
+    "HomeInfo": {
+      "type": "object",
+      "description": "One home exposed by the daemon during handshake.",
+      "properties": {
+        "homeId": { "$ref": "#/$defs/HomeId" },
+        "name": { "type": "string" },
+        "kind": { "type": "string", "enum": ["workspace", "global"] },
+        "path": { "type": "string", "description": "Absolute path of the home bundle (informational)." }
+      },
+      "required": ["homeId", "name", "kind"]
+    },
+    "ReindexResult": {
+      "type": "object",
+      "description": "Outcome of a full reindex from Markdown to SQLite.",
+      "properties": {
+        "nodes": { "type": "integer", "minimum": 0 },
+        "edges": { "type": "integer", "minimum": 0 },
+        "skipped": { "type": "integer", "minimum": 0, "description": "Entries skipped because they were illegal or unparseable." }
+      },
+      "required": ["nodes", "edges", "skipped"]
+    },
+    "SavedFilters": {
+      "type": "object",
+      "description": "Opaque UI filter bag persisted per principal. The daemon stores it without interpreting it; the schema only pins it to an object.",
+      "additionalProperties": true
+    }
+  }
+}

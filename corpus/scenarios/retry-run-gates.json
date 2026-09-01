@@ -1,0 +1,28 @@
+{
+  "meta": {
+    "name": "retry-run-gates",
+    "source": "tests/run-core.spec.ts#boundary semantics > retry rejects a completed run (+ canceled from cancel-freezes)",
+    "description": "completed accepts no row-level retry (full success has no reopen path); canceled likewise; completed_with_failures DOES reopen via retry."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "批量" },
+      { "type": "story", "title": "批次", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "任务1", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "createRun", "params": { "nodeIds": ["TICKET-0001"] } },
+    { "op": "startRun", "params": { "id": "RUN-0001" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "to": "running" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "to": "done" } },
+    { "op": "retryItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001" }, "label": "completedRetry" },
+    { "op": "createRun", "params": { "nodeIds": ["TICKET-0001"] } },
+    { "op": "cancelRun", "params": { "id": "RUN-0002" } },
+    { "op": "retryItem", "params": { "runId": "RUN-0002", "nodeId": "TICKET-0001" }, "label": "canceledRetry" }
+  ],
+  "invariants": [
+    { "expect": "matches", "op": "completedRetry", "path": "error", "value": { "code": "CONFLICT", "details": { "rule": "retry-run-gate", "runStatus": "completed" } } },
+    { "expect": "matches", "op": "canceledRetry", "path": "error", "value": { "code": "CONFLICT", "details": { "rule": "retry-run-gate", "runStatus": "canceled" } } }
+  ]
+}

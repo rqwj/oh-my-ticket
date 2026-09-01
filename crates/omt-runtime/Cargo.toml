@@ -1,0 +1,36 @@
+[package]
+name = "omt-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The runnable OMT runtime (plan U5): omt-daemon serving JSON-RPC 2.0 over UDS/named pipe with bootstrap election, peer-credential enrollment, per-home serialized mutation queues, and full command dispatch; plus the `omt` operator CLI."
+
+[lib]
+name = "omt_runtime"
+path = "src/lib.rs"
+
+[[bin]]
+name = "omt-daemon"
+path = "src/main.rs"
+
+[[bin]]
+name = "omt"
+path = "src/cli_main.rs"
+
+[dependencies]
+omt-client = { path = "../omt-client" }
+omt-contracts = { path = "../omt-contracts" }
+omt-domain = { path = "../omt-domain" }
+omt-storage = { path = "../omt-storage" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Peer credentials (SO_PEERCRED / LOCAL_PEERCRED) and SIGTERM/SIGINT handling
+# via sigwait cross-platform (unix half; windows transport is cfg-gated).
+libc = { workspace = true }
+getrandom = { workspace = true }
+# Direct SQL reads/writes on the home actor thread (run-plane transactions,
+# reindex's dedicated connection).
+rusqlite = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

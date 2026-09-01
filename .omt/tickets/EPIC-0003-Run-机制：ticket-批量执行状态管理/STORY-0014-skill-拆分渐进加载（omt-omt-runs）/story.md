@@ -27,5 +27,5 @@ run 机制使工具面从 6 个涨到 ~12 个，全部塞进单个 omt skill 会
 <!-- omt:children -->
 ## 子节点
 
-- [TICKET-0072 omt / omt-runs skill 拆分与内容编写](TICKET-0072-omt-omt-runs-skill-拆分与内容编写/ticket.md) — open
+- [TICKET-0072 omt / omt-runs skill 拆分与内容编写](TICKET-0072-omt-omt-runs-skill-拆分与内容编写/ticket.md) — done
 <!-- /omt:children -->

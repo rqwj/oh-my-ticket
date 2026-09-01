@@ -1,0 +1,40 @@
+{
+  "meta": {
+    "name": "retry-resets-and-clears-budget",
+    "source": "tests/run-core.spec.ts#boundary semantics > retry resets failed/interrupted/stalled items and clears the nudge budget",
+    "description": "retryItem: state → pending, attempts+1, last_error kept, executor/timestamps/nudge bookkeeping cleared (explicit nudge op replaces direct OmtStore writes). Stalled pending items retry too; done items refuse."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "批量" },
+      { "type": "story", "title": "批次", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "任务1", "parentId": "STORY-0001" },
+      { "type": "ticket", "title": "任务2", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "createRun", "params": { "nodeIds": ["TICKET-0001", "TICKET-0002"] } },
+    { "op": "startRun", "params": { "id": "RUN-0001" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "to": "running", "executorSessionId": "sess-1" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "to": "failed", "error": "编译失败" } },
+    { "op": "nudge", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "count": 3 } },
+    { "op": "retryItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001" }, "label": "retried" },
+    { "op": "retryItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0002" }, "label": "stalledRetried" },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "to": "running" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "to": "done" } },
+    { "op": "retryItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001" }, "label": "doneRetried" }
+  ],
+  "invariants": [
+    { "expect": "equals", "op": "retried", "path": "state", "value": "pending" },
+    { "expect": "equals", "op": "retried", "path": "attempts", "value": 1 },
+    { "expect": "equals", "op": "retried", "path": "last_error", "value": "编译失败" },
+    { "expect": "equals", "op": "retried", "path": "nudge_count", "value": 0 },
+    { "expect": "notDefined", "op": "retried", "path": "nudged_at" },
+    { "expect": "notDefined", "op": "retried", "path": "executor_session_id" },
+    { "expect": "notDefined", "op": "retried", "path": "started_at" },
+    { "expect": "notDefined", "op": "retried", "path": "finished_at" },
+    { "expect": "equals", "op": "stalledRetried", "path": "state", "value": "pending" },
+    { "expect": "equals", "op": "stalledRetried", "path": "attempts", "value": 1 },
+    { "expect": "matches", "op": "doneRetried", "path": "error", "value": { "code": "CONFLICT", "details": { "rule": "retry-state-gate", "itemState": "done" } } }
+  ]
+}

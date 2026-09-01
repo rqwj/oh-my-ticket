@@ -29,11 +29,11 @@ done 可靠性的核心机制。挂点选择原则：执行现场由近到远。
 <!-- omt:children -->
 ## 子节点
 
-- [TICKET-0062 idle hook：未收尾提醒与 run 续跑 nudge](TICKET-0062-idle-hook：未收尾提醒与-run-续跑-nudge/ticket.md) — in_progress
-- [TICKET-0063 disposed hook：subagent 终止父会话兜底](TICKET-0063-disposed-hook：subagent-终止父会话兜底/ticket.md) — open
-- [TICKET-0064 awaiting_confirmation 信任策略](TICKET-0064-awaiting_confirmation-信任策略/ticket.md) — open
-- [TICKET-0065 item 完成通知与 run 终态总结](TICKET-0065-item-完成通知与-run-终态总结/ticket.md) — open
-- [TICKET-0066 RunningInfo 执行者谱系扩展](TICKET-0066-RunningInfo-执行者谱系扩展/ticket.md) — open
+- [TICKET-0062 idle hook：未收尾提醒与 run 续跑 nudge](TICKET-0062-idle-hook：未收尾提醒与-run-续跑-nudge/ticket.md) — done
+- [TICKET-0063 disposed hook：subagent 终止父会话兜底](TICKET-0063-disposed-hook：subagent-终止父会话兜底/ticket.md) — done
+- [TICKET-0064 awaiting_confirmation 信任策略](TICKET-0064-awaiting_confirmation-信任策略/ticket.md) — done
+- [TICKET-0065 item 完成通知与 run 终态总结](TICKET-0065-item-完成通知与-run-终态总结/ticket.md) — done
+- [TICKET-0066 RunningInfo 执行者谱系扩展](TICKET-0066-RunningInfo-执行者谱系扩展/ticket.md) — done
 <!-- /omt:children -->
 
 

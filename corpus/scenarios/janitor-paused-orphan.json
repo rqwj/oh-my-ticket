@@ -1,0 +1,36 @@
+{
+  "meta": {
+    "name": "janitor-paused-orphan",
+    "source": "tests/run-core.spec.ts#startup janitor > paused runs stay paused; only their orphaned running items are demoted",
+    "description": "The sweep leaves a paused run paused (human-controlled) but still demotes its orphaned running item; resume then dispatches the pending item again."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "批量" },
+      { "type": "story", "title": "批次", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "任务1", "parentId": "STORY-0001" },
+      { "type": "ticket", "title": "任务2", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "createRun", "params": { "nodeIds": ["TICKET-0001", "TICKET-0002"] } },
+    { "op": "startRun", "params": { "id": "RUN-0001" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "to": "running", "executorSessionId": "sess-dead" } },
+    { "op": "pauseRun", "params": { "id": "RUN-0001" } },
+    { "op": "reopen" },
+    { "op": "getRun", "params": { "id": "RUN-0001" }, "label": "stillPaused" },
+    { "op": "getRunItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001" }, "label": "demoted" },
+    { "op": "getRunItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0002" }, "label": "pending" },
+    { "op": "resumeRun", "params": { "id": "RUN-0001" }, "label": "resumed" },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0002", "to": "running", "executorSessionId": "sess-2" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0002", "to": "done" } },
+    { "op": "getRun", "params": { "id": "RUN-0001" }, "label": "finished" }
+  ],
+  "invariants": [
+    { "expect": "equals", "op": "stillPaused", "path": "status", "value": "paused" },
+    { "expect": "equals", "op": "demoted", "path": "state", "value": "interrupted" },
+    { "expect": "equals", "op": "pending", "path": "state", "value": "pending" },
+    { "expect": "equals", "op": "resumed", "path": "status", "value": "running" },
+    { "expect": "equals", "op": "finished", "path": "status", "value": "completed_with_failures" }
+  ]
+}

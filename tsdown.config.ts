@@ -70,13 +70,11 @@ const CLIENT_EXTERNALS: readonly string[] = [
   'react-dom/client',
   '@deepseek-ai/cordis',
   '@deepseek-ai/dsh-client-ui-slots',
-  '@deepseek-ai/dsh-client-web-react',
   '@deepseek-ai/dsh-client-ui-primitives',
-  '@deepseek-ai/dsh-client-ui-attachment',
-  '@deepseek-ai/dsh-client-schema-form',
-  // Documented runtime exemption (snapshot-store engine): the lazy CJS table
-  // answers this require natively (runtime is an immediately-tier row).
-  '@deepseek-ai/dsh-client-runtime/client',
+  // Static platform-table row (packages/client/web/src/platform.ts
+  // PLATFORM_MODULES): the snapshot-store engine the lazy CJS table answers
+  // natively.
+  '@deepseek-ai/dsh-client-store',
 ]
 
 const NODE_ENV = process.env.NODE_ENV ?? 'production'

@@ -1,0 +1,44 @@
+{
+  "meta": {
+    "name": "replay-to-pending",
+    "source": "tests/run-core.spec.ts#boundary semantics > replay returns done/blocked/skipped items to pending, keeping position",
+    "description": "Replay clears execution bookkeeping but keeps position/attempt history; running/pending items have nothing to replay."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "批量" },
+      { "type": "story", "title": "批次", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "任务1", "parentId": "STORY-0001" },
+      { "type": "ticket", "title": "任务2", "parentId": "STORY-0001" },
+      { "type": "ticket", "title": "任务3", "parentId": "STORY-0001" },
+      { "type": "ticket", "title": "任务4", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "createRun", "params": { "nodeIds": ["TICKET-0001", "TICKET-0002", "TICKET-0003", "TICKET-0004"] } },
+    { "op": "startRun", "params": { "id": "RUN-0001" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "to": "running" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "to": "done" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0002", "to": "running" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0002", "to": "blocked" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0003", "to": "skipped" } },
+    { "op": "getRun", "params": { "id": "RUN-0001" }, "label": "midRun" },
+    { "op": "replayItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001" }, "label": "replayedDone" },
+    { "op": "replayItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0002" }, "label": "replayedBlocked" },
+    { "op": "replayItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0003" }, "label": "replayedSkipped" },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "to": "running" } },
+    { "op": "replayItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001" }, "label": "runningReplay" }
+  ],
+  "invariants": [
+    { "expect": "equals", "op": "midRun", "path": "status", "value": "running" },
+    { "expect": "equals", "op": "replayedDone", "path": "state", "value": "pending" },
+    { "expect": "equals", "op": "replayedDone", "path": "position", "value": 0 },
+    { "expect": "notDefined", "op": "replayedDone", "path": "executor_session_id" },
+    { "expect": "notDefined", "op": "replayedDone", "path": "finished_at" },
+    { "expect": "equals", "op": "replayedBlocked", "path": "state", "value": "pending" },
+    { "expect": "equals", "op": "replayedBlocked", "path": "position", "value": 1 },
+    { "expect": "equals", "op": "replayedSkipped", "path": "state", "value": "pending" },
+    { "expect": "equals", "op": "replayedSkipped", "path": "position", "value": 2 },
+    { "expect": "matches", "op": "runningReplay", "path": "error", "value": { "code": "CONFLICT", "details": { "rule": "replay-state-gate", "itemState": "running" } } }
+  ]
+}

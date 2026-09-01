@@ -1,0 +1,321 @@
+# Release pipeline (plan U11 / R19, KD1, KD5, R21): a pushed v* tag produces
+# the trusted facts on GitHub Releases AND the npm distribution surfaces —
+# macOS arm64 binaries as tar.gz + SHA256SUMS (job 1), the Tauri desktop
+# bundle .app/.dmg (job 2), npm platform packages filled from the same
+# release artifacts (job 3), and the oh-my-ticket DSH plugin package built
+# from a pinned deepseek-harness checkout, attached to the release and
+# published (job 4).
+#
+# Version lockstep (KTD1 unification): the tag, the Cargo workspace version
+# and every package.json / tauri.conf.json carry the SAME number — jobs 1
+# and 4 both verify it; `pnpm sync-version` is the single entry point that
+# keeps them aligned.
+#
+# Supply-chain hygiene (KTD8): third-party actions are referenced by tag for
+# bootstrap; policy is to pin every third-party action to an immutable commit
+# SHA before stable distribution use. No curl|bash steps anywhere; checksums
+# are always emitted by scripts/assemble-release-archive.sh; permissions are
+# least-privilege (contents:write only where assets are uploaded, tag push
+# only — no pull_request_target).
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  binary-assets:
+    name: binaries (aarch64-apple-darwin)
+    runs-on: macos-latest
+    permissions:
+      contents: write # attach assets to the GitHub Release
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify tag matches workspace version (KTD1)
+        run: |
+          version="$(bash scripts/assemble-release-archive.sh --print-version)"
+          if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match workspace version v${version} (root Cargo.toml [workspace.package])"
+            exit 1
+          fi
+          echo "tag ok: ${GITHUB_REF_NAME} == v${version}"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Build release binaries
+        run: cargo build --release --target aarch64-apple-darwin -p omt-runtime --bin omt-daemon --bin omt
+
+      - name: Assemble archive + SHA256SUMS (ad-hoc codesign inside)
+        run: bash scripts/assemble-release-archive.sh --target aarch64-apple-darwin --out-dir dist/release
+
+      - name: Smoke — extract archive and run ./omt --version
+        run: |
+          smoke="$(mktemp -d)"
+          tar -xzf dist/release/*.tar.gz -C "$smoke"
+          "$smoke"/*/omt --version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-binaries-${{ github.ref_name }}
+          path: |
+            dist/release/*.tar.gz
+            dist/release/SHA256SUMS
+          if-no-files-found: error
+
+      - name: Attach assets to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: |
+            dist/release/*.tar.gz
+            dist/release/SHA256SUMS
+          fail_on_unmatched_files: true
+
+  desktop-bundle:
+    name: desktop bundle (.app/.dmg)
+    runs-on: macos-latest
+    needs: binary-assets
+    # No-op until the Tauri scaffold (U8) creates apps/desktop.
+    if: hashFiles('apps/desktop/src-tauri/tauri.conf.json') != ''
+    permissions:
+      contents: write # tauri-action uploads bundles to the same Release
+    env:
+      # Signing/notarization is opt-in (KTD5): when these secrets are absent,
+      # tauri-bundler skips identity signing and notarization natively and
+      # ships an ad-hoc-signed bundle. Nothing here hard-fails on unset
+      # secrets — Gatekeeper caveats for unsigned downloads are documented in
+      # docs/runtime/distribution.md.
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Report signing mode
+        run: |
+          if [ -z "${APPLE_SIGNING_IDENTITY}" ]; then
+            echo "APPLE_SIGNING_IDENTITY unset → bundler signs ad-hoc / skips notarization"
+          else
+            echo "signing identity present → inside-out re-sign + notarization enabled"
+          fi
+
+      # KD5/R12: the desktop sidecar embeds exactly this Release's daemon
+      # build, staged under the externalBin target-triple name.
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-binaries-${{ github.ref_name }}
+          path: dist/release
+
+      - name: Stage daemon sidecar for tauri externalBin
+        run: |
+          stage="apps/desktop/src-tauri/binaries"
+          mkdir -p "$stage"
+          tmp="$(mktemp -d)"
+          tar -xzf dist/release/*.tar.gz -C "$tmp"
+          cp "$tmp"/*/omt-daemon "$stage/omt-daemon-aarch64-apple-darwin"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      - name: Build desktop bundle and attach to the same release
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: apps/desktop
+          args: --target aarch64-apple-darwin
+          tagName: ${{ github.ref_name }}
+          releaseName: ${{ github.ref_name }}
+          releaseDraft: false
+          prerelease: false
+
+  npm-platform-packages:
+    name: npm platform packages
+    runs-on: macos-latest
+    needs: binary-assets
+    # Active since U13 landed the platform-package templates under
+    # npm/platform-packages/ (R21: packages are a thin DSH fallback filled
+    # from Release artifacts).
+    if: hashFiles('npm/platform-packages/**') != ''
+    env:
+      # Same skip philosophy as code signing (KTD5): without the token the job
+      # still fills and pack-verifies every package, then skips publishing
+      # with an explicit notice — nothing hard-fails on the missing secret.
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # U13 ratification: no workspace install here — template filling,
+      # npm pack verification, and publishing are pure npm CLI work, and a
+      # frozen root install cannot resolve the @oh-my-ticket/* optional
+      # dependencies before THIS job publishes them for the first time
+      # (chicken-and-egg). setup-node still pins Node and wires the npm
+      # registry for NODE_AUTH_TOKEN below.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org/
+
+      # Same-source binaries as job1 (KD5): download its artifact, verify the
+      # checksums, then fill every package template with its triple's binaries.
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-binaries-${{ github.ref_name }}
+          path: dist/release
+
+      - name: Fill per-triple binaries into each platform package
+        run: |
+          set -euo pipefail
+          version="$(bash scripts/assemble-release-archive.sh --print-version)"
+          work="$(mktemp -d)"
+          mkdir "$work/extracted"
+          for tgz in dist/release/*.tar.gz; do tar -xzf "$tgz" -C "$work/extracted"; done
+          # Checksums gate everything downstream (KTD8).
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd dist/release && sha256sum -c SHA256SUMS)
+          else
+            (cd dist/release && shasum -a 256 -c SHA256SUMS)
+          fi
+          # macOS-only release matrix: fill ONLY darwin-arm64 (the sole
+          # archive binary-assets produces). Other templates stay templates
+          # until their triples join the matrix — shipping them unfilled
+          # would publish empty packages, so every loop below skips them.
+          FILLED=""
+          for pkg_dir in npm/platform-packages/*/; do
+            [ -d "$pkg_dir" ] || continue
+            name="$(basename "$pkg_dir")"
+            if [ "$name" != "darwin-arm64" ]; then
+              echo "::notice::skipping $name — no archive in this release matrix (macOS arm64 only)"
+              continue
+            fi
+            src="$work/extracted/omt-aarch64-apple-darwin-v${version}"
+            if [ ! -d "$src" ]; then
+              echo "::error::no release archive for aarch64-apple-darwin (package ${name}); the build matrix must cover every packaged triple"
+              exit 1
+            fi
+            mkdir -p "${pkg_dir}bin"
+            cp "$src/omt-daemon" "$src/omt" "${pkg_dir}bin/"
+            # Platform packages carry this tag's product version (R22 dual
+            # track: npm root package stays independent).
+            (cd "$pkg_dir" && npm version "$version" --allow-same-version --no-git-tag-version)
+            FILLED="${FILLED} ${name}"
+            echo "filled ${name} ← aarch64-apple-darwin"
+          done
+          echo "$FILLED" > .filled-packages
+
+      - name: Verify package contents (npm pack --dry-run)
+        run: |
+          for name in $(cat .filled-packages); do
+            (cd "npm/platform-packages/${name}" && npm pack --dry-run)
+          done
+
+      - name: Notice — publish skipped (NPM_TOKEN unset)
+        if: env.NPM_TOKEN == ''
+        run: echo "::notice::NPM_TOKEN is not configured — npm publish skipped cleanly; pack verification above still ran"
+
+      - name: Publish platform packages
+        if: env.NPM_TOKEN != ''
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for name in $(cat .filled-packages); do
+            (cd "npm/platform-packages/${name}" && npm publish --access public)
+          done
+
+  npm-dsh-plugin:
+    name: npm package (DSH plugin)
+    runs-on: macos-latest
+    needs: binary-assets # the Release exists by then — the tgz joins its assets
+    permissions:
+      contents: write # attach the packed tgz to the GitHub Release
+    env:
+      # Same skip philosophy as job 3 (KTD5): without the token the job still
+      # builds, packs and attaches — only publishing is skipped, with notice.
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Version lockstep gate (KTD1): tag == Cargo workspace == plugin package.
+      - name: Verify tag matches product version
+        run: |
+          version="$(bash scripts/assemble-release-archive.sh --print-version)"
+          pkg="$(node -p "require('./package.json').version")"
+          if [ "v${version}" != "${GITHUB_REF_NAME}" ] || [ "${pkg}" != "${version}" ]; then
+            echo "::error::version lockstep broken — tag ${GITHUB_REF_NAME}, workspace v${version}, plugin package ${pkg}; run pnpm sync-version and re-tag"
+            exit 1
+          fi
+          echo "tag ok: ${GITHUB_REF_NAME} == workspace v${version} == plugin ${pkg}"
+
+      # pnpm test auto-builds the debug daemon through the fixture (cargo),
+      # so the unit suite doubles as a compile gate on the release tag.
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org/
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      # Prebuild the debug daemon OUTSIDE the test hooks (see ci.yml node
+      # job): fixture-time cargo builds blow the 10 s hookTimeout on a
+      # fresh runner and starve sibling workers' event windows.
+      - name: Prebuild debug daemon
+        run: pnpm build:daemon
+
+      - name: Unit tests
+        run: pnpm test
+
+      - name: Build host + client bundles
+        run: pnpm build
+
+      - name: Pack and verify contents
+        run: |
+          npm pack
+          tgz="oh-my-ticket-$(node -p "require('./package.json').version").tgz"
+          test -f "$tgz"
+          for entry in package/lib/index.js package/lib/client.js package/cordis.patch.yml; do
+            tar -tzf "$tgz" "$entry" >/dev/null || { echo "::error::$entry missing from $tgz"; exit 1; }
+          done
+          echo "packed $tgz"
+
+      - name: Attach package to the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: oh-my-ticket-*.tgz
+          fail_on_unmatched_files: true
+
+      - name: Notice — publish skipped (NPM_TOKEN unset)
+        if: env.NPM_TOKEN == ''
+        run: echo "::notice::NPM_TOKEN is not configured — npm publish skipped cleanly; build, tests, pack and release attachment above still ran"
+
+      - name: Publish the DSH plugin package
+        if: env.NPM_TOKEN != ''
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish

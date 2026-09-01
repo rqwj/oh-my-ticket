@@ -174,6 +174,11 @@ export interface OmtRunItem {
   readonly nudge_count: number
   readonly started_at?: string
   readonly finished_at?: string
+  /**
+   * Joined node title — present only on daemon detail views (run/get,
+   * run/control, claim); list projections omit it.
+   */
+  readonly title?: string
 }
 
 export function isRunItemState(value: unknown): value is RunItemState {
@@ -198,11 +203,37 @@ export function isRunItemStalled(item: Pick<OmtRunItem, 'state' | 'nudge_count'>
   return item.state === 'pending' && item.nudge_count >= NUDGE_BUDGET
 }
 
-/** Error with a stable machine-readable code for tool/API surfaces. */
+/**
+ * Problem codes raised by the TypeScript core (U2 pre-freeze taxonomy). The
+ * first five are the coarse v1 codes; the indented ones are subdivisions
+ * introduced before the behavioral corpus freeze so assertions bind to
+ * codes/details instead of message regexes. The registry lives in
+ * schema/problems.schema.json; unknown subdivided codes fall back to their
+ * registered coarse ancestor.
+ */
+export type ProblemCode =
+  | 'CONFLICT'
+  | 'INVALID_HIERARCHY'
+  | 'INVALID_INPUT'
+  | 'NOT_FOUND'
+  | 'IO'
+  // Subdivisions (each falls back to a coarse code above):
+  | 'ARCHIVED_READONLY'   // → CONFLICT: the node is archived and read-only
+  | 'DUPLICATE_MEMBER'    // → INVALID_INPUT: a run member list repeats a node
+  | 'INVALID_CONCURRENCY' // → INVALID_INPUT: run concurrency is not a positive integer
+  | 'HOME_LOCKED'         // → CONFLICT: another live writer owns the home (owner lock, U2b/R2)
+  | 'DAEMON_OWNS_HOME'    // → CONFLICT: a daemon owner marker is present; TS writers always refuse
+  | 'FORBIDDEN'           // → CONFLICT-family refusal: forged sessionId / unauthorized actor (TICKET-0123)
+
+/** Structured, assertion-ready details carried alongside a problem code (R5). */
+export type ProblemDetails = Record<string, unknown>
+
+/** Error with a stable machine-readable code (+ optional structured details) for tool/API surfaces. */
 export class OmtError extends Error {
   constructor(
-    readonly code: 'NOT_FOUND' | 'INVALID_HIERARCHY' | 'INVALID_INPUT' | 'CONFLICT' | 'IO',
+    readonly code: ProblemCode,
     message: string,
+    readonly details?: ProblemDetails,
   ) {
     super(message)
     this.name = 'OmtError'
@@ -215,4 +246,60 @@ export function isNodeType(value: unknown): value is NodeType {
 
 export function isStatus(value: unknown): value is Status {
   return typeof value === 'string' && (STATUSES as readonly string[]).includes(value)
+}
+
+// ── shared operation results (formerly on core.ts; U7a moved here so the
+//    adapter surfaces can keep their shapes while data ops live behind the
+//    runtime service) ────────────────────────────────────────────────────
+
+/** Explicit report vocabulary (TICKET-0059): the only legal outcomes. */
+export const RUN_REPORT_OUTCOMES = ['done', 'failed', 'blocked', 'skipped'] as const
+export type RunReportOutcome = (typeof RUN_REPORT_OUTCOMES)[number]
+
+export interface ShowResult {
+  readonly node: OmtNode
+  readonly body: string
+  readonly parent?: OmtNode
+  readonly children: OmtNode[]
+}
+
+export type LineageContent =
+  | {
+      readonly node: OmtNode
+      /** User-owned Markdown only; the managed children block is excluded. */
+      readonly body: string
+      readonly error?: never
+    }
+  | {
+      readonly node: OmtNode
+      readonly body?: never
+      readonly error: string
+    }
+
+export interface ReindexResult {
+  readonly nodes: number
+  readonly edges: number
+  readonly skipped: number
+}
+
+/** Result of an explicit report: the transitioned item plus the node as-is. */
+export interface ReportResult {
+  readonly item: OmtRunItem
+  readonly node: OmtNode
+}
+
+/**
+ * Run/item transition broadcast (TICKET-0065 notification hooks), now
+ * synthesized by the runtime service from daemon event envelopes. The run
+ * snapshot is post-change; on item events the full membership rides along so
+ * notification lines can derive progress without a second roundtrip.
+ */
+export interface OmtRunEvent {
+  readonly kind: 'item' | 'run'
+  readonly run: OmtRun
+  readonly item?: OmtRunItem
+  /** Post-change membership (present when the synthesizing fetch succeeded). */
+  readonly items?: readonly OmtRunItem[]
+  readonly fromItemState?: RunItemState
+  readonly fromRunStatus?: RunStatus
 }

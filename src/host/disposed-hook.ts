@@ -7,22 +7,25 @@
  *     parentSession 可读）：名下仍有 running item → 向父会话 **followup**
  *     （唤醒 idle 驱动；inject 不唤醒 idle 会话）注入兜底通知，含未完成的
  *     run/item 清单与 subagent 最终报告摘要（best-effort：取会话事件流里
- *     最后一条 assistant 文本）。父会话也不在 → 走 janitor 降级：
- *     item → interrupted。
- *  2. executor 是主会话：名下有未完项的 running/paused run → janitor 降级
- *     （item → interrupted，无存活执行者的 running run → interrupted，等
- *     resume + 逐项 retry）。已交接给父会话的 subagent 项同理：父会话之
- *     后销毁时落入同一 sweep（存活谓词把死掉的 child 的 item 降级）。
+ *     最后一条 assistant 文本）。父会话也不在 → 走降级路径（见下）。
+ *  2. executor 是主会话：名下有未完项的 running/paused run → 同一降级路径。
  *
- * 降级复用 core.janitorSweep（以存活会话清单为谓词），与启动 janitor
- * （decision 12）语义一致；已终态的 run 不受影响。死会话的
- * RunningRegistry 标记总是清理（无论是否参与 run）。所有注入失败都被
- * 包容（warn），绝不抛出。
+ * U7a degradation note: the pre-daemon janitor sweep demoted dead sessions'
+ * running items to interrupted IN-PROCESS. This daemon build owns lease
+ * expiry (claims carry a bounded lease; the daemon's startup janitor demotes
+ * on open) and exposes no mid-flight demotion RPC, so the adapter's sweep is
+ * notify-only: outstanding items stay `running` until the daemon-side lease
+ * path or a human retry settles them. The liveness probe below still runs —
+ * it decides whether the parent handoff or the degraded warning fires.
+ *
+ * 死会话的 RunningRegistry 标记总是清理（无论是否参与 run）。所有注入失败都
+ * 被包容（warn），绝不抛出。finalReport 提取保持 DSH-side（cordis-only，
+ * 会话事件流不经 daemon）。
  */
 import type { Context } from '@deepseek-ai/cordis'
 import type { AgentsLike } from './agents-like.ts'
 import { safeFollowup, type FollowupTargetLike } from './messages.ts'
-import type { OmtCorePool } from './pool.ts'
+import type { OmtService } from './service.ts'
 import type { RunningRegistry } from './running.ts'
 import { RUN_ITEM_FINAL_STATES } from './types.ts'
 
@@ -68,7 +71,7 @@ function finalReportOf(agent: DisposedAgentLike): string | undefined {
 }
 
 /** Register the disposed hook. */
-export function registerOmtDisposedHook(ctx: Context, pool: OmtCorePool, running: RunningRegistry): void {
+export function registerOmtDisposedHook(ctx: Context, service: OmtService, running: RunningRegistry): void {
   const agents = (ctx as unknown as { agents?: AgentsLike<FollowupTarget> }).agents
 
   const warn = (message: string, error: unknown): void => {
@@ -79,24 +82,26 @@ export function registerOmtDisposedHook(ctx: Context, pool: OmtCorePool, running
     safeFollowup(agent, text, warn)
   }
 
+  /** One degraded-sweep warning per process (the condition is structural). */
+  let warnedSweepDegraded = false
+
   /**
    * Outstanding subagent→parent handoffs (TICKET-0063): parent session ids
    * that took over a disposed subagent's unfinished items. When such a
-   * parent later disposes, the early return must not fire — the janitor
-   * sweep's liveness predicate demotes the dead child's orphaned items.
+   * parent later disposes, the early return must not fire — the degraded
+   * sweep's liveness predicate covers the dead child's orphaned items.
    * In-memory only: after a process restart the set is empty, which is
-   * acceptable — the startup janitor (decision 12) covers that window.
+   * acceptable — the daemon-side lease/startup janitor covers that window.
    */
   const pendingHandoffs = new Set<string>()
 
   const onDisposed = async (agent: DisposedAgentLike): Promise<void> => {
     const header = agent.session.header
-    const core = await pool.coreFor(header.cwd)
     // The dead session's running marks are stale by definition — always
     // clean them, regardless of run involvement.
     for (const { id } of running.forSession(agent.id)) running.stop(id)
 
-    const owned = core.executorItems(agent.id)
+    const owned = await service.executorItems(agent.id, header.cwd)
     // A session with no run involvement and no outstanding handoff changes
     // nothing — and must not trigger a sweep over unrelated runs.
     const handedOff = pendingHandoffs.delete(agent.id)
@@ -117,26 +122,27 @@ export function registerOmtDisposedHook(ctx: Context, pool: OmtCorePool, running
             `subagent 最终报告摘要：${summary ?? '（不可得）'}`,
             '请核对结果：已完成用 omt_run_report 报告；未完成用 omt_run_control retry 重置后重新认领执行。',
           ].join('\n'))
-          // 交接登记：父会话之后销毁时落入 janitor sweep（存活谓词把死掉
+          // 交接登记：父会话之后销毁时落入降级 sweep（存活谓词把死掉
           // 的 child 的 item 降级），而不是因子会话已死、父会话名下无项
           // 而漏清。
           pendingHandoffs.add(header.parentSession)
         }
         return
       }
-      // 父会话也不在：落入下方的 janitor 降级。
+      // 父会话也不在：落入下方的降级处理。
     }
 
     // 主会话（或无父 subagent）：名下 running/paused run 有未完项（paused
-    // run 与 executorItems/janitorSweep 的候选口径一致），或有未了结的
-    // subagent 交接，才降级；已全终态的介入不触发 sweep。
+    // run 与 executorItems 的候选口径一致），或有未了结的 subagent 交接，才
+    // 进入降级处理；已全终态的介入不触发。
     const involved = handedOff || owned.some(({ run, item }) => (run.status === 'running' || run.status === 'paused') && !RUN_ITEM_FINAL_STATES.includes(item.state))
     if (!involved) return
-    const live = new Set((agents?.list() ?? []).map(candidate => candidate.id))
-    // Defensive: the disposed agent must read as dead even if the registry
-    // still carried it when the event fired.
-    live.delete(agent.id)
-    core.janitorSweep(sessionId => live.has(sessionId))
+    // Degraded sweep: this daemon build has no mid-flight demotion RPC —
+    // items stay running until the daemon-side lease path settles them.
+    if (!warnedSweepDegraded) {
+      warnedSweepDegraded = true
+      warn('janitor sweep unavailable over RPC; outstanding items await daemon lease expiry or manual retry', undefined)
+    }
   }
 
   const events = ctx as unknown as DisposedEvents

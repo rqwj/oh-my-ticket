@@ -1,0 +1,38 @@
+{
+  "meta": {
+    "name": "trust-gate-bypasses",
+    "source": "tests/run-core.spec.ts observeNodeStatus doc — autoVerify / other-session / agent-less bare dones land done",
+    "description": "The gate is narrow: autoVerify runs, other sessions, and agent-less updates complete items directly; repeated bare dones on an awaiting item never bypass it."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "批量" },
+      { "type": "story", "title": "批次", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "任务1", "parentId": "STORY-0001" },
+      { "type": "ticket", "title": "任务2", "parentId": "STORY-0001" },
+      { "type": "ticket", "title": "任务3", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "createRun", "params": { "config": { "autoVerify": true }, "nodeIds": ["TICKET-0001"] }, "label": "verifyRun" },
+    { "op": "startRun", "params": { "id": "RUN-0001" } },
+    { "op": "claimRunItem", "params": { "runId": "RUN-0001", "executorSessionId": "s1" } },
+    { "op": "update", "params": { "id": "TICKET-0001", "status": "done", "executorSessionId": "s1" } },
+    { "op": "getRunItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001" }, "label": "autoVerified" },
+    { "op": "createRun", "params": { "nodeIds": ["TICKET-0002"] }, "label": "plainRun" },
+    { "op": "startRun", "params": { "id": "RUN-0002" } },
+    { "op": "claimRunItem", "params": { "runId": "RUN-0002", "executorSessionId": "s1" } },
+    { "op": "update", "params": { "id": "TICKET-0002", "status": "done", "executorSessionId": "s-other" } },
+    { "op": "getRunItem", "params": { "runId": "RUN-0002", "nodeId": "TICKET-0002" }, "label": "otherSession" },
+    { "op": "createRun", "params": { "nodeIds": ["TICKET-0003"] }, "label": "thirdRun" },
+    { "op": "startRun", "params": { "id": "RUN-0003" } },
+    { "op": "claimRunItem", "params": { "runId": "RUN-0003", "executorSessionId": "s1" } },
+    { "op": "update", "params": { "id": "TICKET-0003", "status": "done" } },
+    { "op": "getRunItem", "params": { "runId": "RUN-0003", "nodeId": "TICKET-0003" }, "label": "agentless" }
+  ],
+  "invariants": [
+    { "expect": "equals", "op": "autoVerified", "path": "state", "value": "done" },
+    { "expect": "equals", "op": "otherSession", "path": "state", "value": "done" },
+    { "expect": "equals", "op": "agentless", "path": "state", "value": "done" }
+  ]
+}

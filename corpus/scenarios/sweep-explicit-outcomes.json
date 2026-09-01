@@ -1,0 +1,37 @@
+{
+  "meta": {
+    "name": "sweep-explicit-outcomes",
+    "source": "tests/run-core.spec.ts#addRunMembers interrupted case + disposed-hook core halves — explicit janitorSweep with injected liveness",
+    "description": "janitorSweep(isSessionActive) driven by injected operations: live executors keep their items; a dead session's item demotes while the run keeps running; the final sweep leaves pending work so the run falls to interrupted (resumable) rather than deriving."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "批量" },
+      { "type": "story", "title": "批次", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "任务1", "parentId": "STORY-0001" },
+      { "type": "ticket", "title": "任务2", "parentId": "STORY-0001" },
+      { "type": "ticket", "title": "任务3", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "createRun", "params": { "nodeIds": ["TICKET-0001", "TICKET-0002", "TICKET-0003"] } },
+    { "op": "startRun", "params": { "id": "RUN-0001" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "to": "running", "executorSessionId": "sess-alive" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0002", "to": "running", "executorSessionId": "sess-dead" } },
+    { "op": "sweep", "params": { "activeSessions": ["sess-alive"] }, "label": "keptSweep" },
+    { "op": "getRun", "params": { "id": "RUN-0001" }, "label": "stillRunning" },
+    { "op": "getRunItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0002" }, "label": "demotedOnly" },
+    { "op": "sweep", "label": "deadSweep" },
+    { "op": "getRun", "params": { "id": "RUN-0001" }, "label": "interruptedRun" },
+    { "op": "getRunItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001" }, "label": "bothDemoted" },
+    { "op": "getRunItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0003" }, "label": "pendingStays" }
+  ],
+  "invariants": [
+    { "expect": "equals", "op": "stillRunning", "path": "status", "value": "running" },
+    { "expect": "equals", "op": "demotedOnly", "path": "state", "value": "interrupted" },
+    { "expect": "contains", "op": "deadSweep", "path": "interruptedRuns", "value": "RUN-0001" },
+    { "expect": "equals", "op": "interruptedRun", "path": "status", "value": "interrupted" },
+    { "expect": "equals", "op": "bothDemoted", "path": "state", "value": "interrupted" },
+    { "expect": "equals", "op": "pendingStays", "path": "state", "value": "pending" }
+  ]
+}

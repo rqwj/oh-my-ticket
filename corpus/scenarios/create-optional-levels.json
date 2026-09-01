@@ -1,0 +1,20 @@
+{
+  "meta": {
+    "name": "create-optional-levels",
+    "source": "tests/core.spec.ts#create > supports the optional substory and subticket levels",
+    "description": "Substory under story and subticket under ticket are legal; a ticket under a substory nests in its directory."
+  },
+  "operations": [
+    { "op": "create", "params": { "type": "epic", "title": "用户体系" } },
+    { "op": "create", "params": { "type": "story", "title": "登录", "parentId": "EPIC-0001" } },
+    { "op": "create", "params": { "type": "ticket", "title": "登录接口", "parentId": "STORY-0001" }, "label": "ticket" },
+    { "op": "create", "params": { "type": "substory", "title": "第三方登录", "parentId": "STORY-0001" }, "label": "substory" },
+    { "op": "create", "params": { "type": "subticket", "title": "参数校验", "parentId": "TICKET-0001" }, "label": "subticket" },
+    { "op": "create", "params": { "type": "ticket", "title": "微信登录", "parentId": "SUBSTORY-0001" }, "label": "nestedTicket" }
+  ],
+  "invariants": [
+    { "expect": "equals", "op": "substory", "path": "id", "value": "SUBSTORY-0001" },
+    { "expect": "equals", "op": "subticket", "path": "id", "value": "SUBTICKET-0001" },
+    { "expect": "contains", "op": "nestedTicket", "path": "path", "value": "SUBSTORY-0001-第三方登录" }
+  ]
+}

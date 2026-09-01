@@ -1,0 +1,33 @@
+{
+  "meta": {
+    "name": "resume-after-stop-on-failure",
+    "source": "tests/run-core.spec.ts#boundary semantics > resume after stop-on-failure skips the failed item and continues dispatch",
+    "description": "Resume flips paused back to running without resetting the failed item; remaining pending work dispatches and the run derives completed_with_failures."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "批量" },
+      { "type": "story", "title": "批次", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "任务1", "parentId": "STORY-0001" },
+      { "type": "ticket", "title": "任务2", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "createRun", "params": { "config": { "stopOnFailure": true }, "nodeIds": ["TICKET-0001", "TICKET-0002"] } },
+    { "op": "startRun", "params": { "id": "RUN-0001" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "to": "running" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "to": "failed" } },
+    { "op": "getRun", "params": { "id": "RUN-0001" }, "label": "pausedRun" },
+    { "op": "resumeRun", "params": { "id": "RUN-0001" }, "label": "resumed" },
+    { "op": "getRunItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001" }, "label": "failedStays" },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0002", "to": "running" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0002", "to": "done" } },
+    { "op": "getRun", "params": { "id": "RUN-0001" }, "label": "finished" }
+  ],
+  "invariants": [
+    { "expect": "equals", "op": "pausedRun", "path": "status", "value": "paused" },
+    { "expect": "equals", "op": "resumed", "path": "status", "value": "running" },
+    { "expect": "equals", "op": "failedStays", "path": "state", "value": "failed" },
+    { "expect": "equals", "op": "finished", "path": "status", "value": "completed_with_failures" }
+  ]
+}

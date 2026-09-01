@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://omt.dev/schemas/v1/envelope.schema.json",
+  "title": "OMT protocol envelope (v1)",
+  "description": "JSON-RPC 2.0 wire envelope for the OMT protocol (KTD2). Single-object messages only (no batch); requests and notifications carry a dot-namespaced method such as \"node/create\"; every response to an unsupported protocol major carries problem code UNSUPPORTED_PROTOCOL in error.data.",
+  "$defs": {
+    "RequestId": {
+      "description": "Client-chosen correlation id: number or string (null-less).",
+      "oneOf": [
+        { "type": "integer" },
+        { "type": "string", "minLength": 1 }
+      ]
+    },
+    "MethodName": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*/[a-z][a-zA-Z0-9]*$",
+      "description": "Dot-free namespaced method name, e.g. node/create, run/claim, events/resume. The registry of methods and their parity lives in commands.schema.json and parity.schema.json."
+    },
+    "JsonRpcRequest": {
+      "type": "object",
+      "description": "A JSON-RPC 2.0 request expecting a response.",
+      "properties": {
+        "jsonrpc": { "type": "string", "enum": ["2.0"] },
+        "id": { "$ref": "#/$defs/RequestId" },
+        "method": { "$ref": "#/$defs/MethodName" },
+        "params": { "type": "object" }
+      },
+      "required": ["jsonrpc", "id", "method"]
+    },
+    "JsonRpcNotification": {
+      "type": "object",
+      "description": "A JSON-RPC 2.0 notification (no id, no reply expected). Used by the daemon for server-initiated event push.",
+      "properties": {
+        "jsonrpc": { "type": "string", "enum": ["2.0"] },
+        "method": { "$ref": "#/$defs/MethodName" },
+        "params": { "type": "object" }
+      },
+      "required": ["jsonrpc", "method"]
+    },
+    "JsonRpcError": {
+      "type": "object",
+      "description": "JSON-RPC 2.0 error object. code uses the JSON-RPC reserved ranges; the OMT-specific machine-readable problem lives in data as a Problem (R5): assert on data.code/data.details, never on message.",
+      "properties": {
+        "code": { "type": "integer" },
+        "message": { "type": "string" },
+        "data": { "$ref": "common.schema.json#/$defs/Problem" }
+      },
+      "required": ["code", "message"]
+    },
+    "JsonRpcResponse": {
+      "type": "object",
+      "description": "A JSON-RPC 2.0 response carrying exactly one of result or error.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "jsonrpc": { "type": "string", "enum": ["2.0"] },
+            "id": { "$ref": "#/$defs/RequestId" },
+            "result": true
+          },
+          "required": ["jsonrpc", "id", "result"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "jsonrpc": { "type": "string", "enum": ["2.0"] },
+            "id": { "$ref": "#/$defs/RequestId" },
+            "error": { "$ref": "#/$defs/JsonRpcError" }
+          },
+          "required": ["jsonrpc", "id", "error"],
+          "additionalProperties": false
+        }
+      ]
+    }
+  }
+}
