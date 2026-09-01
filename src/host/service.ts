@@ -635,6 +635,21 @@ export class OmtService {
     try {
       return await this.client.call<T>(method, params, hooks)
     } catch (error) {
+      // Post-restart convergence window: the daemon is up but this session's
+      // credential scope predates a re-opened home (details.requiresRehandshake).
+      // Generalize the declare flow's remedy (KTD3) THROUGH the shared heal:
+      // refreshAfterGenerationChange is cooldown-guarded and shares in-flight
+      // reconnects, so a burst of windowed failures triggers ONE re-handshake,
+      // never reconnection churn. The daemon rejects BEFORE executing
+      // anything, so the retry is effect-safe for reads and writes alike.
+      if (this.isRehandshakeProblem(error)) {
+        try {
+          await this.refreshAfterGenerationChange()
+        } catch {
+          throw error // heal failed (daemon still down): surface the original
+        }
+        return await this.client.call<T>(method, params, hooks)
+      }
       const staleId = this.staleHomeIdProblem(error)
       if (staleId === undefined || !this.knownHomeIds.has(staleId)) throw error
       try {
@@ -650,6 +665,14 @@ export class OmtService {
         throw retryError
       }
     }
+  }
+
+  /** NOT_FOUND problems the daemon marks as fixable by re-handshaking. */
+  private isRehandshakeProblem(error: unknown): boolean {
+    return (
+      error instanceof OmtProtocolError &&
+      (error.details as { requiresRehandshake?: boolean } | null)?.requiresRehandshake === true
+    )
   }
 
   /** Fetch post-change snapshots and fan out to hook listeners. */
