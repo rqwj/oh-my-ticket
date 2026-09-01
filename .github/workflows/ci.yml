@@ -34,6 +34,16 @@ jobs:
           components: rustfmt, clippy
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
+      # tauri-build validates the externalBin resource path at COMPILE time,
+      # but the sidecar is a build artifact that never enters the repo — a
+      # fresh clone has nothing at binaries/. Build the daemon and stage it
+      # under the target-triple name before clippy/test compile the desktop
+      # crate.
+      - name: Stage desktop sidecar for tauri-build
+        run: |
+          cargo build -p omt-runtime --bin omt-daemon
+          mkdir -p apps/desktop/src-tauri/binaries
+          cp target/debug/omt-daemon apps/desktop/src-tauri/binaries/omt-daemon-aarch64-apple-darwin
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo test
