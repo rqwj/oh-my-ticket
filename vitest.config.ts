@@ -2,6 +2,10 @@ import { defineConfig } from 'vitest/config'
 
 export default defineConfig({
   test: {
+    // Daemon fixtures spawn + handshake in hooks; shared CI runners can be
+    // slow enough that the 10 s default is tight even with the daemon
+    // prebuilt (workflows prebuild it before `pnpm test`).
+    hookTimeout: 30_000,
     // .dsh-checkout is a local symlink to the deepseek-harness checkout
     // (created by `pnpm run setup`); never collect its test suites.
     // corpus/** is the U4b scenario corpus: its runner imports the retired

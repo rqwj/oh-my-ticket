@@ -281,7 +281,13 @@ jobs:
       - name: Typecheck
         run: pnpm typecheck
 
-      - name: Unit tests (fixture auto-builds the debug daemon via cargo)
+      # Prebuild the debug daemon OUTSIDE the test hooks (see ci.yml node
+      # job): fixture-time cargo builds blow the 10 s hookTimeout on a
+      # fresh runner and starve sibling workers' event windows.
+      - name: Prebuild debug daemon
+        run: pnpm build:daemon
+
+      - name: Unit tests
         run: pnpm test
 
       - name: Build host + client bundles

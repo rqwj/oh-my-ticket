@@ -77,4 +77,9 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
+      # Prebuild the debug daemon OUTSIDE the test hooks: on a fresh runner
+      # the runtime fixture would otherwise run this minute-scale cargo
+      # build inside a 10 s hookTimeout, and the concurrent build starves
+      # sibling workers' daemon-event windows.
+      - run: pnpm build:daemon
       - run: pnpm test
