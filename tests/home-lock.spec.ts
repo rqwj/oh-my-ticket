@@ -281,7 +281,12 @@ describe('integration: home ownership through the daemon surface', () => {
 
   /** Connect a service whose runtime dir spawns a fresh daemon over `home`. */
   function connectService(): OmtService {
-    return new OmtService({ runtimeDir: join(root, 'runtime'), name: 'oh-my-ticket-home-lock-test' })
+    // daemonArgs pins the spawned daemon to the TEST home: without it the
+    // daemon boots the default global home (~/.omt) and the assertion only
+    // passes on machines where a real daemon already holds that lock
+    // (CI runners have an empty ~/.omt → the daemon boots fine → ready()
+    // resolves and the test fails).
+    return new OmtService({ runtimeDir: join(root, 'runtime'), name: 'oh-my-ticket-home-lock-test', daemonArgs: ['--home', home] })
   }
 
   it('a live ts-bridge marker refuses the daemon at boot with HOME_LOCKED', async () => {
