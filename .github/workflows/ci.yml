@@ -45,7 +45,7 @@ jobs:
       # @deepseek-ai/* devDependencies link into .dsh-checkout/, which must
       # exist BEFORE pnpm install or the links materialize dangling and
       # tsc fails with TS2307 on every plugin import.
-      DSH_CHECKOUT_REF: ${{ vars.DSH_CHECKOUT_REF || 'v0.1.2-alpha.3' }}
+      DSH_CHECKOUT_REF: ${{ vars.DSH_CHECKOUT_REF || 'dsh-v0.1.2-alpha.3' }}
     steps:
       - uses: actions/checkout@v4
       - name: Check out pinned deepseek-harness (build-time source dependency)
