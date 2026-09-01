@@ -239,8 +239,17 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
+          version="$(bash scripts/assemble-release-archive.sh --print-version)"
           for name in $(cat .filled-packages); do
-            (cd "npm/platform-packages/${name}" && npm publish --access public)
+            pkg="$(node -p "require('./npm/platform-packages/${name}/package.json').name")"
+            # Idempotent re-runs: an earlier partial run may have already
+            # published this exact version — npm versions are immutable, so
+            # publishing twice errors and blocks the needs chain downstream.
+            if npm view "${pkg}@${version}" version --silent >/dev/null 2>&1; then
+              echo "::notice::${pkg}@${version} already published — skipping (idempotent re-run)"
+            else
+              (cd "npm/platform-packages/${name}" && npm publish --access public)
+            fi
           done
 
   npm-dsh-plugin:
@@ -326,4 +335,11 @@ jobs:
         if: env.NPM_TOKEN != ''
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish
+        run: |
+          spec="$(node -p "require('./package.json').name + '@' + require('./package.json').version")"
+          # Idempotent re-runs (same rationale as the platform packages job).
+          if npm view "$spec" version --silent >/dev/null 2>&1; then
+            echo "::notice::$spec already published — skipping (idempotent re-run)"
+          else
+            npm publish
+          fi
