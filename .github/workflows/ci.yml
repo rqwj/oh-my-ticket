@@ -32,6 +32,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      # The yaml_differential suite shells out to scripts/gen-yaml-goldens.mjs
+      # (Rust vs TypeScript serialization parity) — it needs the repo's npm
+      # dependencies installed, which the node job's runner never shares.
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
       # tauri-build validates the externalBin resource path at COMPILE time,
