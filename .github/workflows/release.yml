@@ -250,11 +250,6 @@ jobs:
       # Same skip philosophy as job 3 (KTD5): without the token the job still
       # builds, packs and attaches — only publishing is skipped, with notice.
       NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-      # The plugin build inlines @deepseek-ai/* SOURCES from a deepseek-harness
-      # checkout (devDependencies link into .dsh-checkout/). CI pins that
-      # build dependency by tag; override via the DSH_CHECKOUT_REF repository
-      # variable when the plugin must track a newer harness.
-      DSH_CHECKOUT_REF: ${{ vars.DSH_CHECKOUT_REF || 'dsh-v0.1.2-alpha.3' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -268,20 +263,6 @@ jobs:
             exit 1
           fi
           echo "tag ok: ${GITHUB_REF_NAME} == workspace v${version} == plugin ${pkg}"
-
-      # Cloned directly INTO .dsh-checkout so the link: devDependencies resolve
-      # without the setup symlink. The checkout is a bare clone (no install) —
-      # safe because the build's runtime import closure (dsh-tools →
-      # schemastery → cosmokit, @omt/client-ts → node builtins) resolves
-      # entirely from THIS repo's node_modules; the cosmokit link above is
-      # what keeps that true.
-      - name: Check out pinned deepseek-harness (build-time source dependency)
-        uses: actions/checkout@v4
-        with:
-          repository: deepseek-ai/deepseek-harness
-          ref: ${{ env.DSH_CHECKOUT_REF }}
-          path: .dsh-checkout
-          persist-credentials: false
 
       # pnpm test auto-builds the debug daemon through the fixture (cargo),
       # so the unit suite doubles as a compile gate on the release tag.

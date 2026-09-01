@@ -42,21 +42,8 @@ jobs:
   node:
     name: node (typecheck · test)
     runs-on: macos-latest
-    env:
-      # Same pinned harness as release.yml's npm-dsh-plugin job — the
-      # @deepseek-ai/* devDependencies link into .dsh-checkout/, which must
-      # exist BEFORE pnpm install or the links materialize dangling and
-      # tsc fails with TS2307 on every plugin import.
-      DSH_CHECKOUT_REF: ${{ vars.DSH_CHECKOUT_REF || 'dsh-v0.1.2-alpha.3' }}
     steps:
       - uses: actions/checkout@v4
-      - name: Check out pinned deepseek-harness (build-time source dependency)
-        uses: actions/checkout@v4
-        with:
-          repository: deepseek-ai/deepseek-harness
-          ref: ${{ env.DSH_CHECKOUT_REF }}
-          path: .dsh-checkout
-          persist-credentials: false
       # Toolchain for the runtime-fixture daemon build path
       # (scripts/build-daemon.mjs → cargo build -p omt-runtime).
       - uses: dtolnay/rust-toolchain@stable
