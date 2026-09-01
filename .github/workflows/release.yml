@@ -259,7 +259,7 @@ jobs:
       # checkout (devDependencies link into .dsh-checkout/). CI pins that
       # build dependency by tag; override via the DSH_CHECKOUT_REF repository
       # variable when the plugin must track a newer harness.
-      DSH_CHECKOUT_REF: ${{ vars.DSH_CHECKOUT_REF || 'v0.1.2-alpha.1' }}
+      DSH_CHECKOUT_REF: ${{ vars.DSH_CHECKOUT_REF || 'v0.1.2-alpha.3' }}
     steps:
       - uses: actions/checkout@v4
 

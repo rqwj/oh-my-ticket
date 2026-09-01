@@ -599,7 +599,7 @@ fn handshake_round_trip_negotiates_shared_version() {
             "maxEventBatch": 500,
             "runConcurrency": 1
         },
-        "features": { "actionParityMatrix": true, "eventResume": true, "idempotencyKeys": false },
+        "features": { "actionParityMatrix": true, "eventResume": true, "idempotencyKeys": false, "homeDeclare": true },
         "credential": {
             "token": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "principalId": "cli:4242",
@@ -666,6 +666,7 @@ fn parity_matrix_seed_covers_whole_vocabulary() {
         "run/nudge-record",
         "run/interrupt",
         "events/resume",
+        "home/declare",
     ];
     let expected_adapter: &[&str] = &[
         "node/execute",
@@ -673,6 +674,7 @@ fn parity_matrix_seed_covers_whole_vocabulary() {
         "ui/filters-set",
         "ui/recent-get",
         "ui/recent-set",
+        "home/list-known",
     ];
     let expected_human: &[&str] = &["home/reindex"];
 
@@ -690,7 +692,7 @@ fn parity_matrix_seed_covers_whole_vocabulary() {
         assert_eq!(entry["since"], "v1", "seed entries all land in v1");
         seen.insert(action.to_string(), class.to_string());
     }
-    assert_eq!(entries.len(), 24, "seed matrix covers all v1 methods");
+    assert_eq!(entries.len(), 26, "seed matrix covers all v1 methods");
 
     for action in expected_agent {
         assert_eq!(seen[*action], "agent_available", "{action}");
@@ -701,7 +703,7 @@ fn parity_matrix_seed_covers_whole_vocabulary() {
     for action in expected_human {
         assert_eq!(seen[*action], "human_administrative", "{action}");
     }
-    assert_eq!(seen.len(), 24, "no duplicate actions in the matrix");
+    assert_eq!(seen.len(), 26, "no duplicate actions in the matrix");
 
     // The classification enum itself is the R22 three-way split.
     let reg = registry();
@@ -725,6 +727,12 @@ fn every_documented_method_has_params_and_result_defs() {
         ("node/archive", "ArchiveNodeParams", "ArchiveNodeResult"),
         ("node/execute", "ExecuteNodeParams", "ExecuteNodeResult"),
         ("home/reindex", "ReindexHomeParams", "ReindexHomeResult"),
+        ("home/declare", "DeclareHomeParams", "DeclareHomeResult"),
+        (
+            "home/list-known",
+            "ListKnownHomesParams",
+            "ListKnownHomesResult",
+        ),
         ("run/create", "RunCreateParams", "RunCreateResult"),
         ("run/get", "RunGetParams", "RunGetResult"),
         ("run/list", "RunListParams", "RunListResult"),

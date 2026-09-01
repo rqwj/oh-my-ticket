@@ -138,7 +138,9 @@ fn run_with_timeout(
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
-    let mut child = cmd.spawn().map_err(|e| format!("无法启动 {}: {e}", program.display()))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("无法启动 {}: {e}", program.display()))?;
     let mut readers = Vec::new();
     // stdout/stderr 类型不同，统一擦除成 Read trait object 再分发线程。
     let mut pipes: Vec<Box<dyn std::io::Read + Send>> = Vec::new();
@@ -212,9 +214,14 @@ pub fn dsh_plugin_install(
             )
         }
         "dev" => {
-            let dir = checkout_dir.as_deref().ok_or("dev 模式需要 checkout 目录")?;
+            let dir = checkout_dir
+                .as_deref()
+                .ok_or("dev 模式需要 checkout 目录")?;
             if !checkout_dir_valid(dir) {
-                return Err("所选目录不是 dsh 开发环境（缺 pnpm-workspace.yaml / apps / packages）".to_string());
+                return Err(
+                    "所选目录不是 dsh 开发环境（缺 pnpm-workspace.yaml / apps / packages）"
+                        .to_string(),
+                );
             }
             (
                 std::path::PathBuf::from("pnpm"),
