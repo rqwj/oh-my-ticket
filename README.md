@@ -1,6 +1,6 @@
 # Oh-My-Ticket (OMT)
 
-![version](https://img.shields.io/badge/version-0.6.0-blue)
+![version](https://img.shields.io/badge/version-0.6.2-blue)
 ![tests](https://img.shields.io/badge/tests-314%20passing-brightgreen)
 ![platform](https://img.shields.io/badge/platform-DeepSeek%20Harness-purple)
 ![dsh](https://img.shields.io/badge/DeepSeek%20Harness%20tested-0.1.2--alpha.3-blue)
