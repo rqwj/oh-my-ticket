@@ -37,7 +37,7 @@
     "sync-version": "node scripts/sync-version.mjs"
   },
   "optionalDependencies": {
-    "@oh-my-ticket/darwin-arm64": "0.6.1"
+    "@oh-my-ticket/darwin-arm64": "^0.6.0"
   },
   "devDependencies": {
     "@omt/client-ts": "link:./packages/client-ts",

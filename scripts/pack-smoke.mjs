@@ -199,16 +199,18 @@ async function pathB() {
 function rootInvariants() {
   console.log('\n[C] root package integrity')
   const pkg = JSON.parse(execFileSync('cat', [join(REPO, 'package.json')], { encoding: 'utf8' }))
-  // optionalDependencies pin the platform package to the CANONICAL product
-  // version (lockstep; sync-version.mjs owns the value). pnpm/npm tolerate a
-  // not-yet-published optional pin in every install mode, so installs stay
-  // hermetic while consumers auto-pull the daemon once it exists on npm.
+  // optionalDependencies reference the platform package with a caret floor
+  // at the canonical MAJOR.MINOR.0 (^0.6.0): the specifier stays stable
+  // across patch releases so pnpm's frozen-lockfile check never goes stale,
+  // while consumers resolve the newest daemon in the line (protocol
+  // compatibility is handshake-negotiated). sync-version.mjs owns the value.
   const cargo = execFileSync('grep', ['-m1', '^version = ', join(REPO, 'Cargo.toml')], { encoding: 'utf8' })
   const canonical = cargo.match(/version = "([^"]+)"/)?.[1]
+  const floor = `^${canonical.split('.').slice(0, 2).join('.')}.0`
   check(
-    'optionalDependencies pins @oh-my-ticket/darwin-arm64 to the canonical version',
-    pkg.optionalDependencies?.['@oh-my-ticket/darwin-arm64'] === canonical,
-    `${pkg.optionalDependencies?.['@oh-my-ticket/darwin-arm64']} !== ${canonical}`,
+    'optionalDependencies pins @oh-my-ticket/darwin-arm64 to the canonical caret floor',
+    pkg.optionalDependencies?.['@oh-my-ticket/darwin-arm64'] === floor,
+    `${pkg.optionalDependencies?.['@oh-my-ticket/darwin-arm64']} !== ${floor}`,
   )
   const packEnv = { ...process.env, npm_config_cache: mkdtempSync(join(tmpdir(), 'omt-npm-cache-')) }
   const packList = execFileSync('npm', ['pack', '--dry-run', '--json'], {

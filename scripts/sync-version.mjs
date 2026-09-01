@@ -57,25 +57,28 @@ function syncJson(path) {
 }
 
 /**
- * The root package pins its platform-package optionalDependencies to the
- * SAME canonical version (lockstep: the daemon users pull alongside the
- * plugin must match the plugin's release). Rewrite every @oh-my-ticket/*
- * entry in place; no-op when the field is absent.
+ * The root package references its platform-package optionalDependencies with
+ * a caret floor at the canonical MAJOR.MINOR.0 (^0.6.0): the specifier stays
+ * STABLE across patch releases so pnpm's frozen-lockfile check never sees a
+ * stale entry, while consumers still resolve the newest daemon in the line
+ * (protocol compatibility is negotiated at handshake). Rewrite every
+ * @oh-my-ticket/* entry in place; no-op when the field is absent.
  */
 function syncOptionalDeps() {
   const full = join(root, 'package.json')
   const pkg = JSON.parse(readFileSync(full, 'utf8'))
   const optional = pkg.optionalDependencies ?? {}
+  const floor = `^${canonical.split('.').slice(0, 2).join('.')}.0`
   let touched = false
   for (const name of Object.keys(optional)) {
-    if (name.startsWith('@oh-my-ticket/')) {
-      optional[name] = canonical
+    if (name.startsWith('@oh-my-ticket/') && optional[name] !== floor) {
+      optional[name] = floor
       touched = true
     }
   }
   if (touched) {
     writeFileSync(full, JSON.stringify(pkg, null, 2) + '\n')
-    console.log(`  package.json optionalDependencies → ${canonical}`)
+    console.log(`  package.json optionalDependencies → ${floor}`)
   }
 }
 
