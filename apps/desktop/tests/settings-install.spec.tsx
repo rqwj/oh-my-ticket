@@ -51,7 +51,7 @@ beforeEach(() => {
 })
 
 describe('SettingsPanel 安装 DSH 插件', () => {
-  it('检测到全局 dsh → 直接以 global 模式安装 oh-my-ticket@<app 版本>', async () => {
+  it('检测到全局 dsh → 直接以 global 模式安装 dsh-oh-my-ticket@<app 版本>', async () => {
     baseInvokeEnvironment()
     invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
       if (cmd === 'daemon_status') return { running: true, pid: 1, generation: 1, endpoint: 'x', spawned_by_us: false }
@@ -61,7 +61,7 @@ describe('SettingsPanel 安装 DSH 插件', () => {
         expect(args).toMatchObject({
           mode: 'global',
           profile: 'web',
-          packageName: 'oh-my-ticket',
+          packageName: 'dsh-oh-my-ticket',
           version: '0.5.2',
         })
         return { ok: true, output: 'Done' }
@@ -71,7 +71,7 @@ describe('SettingsPanel 安装 DSH 插件', () => {
     render(<SettingsPanel {...baseProps} />)
     await waitFor(() => screen.getByText('安装 DSH 插件…'))
     screen.getByText('安装 DSH 插件…').click()
-    await waitFor(() => expect(screen.getByText(/已安装 oh-my-ticket@0\.5\.2/)).toBeTruthy())
+    await waitFor(() => expect(screen.getByText(/已安装 dsh-oh-my-ticket@0\.5\.2/)).toBeTruthy())
     expect(askMock).not.toHaveBeenCalled()
   })
 
@@ -107,7 +107,7 @@ describe('SettingsPanel 安装 DSH 插件', () => {
           mode: 'dev',
           checkoutDir: '/Users/me/tools/deepseek-harness',
           profile: 'web',
-          packageName: 'oh-my-ticket',
+          packageName: 'dsh-oh-my-ticket',
           version: '0.5.2',
         })
         return { ok: true, output: 'Done' }
@@ -119,7 +119,7 @@ describe('SettingsPanel 安装 DSH 插件', () => {
     render(<SettingsPanel {...baseProps} />)
     await waitFor(() => screen.getByText('安装 DSH 插件…'))
     screen.getByText('安装 DSH 插件…').click()
-    await waitFor(() => expect(screen.getByText(/已安装 oh-my-ticket@0\.5\.2/)).toBeTruthy())
+    await waitFor(() => expect(screen.getByText(/已安装 dsh-oh-my-ticket@0\.5\.2/)).toBeTruthy())
     expect(invokeMock.mock.calls.some(c => c[0] === 'harness_validate_checkout')).toBe(true)
   })
 

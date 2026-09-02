@@ -46,9 +46,14 @@ describe('daemon generation changes (TICKET-0131/0132)', () => {
       await fx.restart()
 
       // Reconnect completes asynchronously; poll until data ops answer again.
+      // The readiness probe must check for the NODE ITSELF: right after a
+      // restart the home answers listNodes while its node index is still
+      // rebuilding (empty list does NOT throw), and a subsequent
+      // updateNode-by-id would probe a not-yet-visible EPIC and fail
+      // NOT_FOUND — slow CI runners open that window wide.
       await waitFor(() => {
         return fx.service.listNodes(fx.globalHome).then(
-          () => true,
+          nodes => (nodes.some(node => node.id === epic.id) ? true : undefined),
           () => undefined,
         )
       })

@@ -6,6 +6,10 @@ export default defineConfig({
     // slow enough that the 10 s default is tight even with the daemon
     // prebuilt (workflows prebuild it before `pnpm test`).
     hookTimeout: 30_000,
+    // Same reasoning for test bodies: daemon-restart scenarios (fixture
+    // spawn → op → kill → respawn → convergence poll) outlast the 5 s
+    // default on loaded shared runners. 20 s still catches real hangs.
+    testTimeout: 20_000,
     // .dsh-checkout is a local symlink to the deepseek-harness checkout
     // (created by `pnpm run setup`); never collect its test suites.
     // corpus/** is the U4b scenario corpus: its runner imports the retired

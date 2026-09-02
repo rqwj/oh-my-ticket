@@ -57,6 +57,23 @@ async function waitForTexts(get: () => string[], min: number): Promise<string[]>
   }
 }
 
+/**
+ * Poll until the UNION of delivered texts covers every marker. The notifier
+ * coalesces per session per flush window BY DESIGN, so rapid successive
+ * outcomes can land in one message — per-index assertions race the flush
+ * timer (CI timing differs from dev machines and flakes).
+ */
+async function waitForMarkers(get: () => string[], markers: string[]): Promise<string[]> {
+  const deadline = Date.now() + 4000
+  for (;;) {
+    const current = get()
+    const all = current.join('\n')
+    if (markers.every(marker => all.includes(marker))) return current
+    if (Date.now() > deadline) return current
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+}
+
 async function runFixture(count: number, config?: Partial<RunConfig>): Promise<{ run: OmtRun; ticketIds: string[] }> {
   const tickets = await ticketFixture(service, globalHome, count)
   const created = await service.createRun(globalHome, {
@@ -121,10 +138,17 @@ describe('item 完成进度', () => {
     await service.claimItem(globalHome, run.id, 's1')
     await service.reportItem(globalHome, run.id, ticketIds[2]!, 'skipped', '不需要')
 
-    const texts = await waitForTexts(() => textsOf(agent.injects), 3)
-    expect(texts[0]).toContain(`${ticketIds[0]} failed`)
-    expect(texts[1]).toContain(`${ticketIds[1]} blocked`)
-    expect(texts[2]).toContain(`${ticketIds[2]} skipped`)
+    const texts = await waitForMarkers(() => textsOf(agent.injects), [
+      `${ticketIds[0]} failed`,
+      `${ticketIds[1]} blocked`,
+      `${ticketIds[2]} skipped`,
+    ])
+    // Coalescing is by design: outcomes may share one message, so assert on
+    // the union rather than one text per outcome.
+    const all = texts.join('\n')
+    expect(all).toContain(`${ticketIds[0]} failed`)
+    expect(all).toContain(`${ticketIds[1]} blocked`)
+    expect(all).toContain(`${ticketIds[2]} skipped`)
     expect(agent.followups).toHaveLength(0)
   })
 

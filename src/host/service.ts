@@ -130,6 +130,16 @@ export interface OmtServiceOptions {
   readonly daemonPath?: string
   /** Extra spawn args (e.g. ['--home', path]). */
   readonly daemonArgs?: readonly string[]
+  /**
+   * Connect-only mode (client noSpawn): never spawn a daemon — poll the
+   * descriptor until one appears. REQUIRED in test fixtures that own the
+   * daemon lifecycle: on a restart the service's discover-or-spawn would
+   * otherwise race the fixture's respawn, and the service's spawn carries
+   * NO --home (it only knows the runtime dir) — if it wins the bootstrap
+   * election, the fixture's daemon exits DAEMON_PRESENT and the surviving
+   * daemon serves an EMPTY registry ("home not opened" forever).
+   */
+  readonly noSpawn?: boolean
   /** Handshake client name. */
   readonly name?: string
   /** Per-request timeout ms forwarded to the transport. */
@@ -381,6 +391,7 @@ export class OmtService {
       daemonPath: options.daemonPath,
       daemonArgs: options.daemonArgs !== undefined ? [...options.daemonArgs] : undefined,
       requestTimeoutMs: options.requestTimeoutMs,
+      noSpawn: options.noSpawn,
       reconnect: { initialDelayMs: 100, maxDelayMs: 5_000 },
       // TICKET-0131: a daemon generation change mints new home ids; rebuild
       // registry + subscriptions from the fresh handshake automatically.
@@ -635,6 +646,34 @@ export class OmtService {
     try {
       return await this.client.call<T>(method, params, hooks)
     } catch (error) {
+      // Post-restart convergence window: the daemon is reachable but its
+      // open-homes registry hasn't finished re-opening the home yet
+      // (details.requiresRehandshake). The registry gate is
+      // SESSION-INDEPENDENT, so once it converges the SAME call succeeds
+      // without a new handshake — poll the call with backoff, bounded by a
+      // deadline so ghosts still fail. The daemon rejects BEFORE executing,
+      // so call retries are effect-safe for reads and writes alike.
+      if (this.isRehandshakeProblem(error)) {
+        const homeId = (error.details as { id?: string } | null)?.id
+        // Never-learned ids fail fast: real bugs stay loud, no churn.
+        if (homeId === undefined || !this.knownHomeIds.has(homeId)) throw error
+        // One shared heal re-syncs our runtime view first…
+        try {
+          await this.refreshAfterGenerationChange()
+        } catch {
+          throw error // heal failed (daemon still down): surface the original
+        }
+        // …then poll until the daemon's registry converges.
+        const deadline = Date.now() + 8_000
+        for (;;) {
+          try {
+            return await this.client.call<T>(method, params, hooks)
+          } catch (retryError) {
+            if (!this.isRehandshakeProblem(retryError) || Date.now() > deadline) throw retryError
+            await new Promise(resolve => setTimeout(resolve, 250))
+          }
+        }
+      }
       const staleId = this.staleHomeIdProblem(error)
       if (staleId === undefined || !this.knownHomeIds.has(staleId)) throw error
       try {
@@ -650,6 +689,14 @@ export class OmtService {
         throw retryError
       }
     }
+  }
+
+  /** NOT_FOUND problems the daemon marks as convergent (safe to poll-retry). */
+  private isRehandshakeProblem(error: unknown): error is OmtProtocolError {
+    return (
+      error instanceof OmtProtocolError &&
+      (error.details as { requiresRehandshake?: boolean } | null)?.requiresRehandshake === true
+    )
   }
 
   /** Fetch post-change snapshots and fan out to hook listeners. */

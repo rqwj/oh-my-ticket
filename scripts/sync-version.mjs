@@ -56,8 +56,35 @@ function syncJson(path) {
   console.log(`  ${path} → ${canonical}`)
 }
 
+/**
+ * The root package references its platform-package optionalDependencies with
+ * a caret floor at the canonical MAJOR.MINOR.0 (^0.6.0): the specifier stays
+ * STABLE across patch releases so pnpm's frozen-lockfile check never sees a
+ * stale entry, while consumers still resolve the newest daemon in the line
+ * (protocol compatibility is negotiated at handshake). Rewrite every
+ * @oh-my-ticket/* entry in place; no-op when the field is absent.
+ */
+function syncOptionalDeps() {
+  const full = join(root, 'package.json')
+  const pkg = JSON.parse(readFileSync(full, 'utf8'))
+  const optional = pkg.optionalDependencies ?? {}
+  const floor = `^${canonical.split('.').slice(0, 2).join('.')}.0`
+  let touched = false
+  for (const name of Object.keys(optional)) {
+    if (name.startsWith('@oh-my-ticket/') && optional[name] !== floor) {
+      optional[name] = floor
+      touched = true
+    }
+  }
+  if (touched) {
+    writeFileSync(full, JSON.stringify(pkg, null, 2) + '\n')
+    console.log(`  package.json optionalDependencies → ${floor}`)
+  }
+}
+
 console.log(`canonical version: ${canonical} (Cargo.toml [workspace.package])`)
 syncJson('package.json')
 syncJson('apps/desktop/package.json')
 syncJson(join('apps', 'desktop', 'src-tauri', 'tauri.conf.json'))
+syncOptionalDeps()
 console.log('lockstep OK')

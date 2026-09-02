@@ -122,7 +122,7 @@ it('filters-get defaults and filters-set persists via the daemon (STORY-0023)', 
   // observes the saved bag (the old assertion read ui-filters.json). U4:
   // the DSH surface persists under its surface-prefixed key.
   const { OmtService, DSH_FILTERS_KEY } = await import('../src/host/service.ts')
-  const freshService = new OmtService({ runtimeDir: fixture.runtimeDir, name: 'rpc-persist-probe' })
+  const freshService = new OmtService({ runtimeDir: fixture.runtimeDir, name: 'rpc-persist-probe', noSpawn: true })
   try {
     await freshService.ready()
     const probe = await freshService.filtersGet(fixture.globalHome, DSH_FILTERS_KEY)

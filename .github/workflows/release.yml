@@ -34,7 +34,7 @@ jobs:
     permissions:
       contents: write # attach assets to the GitHub Release
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Verify tag matches workspace version (KTD1)
         run: |
@@ -61,7 +61,7 @@ jobs:
           tar -xzf dist/release/*.tar.gz -C "$smoke"
           "$smoke"/*/omt --version
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: release-binaries-${{ github.ref_name }}
           path: |
@@ -70,7 +70,7 @@ jobs:
           if-no-files-found: error
 
       - name: Attach assets to GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
           files: |
@@ -82,34 +82,39 @@ jobs:
     name: desktop bundle (.app/.dmg)
     runs-on: macos-latest
     needs: binary-assets
-    # No-op until the Tauri scaffold (U8) creates apps/desktop.
-    if: hashFiles('apps/desktop/src-tauri/tauri.conf.json') != ''
     permissions:
       contents: write # tauri-action uploads bundles to the same Release
-    env:
-      # Signing/notarization is opt-in (KTD5): when these secrets are absent,
-      # tauri-bundler skips identity signing and notarization natively and
-      # ships an ad-hoc-signed bundle. Nothing here hard-fails on unset
-      # secrets — Gatekeeper caveats for unsigned downloads are documented in
-      # docs/runtime/distribution.md.
-      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-      APPLE_ID: ${{ secrets.APPLE_ID }}
-      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - name: Report signing mode
+      # Signing/notarization is opt-in (KTD5). The secrets MUST NOT be passed
+      # through job env directly: an unset secret expands to an EMPTY STRING,
+      # and tauri-bundler treats a present-but-empty APPLE_SIGNING_IDENTITY as
+      # an explicit identity (codesign: "no identity found"). Only a fully
+      # ABSENT variable triggers the bundler's ad-hoc path, so inject via
+      # $GITHUB_ENV solely when the identity is non-empty.
+      - name: Configure signing mode
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          if [ -z "${APPLE_SIGNING_IDENTITY}" ]; then
-            echo "APPLE_SIGNING_IDENTITY unset → bundler signs ad-hoc / skips notarization"
-          else
+          if [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
             echo "signing identity present → inside-out re-sign + notarization enabled"
+            {
+              echo "APPLE_SIGNING_IDENTITY=${APPLE_SIGNING_IDENTITY}"
+              echo "APPLE_ID=${APPLE_ID}"
+              echo "APPLE_PASSWORD=${APPLE_PASSWORD}"
+              echo "APPLE_TEAM_ID=${APPLE_TEAM_ID}"
+            } >> "$GITHUB_ENV"
+          else
+            echo "no identity secret → bundler signs ad-hoc, notarization skipped"
           fi
 
       # KD5/R12: the desktop sidecar embeds exactly this Release's daemon
       # build, staged under the externalBin target-triple name.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           name: release-binaries-${{ github.ref_name }}
           path: dist/release
@@ -128,7 +133,7 @@ jobs:
 
       - uses: pnpm/action-setup@v4
         with:
-          version: 9
+          version: 11
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -151,17 +156,15 @@ jobs:
     name: npm platform packages
     runs-on: macos-latest
     needs: binary-assets
-    # Active since U13 landed the platform-package templates under
-    # npm/platform-packages/ (R21: packages are a thin DSH fallback filled
-    # from Release artifacts).
-    if: hashFiles('npm/platform-packages/**') != ''
+    # Fills the platform-package templates under npm/platform-packages/
+    # (R21: packages are a thin DSH fallback filled from Release artifacts).
     env:
       # Same skip philosophy as code signing (KTD5): without the token the job
       # still fills and pack-verifies every package, then skips publishing
       # with an explicit notice — nothing hard-fails on the missing secret.
       NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # U13 ratification: no workspace install here — template filling,
       # npm pack verification, and publishing are pure npm CLI work, and a
@@ -176,7 +179,7 @@ jobs:
 
       # Same-source binaries as job1 (KD5): download its artifact, verify the
       # checksums, then fill every package template with its triple's binaries.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           name: release-binaries-${{ github.ref_name }}
           path: dist/release
@@ -236,14 +239,28 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
+          version="$(bash scripts/assemble-release-archive.sh --print-version)"
           for name in $(cat .filled-packages); do
-            (cd "npm/platform-packages/${name}" && npm publish --access public)
+            pkg="$(node -p "require('./npm/platform-packages/${name}/package.json').name")"
+            # Idempotent re-runs: an earlier partial run may have already
+            # published this exact version — npm versions are immutable, so
+            # publishing twice errors and blocks the needs chain downstream.
+            if npm view "${pkg}@${version}" version --silent >/dev/null 2>&1; then
+              echo "::notice::${pkg}@${version} already published — skipping (idempotent re-run)"
+            else
+              (cd "npm/platform-packages/${name}" && npm publish --access public)
+            fi
           done
 
   npm-dsh-plugin:
     name: npm package (DSH plugin)
     runs-on: macos-latest
-    needs: binary-assets # the Release exists by then — the tgz joins its assets
+    # Serialize AFTER the platform package publish: the plugin pins
+    # @oh-my-ticket/darwin-arm64@<same version> as an optionalDependency, and
+    # publishing it before its daemon exists on npm would let consumers
+    # silently skip the optional dep in the race window. Failure coupling is
+    # deliberate — never ship a plugin whose pinned daemon is missing.
+    needs: npm-platform-packages
     permissions:
       contents: write # attach the packed tgz to the GitHub Release
     env:
@@ -251,7 +268,7 @@ jobs:
       # builds, packs and attaches — only publishing is skipped, with notice.
       NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Version lockstep gate (KTD1): tag == Cargo workspace == plugin package.
       - name: Verify tag matches product version
@@ -270,7 +287,7 @@ jobs:
 
       - uses: pnpm/action-setup@v4
         with:
-          version: 9
+          version: 11
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -296,7 +313,7 @@ jobs:
       - name: Pack and verify contents
         run: |
           npm pack
-          tgz="oh-my-ticket-$(node -p "require('./package.json').version").tgz"
+          tgz="dsh-oh-my-ticket-$(node -p "require('./package.json').version").tgz"
           test -f "$tgz"
           for entry in package/lib/index.js package/lib/client.js package/cordis.patch.yml; do
             tar -tzf "$tgz" "$entry" >/dev/null || { echo "::error::$entry missing from $tgz"; exit 1; }
@@ -304,10 +321,10 @@ jobs:
           echo "packed $tgz"
 
       - name: Attach package to the GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
-          files: oh-my-ticket-*.tgz
+          files: dsh-oh-my-ticket-*.tgz
           fail_on_unmatched_files: true
 
       - name: Notice — publish skipped (NPM_TOKEN unset)
@@ -318,4 +335,11 @@ jobs:
         if: env.NPM_TOKEN != ''
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish
+        run: |
+          spec="$(node -p "require('./package.json').name + '@' + require('./package.json').version")"
+          # Idempotent re-runs (same rationale as the platform packages job).
+          if npm view "$spec" version --silent >/dev/null 2>&1; then
+            echo "::notice::$spec already published — skipping (idempotent re-run)"
+          else
+            npm publish
+          fi

@@ -95,7 +95,7 @@ it('bump carries an optional run hint (additive; old clients ignore it)', () => 
 it('daemon events stream into the change hub until the client detaches', async () => {
   const fixture: RuntimeFixture = await createRuntimeFixture({ label: 'events' })
   try {
-    const observer = new OmtService({ runtimeDir: fixture.runtimeDir, name: 'observer' })
+    const observer = new OmtService({ runtimeDir: fixture.runtimeDir, name: 'observer', noSpawn: true })
     await observer.ready()
     const hub = observer.hub
     const seen: OmtChangeEvent[] = []
@@ -141,7 +141,7 @@ it('daemon events stream into the change hub until the client detaches', async (
 it('hub keeps receiving frames after a daemon restart (cursor resume)', { timeout: 40_000 }, async () => {
   const fixture: RuntimeFixture = await createRuntimeFixture({ label: 'events-restart' })
   try {
-    const observer = new OmtService({ runtimeDir: fixture.runtimeDir, name: 'observer-restart' })
+    const observer = new OmtService({ runtimeDir: fixture.runtimeDir, name: 'observer-restart', noSpawn: true })
     await observer.ready()
     const seen: OmtChangeEvent[] = []
     observer.hub.subscribe(event => seen.push(event))

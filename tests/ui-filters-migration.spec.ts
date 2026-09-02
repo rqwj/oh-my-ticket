@@ -61,9 +61,24 @@ describe('legacy ui-filters.json migration', () => {
 
     // …and it survives a daemon restart over the same runtime dir.
     await fixture.restart()
-    const revived = await fixture.service.filtersGet(home, DSH_FILTERS_KEY)
-    expect(revived.sortOrder).toBe('priority-desc')
-    expect(revived.query).toBe('登录')
+    // Post-restart convergence is asynchronous: the daemon re-opens homes
+    // and the client re-handshakes (credential scope) on their own clocks,
+    // and the service has no transparent requiresRehandshake retry for
+    // reads — on slow CI runners the first read can land in the
+    // NOT_FOUND/requiresRehandshake window. Poll until the scope converges.
+    let revived: Record<string, unknown> | undefined
+    const deadline = Date.now() + 15_000
+    for (;;) {
+      try {
+        revived = await fixture.service.filtersGet(home, DSH_FILTERS_KEY)
+        break
+      } catch (error) {
+        if (Date.now() > deadline) throw error
+        await new Promise(resolve => setTimeout(resolve, 200))
+      }
+    }
+    expect(revived!.sortOrder).toBe('priority-desc')
+    expect(revived!.query).toBe('登录')
   })
 
   it('skips missing and corrupt legacy files without touching daemon storage', async () => {

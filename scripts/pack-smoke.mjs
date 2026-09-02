@@ -199,9 +199,18 @@ async function pathB() {
 function rootInvariants() {
   console.log('\n[C] root package integrity')
   const pkg = JSON.parse(execFileSync('cat', [join(REPO, 'package.json')], { encoding: 'utf8' }))
+  // optionalDependencies reference the platform package with a caret floor
+  // at the canonical MAJOR.MINOR.0 (^0.6.0): the specifier stays stable
+  // across patch releases so pnpm's frozen-lockfile check never goes stale,
+  // while consumers resolve the newest daemon in the line (protocol
+  // compatibility is handshake-negotiated). sync-version.mjs owns the value.
+  const cargo = execFileSync('grep', ['-m1', '^version = ', join(REPO, 'Cargo.toml')], { encoding: 'utf8' })
+  const canonical = cargo.match(/version = "([^"]+)"/)?.[1]
+  const floor = `^${canonical.split('.').slice(0, 2).join('.')}.0`
   check(
-    'root package.json carries NO optionalDependencies until the first platform publish (frozen-lockfile parity)',
-    pkg.optionalDependencies === undefined,
+    'optionalDependencies pins @oh-my-ticket/darwin-arm64 to the canonical caret floor',
+    pkg.optionalDependencies?.['@oh-my-ticket/darwin-arm64'] === floor,
+    `${pkg.optionalDependencies?.['@oh-my-ticket/darwin-arm64']} !== ${floor}`,
   )
   const packEnv = { ...process.env, npm_config_cache: mkdtempSync(join(tmpdir(), 'omt-npm-cache-')) }
   const packList = execFileSync('npm', ['pack', '--dry-run', '--json'], {

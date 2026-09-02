@@ -99,11 +99,11 @@ export function SettingsPanel({ homes, knownHomes, homeDir, harnessByHome, onSav
         mode = 'dev'
         checkoutDir = picked
       }
-      setInstallMessage(`安装中… oh-my-ticket@${version}（${mode === 'global' ? '全局 dsh' : '开发模式'}）`)
-      const result = await installDshPlugin({ mode, checkoutDir, packageName: 'oh-my-ticket', version })
+      setInstallMessage(`安装中… dsh-oh-my-ticket@${version}（${mode === 'global' ? '全局 dsh' : '开发模式'}）`)
+      const result = await installDshPlugin({ mode, checkoutDir, packageName: 'dsh-oh-my-ticket', version })
       setInstallMessage(
         result.ok
-          ? `已安装 oh-my-ticket@${version} 到 dsh「web」profile（${mode === 'global' ? '全局 dsh' : '开发模式'}）。重启 dsh web 后生效。`
+          ? `已安装 dsh-oh-my-ticket@${version} 到 dsh「web」profile（${mode === 'global' ? '全局 dsh' : '开发模式'}）。重启 dsh web 后生效。`
           : `安装失败：${result.output || '命令非零退出'}`,
       )
     } catch (error) {

@@ -28,7 +28,7 @@ jobs:
     # (glib/webkit2gtk system deps), and the product ships macOS binaries only.
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -37,7 +37,7 @@ jobs:
       # dependencies installed, which the node job's runner never shares.
       - uses: pnpm/action-setup@v4
         with:
-          version: 9
+          version: 11
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -64,13 +64,13 @@ jobs:
     name: node (typecheck · test)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # Toolchain for the runtime-fixture daemon build path
       # (scripts/build-daemon.mjs → cargo build -p omt-runtime).
       - uses: dtolnay/rust-toolchain@stable
       - uses: pnpm/action-setup@v4
         with:
-          version: 9
+          version: 11
       - uses: actions/setup-node@v4
         with:
           node-version: 22

@@ -18,7 +18,7 @@ import { transform } from 'lightningcss'
  */
 const CSS_VIRTUAL_PREFIX = '\0dsh-css:'
 const CSS_VIRTUAL_SUFFIX = '.mjs'
-const PLUGIN_ID = 'oh-my-ticket'
+const PLUGIN_ID = 'dsh-oh-my-ticket'
 
 function cssModulesPlugin() {
   return {
@@ -81,7 +81,7 @@ const NODE_ENV = process.env.NODE_ENV ?? 'production'
 
 export default defineConfig([
   {
-    name: 'oh-my-ticket',
+    name: 'dsh-oh-my-ticket',
     entry: ['src/index.ts'],
     outDir: 'lib',
     format: ['esm'],
@@ -115,7 +115,7 @@ export default defineConfig([
     },
     outputOptions: {
       entryFileNames: 'client.js',
-      banner: `window.__ModuleLoader__.load({ id: "oh-my-ticket", factory: (require) => {`,
+      banner: `window.__ModuleLoader__.load({ id: "dsh-oh-my-ticket", factory: (require) => {`,
       footer: 'return module.exports; } });',
       intro: 'var module = { exports: {} }; var exports = module.exports;',
     },
