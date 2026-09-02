@@ -3,10 +3,10 @@
  * reads/writes (the @ codec's get, UI actions) and by omt_* tool executes.
  * Powers the conversation turn-tail "相关 ticket" list.
  *
- * Persistence: an optional delegate mirrors every touch into the global
- * home's meta table (`recent:<sessionId>`) and lazily reloads it after a
- * host restart, so the list survives process restarts as well as page
- * refreshes (TICKET-0019).
+ * Persistence: an optional delegate mirrors every touch into daemon-owned
+ * storage (`ui/recent-get|set`, global-home scoped, key = session id) and
+ * lazily reloads it after a host restart, so the list survives process
+ * restarts as well as page refreshes (TICKET-0019).
  */
 export interface RecentPersistence {
   /** Load the persisted id list (most-recent-first); undefined = none. */

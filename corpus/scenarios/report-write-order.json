@@ -1,0 +1,29 @@
+{
+  "meta": {
+    "name": "report-write-order",
+    "source": "tests/run-core.spec.ts#reportRunItem write order > failed transitions the item before appending the note",
+    "description": "When the note-append fails (node file deleted), the transition has already landed: item failed with last_error kept, run derived completed_with_failures. The append failure surfaces as IO."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "批量" },
+      { "type": "story", "title": "批次", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "任务1", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "createRun", "params": { "nodeIds": ["TICKET-0001"] } },
+    { "op": "startRun", "params": { "id": "RUN-0001" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "to": "running", "executorSessionId": "sess-1" } },
+    { "op": "deleteFile", "params": { "path": "tickets/EPIC-0001-批量/STORY-0001-批次/TICKET-0001-任务1/ticket.md" } },
+    { "op": "reportRunItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "outcome": "failed", "note": "炸了" }, "label": "reported" },
+    { "op": "getRunItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001" }, "label": "item" },
+    { "op": "getRun", "params": { "id": "RUN-0001" }, "label": "run" }
+  ],
+  "invariants": [
+    { "expect": "matches", "op": "reported", "path": "error.code", "value": "IO" },
+    { "expect": "equals", "op": "item", "path": "state", "value": "failed" },
+    { "expect": "equals", "op": "item", "path": "last_error", "value": "炸了" },
+    { "expect": "equals", "op": "run", "path": "status", "value": "completed_with_failures" }
+  ]
+}

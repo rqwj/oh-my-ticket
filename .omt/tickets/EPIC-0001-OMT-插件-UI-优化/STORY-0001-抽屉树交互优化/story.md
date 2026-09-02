@@ -35,4 +35,5 @@ updated_at: '2026-08-17T14:07:08.056Z'
 - [TICKET-0022 状态图标区分（归档空心化）](TICKET-0022-状态图标区分（归档空心化）/ticket.md) — done
 - [TICKET-0023 归档独立维度与归档只读](TICKET-0023-归档独立维度与归档只读/ticket.md) — done
 - [TICKET-0029 显示开关行与优先级筛选](TICKET-0029-显示开关行与优先级筛选/ticket.md) — done
+- [TICKET-0074 测试ticket](TICKET-0074-测试ticket/ticket.md) — done
 <!-- /omt:children -->

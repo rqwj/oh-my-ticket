@@ -1,0 +1,27 @@
+{
+  "meta": {
+    "name": "move-hierarchy-guards",
+    "source": "tests/core.spec.ts#move > rejects moving a node under its own descendant (+ self-parent, already-at-target)",
+    "description": "U2 characterization: under the current HIERARCHY matrix the child-type rule always preempts the ancestry check — descendant-cycle is defensive-only and unreachable through the public API. Self-parent and already-at-target are distinct CONFLICT/HIERARCHY rules."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "用户体系" },
+      { "type": "story", "title": "登录", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "登录接口", "parentId": "STORY-0001" },
+      { "type": "subticket", "title": "子票据", "parentId": "TICKET-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "move", "params": { "id": "STORY-0001", "newParentId": "TICKET-0001" }, "label": "underOwnChild" },
+    { "op": "move", "params": { "id": "TICKET-0001", "newParentId": "SUBTICKET-0001" }, "label": "underLeafDescendant" },
+    { "op": "move", "params": { "id": "TICKET-0001", "newParentId": "TICKET-0001" }, "label": "selfParent" },
+    { "op": "move", "params": { "id": "TICKET-0001", "newParentId": "STORY-0001" }, "label": "alreadyThere" }
+  ],
+  "invariants": [
+    { "expect": "matches", "op": "underOwnChild", "path": "error", "value": { "code": "INVALID_HIERARCHY", "details": { "rule": "child-type", "parentType": "ticket", "childType": "story" } } },
+    { "expect": "matches", "op": "underLeafDescendant", "path": "error", "value": { "code": "INVALID_HIERARCHY", "details": { "rule": "child-type", "parentType": "subticket", "childType": "ticket" } } },
+    { "expect": "matches", "op": "selfParent", "path": "error", "value": { "code": "INVALID_HIERARCHY", "details": { "rule": "self-parent", "nodeId": "TICKET-0001" } } },
+    { "expect": "matches", "op": "alreadyThere", "path": "error", "value": { "code": "CONFLICT", "details": { "rule": "already-at-target", "nodeId": "TICKET-0001" } } }
+  ]
+}

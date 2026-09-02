@@ -1,0 +1,22 @@
+{
+  "meta": {
+    "name": "update-body-replace",
+    "source": "tests/core.spec.ts#update > replaces the whole body when body is given",
+    "description": "body replaces the entire user body (template gone); append would have kept it."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "用户体系" },
+      { "type": "story", "title": "登录", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "登录接口", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "update", "params": { "id": "TICKET-0001", "body": "## 全新正文\n" } },
+    { "op": "show", "params": { "id": "TICKET-0001" }, "label": "shown" }
+  ],
+  "invariants": [
+    { "expect": "contains", "op": "shown", "path": "body", "value": "全新正文" },
+    { "expect": "fileNotContains", "file": "tickets/EPIC-0001-用户体系/STORY-0001-登录/TICKET-0001-登录接口/ticket.md", "text": "## 进度记录" }
+  ]
+}

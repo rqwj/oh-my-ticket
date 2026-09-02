@@ -5,7 +5,7 @@
  * type graph; shapes copied from their sources.
  */
 
-declare module '@deepseek-ai/dsh-client-runtime/client' {
+declare module '@deepseek-ai/dsh-client-store' {
   /** Bare observable snapshot (hook-binding identity must stay stable). */
   export interface ObservableSnapshot<T> {
     getSnapshot(): T

@@ -1,0 +1,30 @@
+{
+  "meta": {
+    "name": "pool-routed-isolation",
+    "source": "tests/pool.spec.ts#routes cores per home (behavioral half: writes land in the routed home)",
+    "description": "Cores route per home: a write through the workspace-local core lands only there — the global core's tree stays empty."
+  },
+  "setup": {
+    "pool": {
+      "globalDirName": "global",
+      "workspaces": [
+        { "name": "ws", "omt": true }
+      ]
+    }
+  },
+  "operations": [
+    { "op": "openRouted", "params": { "cwd": null }, "label": "openGlobal" },
+    { "op": "tree", "label": "globalTreeEmpty" },
+    { "op": "openRouted", "params": { "cwd": "$ws" }, "label": "openLocal" },
+    { "op": "create", "params": { "type": "epic", "title": "项目内" } },
+    { "op": "tree", "label": "localTree" },
+    { "op": "openRouted", "params": { "cwd": null } },
+    { "op": "tree", "label": "globalTreeStillEmpty" }
+  ],
+  "invariants": [
+    { "expect": "length", "op": "localTree", "value": 1 },
+    { "expect": "equals", "op": "localTree", "path": "0.id", "value": "EPIC-0001" },
+    { "expect": "length", "op": "globalTreeStillEmpty", "value": 0 },
+    { "expect": "contains", "op": "openLocal", "path": "home", "value": ".omt" }
+  ]
+}

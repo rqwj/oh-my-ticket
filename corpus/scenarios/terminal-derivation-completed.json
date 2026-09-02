@@ -1,0 +1,32 @@
+{
+  "meta": {
+    "name": "terminal-derivation-completed",
+    "source": "tests/run-core.spec.ts#terminal derivation > all done/skipped → completed",
+    "description": "When the last item reaches a final state, the run derives completed (all-success) with finished_at; skipped alone never blocks derivation while work remains."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "批量" },
+      { "type": "story", "title": "批次", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "任务1", "parentId": "STORY-0001" },
+      { "type": "ticket", "title": "任务2", "parentId": "STORY-0001" },
+      { "type": "ticket", "title": "任务3", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "createRun", "params": { "nodeIds": ["TICKET-0001", "TICKET-0002", "TICKET-0003"] } },
+    { "op": "startRun", "params": { "id": "RUN-0001" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "to": "running" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "to": "done" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0003", "to": "skipped" } },
+    { "op": "getRun", "params": { "id": "RUN-0001" }, "label": "midRun" },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0002", "to": "running" } },
+    { "op": "transitionItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0002", "to": "done" } },
+    { "op": "getRun", "params": { "id": "RUN-0001" }, "label": "finished" }
+  ],
+  "invariants": [
+    { "expect": "equals", "op": "midRun", "path": "status", "value": "running" },
+    { "expect": "equals", "op": "finished", "path": "status", "value": "completed" },
+    { "expect": "defined", "op": "finished", "path": "finished_at" }
+  ]
+}

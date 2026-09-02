@@ -1,0 +1,27 @@
+{
+  "meta": {
+    "name": "ancestor-activation-non-open-archived",
+    "source": "tests/core.spec.ts#ancestor activation > never reopens non-open ancestors and skips archived ones without failing",
+    "description": "blocked ancestors stay blocked; archived ancestors stay archived with status open; activation still succeeds on the ticket itself."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "用户体系" },
+      { "type": "story", "title": "登录", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "登录接口", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "update", "params": { "id": "STORY-0001", "status": "blocked" } },
+    { "op": "update", "params": { "id": "EPIC-0001", "archived": true } },
+    { "op": "update", "params": { "id": "TICKET-0001", "status": "in_progress" }, "label": "updated" },
+    { "op": "getNode", "params": { "id": "STORY-0001" }, "label": "story" },
+    { "op": "getNode", "params": { "id": "EPIC-0001" }, "label": "epic" }
+  ],
+  "invariants": [
+    { "expect": "equals", "op": "updated", "path": "status", "value": "in_progress" },
+    { "expect": "equals", "op": "story", "path": "status", "value": "blocked" },
+    { "expect": "equals", "op": "epic", "path": "archived", "value": true },
+    { "expect": "equals", "op": "epic", "path": "status", "value": "open" }
+  ]
+}

@@ -1,10 +1,11 @@
 /**
  * SSE route for OMT change notifications: GET /omt/events keeps the
- * connection open and pushes one `data:` frame per ChangeHub event. The
+ * connection open and pushes one `data:` frame per change-hub event. The
  * browser subscribes with EventSource (same origin, auto-reconnect).
+ * U7a: the hub is fed by daemon event envelopes via the runtime service.
  */
 import type { Context } from '@deepseek-ai/cordis'
-import type { ChangeHub } from './changes.ts'
+import type { ChangeHub } from './service.ts'
 
 /** Structural ctx.webServer face (route registration only). */
 interface WebServerLike {

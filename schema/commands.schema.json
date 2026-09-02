@@ -1,0 +1,545 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://omt.dev/schemas/v1/commands.schema.json",
+  "title": "OMT protocol command registry (v1)",
+  "description": "Per-method params/result contracts for the OMT JSON-RPC protocol. Method names are <namespace>/<verb>. Every public reference is qualified by homeId (R4); create commands address an explicitly authorized home. Mutations accept optional expectedRevision where noted for optimistic concurrency (R9 seed). Results mirror the current TypeScript core's shapes (rpc.ts/tools.ts vocabulary) lifted onto qualified refs.",
+  "$defs": {
+    "NodeFilter": {
+      "type": "object",
+      "description": "Conjunction of optional filters; empty object lists everything.",
+      "properties": {
+        "type": { "$ref": "common.schema.json#/$defs/NodeType" },
+        "status": { "$ref": "common.schema.json#/$defs/NodeStatus" },
+        "archived": { "$ref": "common.schema.json#/$defs/Archived" },
+        "query": { "type": "string", "description": "Whitespace-separated keywords, ALL must match title/body." }
+      }
+    },
+    "NodeChanges": {
+      "type": "object",
+      "description": "Patch applied by node/update. body replaces the whole text and is mutually exclusive with append; at least one property must be present.",
+      "minProperties": 1,
+      "not": { "required": ["body", "append"] },
+      "properties": {
+        "title": { "type": "string", "minLength": 1 },
+        "status": { "$ref": "common.schema.json#/$defs/NodeStatus" },
+        "priority": { "$ref": "common.schema.json#/$defs/Priority" },
+        "archived": { "$ref": "common.schema.json#/$defs/Archived" },
+        "body": { "type": "string" },
+        "append": { "type": "string", "minLength": 1 }
+      }
+    },
+
+    "CreateNodeParams": {
+      "type": "object",
+      "description": "Method node/create. Children always land in their parent's home; scope applies only to root epics.",
+      "properties": {
+        "homeId": { "$ref": "common.schema.json#/$defs/HomeId" },
+        "type": { "$ref": "common.schema.json#/$defs/NodeType" },
+        "title": { "type": "string", "minLength": 1 },
+        "parentId": { "$ref": "common.schema.json#/$defs/NodeId" },
+        "body": { "type": "string" },
+        "priority": { "$ref": "common.schema.json#/$defs/Priority" },
+        "scope": { "$ref": "common.schema.json#/$defs/CreateScope" }
+      },
+      "required": ["homeId", "type", "title"]
+    },
+    "CreateNodeResult": {
+      "type": "object",
+      "properties": { "node": { "$ref": "common.schema.json#/$defs/NodeView" } },
+      "required": ["node"]
+    },
+
+    "GetNodeParams": {
+      "type": "object",
+      "description": "Method node/get.",
+      "properties": {
+        "homeId": { "$ref": "common.schema.json#/$defs/HomeId" },
+        "nodeId": { "$ref": "common.schema.json#/$defs/NodeId" }
+      },
+      "required": ["homeId", "nodeId"]
+    },
+    "GetNodeResult": {
+      "type": "object",
+      "description": "Detail view: node, optional parent, children, user-owned body, and non-terminal runs holding this ticket.",
+      "properties": {
+        "node": { "$ref": "common.schema.json#/$defs/NodeView" },
+        "parent": { "$ref": "common.schema.json#/$defs/NodeSummary" },
+        "children": { "type": "array", "items": { "$ref": "common.schema.json#/$defs/NodeSummary" } },
+        "body": { "type": "string" },
+        "runs": { "type": "array", "items": { "$ref": "common.schema.json#/$defs/RunLink" } }
+      },
+      "required": ["node", "children", "body", "runs"]
+    },
+
+    "ListNodeParams": {
+      "type": "object",
+      "description": "Method node/list.",
+      "properties": {
+        "homeId": { "$ref": "common.schema.json#/$defs/HomeId" },
+        "filter": { "$ref": "#/$defs/NodeFilter" }
+      },
+      "required": ["homeId"]
+    },
+    "ListNodeResult": {
+      "type": "object",
+      "properties": { "nodes": { "type": "array", "items": { "$ref": "common.schema.json#/$defs/NodeSummary" } } },
+      "required": ["nodes"]
+    },
+
+    "TreeParams": {
+      "type": "object",
+      "description": "Method node/tree: full forest, or the subtree under rootId.",
+      "properties": {
+        "homeId": { "$ref": "common.schema.json#/$defs/HomeId" },
+        "rootId": { "$ref": "common.schema.json#/$defs/NodeId" }
+      },
+      "required": ["homeId"]
+    },
+    "TreeResult": {
+      "type": "object",
+      "properties": { "trees": { "type": "array", "items": { "$ref": "common.schema.json#/$defs/TreeNode" } } },
+      "required": ["trees"]
+    },
+
+    "SearchNodesParams": {
+      "type": "object",
+      "description": "Method node/search (@-trigger candidates). Empty query yields latest nodes first.",
+      "properties": {
+        "homeId": { "$ref": "common.schema.json#/$defs/HomeId" },
+        "query": { "type": "string", "default": "" },
+        "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }
+      },
+      "required": ["homeId"]
+    },
+    "SearchNodesResult": {
+      "type": "object",
+      "properties": { "nodes": { "type": "array", "items": { "$ref": "common.schema.json#/$defs/NodeSummary" } } },
+      "required": ["nodes"]
+    },
+
+    "UpdateNodeParams": {
+      "type": "object",
+      "description": "Method node/update.",
+      "properties": {
+        "homeId": { "$ref": "common.schema.json#/$defs/HomeId" },
+        "nodeId": { "$ref": "common.schema.json#/$defs/NodeId" },
+        "expectedRevision": { "$ref": "common.schema.json#/$defs/Revision" },
+        "changes": { "$ref": "#/$defs/NodeChanges" }
+      },
+      "required": ["homeId", "nodeId", "changes"]
+    },
+    "UpdateNodeResult": {
+      "type": "object",
+      "properties": { "node": { "$ref": "common.schema.json#/$defs/NodeView" } },
+      "required": ["node"]
+    },
+
+    "MoveNodeParams": {
+      "type": "object",
+      "description": "Method node/move: move the node with its whole subtree under newParentId (same home only).",
+      "properties": {
+        "homeId": { "$ref": "common.schema.json#/$defs/HomeId" },
+        "nodeId": { "$ref": "common.schema.json#/$defs/NodeId" },
+        "newParentId": { "$ref": "common.schema.json#/$defs/NodeId" }
+      },
+      "required": ["homeId", "nodeId", "newParentId"]
+    },
+    "MoveNodeResult": {
+      "type": "object",
+      "properties": { "node": { "$ref": "common.schema.json#/$defs/NodeView" } },
+      "required": ["node"]
+    },
+
+    "ArchiveNodeParams": {
+      "type": "object",
+      "description": "Method node/archive: set the read-only archival dimension. Unarchive goes through node/update changes.archived=false.",
+      "properties": {
+        "homeId": { "$ref": "common.schema.json#/$defs/HomeId" },
+        "nodeId": { "$ref": "common.schema.json#/$defs/NodeId" }
+      },
+      "required": ["homeId", "nodeId"]
+    },
+    "ArchiveNodeResult": {
+      "type": "object",
+      "properties": { "node": { "$ref": "common.schema.json#/$defs/NodeView" } },
+      "required": ["node"]
+    },
+
+    "ExecuteNodeParams": {
+      "type": "object",
+      "description": "Method node/execute: mark in_progress and bind the caller's execution mark (the UI execute button). Executor identity derives from the connection principal, never from payload fields (R12).",
+      "properties": {
+        "homeId": { "$ref": "common.schema.json#/$defs/HomeId" },
+        "nodeId": { "$ref": "common.schema.json#/$defs/NodeId" }
+      },
+      "required": ["homeId", "nodeId"]
+    },
+    "ExecuteNodeResult": {
+      "type": "object",
+      "properties": { "node": { "$ref": "common.schema.json#/$defs/NodeView" } },
+      "required": ["node"]
+    },
+
+    "ReindexHomeParams": {
+      "type": "object",
+      "description": "Method home/reindex: rebuild the SQLite index from Markdown after hand edits.",
+      "properties": { "homeId": { "$ref": "common.schema.json#/$defs/HomeId" } },
+      "required": ["homeId"]
+    },
+    "ReindexHomeResult": { "$ref": "common.schema.json#/$defs/ReindexResult" },
+
+    "DeclareHomeParams": {
+      "type": "object",
+      "description": "Method home/declare (U5/R6): idempotently register an existing on-disk home directory into the running daemon. Deduplication is by canonical path; concurrent declares of one path return the winner's homeId. Advertised via handshake features.homeDeclare.",
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Filesystem path of an existing home directory. Missing paths and non-directories are rejected before any lock work."
+        }
+      },
+      "required": ["path"]
+    },
+    "DeclareHomeResult": {
+      "type": "object",
+      "description": "Method home/declare result: registry insertion happened before this response; requiresRehandshake tells memory-credential clients to rehandshake so the new home enters their scoped grant (R8/KTD3).",
+      "properties": {
+        "homeId": { "$ref": "common.schema.json#/$defs/HomeId" },
+        "requiresRehandshake": { "type": "boolean" },
+        "name": { "type": "string", "description": "Home display name (final path segment)." },
+        "kind": { "type": "string", "enum": ["workspace", "global"], "description": "Effective kind; global when the declared path equals the resolved global home." }
+      },
+      "required": ["homeId", "requiresRehandshake"]
+    },
+
+    "ListKnownHomesParams": {
+      "type": "object",
+      "description": "Method home/list-known: the runtime-dir catalog of every directory this daemon has ever opened or declared, persisted across generations (runtime-level known-homes.db — identity key is the canonical path; homeIds rotate per generation so lastHomeId is informational only). Adapter-only channel for surface home pickers; home operation family required (R7: mcp credentials refuse).",
+      "properties": {},
+      "additionalProperties": true
+    },
+    "ListKnownHomesResult": {
+      "type": "object",
+      "properties": {
+        "homes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "path": { "type": "string", "description": "Canonical filesystem path of the home directory." },
+              "name": { "type": "string" },
+              "kind": { "type": "string", "enum": ["workspace", "global"] },
+              "lastHomeId": { "type": "string", "description": "Informational only — stored inside the home database, so it is stable across daemon generations and changes only when the home store is wiped/recreated." },
+              "firstSeenAt": { "type": "string" },
+              "lastSeenAt": { "type": "string" },
+              "open": { "type": "boolean", "description": "Currently open in this daemon (switchable without declare)." },
+              "missing": { "type": "boolean", "description": "On-disk liveness probe failed (moved/deleted/unmounted). Entries are never auto-pruned." }
+            },
+            "required": ["path", "name", "kind", "lastHomeId", "firstSeenAt", "lastSeenAt", "open", "missing"]
+          }
+        }
+      },
+      "required": ["homes"]
+    },
+
+    "RunCreateParams": {
+      "type": "object",
+      "description": "Method run/create: ordered batch of Ticket/SubTicket members; every member must belong to homeId.",
+      "properties": {
+        "homeId": { "$ref": "common.schema.json#/$defs/HomeId" },
+        "title": { "type": "string", "minLength": 1 },
+        "nodeIds": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "common.schema.json#/$defs/NodeId" }
+        },
+        "config": { "$ref": "common.schema.json#/$defs/RunConfig" }
+      },
+      "required": ["homeId", "nodeIds"]
+    },
+    "RunCreateResult": {
+      "type": "object",
+      "properties": {
+        "run": { "$ref": "common.schema.json#/$defs/RunView" },
+        "items": { "type": "array", "items": { "$ref": "common.schema.json#/$defs/RunItemView" } }
+      },
+      "required": ["run", "items"]
+    },
+
+    "RunGetParams": {
+      "type": "object",
+      "description": "Method run/get.",
+      "properties": {
+        "homeId": { "$ref": "common.schema.json#/$defs/HomeId" },
+        "runId": { "$ref": "common.schema.json#/$defs/RunId" }
+      },
+      "required": ["homeId", "runId"]
+    },
+    "RunGetResult": {
+      "type": "object",
+      "properties": {
+        "run": { "$ref": "common.schema.json#/$defs/RunView" },
+        "items": { "type": "array", "items": { "$ref": "common.schema.json#/$defs/RunItemView" } }
+      },
+      "required": ["run", "items"]
+    },
+
+    "RunListParams": {
+      "type": "object",
+      "description": "Method run/list: active, interrupted and history runs of one home.",
+      "properties": {
+        "homeId": { "$ref": "common.schema.json#/$defs/HomeId" },
+        "status": { "$ref": "common.schema.json#/$defs/RunStatus" }
+      },
+      "required": ["homeId"]
+    },
+    "RunListResult": {
+      "type": "object",
+      "properties": { "runs": { "type": "array", "items": { "$ref": "common.schema.json#/$defs/RunView" } } },
+      "required": ["runs"]
+    },
+
+    "RunControlParams": {
+      "type": "object",
+      "description": "Method run/control. retry/remove additionally require nodeId naming the target member.",
+      "properties": {
+        "homeId": { "$ref": "common.schema.json#/$defs/HomeId" },
+        "runId": { "$ref": "common.schema.json#/$defs/RunId" },
+        "action": { "$ref": "common.schema.json#/$defs/RunControlAction" },
+        "nodeId": { "$ref": "common.schema.json#/$defs/NodeId" }
+      },
+      "required": ["homeId", "runId", "action"],
+      "allOf": [
+        {
+          "if": { "properties": { "action": { "enum": ["retry", "remove"] } } },
+          "then": { "required": ["nodeId"] }
+        }
+      ]
+    },
+    "RunControlResult": {
+      "type": "object",
+      "properties": {
+        "run": { "$ref": "common.schema.json#/$defs/RunView" },
+        "item": { "$ref": "common.schema.json#/$defs/RunItemView" }
+      },
+      "required": ["run"]
+    },
+
+    "ClaimRunParams": {
+      "type": "object",
+      "description": "Method run/claim: atomically claim the next pending item; executor binds to the connection principal's actor namespace (R12); agent-less callers cannot claim.",
+      "properties": {
+        "homeId": { "$ref": "common.schema.json#/$defs/HomeId" },
+        "runId": { "$ref": "common.schema.json#/$defs/RunId" }
+      },
+      "required": ["homeId", "runId"]
+    },
+    "ClaimRunResult": {
+      "type": "object",
+      "description": "claimed=false when no pending member remains; otherwise lease+item+ticket+context are present.",
+      "properties": {
+        "homeId": { "$ref": "common.schema.json#/$defs/HomeId" },
+        "runId": { "$ref": "common.schema.json#/$defs/RunId" },
+        "claimed": { "type": "boolean" },
+        "lease": { "$ref": "common.schema.json#/$defs/LeaseGrant" },
+        "item": { "$ref": "common.schema.json#/$defs/RunItemView" },
+        "ticket": { "$ref": "common.schema.json#/$defs/NodeView" },
+        "context": { "$ref": "common.schema.json#/$defs/ClaimContext" },
+        "contextError": { "type": "string" }
+      },
+      "required": ["homeId", "runId", "claimed"]
+    },
+
+    "ReportRunParams": {
+      "type": "object",
+      "description": "Method run/report: report one claimed item's outcome; lease-fenced when a lease token is supplied (R10).",
+      "properties": {
+        "homeId": { "$ref": "common.schema.json#/$defs/HomeId" },
+        "runId": { "$ref": "common.schema.json#/$defs/RunId" },
+        "nodeId": { "$ref": "common.schema.json#/$defs/NodeId" },
+        "outcome": { "$ref": "common.schema.json#/$defs/RunReportOutcome" },
+        "note": { "type": "string" },
+        "leaseToken": { "type": "string" }
+      },
+      "required": ["homeId", "runId", "nodeId", "outcome"]
+    },
+    "ReportRunResult": {
+      "type": "object",
+      "properties": {
+        "run": { "$ref": "common.schema.json#/$defs/RunView" },
+        "item": { "$ref": "common.schema.json#/$defs/RunItemView" },
+        "node": { "$ref": "common.schema.json#/$defs/NodeView" }
+      },
+      "required": ["run", "item", "node"]
+    },
+
+    "RunAddMembersParams": {
+      "type": "object",
+      "description": "Method run/add-members: append ticket/subticket members to a PENDING run (duplicates rejected, positions continue after existing members).",
+      "properties": {
+        "homeId": { "$ref": "common.schema.json#/$defs/HomeId" },
+        "runId": { "$ref": "common.schema.json#/$defs/RunId" },
+        "nodeIds": {
+          "type": "array",
+          "items": { "$ref": "common.schema.json#/$defs/NodeId" },
+          "minItems": 1
+        }
+      },
+      "required": ["homeId", "runId", "nodeIds"]
+    },
+    "RunAddMembersResult": {
+      "type": "object",
+      "properties": {
+        "homeId": { "$ref": "common.schema.json#/$defs/HomeId" },
+        "run": { "$ref": "common.schema.json#/$defs/RunView" }
+      },
+      "required": ["homeId", "run"]
+    },
+
+    "RunNudgeRecordParams": {
+      "type": "object",
+      "description": "Method run/nudge-record: record a continuation nudge; nodeId targets one pending item, omission nudges every pending item of the run.",
+      "properties": {
+        "homeId": { "$ref": "common.schema.json#/$defs/HomeId" },
+        "runId": { "$ref": "common.schema.json#/$defs/RunId" },
+        "nodeId": { "$ref": "common.schema.json#/$defs/NodeId" }
+      },
+      "required": ["homeId", "runId"]
+    },
+    "RunNudgeRecordResult": {
+      "type": "object",
+      "properties": {
+        "homeId": { "$ref": "common.schema.json#/$defs/HomeId" },
+        "runId": { "$ref": "common.schema.json#/$defs/RunId" },
+        "nudged": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "nodeId": { "$ref": "common.schema.json#/$defs/NodeId" },
+              "nudgeCount": { "type": "integer", "minimum": 1 }
+            },
+            "required": ["nodeId", "nudgeCount"]
+          }
+        }
+      },
+      "required": ["homeId", "runId", "nudged"]
+    },
+
+    "RunInterruptParams": {
+      "type": "object",
+      "description": "Method run/interrupt: demote every in-flight item of a running/paused run to interrupted, then derive terminal state.",
+      "properties": {
+        "homeId": { "$ref": "common.schema.json#/$defs/HomeId" },
+        "runId": { "$ref": "common.schema.json#/$defs/RunId" }
+      },
+      "required": ["homeId", "runId"]
+    },
+    "RunInterruptResult": {
+      "type": "object",
+      "properties": {
+        "homeId": { "$ref": "common.schema.json#/$defs/HomeId" },
+        "run": { "$ref": "common.schema.json#/$defs/RunView" },
+        "interrupted": {
+          "type": "array",
+          "items": { "$ref": "common.schema.json#/$defs/NodeId" }
+        }
+      },
+      "required": ["homeId", "run", "interrupted"]
+    },
+
+    "EventsResumeParams": {
+      "type": "object",
+      "description": "Method events/resume: fetch committed events after a stored cursor (F4); omit cursor to start from the oldest retained event.",
+      "properties": {
+        "homeId": { "$ref": "common.schema.json#/$defs/HomeId" },
+        "cursor": { "type": "integer", "minimum": 0 },
+        "limit": { "type": "integer", "minimum": 1 }
+      },
+      "required": ["homeId"]
+    },
+    "EventsResumeResult": {
+      "type": "object",
+      "description": "resync=true signals retention expiry: drop local projections and take a snapshot instead.",
+      "properties": {
+        "cursor": { "type": "integer", "minimum": 0 },
+        "resync": { "type": "boolean" },
+        "events": { "type": "array", "items": { "$ref": "events.schema.json#/$defs/EventEnvelope" } }
+      },
+      "required": ["cursor", "resync", "events"]
+    },
+
+    "FiltersGetParams": {
+      "type": "object",
+      "description": "Method ui/filters-get. Adapter-only channel; key is the surface-prefixed bag key (R3: DSH uses dsh:ui, desktop uses tauri:ui; the server does NOT enforce the prefix this generation). Missing/corrupt bags fall back to defaults; adapters migrate legacy bare keys on read (U4).",
+      "properties": {
+        "homeId": { "$ref": "common.schema.json#/$defs/HomeId" },
+        "key": { "type": "string", "minLength": 1 }
+      },
+      "required": ["homeId", "key"]
+    },
+    "FiltersGetResult": {
+      "type": "object",
+      "properties": { "filters": { "$ref": "common.schema.json#/$defs/SavedFilters" } },
+      "required": ["filters"]
+    },
+
+    "FiltersSetParams": {
+      "type": "object",
+      "description": "Method ui/filters-set: merge patch onto the saved bag under the surface-prefixed key (R3 prefix convention, unenforced server-side); merged result validated server-side.",
+      "properties": {
+        "homeId": { "$ref": "common.schema.json#/$defs/HomeId" },
+        "key": { "type": "string", "minLength": 1 },
+        "filters": { "$ref": "common.schema.json#/$defs/SavedFilters" }
+      },
+      "required": ["homeId", "key", "filters"]
+    },
+    "FiltersSetResult": {
+      "type": "object",
+      "properties": { "filters": { "$ref": "common.schema.json#/$defs/SavedFilters" } },
+      "required": ["filters"]
+    },
+
+    "RecentGetParams": {
+      "type": "object",
+      "description": "Method ui/recent-get: recently-touched qualified node refs for one bag key. Recent bags are global-home scoped, not per workspace home. R4: every surface shares the single global key 'recent' (legacy per-session keys become orphans by design — no delete RPC).",
+      "properties": { "key": { "type": "string", "minLength": 1 } },
+      "required": ["key"]
+    },
+    "RecentGetResult": {
+      "type": "object",
+      "description": "Most-recent-first qualified ids.",
+      "properties": {
+        "refs": {
+          "type": "array",
+          "items": { "$ref": "common.schema.json#/$defs/QualifiedNodeRef" }
+        }
+      },
+      "required": ["refs"]
+    },
+
+    "RecentSetParams": {
+      "type": "object",
+      "description": "Method ui/recent-set: replace the bag (most-recent-first order preserved) under the shared global key 'recent' per R4.",
+      "properties": {
+        "key": { "type": "string", "minLength": 1 },
+        "refs": {
+          "type": "array",
+          "maxItems": 100,
+          "items": { "$ref": "common.schema.json#/$defs/QualifiedNodeRef" }
+        }
+      },
+      "required": ["key", "refs"]
+    },
+    "RecentSetResult": {
+      "type": "object",
+      "properties": {
+        "refs": {
+          "type": "array",
+          "items": { "$ref": "common.schema.json#/$defs/QualifiedNodeRef" }
+        }
+      },
+      "required": ["refs"]
+    }
+  }
+}

@@ -5,17 +5,15 @@
  * a running, autoContinue run the session executes. Covers timing/content,
  * paused and autoContinue=false gating, exponential backoff, budget
  * exhaustion → stalled marker, retry budget reset, and loop prevention.
+ * U7a: runs against a REAL omt-daemon through the runtime fixture.
  */
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { OmtCore } from '../src/host/core.ts'
 import { registerOmtIdleHook } from '../src/host/idle-hook.ts'
-import { OmtCorePool } from '../src/host/pool.ts'
 import { RunningRegistry } from '../src/host/running.ts'
+import type { HomeRef, OmtService } from '../src/host/service.ts'
 import { isRunItemStalled, NUDGE_BUDGET, type OmtRun, type OmtRunItem, type RunConfig } from '../src/host/types.ts'
 import { requireItem, ticketFixture } from './mocks/fixtures.ts'
+import { createRuntimeFixture, type RuntimeFixture } from './mocks/runtime-fixture.ts'
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -35,9 +33,9 @@ interface Scheduled {
   cleared: boolean
 }
 
-let home: string
-let pool: OmtCorePool
-let core: OmtCore
+let fixture: RuntimeFixture
+let service: OmtService
+let globalHome: HomeRef
 let running: RunningRegistry
 let nowMs: number
 let scheduled: Scheduled[]
@@ -61,9 +59,26 @@ function emitIdle(agent: FakeAgent): void {
   for (const listener of statusListeners) listener({ agent, status: 'idle' })
 }
 
-/** The hook's idle handler is async (pool resolution) — drain microtasks. */
-function flush(): Promise<void> {
-  return new Promise<void>(resolve => setImmediate(resolve))
+/**
+ * Real-time settle for one idle event: the handler performs several async
+ * daemon round-trips, so a microtask drain is NOT enough — overlapping
+ * handlers would decide from stale snapshots. Local daemon calls are
+ * sub-millisecond; 50ms is ample headroom.
+ */
+const settle = (): Promise<void> => new Promise(resolve => setTimeout(resolve, 50))
+
+/**
+ * The hook's idle handler performs several async daemon round-trips; poll
+ * until the expectation holds (or fail after the budget).
+ */
+async function waitFor<T>(probe: () => T | Promise<T>, timeoutMs = 4000): Promise<T> {
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    const value = await probe()
+    if (value) return value
+    if (Date.now() > deadline) return value // let the caller's expect fail
+    await settle()
+  }
 }
 
 function fireLastTimer(): void {
@@ -78,24 +93,40 @@ function texts(): string[] {
   return messages.map(message => (message as { content: { text: string }[] }).content.map(block => block.text).join('\n'))
 }
 
-/** Two-ticket run, started, first item claimed+reported done by `sessionId`. */
-async function runFixture(sessionId: string, config?: Partial<RunConfig>): Promise<{ run: OmtRun; ticketIds: string[] }> {
-  const tickets = await ticketFixture(core, 2)
-  const run = await core.createRun({ nodeIds: tickets.map(ticket => ticket.id), ...(config !== undefined ? { config } : {}) })
-  await core.startRun(run.id)
-  await core.claimRunItem(run.id, sessionId)
-  await core.reportRunItem(run.id, tickets[0]!.id, 'done')
-  return { run, ticketIds: tickets.map(ticket => ticket.id) }
+async function messageCount(): Promise<number> {
+  return waitFor(async () => {
+    const resolved = await texts()
+    return resolved.length > 0 ? resolved.length : undefined
+  }).then(count => count ?? 0)
 }
 
-function itemOf(runId: string, nodeId: string): OmtRunItem {
-  return requireItem(core, runId, nodeId)
+/** Poll until at least `min` messages have landed (timer paths are async). */
+async function waitForCount(min: number): Promise<void> {
+  await waitFor(async () => ((await texts()).length >= min ? true : undefined))
+}
+
+/** Two-ticket run, started, first item claimed+reported done by `sessionId`. */
+async function runFixture(sessionId: string, config?: Partial<RunConfig>): Promise<{ run: OmtRun; ticketIds: string[] }> {
+  const tickets = await ticketFixture(service, globalHome, 2)
+  const ticketIds = tickets.map(ticket => ticket.id)
+  const created = await service.createRun(globalHome, {
+    nodeIds: ticketIds,
+    ...(config !== undefined ? { config } : {}),
+  })
+  await service.controlRun(globalHome, created.run.id, 'start')
+  await service.claimItem(globalHome, created.run.id, sessionId)
+  await service.reportItem(globalHome, created.run.id, ticketIds[0]!, 'done')
+  return { run: created.run, ticketIds }
+}
+
+async function itemOf(runId: string, nodeId: string): Promise<OmtRunItem> {
+  return requireItem(service, globalHome, runId, nodeId)
 }
 
 beforeEach(async () => {
-  home = await mkdtemp(join(tmpdir(), 'omt-idle-hook-'))
-  pool = new OmtCorePool(home)
-  core = await pool.coreFor(undefined)
+  fixture = await createRuntimeFixture({ label: 'idle-hook' })
+  service = fixture.service
+  globalHome = fixture.globalHome
   running = new RunningRegistry()
   nowMs = T0
   scheduled = []
@@ -111,7 +142,7 @@ beforeEach(async () => {
       for (const disposer of body()) disposers.push(disposer)
     },
   }
-  registerOmtIdleHook(stubCtx as never, pool, running, {
+  registerOmtIdleHook(stubCtx as never, service, running, {
     backoffBaseMs: BACKOFF_BASE_MS,
     now: () => nowMs,
     setTimer: (fn, ms) => {
@@ -126,8 +157,7 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
-  await pool.closeAll()
-  await rm(home, { recursive: true, force: true })
+  await fixture.stop()
 })
 
 describe('未收尾提醒', () => {
@@ -136,27 +166,25 @@ describe('未收尾提醒', () => {
     const agent = fakeAgent('s1')
 
     emitIdle(agent)
-    await flush()
-    expect(texts()).toHaveLength(1)
+    expect((await messageCount()) >= 1).toBe(true)
     expect(texts()[0]).toContain('TICKET-0042')
     expect(texts()[0]).toContain('收尾')
 
     // The reminder followup itself drives a turn that idles again: no repeat.
     emitIdle(agent)
-    await flush()
+    await settle()
     expect(texts()).toHaveLength(1)
   })
 
   it('scopes reminders to the idling session', async () => {
     running.start('TICKET-0042', 's1', 'demo 的会话')
     emitIdle(fakeAgent('s2'))
-    await flush()
+    await settle()
     expect(texts()).toHaveLength(0)
 
     running.start('TICKET-0043', 's2', 'demo 的会话')
     emitIdle(fakeAgent('s2'))
-    await flush()
-    expect(texts()).toHaveLength(1)
+    expect(await messageCount()).toBe(1)
     expect(texts()[0]).toContain('TICKET-0043')
     expect(texts()[0]).not.toContain('TICKET-0042')
   })
@@ -165,7 +193,7 @@ describe('未收尾提醒', () => {
     running.start('TICKET-0042', 's1', 'demo 的会话')
     running.stop('TICKET-0042')
     emitIdle(fakeAgent('s1'))
-    await flush()
+    await settle()
     expect(texts()).toHaveLength(0)
   })
 })
@@ -174,12 +202,11 @@ describe('run 续跑 nudge', () => {
   it('nudges the next pending item of a running run the session executes', async () => {
     const { run, ticketIds } = await runFixture('s1')
     emitIdle(fakeAgent('s1'))
-    await flush()
 
-    expect(texts()).toHaveLength(1)
+    expect(await messageCount()).toBe(1)
     expect(texts()[0]).toContain('继续下一项')
     expect(texts()[0]).toContain(ticketIds[1])
-    const item = itemOf(run.id, ticketIds[1])
+    const item = await itemOf(run.id, ticketIds[1])
     expect(item.nudge_count).toBe(1)
     expect(item.nudged_at).toBe(new Date(T0).toISOString())
   })
@@ -188,18 +215,17 @@ describe('run 续跑 nudge', () => {
     const { ticketIds } = await runFixture('s1')
     running.start(ticketIds[1], 's1', 'demo 的会话')
     emitIdle(fakeAgent('s1'))
-    await flush()
 
-    expect(texts()).toHaveLength(1)
+    expect(await messageCount()).toBe(1)
     expect(texts()[0]).toContain('仍标记为执行中')
     expect(texts()[0]).toContain('继续下一项')
   })
 
   it('does not nudge a paused run (decision 9)', async () => {
     const { run } = await runFixture('s1')
-    await core.pauseRun(run.id)
+    await service.controlRun(globalHome, run.id, 'pause')
     emitIdle(fakeAgent('s1'))
-    await flush()
+    await settle()
     expect(texts()).toHaveLength(0)
   })
 
@@ -207,9 +233,8 @@ describe('run 续跑 nudge', () => {
     const { ticketIds } = await runFixture('s1', { autoContinue: false })
     running.start(ticketIds[1], 's1', 'demo 的会话')
     emitIdle(fakeAgent('s1'))
-    await flush()
 
-    expect(texts()).toHaveLength(1)
+    expect(await messageCount()).toBe(1)
     expect(texts()[0]).toContain('仍标记为执行中')
     expect(texts()[0]).not.toContain('继续下一项')
   })
@@ -217,17 +242,17 @@ describe('run 续跑 nudge', () => {
   it('does not nudge a session that is not the run executor', async () => {
     await runFixture('s1')
     emitIdle(fakeAgent('s2'))
-    await flush()
+    await settle()
     expect(texts()).toHaveLength(0)
   })
 
   it('does not nudge when the run has no pending item left', async () => {
     const { run, ticketIds } = await runFixture('s1')
-    const claimed = await core.claimRunItem(run.id, 's1')
-    expect(claimed?.node_id).toBe(ticketIds[1])
-    await core.reportRunItem(run.id, ticketIds[1], 'done')
+    const claimed = await service.claimItem(globalHome, run.id, 's1')
+    expect(claimed.item?.node_id).toBe(ticketIds[1])
+    await service.reportItem(globalHome, run.id, ticketIds[1]!, 'done')
     emitIdle(fakeAgent('s1'))
-    await flush()
+    await settle()
     expect(texts()).toHaveLength(0)
   })
 })
@@ -239,35 +264,33 @@ describe('nudge 预算与退避', () => {
 
     // Nudge 1: immediate on idle.
     emitIdle(agent)
-    await flush()
-    expect(texts()).toHaveLength(1)
-    expect(itemOf(run.id, ticketIds[1]).nudge_count).toBe(1)
+    expect(await messageCount()).toBe(1)
+    expect((await itemOf(run.id, ticketIds[1])).nudge_count).toBe(1)
 
     // Inside the backoff window (base=1000, first interval): no nudge, a
     // timer is armed for the remainder.
     nowMs = T0 + 400
     emitIdle(agent)
-    await flush()
+    await waitFor(() => scheduled.filter(entry => !entry.cleared).length === 1)
     expect(texts()).toHaveLength(1)
-    expect(scheduled.filter(entry => !entry.cleared)).toHaveLength(1)
     expect(scheduled[0]?.ms).toBe(BACKOFF_BASE_MS - 400)
 
     // A second idle inside the window still does not nudge.
     emitIdle(agent)
-    await flush()
+    await settle()
     expect(texts()).toHaveLength(1)
 
     // Backoff elapsed → timer fires nudge 2.
     nowMs = T0 + 1000
     fireLastTimer()
-    await flush()
+    await waitForCount(2)
     expect(texts()).toHaveLength(2)
     expect(texts()[1]).toContain('继续下一项')
-    expect(itemOf(run.id, ticketIds[1]).nudge_count).toBe(2)
+    expect((await itemOf(run.id, ticketIds[1])).nudge_count).toBe(2)
 
     // Next interval doubles: 2 * base. Idle right after nudge 2 rearms.
     emitIdle(agent)
-    await flush()
+    await waitFor(() => scheduled.filter(entry => !entry.cleared).length === 1)
     expect(texts()).toHaveLength(2)
     const armed = scheduled.filter(entry => !entry.cleared).pop()
     expect(armed?.ms).toBe(BACKOFF_BASE_MS * 2)
@@ -275,17 +298,17 @@ describe('nudge 预算与退避', () => {
     // Budget (NUDGE_BUDGET) reached with nudge 3.
     nowMs = T0 + 1000 + BACKOFF_BASE_MS * 2
     fireLastTimer()
-    await flush()
+    await waitForCount(3)
     expect(texts()).toHaveLength(3)
-    expect(itemOf(run.id, ticketIds[1]).nudge_count).toBe(NUDGE_BUDGET)
+    expect((await itemOf(run.id, ticketIds[1])).nudge_count).toBe(NUDGE_BUDGET)
 
     // Budget exhausted: the item is stalled — no more nudges, no timers.
     nowMs = T0 + 1000_000
     emitIdle(agent)
-    await flush()
+    await settle()
     expect(texts()).toHaveLength(3)
     expect(scheduled.filter(entry => !entry.cleared)).toHaveLength(0)
-    expect(isRunItemStalled(itemOf(run.id, ticketIds[1]))).toBe(true)
+    expect(isRunItemStalled(await itemOf(run.id, ticketIds[1]))).toBe(true)
   })
 
   it('does not nudge from a backoff timer while the agent is running', async () => {
@@ -293,18 +316,17 @@ describe('nudge 预算与退避', () => {
     const agent = fakeAgent('s1')
 
     emitIdle(agent)
-    await flush()
+    expect(await messageCount()).toBe(1)
     nowMs = T0 + 400
     emitIdle(agent)
-    await flush()
-    expect(scheduled.filter(entry => !entry.cleared)).toHaveLength(1)
+    await waitFor(() => scheduled.filter(entry => !entry.cleared).length === 1)
 
     agent.status = 'running'
     nowMs = T0 + 1000
     fireLastTimer()
-    await flush()
+    await settle()
     expect(texts()).toHaveLength(1)
-    expect(itemOf(run.id, ticketIds[1]).nudge_count).toBe(1)
+    expect((await itemOf(run.id, ticketIds[1])).nudge_count).toBe(1)
   })
 
   it('a timer revalidates the item: claimed meanwhile → no nudge', async () => {
@@ -312,18 +334,18 @@ describe('nudge 预算与退避', () => {
     const agent = fakeAgent('s1')
 
     emitIdle(agent)
-    await flush()
+    expect(await messageCount()).toBe(1)
     nowMs = T0 + 400
     emitIdle(agent)
-    await flush()
+    await waitFor(() => scheduled.filter(entry => !entry.cleared).length === 1)
 
     // Another path claims the item before the backoff elapses.
-    await core.claimRunItem(run.id, 's9')
+    await service.claimItem(globalHome, run.id, 's9')
     nowMs = T0 + 1000
     fireLastTimer()
-    await flush()
+    await settle()
     expect(texts()).toHaveLength(1)
-    expect(itemOf(run.id, ticketIds[1]).nudge_count).toBe(1)
+    expect((await itemOf(run.id, ticketIds[1])).nudge_count).toBe(1)
   })
 
   it('retry clears the nudge budget: a stalled item can be nudged again', async () => {
@@ -331,34 +353,35 @@ describe('nudge 预算与退避', () => {
     const agent = fakeAgent('s1')
 
     emitIdle(agent)
-    await flush()
+    expect(await messageCount()).toBe(1)
     // Arm the backoff timer, then let it fire nudge 2.
     nowMs = T0 + 400
     emitIdle(agent)
-    await flush()
+    await waitFor(() => scheduled.filter(entry => !entry.cleared).length === 1)
     nowMs = T0 + 1000
     fireLastTimer()
-    await flush()
+    await waitForCount(2)
+    expect(texts()).toHaveLength(2)
     // Arm the doubled backoff, then let it fire nudge 3 (budget exhausted).
     emitIdle(agent)
-    await flush()
+    await waitFor(() => scheduled.filter(entry => !entry.cleared).length === 1)
     nowMs = T0 + 1000 + BACKOFF_BASE_MS * 2
     fireLastTimer()
-    await flush()
-    expect(itemOf(run.id, ticketIds[1]).nudge_count).toBe(NUDGE_BUDGET)
-    expect(isRunItemStalled(itemOf(run.id, ticketIds[1]))).toBe(true)
+    await waitForCount(3)
     expect(texts()).toHaveLength(3)
+    expect((await itemOf(run.id, ticketIds[1])).nudge_count).toBe(NUDGE_BUDGET)
+    expect(isRunItemStalled(await itemOf(run.id, ticketIds[1]))).toBe(true)
 
-    await core.retryItem(run.id, ticketIds[1])
-    expect(itemOf(run.id, ticketIds[1]).nudge_count).toBe(0)
-    expect(isRunItemStalled(itemOf(run.id, ticketIds[1]))).toBe(false)
+    await service.controlRun(globalHome, run.id, 'retry', ticketIds[1])
+    expect((await itemOf(run.id, ticketIds[1])).nudge_count).toBe(0)
+    expect(isRunItemStalled(await itemOf(run.id, ticketIds[1]))).toBe(false)
 
     nowMs = T0 + 2000_000
     emitIdle(agent)
-    await flush()
+    await waitForCount(4)
     expect(texts()).toHaveLength(4)
     expect(texts()[3]).toContain('继续下一项')
-    expect(itemOf(run.id, ticketIds[1]).nudge_count).toBe(1)
+    expect((await itemOf(run.id, ticketIds[1])).nudge_count).toBe(1)
   })
 })
 
@@ -373,12 +396,10 @@ describe('ctx.effect 清理路径', () => {
     // Nudge 1 on idle, then a second idle inside the backoff window arms a
     // timer for the remainder.
     emitIdle(agent)
-    await flush()
-    expect(texts()).toHaveLength(1)
+    expect(await messageCount()).toBe(1)
     nowMs = T0 + 400
     emitIdle(agent)
-    await flush()
-    expect(scheduled.filter(entry => !entry.cleared)).toHaveLength(1)
+    await waitFor(() => scheduled.filter(entry => !entry.cleared).length === 1)
 
     // Plugin dispose: the armed timer is dropped, nothing left behind.
     disposers[0]!()
@@ -399,15 +420,14 @@ describe('错误路径', () => {
       // The throw is caught inside the hook (logged as a warning) — the idle
       // handling promise still settles, so vitest sees no rejection.
       emitIdle(broken)
-      await flush()
+      await new Promise(resolve => setTimeout(resolve, 50))
       expect(warn).toHaveBeenCalled()
       expect(texts()).toHaveLength(0)
 
       // …and the failure never poisons delivery to other sessions.
       running.start('TICKET-0043', 's2', 'demo 的会话')
       emitIdle(fakeAgent('s2'))
-      await flush()
-      expect(texts()).toHaveLength(1)
+      expect(await messageCount()).toBe(1)
       expect(texts()[0]).toContain('TICKET-0043')
       expect(texts()[0]).toContain('收尾')
     } finally {

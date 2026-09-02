@@ -1,6 +1,6 @@
 {
-  "name": "oh-my-ticket",
-  "version": "0.4.1",
+  "name": "dsh-oh-my-ticket",
+  "version": "0.6.2",
   "description": "DSH ticket management plugin: Epic/Story/Ticket hierarchy backed by SQLite + Markdown",
   "license": "MIT",
   "type": "module",
@@ -27,27 +27,35 @@
     }
   },
   "scripts": {
-    "setup": "bash scripts/setup-links.sh",
     "prebuild": "rm -rf lib",
     "build": "tsdown",
     "watch": "tsdown --watch",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "gen": "node scripts/gen-bindings.mjs",
+    "build:daemon": "node scripts/build-daemon.mjs",
+    "sync-version": "node scripts/sync-version.mjs"
+  },
+  "optionalDependencies": {
+    "@oh-my-ticket/darwin-arm64": "^0.6.0"
   },
   "devDependencies": {
-    "@deepseek-ai/cordis": "link:./.dsh-checkout/vendor/cordis",
-    "@deepseek-ai/dsh-client-connection": "link:./.dsh-checkout/packages/client/connection",
-    "@deepseek-ai/dsh-client-ui-input-trigger": "link:./.dsh-checkout/packages/client/ui-input-trigger",
-    "@deepseek-ai/dsh-host-apiproxy": "link:./.dsh-checkout/packages/host/apiproxy",
-    "@deepseek-ai/dsh-skill": "link:./.dsh-checkout/packages/skill/skill",
-    "@deepseek-ai/dsh-tools": "link:./.dsh-checkout/packages/core/tools",
-    "@deepseek-ai/schemastery": "link:./.dsh-checkout/vendor/schemastery",
+    "@omt/client-ts": "link:./packages/client-ts",
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/cosmokit": "^1.8.3",
+    "@deepseek-ai/dsh-client-connection": "0.1.2-alpha.3",
+    "@deepseek-ai/dsh-client-store": "0.1.2-alpha.3",
+    "@deepseek-ai/dsh-client-ui-input-trigger": "0.1.2-alpha.3",
+    "@deepseek-ai/dsh-skill": "0.1.2-alpha.3",
+    "@deepseek-ai/dsh-tools": "0.1.2-alpha.3",
+    "@deepseek-ai/schemastery": "^3.18.2",
     "@types/js-yaml": "^4.0.9",
     "@types/node": "^22.0.0",
     "@types/react": "^18.3.0",
     "@types/react-dom": "^18.0.0",
     "js-yaml": "^4.1.0",
     "jsdom": "^24.0.0",
+    "json-schema-to-typescript": "^15.0.4",
     "lightningcss": "^1.27.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",

@@ -1,0 +1,30 @@
+{
+  "meta": {
+    "name": "nudge-record-bookkeeping",
+    "source": "tests/idle-hook.spec.ts (core-visible half) — recordItemNudge bookkeeping and the stalled convention",
+    "description": "recordItemNudge increments nudge_count and stamps nudged_at (hook owns timing/backoff; core owns the record). NUDGE_BUDGET=3 exhausted → isRunItemStalled true; unknown items NOT_FOUND."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "批量" },
+      { "type": "story", "title": "批次", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "任务1", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "createRun", "params": { "nodeIds": ["TICKET-0001"] } },
+    { "op": "nudge", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001" }, "label": "firstNudge" },
+    { "op": "stallCheck", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001" }, "label": "notYetStalled" },
+    { "op": "nudge", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001", "count": 2 }, "label": "budgetExhausted" },
+    { "op": "stallCheck", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001" }, "label": "stalledNow" },
+    { "op": "nudge", "params": { "runId": "RUN-0001", "nodeId": "TICKET-9999" }, "label": "unknownItem" }
+  ],
+  "invariants": [
+    { "expect": "equals", "op": "firstNudge", "path": "nudge_count", "value": 1 },
+    { "expect": "defined", "op": "firstNudge", "path": "nudged_at" },
+    { "expect": "equals", "op": "notYetStalled", "path": "stalled", "value": false },
+    { "expect": "equals", "op": "budgetExhausted", "path": "nudge_count", "value": 3 },
+    { "expect": "equals", "op": "stalledNow", "path": "stalled", "value": true },
+    { "expect": "matches", "op": "unknownItem", "path": "error", "value": { "code": "NOT_FOUND", "details": { "kind": "run-item", "nodeId": "TICKET-9999" } } }
+  ]
+}

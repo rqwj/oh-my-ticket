@@ -1,0 +1,28 @@
+{
+  "meta": {
+    "name": "run-create-validation",
+    "source": "tests/run-core.spec.ts#createRun > rejects unknown members, duplicates, and unknown run ids",
+    "description": "Unknown members are NOT_FOUND; repeated members are DUPLICATE_MEMBER (subdivided from INVALID_INPUT); concurrency must be a positive integer (INVALID_CONCURRENCY)."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "批量" },
+      { "type": "story", "title": "批次", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "任务1", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "createRun", "params": { "nodeIds": ["TICKET-9999"] }, "label": "unknownMember" },
+    { "op": "createRun", "params": { "nodeIds": ["TICKET-0001", "TICKET-0001"] }, "label": "dupMember" },
+    { "op": "createRun", "params": { "nodeIds": [], "config": { "concurrency": 0 } }, "label": "zeroConcurrency" },
+    { "op": "createRun", "params": { "nodeIds": [], "config": { "concurrency": 2.5 } }, "label": "fracConcurrency" },
+    { "op": "runItems", "params": { "runId": "RUN-9999" }, "label": "unknownRun" }
+  ],
+  "invariants": [
+    { "expect": "matches", "op": "unknownMember", "path": "error", "value": { "code": "NOT_FOUND", "details": { "kind": "node", "id": "TICKET-9999" } } },
+    { "expect": "matches", "op": "dupMember", "path": "error", "value": { "code": "DUPLICATE_MEMBER", "details": { "nodeId": "TICKET-0001" } } },
+    { "expect": "matches", "op": "zeroConcurrency", "path": "error", "value": { "code": "INVALID_CONCURRENCY", "details": { "value": 0 } } },
+    { "expect": "matches", "op": "fracConcurrency", "path": "error", "value": { "code": "INVALID_CONCURRENCY", "details": { "value": 2.5 } } },
+    { "expect": "matches", "op": "unknownRun", "path": "error", "value": { "code": "NOT_FOUND", "details": { "kind": "run", "id": "RUN-9999" } } }
+  ]
+}

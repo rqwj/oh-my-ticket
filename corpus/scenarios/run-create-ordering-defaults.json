@@ -1,0 +1,32 @@
+{
+  "meta": {
+    "name": "run-create-ordering-defaults",
+    "source": "tests/run-core.spec.ts#createRun > creates a run with pending items ordered by position (+ RUN counter)",
+    "description": "createRun snapshots member order into positions, initializes pending items at zero attempts/nudges, and applies DEFAULT_RUN_CONFIG."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "批量" },
+      { "type": "story", "title": "批次", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "任务1", "parentId": "STORY-0001" },
+      { "type": "ticket", "title": "任务2", "parentId": "STORY-0001" },
+      { "type": "ticket", "title": "任务3", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "createRun", "params": { "title": "第一批次", "nodeIds": ["TICKET-0001", "TICKET-0002", "TICKET-0003"] }, "label": "run" },
+    { "op": "runItems", "params": { "runId": "RUN-0001" }, "label": "items" }
+  ],
+  "invariants": [
+    { "expect": "equals", "op": "run", "path": "id", "value": "RUN-0001" },
+    { "expect": "equals", "op": "run", "path": "status", "value": "pending" },
+    { "expect": "equals", "op": "run", "path": "config", "value": { "stopOnFailure": false, "autoContinue": true, "autoVerify": false, "concurrency": 1 } },
+    { "expect": "equals", "op": "items", "path": "0.node_id", "value": "TICKET-0001" },
+    { "expect": "equals", "op": "items", "path": "2.node_id", "value": "TICKET-0003" },
+    { "expect": "equals", "op": "items", "path": "0.position", "value": 0 },
+    { "expect": "equals", "op": "items", "path": "2.position", "value": 2 },
+    { "expect": "equals", "op": "items", "path": "0.state", "value": "pending" },
+    { "expect": "equals", "op": "items", "path": "0.attempts", "value": 0 },
+    { "expect": "equals", "op": "items", "path": "0.nudge_count", "value": 0 }
+  ]
+}

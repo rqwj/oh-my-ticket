@@ -1,0 +1,36 @@
+{
+  "meta": {
+    "name": "run-state-transitions",
+    "source": "tests/run-core.spec.ts#run state machine > walks pending → running → paused → running (+ empty-run vacuous completed)",
+    "description": "Only legal transitions land; illegal ones are CONFLICT with run-status-gate details. An empty started run derives completed immediately."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "批量" },
+      { "type": "story", "title": "批次", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "任务1", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "createRun", "params": { "nodeIds": ["TICKET-0001"] }, "label": "run" },
+    { "op": "pauseRun", "params": { "id": "RUN-0001" }, "label": "pausePending" },
+    { "op": "resumeRun", "params": { "id": "RUN-0001" }, "label": "resumePending" },
+    { "op": "startRun", "params": { "id": "RUN-0001" }, "label": "started" },
+    { "op": "startRun", "params": { "id": "RUN-0001" }, "label": "startTwice" },
+    { "op": "pauseRun", "params": { "id": "RUN-0001" }, "label": "paused" },
+    { "op": "pauseRun", "params": { "id": "RUN-0001" }, "label": "pauseTwice" },
+    { "op": "resumeRun", "params": { "id": "RUN-0001" }, "label": "resumed" },
+    { "op": "getRun", "params": { "id": "RUN-0001" }, "label": "final" },
+    { "op": "createRun", "params": { "nodeIds": [] }, "label": "empty" },
+    { "op": "startRun", "params": { "id": "RUN-0002" }, "label": "emptyStarted" }
+  ],
+  "invariants": [
+    { "expect": "equals", "op": "started", "path": "status", "value": "running" },
+    { "expect": "matches", "op": "startTwice", "path": "error", "value": { "code": "CONFLICT", "details": { "rule": "run-status-gate", "current": "running", "required": ["pending"] } } },
+    { "expect": "matches", "op": "pausePending", "path": "error", "value": { "code": "CONFLICT", "details": { "rule": "run-status-gate", "current": "pending" } } },
+    { "expect": "matches", "op": "resumePending", "path": "error", "value": { "code": "CONFLICT", "details": { "rule": "run-status-gate", "current": "pending" } } },
+    { "expect": "matches", "op": "pauseTwice", "path": "error", "value": { "code": "CONFLICT", "details": { "rule": "run-status-gate", "current": "paused" } } },
+    { "expect": "equals", "op": "resumed", "path": "status", "value": "running" },
+    { "expect": "equals", "op": "emptyStarted", "path": "status", "value": "completed" }
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "meta": {
+    "name": "observation-direct-blocked-skipped",
+    "source": "tests/run-core.spec.ts observeNodeStatus — direct blocked/skipped sets must not wedge a run (pending items included)",
+    "description": "Setting a ticket directly to blocked/skipped advances even its not-yet-dispatched pending item, keeping runs derivable."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "批量" },
+      { "type": "story", "title": "批次", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "任务1", "parentId": "STORY-0001" },
+      { "type": "ticket", "title": "任务2", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "createRun", "params": { "nodeIds": ["TICKET-0001", "TICKET-0002"] } },
+    { "op": "startRun", "params": { "id": "RUN-0001" } },
+    { "op": "update", "params": { "id": "TICKET-0001", "status": "blocked" } },
+    { "op": "update", "params": { "id": "TICKET-0002", "status": "skipped" } },
+    { "op": "getRunItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0001" }, "label": "blockedItem" },
+    { "op": "getRunItem", "params": { "runId": "RUN-0001", "nodeId": "TICKET-0002" }, "label": "skippedItem" },
+    { "op": "getRun", "params": { "id": "RUN-0001" }, "label": "derived" }
+  ],
+  "invariants": [
+    { "expect": "equals", "op": "blockedItem", "path": "state", "value": "blocked" },
+    { "expect": "equals", "op": "skippedItem", "path": "state", "value": "skipped" },
+    { "expect": "equals", "op": "derived", "path": "status", "value": "completed_with_failures" }
+  ]
+}

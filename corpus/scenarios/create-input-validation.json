@@ -1,0 +1,18 @@
+{
+  "meta": {
+    "name": "create-input-validation",
+    "source": "tests/core.spec.ts#create > rejects an empty title (+ explicit-id conflict)",
+    "description": "Whitespace-only titles and unknown node types are INVALID_INPUT with field details; a pre-allocated id that already exists is CONFLICT."
+  },
+  "operations": [
+    { "op": "create", "params": { "type": "epic", "title": "  " }, "label": "emptyTitle" },
+    { "op": "create", "params": { "type": "bogus", "title": "x" }, "label": "badType" },
+    { "op": "create", "params": { "type": "epic", "title": "首个", "id": "EPIC-0001" } },
+    { "op": "create", "params": { "type": "epic", "title": "重复", "id": "EPIC-0001" }, "label": "dupId" }
+  ],
+  "invariants": [
+    { "expect": "matches", "op": "emptyTitle", "path": "error", "value": { "code": "INVALID_INPUT", "details": { "field": "title" } } },
+    { "expect": "matches", "op": "badType", "path": "error", "value": { "code": "INVALID_INPUT", "details": { "field": "type", "value": "bogus" } } },
+    { "expect": "matches", "op": "dupId", "path": "error", "value": { "code": "CONFLICT", "details": { "rule": "duplicate-node-id", "nodeId": "EPIC-0001" } } }
+  ]
+}

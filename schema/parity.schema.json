@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://omt.dev/schemas/v1/parity.schema.json",
+  "title": "OMT action-parity matrix (v1)",
+  "description": "Classification of every protocol action (R22): agent_available actions expose identical qualified context on every consumer (DSH adapter, CLI, Tauri, MCP); adapter_only actions belong to one adapter channel; human_administrative actions are reserved for humans via CLI/desktop and audited when delegated. The entries array is the seed for the extracted v1 vocabulary; later units extend it additively.",
+  "$defs": {
+    "ActionName": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*/[a-z][a-zA-Z0-9]*$",
+      "description": "Protocol method name this classification applies to."
+    },
+    "ActionParityEntry": {
+      "type": "object",
+      "properties": {
+        "action": { "$ref": "#/$defs/ActionName" },
+        "classification": { "$ref": "common.schema.json#/$defs/ActionParity" },
+        "summary": { "type": "string" },
+        "since": { "type": "string", "pattern": "^v[0-9]+$", "description": "Protocol version that introduced the action." }
+      },
+      "required": ["action", "classification", "summary", "since"]
+    },
+    "ActionParityMatrix": {
+      "type": "object",
+      "description": "The full published matrix. revision increases whenever the matrix changes; consumers should treat unknown actions as NOT agent_available.",
+      "properties": {
+        "revision": { "type": "integer", "minimum": 1, "constDescription": "Bumped on any classification change." },
+        "entries": { "type": "array", "items": { "$ref": "#/$defs/ActionParityEntry" } }
+      },
+      "required": ["revision", "entries"]
+    },
+    "SeedActionParityMatrix": {
+      "type": "object",
+      "$comment": "Seed classification of the U1 command vocabulary. node/execute and ui/* are the DSH-adapter channels; home/reindex is human maintenance (CLI/desktop). Everything else is agent-available everywhere.",
+      "properties": {
+        "revision": { "const": 1 },
+        "entries": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ActionParityEntry" },
+          "minItems": 24
+        }
+      },
+      "required": ["revision", "entries"],
+      "default": {
+        "revision": 1,
+        "entries": [
+          { "action": "node/create", "classification": "agent_available", "summary": "Create a ticket node in an authorized home.", "since": "v1" },
+          { "action": "node/get", "classification": "agent_available", "summary": "Node detail: view, parent, children, body, holding runs.", "since": "v1" },
+          { "action": "node/list", "classification": "agent_available", "summary": "List/filter nodes of one home.", "since": "v1" },
+          { "action": "node/tree", "classification": "agent_available", "summary": "Full forest or subtree projection.", "since": "v1" },
+          { "action": "node/search", "classification": "agent_available", "summary": "@-trigger candidate search.", "since": "v1" },
+          { "action": "node/update", "classification": "agent_available", "summary": "Patch title/status/priority/body/archive.", "since": "v1" },
+          { "action": "node/move", "classification": "agent_available", "summary": "Move subtree under a new parent in the same home.", "since": "v1" },
+          { "action": "node/archive", "classification": "agent_available", "summary": "Set the read-only archived dimension.", "since": "v1" },
+          { "action": "node/execute", "classification": "adapter_only", "summary": "DSH UI execute button: mark running with connection-derived executor.", "since": "v1" },
+          { "action": "home/reindex", "classification": "human_administrative", "summary": "Rebuild SQLite index from Markdown; maintenance duty.", "since": "v1" },
+          { "action": "run/create", "classification": "agent_available", "summary": "Create an ordered run batch from ticket ids.", "since": "v1" },
+          { "action": "run/get", "classification": "agent_available", "summary": "Run detail with items.", "since": "v1" },
+          { "action": "run/list", "classification": "agent_available", "summary": "List runs of one home.", "since": "v1" },
+          { "action": "run/control", "classification": "agent_available", "summary": "start/pause/resume/cancel/retry/remove a run or member.", "since": "v1" },
+          { "action": "run/claim", "classification": "agent_available", "summary": "Atomically claim next pending item with fenced lease.", "since": "v1" },
+          { "action": "run/report", "classification": "agent_available", "summary": "Lease-fenced outcome report for a claimed item.", "since": "v1" },
+          { "action": "run/add-members", "classification": "agent_available", "summary": "Append ticket/subticket members to a pending run.", "since": "v1" },
+          { "action": "run/nudge-record", "classification": "agent_available", "summary": "Record a continuation nudge on pending item(s).", "since": "v1" },
+          { "action": "run/interrupt", "classification": "agent_available", "summary": "Demote in-flight items to interrupted and derive terminal state.", "since": "v1" },
+          { "action": "events/resume", "classification": "agent_available", "summary": "Resume the durable event stream from a cursor.", "since": "v1" },
+          { "action": "ui/filters-get", "classification": "adapter_only", "summary": "Adapter UI filter bag read; keys are surface-prefixed (dsh:/tauri:) per R3.", "since": "v1" },
+          { "action": "ui/filters-set", "classification": "adapter_only", "summary": "Adapter UI filter bag merge-write.", "since": "v1" },
+          { "action": "ui/recent-get", "classification": "adapter_only", "summary": "Recently-touched nodes under the single shared key 'recent' (R4).", "since": "v1" },
+          { "action": "ui/recent-set", "classification": "adapter_only", "summary": "Replace recently-touched bag per adapter key.", "since": "v1" },
+          { "action": "home/declare", "classification": "agent_available", "summary": "Idempotently register an existing on-disk home into the running daemon (U5/R6-R9); same-uid trust boundary, MCP minimum-privilege credentials exclude it via the home operation family.", "since": "v1" },
+          { "action": "home/list-known", "classification": "adapter_only", "summary": "Runtime-dir known-homes catalog for surface pickers (persisted across generations; open/missing annotated). Discovery aid, not an agent action.", "since": "v1" }
+        ]
+      }
+    }
+  }
+}

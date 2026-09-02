@@ -1,0 +1,23 @@
+| method | classification | routed |
+|---|---|---|
+| node/create | agent_available | ok |
+| node/get | agent_available | ok |
+| node/list | agent_available | ok |
+| node/tree | agent_available | ok |
+| node/search | agent_available | ok |
+| node/update | agent_available | ok |
+| node/move | agent_available | ok |
+| node/execute | adapter_only | ok |
+| home/reindex | human_administrative | ok |
+| run/create | agent_available | ok |
+| run/get | agent_available | ok |
+| run/list | agent_available | ok |
+| run/control | agent_available | ok |
+| run/claim | agent_available | ok |
+| run/report | agent_available | ok |
+| events/resume | agent_available | ok |
+| ui/filters-get | adapter_only | ok |
+| ui/filters-set | adapter_only | ok |
+| ui/recent-get | adapter_only | ok |
+| ui/recent-set | adapter_only | ok |
+| node/archive | agent_available | ok |

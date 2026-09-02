@@ -1,25 +1,39 @@
 /**
- * OMT host plugin (node half). Wires the data core (OMT home resolution:
- * plugin config > OMT_HOME env > ~/.omt) and registers the omt_* tool family.
+ * OMT host plugin (node half). U7a: a thin DSH adapter over the omt-daemon
+ * runtime — no direct SQLite/Markdown access remains. The plugin wires the
+ * OmtService (@omt/client-ts lifecycle: discover-or-spawn via OMT_DAEMON or
+ * PATH, handshake kind:"dsh", capped-backoff reconnect, disposal), exposes it
+ * as the optional-inject Cordis service `omt` (ctx.get('omt')), and registers
+ * the omt_* tool family, the /omt RPC channel, SSE change push, and the three
+ * session hooks — every data op routed through the service.
  */
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import Schema from '@deepseek-ai/schemastery'
 import type { AgentsLike } from './host/agents-like.ts'
-import { bridgeRunEvents, ChangeHub } from './host/changes.ts'
 import { registerOmtDisposedHook } from './host/disposed-hook.ts'
 import { registerOmtEvents } from './host/events.ts'
 import { registerOmtIdleHook } from './host/idle-hook.ts'
 import { createOmtRunNotifier } from './host/notify-hook.ts'
-import { OmtCorePool } from './host/pool.ts'
 import { DEFAULT_PROMPT_SETTINGS, InstalledSkillCache, resolveLiveAgent, selectBindableSkills, type PromptSettings } from './host/prompt-settings.ts'
 import { registerOmtPrompt } from './host/prompt.ts'
 import { RecentRegistry } from './host/recent.ts'
 import { registerOmtRpc } from './host/rpc.ts'
 import { RunningRegistry } from './host/running.ts'
 import { registerOmtRunsSkill, registerOmtSkill } from './host/skill.ts'
+import { OmtService, RECENT_SHARED_KEY } from './host/service.ts'
 import { registerOmtTools } from './host/tools.ts'
+
+// Zero-config daemon resolution (U13/KTD7): re-exported so packed-package
+// consumers (scripts/pack-smoke.mjs, embedders) share the SAME resolver the
+// adapter spawns through.
+export {
+  DAEMON_INSTALL_HINT,
+  DaemonNotFoundError,
+  resolveDaemonBinary,
+} from '@omt/client-ts'
+export type { DaemonBinary, DaemonSource } from '@omt/client-ts'
 
 export const name = 'oh-my-ticket'
 export const inject = ['tools', 'skills', 'connection', 'agents', 'userQuestions', 'webServer', 'systemPrompt']
@@ -72,30 +86,35 @@ type HeaderAgent = { session: { header?: { cwd?: string } } }
 export function apply(ctx: Context, config: Config): void {
   const globalHome = resolveHome(config.home)
   const agents = (ctx as unknown as { agents?: AgentsLike<HeaderAgent> }).agents
-  // Run-notification closure (TICKET-0065): attaches to every core as it
-  // opens, so lazily-opened workspace homes notify too.
+
+  // Runtime boundary (U7a): one client lifecycle per plugin instance. The
+  // spawned/discovered daemon learns the global home from OMT_HOME (or its
+  // own --home args); this adapter resolves workspace homes against the
+  // registry learned at handshake.
+  const service = new OmtService({ name: 'oh-my-ticket-dsh' })
+
+  // Optional-inject Cordis service `omt` (ctx.get('omt')); tied to this
+  // fiber via reflect.provide and disposed with it.
+  const withReflect = ctx as unknown as { reflect?: { provide(name: string, value: unknown): () => void } }
+  const disposeService = withReflect.reflect?.provide('omt', service)
+
+  // Run-notification closure (TICKET-0065): subscribes to the service's
+  // run-event stream (daemon envelopes), so notifications fire for tools,
+  // RPC, and CLI mutations alike.
   const notifier = createOmtRunNotifier(ctx)
-  const changes = new ChangeHub()
-  // Workspace-aware pool: a workspace root with its own `.omt/` wins, the
-  // global home is the fallback. Cores open lazily per home (lazy
-  // node:sqlite import, possible first-run reindex). The startup janitor
-  // receives the live-session list so a plugin reload never demotes items
-  // whose executor session is still alive (review fix #4). Each opened core
-  // also bridges its run events into the SSE hub (TICKET-0071).
-  const pool = new OmtCorePool(globalHome, {
-    activeSessionIds: () => agents?.list().map(agent => agent.id) ?? [],
-    onCoreOpened: core => {
-      notifier.attach(core)
-      bridgeRunEvents(core, changes)
-    },
-  })
-  console.log(`[omt] host plugin loaded (global home: ${globalHome}; workspace .omt/ wins when present)`)
+
+  console.log(`[omt] host adapter loaded (global home: ${globalHome}; data ops route through omt-daemon)`)
   const recent = new RecentRegistry()
   const running = new RunningRegistry()
+  // Persistence rides ui/recent-get|set on the GLOBAL home (TICKET-0019);
+  // bare ids are re-resolved by ownership on read. U4/R4: every surface
+  // persists under the ONE shared key 'recent' (KD3's sole cross-surface
+  // exception) — the in-memory registry stays per-session, but storage is
+  // converged; legacy per-session keys are left as orphans by design.
   recent.attachPersistence({
-    load: async sessionId => (await pool.coreFor(undefined)).getSessionRecent(sessionId),
-    save: async (sessionId, ids) => {
-      ;(await pool.coreFor(undefined)).setSessionRecent(sessionId, ids)
+    load: () => service.recentGet(RECENT_SHARED_KEY),
+    save: async (_sessionId, ids) => {
+      await service.recentSet(RECENT_SHARED_KEY, ids)
     },
   })
   const installed = new InstalledSkillCache()
@@ -105,12 +124,19 @@ export function apply(ctx: Context, config: Config): void {
     boundSkillNames: promptSettings.boundSkillNames,
     installedNames: [...installed.names()],
   })
-  registerOmtTools(ctx, pool, (sessionId, id) => recent.touch(sessionId, id), home => changes.bump(home), running)
+
+  // SSE refresh is fed by daemon event envelopes through the service-owned
+  // hub (single source of truth); only reindex — which rebuilds silently —
+  // bumps explicitly via the RPC layer.
+  registerOmtTools(ctx, service, (sessionId, id) => recent.touch(sessionId, id), undefined, running)
   registerOmtSkill(ctx)
   registerOmtRunsSkill(ctx)
   registerOmtPrompt(ctx, promptInputs)
   const listCatalog = async (sessionId?: string) => {
-    const live = resolveLiveAgent(sessionId, id => agents?.get(id), () => (agents?.list() ?? []) as HeaderAgent[])
+    const live = resolveLiveAgent(sessionId, id => agents?.get(id), () => (agents?.list() ?? []).flatMap(({ id }) => {
+      const agent = agents?.get(id)
+      return agent === undefined ? [] : [agent]
+    }))
     const presets = ctx.get('agentPresets') as { serviceFor?: (agent: unknown, name: string) => { list: (opts: { cwd?: string; scope?: unknown }) => Promise<{ name: string; description: string; invocation?: { modelInvocable?: boolean } }[]> } | undefined } | undefined
     const registry = (live === undefined ? undefined : presets?.serviceFor?.(live, 'skills')) ?? ctx.skills
     const cwd = live?.session?.header?.cwd
@@ -119,15 +145,28 @@ export function apply(ctx: Context, config: Config): void {
     console.log(`[omt] skill catalog ${catalog.length}: ${catalog.map(row => row.name).join(', ')}`)
     return catalog
   }
-  registerOmtRpc(ctx, pool, recent, changes, running, {
+  registerOmtRpc(ctx, service, recent, service.hub, running, {
     getSettings: () => promptSettings,
     listCatalog,
   })
-  registerOmtEvents(ctx, changes)
-  registerOmtIdleHook(ctx, pool, running)
-  registerOmtDisposedHook(ctx, pool, running)
+  registerOmtEvents(ctx, service.hub)
+  registerOmtIdleHook(ctx, service, running)
+  registerOmtDisposedHook(ctx, service, running)
   const refreshInstalled = () => installed.refresh(async () => listCatalog())
   void refreshInstalled()
   ctx.on('skills/change', () => { void refreshInstalled() })
   attachPromptSettings(ctx, value => { promptSettings = value })
+
+  const detachNotifier = notifier.attach(service)
+
+  // Disposal binds to the fiber: detach listeners, drop the Cordis
+  // registration, close the client (credentials die server-side).
+  const withEffect = ctx as unknown as { effect?: (body: () => Generator<() => void, void, unknown>) => void }
+  withEffect.effect?.call(ctx, function* () {
+    yield () => {
+      detachNotifier()
+      disposeService?.()
+      void service.close().catch(() => {})
+    }
+  })
 }

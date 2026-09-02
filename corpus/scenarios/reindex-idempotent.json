@@ -1,0 +1,23 @@
+{
+  "meta": {
+    "name": "reindex-idempotent",
+    "source": "tests/core.spec.ts#reindex > is idempotent",
+    "description": "Two consecutive reindexes produce identical results and a stable tree."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "用户体系" },
+      { "type": "story", "title": "登录", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "登录接口", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "reindex", "label": "first" },
+    { "op": "reindex", "label": "second" },
+    { "op": "tree", "label": "forest" }
+  ],
+  "invariants": [
+    { "expect": "equals", "op": "second", "valueFrom": "first" },
+    { "expect": "length", "op": "forest", "value": 1 }
+  ]
+}

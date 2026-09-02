@@ -1,0 +1,11 @@
+[package]
+name = "omt-client"
+version.workspace = true
+edition.workspace = true
+description = "Thin shared client for the omt-daemon JSON-RPC runtime (KTD4/KTD6): descriptor discovery, UDS endpoint connect, JSON-line framing, handshake enrollment, optional credential persistence."
+
+[dependencies]
+omt-domain = { path = "../omt-domain" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+libc = { workspace = true }

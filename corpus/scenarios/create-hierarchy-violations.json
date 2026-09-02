@@ -1,0 +1,28 @@
+{
+  "meta": {
+    "name": "create-hierarchy-violations",
+    "source": "tests/core.spec.ts#create > rejects hierarchy violations",
+    "description": "Root creation is epic-only; every illegal parent/child pair is INVALID_HIERARCHY with rule=child-type details; unknown parent refs are NOT_FOUND."
+  },
+  "setup": {
+    "nodes": [
+      { "type": "epic", "title": "用户体系" },
+      { "type": "story", "title": "登录", "parentId": "EPIC-0001" },
+      { "type": "ticket", "title": "登录接口", "parentId": "STORY-0001" }
+    ]
+  },
+  "operations": [
+    { "op": "create", "params": { "type": "story", "title": "孤儿" }, "label": "orphan" },
+    { "op": "create", "params": { "type": "ticket", "title": "跨层", "parentId": "EPIC-0001" }, "label": "crossLayer" },
+    { "op": "create", "params": { "type": "substory", "title": "错层", "parentId": "TICKET-0001" }, "label": "wrongLevel" },
+    { "op": "create", "params": { "type": "epic", "title": "嵌套", "parentId": "STORY-0001" }, "label": "nestedEpic" },
+    { "op": "create", "params": { "type": "ticket", "title": "无父", "parentId": "STORY-9999" }, "label": "noParent" }
+  ],
+  "invariants": [
+    { "expect": "matches", "op": "orphan", "path": "error", "value": { "code": "INVALID_HIERARCHY", "details": { "rule": "root-requires-epic", "childType": "story" } } },
+    { "expect": "matches", "op": "crossLayer", "path": "error", "value": { "code": "INVALID_HIERARCHY", "details": { "rule": "child-type", "parentId": "EPIC-0001", "parentType": "epic", "childType": "ticket" } } },
+    { "expect": "matches", "op": "wrongLevel", "path": "error", "value": { "code": "INVALID_HIERARCHY", "details": { "rule": "child-type", "parentType": "ticket", "childType": "substory" } } },
+    { "expect": "matches", "op": "nestedEpic", "path": "error", "value": { "code": "INVALID_HIERARCHY", "details": { "rule": "child-type", "parentType": "story", "childType": "epic" } } },
+    { "expect": "matches", "op": "noParent", "path": "error", "value": { "code": "NOT_FOUND", "details": { "kind": "node", "id": "STORY-9999" } } }
+  ]
+}
