@@ -17,15 +17,17 @@ import { createRuntimeFixture, type RuntimeFixture } from './mocks/runtime-fixtu
 
 let fixture: RuntimeFixture
 
-beforeEach(async () => {
-  fixture = await createRuntimeFixture({ label: 'ui-migration' })
-})
-
-afterEach(async () => {
-  await fixture.stop()
-})
-
 describe('legacy ui-filters.json migration', () => {
+  // Scoped INSIDE this describe: an outer-level beforeEach would also run
+  // for the sibling describe below, whose own beforeEach then overwrites
+  // `fixture` — orphaning the first fixture's daemon forever (process leak).
+  beforeEach(async () => {
+    fixture = await createRuntimeFixture({ label: 'ui-migration' })
+  })
+
+  afterEach(async () => {
+    await fixture.stop()
+  })
   it('imports the legacy bag into daemon storage and renames the file', async () => {
     const home = fixture.globalHome
     const legacyPath = join(home.path, 'ui-filters.json')
