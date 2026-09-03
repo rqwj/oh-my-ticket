@@ -71,9 +71,11 @@ const CLIENT_EXTERNALS: readonly string[] = [
   '@deepseek-ai/cordis',
   '@deepseek-ai/dsh-client-ui-slots',
   '@deepseek-ai/dsh-client-ui-primitives',
+  '@deepseek-ai/dsh-client-ui-attachment',
+  '@deepseek-ai/dsh-client-schema-form',
   // Static platform-table row (packages/client/web/src/platform.ts
-  // PLATFORM_MODULES): the snapshot-store engine the lazy CJS table answers
-  // natively.
+  // PLATFORM_MODULES): keep the snapshot store external so every plugin
+  // observes the shell's singleton instance.
   '@deepseek-ai/dsh-client-store',
 ]
 

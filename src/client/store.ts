@@ -14,6 +14,8 @@ export interface OmtTreeNode {
   readonly archived: boolean
   readonly priority: number
   readonly path: string
+  /** Present on full node details for optimistic body-save fencing. */
+  readonly revision?: number
   readonly created_at: string
   readonly updated_at: string
   readonly children: readonly OmtTreeNode[]
@@ -31,6 +33,8 @@ export interface NodeSummary {
 export interface DocData {
   /** OMT home of the owning core (absolute path copy). */
   readonly home?: string
+  /** Owning home kind, used to qualify later mutations when ids collide. */
+  readonly scope?: 'workspace' | 'global'
   /** Present while a session is executing this ticket. */
   readonly running?: { readonly sessionId: string; readonly sessionLabel: string; readonly since: string }
   readonly node: OmtTreeNode
@@ -60,6 +64,7 @@ export interface ActiveInfo {
   readonly title: string
   readonly status: OmtTreeNode['status']
   readonly priority: number
+  readonly scope?: 'workspace' | 'global'
 }
 
 // ── run view values (STORY-0013) ─────────────────────────────────────────

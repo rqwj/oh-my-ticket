@@ -12,6 +12,11 @@ describe('sanitizeExtraPrompt', () => {
 
   it('strips complete mustache groups so renderPrompt cannot throw', () => {
     expect(sanitizeExtraPrompt('见 {{model}} 再拆')).toBe('见  再拆')
+    expect(sanitizeExtraPrompt('见 {{model} }} 再拆')).toBe('见  再拆')
+  })
+
+  it('keeps an unmatched opener as literal text', () => {
+    expect(sanitizeExtraPrompt('见 {{model 再拆')).toBe('见 {{model 再拆')
   })
 })
 
@@ -20,8 +25,10 @@ describe('liveBoundNames', () => {
     expect(liveBoundNames(['ce-plan', 'gone', 'omt'], ['ce-plan', 'omt', 'ce-work'])).toEqual(['ce-plan', 'omt'])
   })
 
-  it('keeps user binds when the catalog is runtime-only', () => {
+  it('keeps configured prerequisites while the catalog is empty or only partially warm', () => {
     expect(liveBoundNames(['ce-plan', 'ce-work'], ['omt'])).toEqual(['ce-plan', 'ce-work'])
+    expect(liveBoundNames(['ce-work', 'omt'], ['omt'])).toEqual(['ce-work', 'omt'])
+    expect(liveBoundNames(['ce-plan', 'ce-work', 'omt'], ['ce-plan', 'omt'])).toEqual(['ce-plan', 'ce-work', 'omt'])
   })
 })
 
@@ -86,6 +93,24 @@ describe('composeOmtPrompt', () => {
     expect(text).toContain('`ce-worktree`')
     expect(text).toContain('`ce-test-browser`')
     expect(text).toContain('禁止不 load `ce-work` 就直接改代码')
+    expect(text).toContain('omt_bypass')
+    expect(text).toContain('next model step')
+    expect(text).toContain('可以继续只读操作')
+    expect(text).toContain('拆票阶段 Skill 只阻止 `omt_create` 与 `plans` 计划文档写入')
+    expect(text).toContain('实施阶段 Skill 只阻止其它 `edit/write`')
+    expect(text).not.toContain('调用任何绑定 skill 后必须结束当前 run_code/工具批次')
+    expect(text).toContain('DSH turn')
+    expect(text).toContain('重新 load')
+  })
+
+  it('does not claim mutation hard gates for verification-only bindings', () => {
+    const text = composeOmtPrompt({
+      extraPrompt: '',
+      boundSkillNames: ['ce-test-browser', 'omt'],
+      installedNames: ['ce-test-browser', 'omt'],
+    })
+    expect(text).not.toContain('next model step')
+    expect(text).not.toContain('omt_bypass')
   })
 })
 

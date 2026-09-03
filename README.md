@@ -1,7 +1,7 @@
 # Oh-My-Ticket (OMT)
 
-![version](https://img.shields.io/badge/version-0.6.2-blue)
-![tests](https://img.shields.io/badge/tests-314%20passing-brightgreen)
+![version](https://img.shields.io/badge/version-0.6.3-blue)
+![tests](https://img.shields.io/badge/tests-399%20passing-brightgreen)
 ![platform](https://img.shields.io/badge/platform-DeepSeek%20Harness-purple)
 ![dsh](https://img.shields.io/badge/DeepSeek%20Harness%20tested-0.1.2--alpha.3-blue)
 
@@ -94,14 +94,14 @@ run 批次纪律（创建/认领/报告/续跑响应）。
 
 ```sh
 # 本仓库构建并打包：
-pnpm install && pnpm build && npm pack    # → dsh-oh-my-ticket-0.6.1.tgz
+pnpm install && pnpm build && npm pack    # → dsh-oh-my-ticket-0.6.3.tgz
 
 # 安装进目标 DSH profile（profile 的 dsh.profile.bundles 依次为）：
 #   @deepseek-ai/dsh-base, @deepseek-ai/dsh-web-app, dsh-oh-my-ticket
-pnpm dsh plugin --profile <profile> add /path/to/dsh-oh-my-ticket-0.6.1.tgz
+pnpm dsh plugin --profile <profile> add /path/to/dsh-oh-my-ticket-0.6.3.tgz
 
 # 或直接从 npm 安装已发布版本：
-pnpm dsh plugin --profile <profile> add dsh-oh-my-ticket@0.6.1
+pnpm dsh plugin --profile <profile> add dsh-oh-my-ticket@0.6.3
 ```
 
 daemon 二进制随主包以 optionalDependency 自动带入（`@oh-my-ticket/darwin-arm64`），

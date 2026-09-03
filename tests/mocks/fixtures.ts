@@ -22,7 +22,7 @@ export async function ticketFixture(service: OmtService, home: HomeRef, count = 
 /** epic → story → n tickets, created through the tool surface. */
 export async function ticketFixtureViaTools(tools: Map<string, RegisteredTool>, count: number): Promise<string[]> {
   const noExec = {}
-  const epic = await toolOf(tools, 'omt_create').execute({ type: 'epic', title: '批量' }, noExec)
+  const epic = await toolOf(tools, 'omt_create').execute({ type: 'epic', title: '批量', scope: 'global' }, noExec)
   const story = await toolOf(tools, 'omt_create').execute({ type: 'story', title: '批次', parentId: epic.id }, noExec)
   const ids: string[] = []
   for (let index = 0; index < count; index += 1) {

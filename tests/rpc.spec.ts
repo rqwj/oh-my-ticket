@@ -87,6 +87,20 @@ it('update accepts a full body replace', async () => {
   expect(shown.value.body).not.toContain('OAuth')
 })
 
+it('rejects a stale full-body replacement by node revision', async () => {
+  const before = await handler('get', { id: 'TICKET-0001' }, new AbortController().signal)
+  expect(typeof before.value.node.revision).toBe('number')
+  await service.updateNode({ id: 'TICKET-0001', append: '\n并发进度' })
+  const stale = await handler('update', {
+    id: 'TICKET-0001',
+    body: '过期正文',
+    expectedRevision: before.value.node.revision,
+  }, new AbortController().signal)
+  expect(stale.ok).toBe(false)
+  const after = await handler('get', { id: 'TICKET-0001' }, new AbortController().signal)
+  expect(after.value.body).toContain('并发进度')
+})
+
 it('get returns ancestors from root to parent', async () => {
   const result = await handler('get', { id: 'TICKET-0001' }, new AbortController().signal)
   expect(result.value.ancestors.map((n: { id: string }) => n.id)).toEqual(['EPIC-0001', 'STORY-0001'])
@@ -97,7 +111,8 @@ it('get returns ancestors from root to parent', async () => {
 it('keeps ancestor traversal in the resolved home when ids collide', async () => {
   const workspace = fixture.workspaceHome!
   const workspaceEpic = await service.createNode(workspace, { type: 'epic', title: '工作区史诗' })
-  await service.createNode(workspace, { type: 'story', title: '工作区故事', parentId: workspaceEpic.id })
+  const workspaceStory = await service.createNode(workspace, { type: 'story', title: '工作区故事', parentId: workspaceEpic.id })
+  await service.createNode(workspace, { type: 'ticket', title: '工作区同号票', parentId: workspaceStory.id })
 
   const liveSession = 'workspace-session'
   let workspaceHandler: Handler | undefined
@@ -115,16 +130,50 @@ it('keeps ancestor traversal in the resolved home when ids collide', async () =>
     sessionId: liveSession,
   }, new AbortController().signal)
   expect(result.ok).toBe(true)
-  expect(result.value.ancestors.map((node: { title: string }) => node.title)).toEqual(['用户体系', '登录'])
+  expect(result.value.ancestors.map((node: { title: string }) => node.title)).toEqual(['工作区史诗', '工作区故事'])
+
+  const globalResult = await workspaceHandler!('get', {
+    id: 'TICKET-0001',
+    sessionId: liveSession,
+    scope: 'global',
+  }, new AbortController().signal)
+  expect(globalResult.ok).toBe(true)
+  expect(globalResult.value.ancestors.map((node: { title: string }) => node.title)).toEqual(['用户体系', '登录'])
+
+  const updatedGlobal = await workspaceHandler!('update', {
+    id: 'TICKET-0001',
+    sessionId: liveSession,
+    scope: 'global',
+    title: '全局票已更新',
+  }, new AbortController().signal)
+  expect(updatedGlobal.ok).toBe(true)
+  const globalAfter = await workspaceHandler!('get', { id: 'TICKET-0001', sessionId: liveSession, scope: 'global' }, new AbortController().signal)
+  const workspaceAfter = await workspaceHandler!('get', { id: 'TICKET-0001', sessionId: liveSession }, new AbortController().signal)
+  expect(globalAfter.value.node.title).toBe('全局票已更新')
+  expect(workspaceAfter.value.node.title).toBe('工作区同号票')
 })
 
 it('create adds a legal child and a root epic', async () => {
   const child = await handler('create', { type: 'ticket', title: '新票', parentId: 'STORY-0001' }, new AbortController().signal)
   expect(child.ok).toBe(true)
   expect(child.value.type).toBe('ticket')
-  const epic = await handler('create', { type: 'epic', title: '新史诗' }, new AbortController().signal)
+  const epic = await handler('create', { type: 'epic', title: '新史诗', scope: 'global' }, new AbortController().signal)
   expect(epic.ok).toBe(true)
   expect(epic.value.type).toBe('epic')
+})
+
+it('rejects root epic creation without an explicit scope', async () => {
+  const result = await handler('create', { type: 'epic', title: '无归属史诗' }, new AbortController().signal)
+  expect(result.ok).toBe(false)
+  expect(result.error.code).toBe('bad-request')
+  expect(result.error.message).toContain('scope')
+})
+
+it('rejects workspace Epic creation when no live session supplies a cwd', async () => {
+  const result = await handler('create', { type: 'epic', title: '无工作区史诗', scope: 'workspace' }, new AbortController().signal)
+  expect(result.ok).toBe(false)
+  expect(result.error.code).toBe('bad-request')
+  expect(result.error.message).toContain('live session')
 })
 
 it('update accepts title and priority', async () => {
@@ -138,6 +187,10 @@ it('rejects invalid payloads and unknown endpoints', async () => {
   const badPayload = await handler('get', { id: 42 }, new AbortController().signal)
   expect(badPayload.ok).toBe(false)
   expect(badPayload.error.code).toBe('bad-request')
+
+  const conflictingUpdate = await handler('update', { id: 'TICKET-0001', body: '正文', append: '进度' }, new AbortController().signal)
+  expect(conflictingUpdate.ok).toBe(false)
+  expect(conflictingUpdate.error.code).toBe('bad-request')
 
   const unknown = await handler('nope', {}, new AbortController().signal)
   expect(unknown.ok).toBe(false)

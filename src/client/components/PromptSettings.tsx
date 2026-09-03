@@ -29,6 +29,7 @@ export function PromptSettings(props: PromptSettingsProps) {
           value={view.extraPrompt}
           placeholder={t('settings.extraPlaceholder')}
           rows={6}
+          disabled={view.catalogStatus === 'loading'}
           onChange={event => props.setDraftExtra(event.target.value)}
           onBlur={event => props.setExtraPrompt(event.target.value)}
         />
@@ -58,7 +59,7 @@ export function PromptSettings(props: PromptSettingsProps) {
                   className={css.skill}
                   title={hint === undefined ? row.name : `${row.name} ${hint}`}
                 >
-                  <input type="checkbox" checked={row.bound} onChange={() => props.toggle(row.name)} />
+                  <input type="checkbox" checked={row.bound} disabled={view.catalogStatus === 'loading'} onChange={() => props.toggle(row.name)} />
                   <span className={css.skillBody}>
                     <span className={css.skillName}>{row.name}</span>
                     {hint !== undefined && (

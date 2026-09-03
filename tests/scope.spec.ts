@@ -81,10 +81,11 @@ it('asks the user when scope is omitted (global answer)', async () => {
   expect(await rootIds(workspaceHome)).toHaveLength(0)
 })
 
-it('falls back to the automatic rule when no answerer is available', async () => {
-  // askBehavior unset → ask rejects → automatic rule (local home wins).
-  await create({ type: 'epic', title: '自动路由' }, execAt(workspaceCwd()))
-  expect(await rootIds(workspaceHome)).toHaveLength(1)
+it('refuses to guess a root Epic scope when the answerer is unavailable', async () => {
+  await expect(create({ type: 'epic', title: '不自动路由' }, execAt(workspaceCwd())))
+    .rejects.toThrow('scope selection')
+  expect(await rootIds(workspaceHome)).toEqual([])
+  expect(await rootIds(globalHome)).toEqual([])
 })
 
 it('children always land in the parent\'s home, regardless of cwd', async () => {

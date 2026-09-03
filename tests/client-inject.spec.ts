@@ -19,4 +19,11 @@ describe('client service injection', () => {
     expect(source).toContain('bind({ namespace: OMT_PROMPT_SETTINGS_NS })')
     expect(source).not.toContain("bind('oh-my-ticket-prompt')")
   })
+
+  it('persists prompt fields in one atomic settings mutation', () => {
+    const source = readFileSync(new URL('../src/client/index.ts', import.meta.url), 'utf8')
+    expect(source).toContain('await promptSettings.mutate(ops)')
+    expect(source).not.toContain("promptSettings.set('extraPrompt'")
+    expect(source).not.toContain("promptSettings.set('boundSkillNames'")
+  })
 })

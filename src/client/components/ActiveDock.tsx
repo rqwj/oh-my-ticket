@@ -13,7 +13,7 @@ export interface ActiveDockProps {
   /** Framework session-scope prop; routes RPC to the workspace home. */
   readonly sessionId?: string
   readonly useActive: Selector<ActiveInfo | undefined>
-  readonly select: (id: string, sessionId?: string) => void
+  readonly select: (id: string, sessionId?: string, scope?: 'workspace' | 'global') => void
   readonly clearActive: () => void
   /** Framework-injected translate seat (registration declares locale: NS). */
   readonly t: Translate
@@ -25,7 +25,7 @@ export function ActiveDock(props: ActiveDockProps) {
   if (active === undefined) return null
   return (
     <div className={css.strip}>
-      <button type="button" className={css.target} onClick={() => props.select(active.id, props.sessionId)} title={t('dock.openInPanel')}>
+      <button type="button" className={css.target} onClick={() => props.select(active.id, props.sessionId, active.scope)} title={t('dock.openInPanel')}>
         <span className={css.pin}>◈</span>
         <span className={css.id}>{active.id}</span>
         <PriorityIcon priority={active.priority} t={t} />

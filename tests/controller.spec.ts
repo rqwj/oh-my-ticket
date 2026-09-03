@@ -78,6 +78,30 @@ it('select loads the doc, pins active, attaches the shadow, opens details', asyn
   expect(shadowAttachCount).toBe(1)
 })
 
+it('select forwards an explicit home scope for colliding ids', async () => {
+  await controller.select('TICKET-0001', 's1', 'global')
+  expect(calls.find(call => call.endpoint === 'get')?.payload).toEqual({ sessionId: 's1', id: 'TICKET-0001', scope: 'global' })
+})
+
+it('keeps the latest selection when an older request resolves last', async () => {
+  const pending = new Map<string, (result: RpcResultLike) => void>()
+  const latest = new OmtController({
+    async call(_channel: string, _endpoint: string, payload: { id: string }): Promise<RpcResultLike> {
+      return await new Promise(resolve => { pending.set(payload.id, resolve) })
+    },
+  }, { openDetails: () => {}, closeDetails: () => {} })
+  const first = latest.select('TICKET-0001')
+  const second = latest.select('TICKET-0002')
+  pending.get('TICKET-0002')!({
+    ok: true,
+    value: { ...(GET_OK.value as object), node: { ...(GET_OK.value as any).node, id: 'TICKET-0002', title: '新选择' } },
+  })
+  await second
+  pending.get('TICKET-0001')!(GET_OK)
+  await first
+  expect(latest.doc.getSnapshot()).toMatchObject({ status: 'ready', data: { node: { id: 'TICKET-0002' } } })
+})
+
 it('closeDoc disposes the shadow, resets the doc, and closes the details column', async () => {
   await controller.select('TICKET-0001')
   controller.closeDoc()
@@ -109,6 +133,13 @@ it('setStatus updates then refreshes tree and doc', async () => {
   expect(calls[0]).toEqual({ endpoint: 'update', payload: { id: 'TICKET-0001', status: 'in_progress' } })
   expect(calls.some(call => call.endpoint === 'tree')).toBe(true)
   expect(calls.some(call => call.endpoint === 'get')).toBe(true)
+})
+
+it('saveBody qualifies the home and sends the optimistic revision', async () => {
+  await controller.saveBody('TICKET-0001', '正文', 7, 's1', 'global')
+  expect(calls.find(call => call.endpoint === 'update')?.payload).toEqual({
+    sessionId: 's1', id: 'TICKET-0001', body: '正文', expectedRevision: 7, scope: 'global',
+  })
 })
 
 it('appendNote ignores blank input', async () => {

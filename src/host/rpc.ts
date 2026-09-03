@@ -75,7 +75,7 @@ const searchPayloadSchema = z.object({
   limit: z.number().int().min(1).max(100).default(20),
   ...sessionField,
 }).strict()
-const getPayloadSchema = z.object({ id: z.string().min(1), ...sessionField }).strict()
+const getPayloadSchema = z.object({ id: z.string().min(1), scope: z.enum(['workspace', 'global']).optional(), ...sessionField }).strict()
 const updatePayloadSchema = z.object({
   id: z.string().min(1),
   title: z.string().min(1).optional(),
@@ -84,6 +84,8 @@ const updatePayloadSchema = z.object({
   priority: z.number().int().optional(),
   append: z.string().min(1).optional(),
   body: z.string().optional(),
+  expectedRevision: z.number().int().nonnegative().optional(),
+  scope: z.enum(['workspace', 'global']).optional(),
   ...sessionField,
 }).strict()
 const reindexPayloadSchema = z.object({ ...sessionField }).strict()
@@ -377,9 +379,17 @@ export function registerOmtRpc(ctx: Context, service: OmtService, recent?: Recen
         case 'get': {
           const parsed = getPayloadSchema.safeParse(payload)
           if (!parsed.success) return badRequest('invalid get payload', parsed.error.issues)
-          const result = await service.showNode(parsed.data.id, cwdOf(parsed.data.sessionId))
+          const cwd = cwdOf(parsed.data.sessionId)
+          if (parsed.data.scope === 'workspace' && cwd === undefined) {
+            return badRequest('workspace scope requires a live session with a cwd', [])
+          }
+          const result = parsed.data.scope === undefined
+            ? await service.showNode(parsed.data.id, cwd)
+            : await service.showNodeIn(await service.homeForScope(cwd, parsed.data.scope), parsed.data.id)
           recent?.touch(parsed.data.sessionId, parsed.data.id)
-          const runningInfo = running?.get(parsed.data.id)
+          const runningInfo = parsed.data.scope === 'global' && parsed.data.sessionId !== undefined
+            ? undefined
+            : running?.get(parsed.data.id)
           // 所属 run 链接 (TICKET-0068): every non-terminal run holding
           // this ticket, with the item state (awaiting_confirmation 标识)
           // and a small progress summary.
@@ -391,7 +401,8 @@ export function registerOmtRpc(ctx: Context, service: OmtService, recent?: Recen
             progress: progressFromCounts(link.progress),
           }))
           return ok({
-            home: result.home.homeId,
+            ...(result.home.path !== undefined ? { home: result.home.path } : {}),
+            ...(result.home.kind !== undefined ? { scope: result.home.kind } : {}),
             ...(runningInfo !== undefined ? { running: runningInfo } : {}),
             node: result.node,
             ...(result.parent != null ? { parent: summarize(result.parent) } : {}),
@@ -404,16 +415,24 @@ export function registerOmtRpc(ctx: Context, service: OmtService, recent?: Recen
         case 'update': {
           const parsed = updatePayloadSchema.safeParse(payload)
           if (!parsed.success) return badRequest('invalid update payload', parsed.error.issues)
-          const { title, status, archived, priority, append, body } = parsed.data
+          const { title, status, archived, priority, append, body, expectedRevision, scope } = parsed.data
           if ([title, status, archived, priority, append, body].every(v => v === undefined)) {
             return badRequest('update requires at least one change (title/status/archived/priority/append/body)', [])
           }
+          if (append !== undefined && body !== undefined) {
+            return badRequest('update body and append are mutually exclusive', [])
+          }
           // Passive observation (TICKET-0061) rides on the daemon update;
           // the session is recorded adapter-side for hook attribution.
-          const { node } = await service.updateNode(
-            { id: parsed.data.id, title, status, archived, priority, append, body },
-            { cwd: cwdOf(parsed.data.sessionId), sessionId: parsed.data.sessionId },
-          )
+          const cwd = cwdOf(parsed.data.sessionId)
+          if (scope === 'workspace' && cwd === undefined) {
+            return badRequest('workspace scope requires a live session with a cwd', [])
+          }
+          const input = { id: parsed.data.id, title, status, archived, priority, append, body, expectedRevision }
+          const context = { cwd, sessionId: parsed.data.sessionId }
+          const { node } = scope === undefined
+            ? await service.updateNode(input, context)
+            : await service.updateNodeIn(await service.homeForScope(cwd, scope), input, context)
           recent?.touch(parsed.data.sessionId, parsed.data.id)
           // Manual status changes never START a running mark — execution is
           // claimed only by the execute endpoint and model tool calls
@@ -424,12 +443,19 @@ export function registerOmtRpc(ctx: Context, service: OmtService, recent?: Recen
         case 'create': {
           const parsed = createPayloadSchema.safeParse(payload)
           if (!parsed.success) return badRequest('invalid create payload', parsed.error.issues)
+          if (parsed.data.parentId === undefined && parsed.data.scope === undefined) {
+            return badRequest('scope is required when creating a root Epic', [])
+          }
+          if (parsed.data.parentId !== undefined && parsed.data.scope !== undefined) {
+            return badRequest('scope is only valid when creating a root Epic', [])
+          }
           const cwd = cwdOf(parsed.data.sessionId)
+          if (parsed.data.scope === 'workspace' && cwd === undefined) {
+            return badRequest('workspace scope requires a live session with a cwd', [])
+          }
           const home = parsed.data.parentId !== undefined
             ? (await service.resolveNodeHome(parsed.data.parentId, cwd)).home
-            : parsed.data.scope !== undefined
-              ? await service.homeForScope(cwd, parsed.data.scope)
-              : await service.homeFor(cwd)
+            : await service.homeForScope(cwd, parsed.data.scope!)
           const node = await service.createNode(home, {
             type: parsed.data.type,
             title: parsed.data.title,

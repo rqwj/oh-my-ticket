@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { catalogLookupsFromAgents, collectBindableCatalog, DEFAULT_PROMPT_SETTINGS, describeBoundCatalog, InstalledSkillCache, resolveLiveAgent, selectBindableSkills } from '../src/host/prompt-settings.ts'
+import { catalogLookupsFromAgents, collectBindableCatalog, DEFAULT_PROMPT_SETTINGS, describeBoundCatalog, InstalledSkillCache, refreshInstalledSkillCache, resolveLiveAgent, selectBindableSkills } from '../src/host/prompt-settings.ts'
 
 describe('describeBoundCatalog', () => {
   it('flags bound and missing names', () => {
@@ -79,6 +79,15 @@ describe('InstalledSkillCache', () => {
     ])
     await cache.refresh(async () => [{ name: 'omt', invocation: { modelInvocable: true } }])
     expect(cache.names()).toEqual(['ce-plan', 'ce-work'])
+  })
+
+  it('contains refresh failures and retains the last successful cache', async () => {
+    const cache = new InstalledSkillCache()
+    await cache.refresh(async () => [{ name: 'ce-plan' }, { name: 'ce-work' }])
+    const errors: unknown[] = []
+    await refreshInstalledSkillCache(cache, async () => { throw new Error('catalog unavailable') }, error => { errors.push(error) })
+    expect(cache.names()).toEqual(['ce-plan', 'ce-work'])
+    expect(errors).toHaveLength(1)
   })
 })
 

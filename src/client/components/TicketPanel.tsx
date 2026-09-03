@@ -40,9 +40,9 @@ export interface TicketPanelProps {
   readonly loadFilters: (sessionId?: string) => Promise<SavedFilters>
   /** Persist a full filter bag; called debounced on change, immediate on reset. */
   readonly saveFilters: (sessionId: string | undefined, filters: SavedFilters) => Promise<void>
-  readonly select: (id: string, sessionId?: string) => void
+  readonly select: (id: string, sessionId?: string, scope?: 'workspace' | 'global') => void
   readonly archive: (id: string, sessionId?: string) => void
-  readonly createNode: (input: { type: OmtTreeNode['type']; title: string; parentId?: string; body?: string }, sessionId?: string) => Promise<string | undefined>
+  readonly createNode: (input: { type: OmtTreeNode['type']; title: string; parentId?: string; body?: string; scope?: 'workspace' | 'global' }, sessionId?: string) => Promise<string | undefined>
   readonly expandIds: (ids: readonly string[]) => void
   /** Run 区块 bindings (STORY-0013): section nav, RunsView, picker, notice. */
   readonly runView: RunBindings
@@ -76,6 +76,15 @@ function statusText(t: Translate, node: { status: OmtTreeNode['status']; archive
   return node.archived
     ? t('status.archivedWith', { status: t(STATUS_KEY[node.status]) })
     : t(STATUS_KEY[node.status])
+}
+
+function childTypesOf(nodes: readonly OmtTreeNode[], parentId: string): readonly OmtTreeNode['type'][] {
+  for (const node of nodes) {
+    if (node.id === parentId) return CHILD_TYPES[node.type]
+    const nested = childTypesOf(node.children, parentId)
+    if (nested.length > 0) return nested
+  }
+  return []
 }
 
 interface TreeRowProps {
@@ -208,9 +217,12 @@ export function TicketPanel(props: TicketPanelProps) {
   const [sortOrder, setSortOrder] = useState<TreeSortOrder>('none')
   const [focusedId, setFocusedId] = useState<string | undefined>(undefined)
   const [flashId, setFlashId] = useState<string | undefined>(undefined)
-  const [creating, setCreating] = useState<{ type: OmtTreeNode['type']; parentId?: string } | undefined>(undefined)
+  const [creating, setCreating] = useState<{ type: OmtTreeNode['type']; parentId?: string; scope?: 'workspace' | 'global' } | undefined>(undefined)
   const [createTitle, setCreateTitle] = useState('')
   const [createBody, setCreateBody] = useState('')
+  const [createPending, setCreatePending] = useState(false)
+  const createPendingRef = useRef(false)
+  const createRequestRef = useRef(0)
   const treeRef = useRef<HTMLDivElement>(null)
   const toggleNum = (list: readonly number[], value: number): readonly number[] =>
     list.includes(value) ? list.filter(item => item !== value) : [...list, value]
@@ -219,6 +231,18 @@ export function TicketPanel(props: TicketPanelProps) {
   // The tree follows the session whose shell this panel lives in. The panel
   // mounts only while its shell is visible, so mount == (re)open.
   const sessionId = props.sessionId
+  useEffect(() => {
+    createRequestRef.current += 1
+    createPendingRef.current = false
+    setCreatePending(false)
+    setCreating(undefined)
+    setCreateTitle('')
+    setCreateBody('')
+    return () => {
+      createRequestRef.current += 1
+      createPendingRef.current = false
+    }
+  }, [sessionId])
   useEffect(() => {
     void props.refreshTree(sessionId)
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -275,6 +299,13 @@ export function TicketPanel(props: TicketPanelProps) {
   }
 
   const filter: TreeFilter = { query, showArchived, types: typeFilter, statuses: statusFilter, priorities: priorityFilter }
+  const createTypeOptions: readonly OmtTreeNode['type'][] = creating === undefined
+    ? []
+    : creating.parentId === undefined
+      ? ['epic']
+      : tree.status === 'ready'
+        ? childTypesOf(tree.forest, creating.parentId)
+        : []
 
   return (
     <div className={css.root}>
@@ -292,7 +323,6 @@ export function TicketPanel(props: TicketPanelProps) {
           title={t('drawer.locate')}
           onClick={() => {
             if (active === undefined || tree.status !== 'ready') return
-            const forest = filterForest(sortForest(tree.forest, sortOrder), filter)
             const hidden = query !== '' || typeFilter.length > 0 || statusFilter.length > 0 || priorityFilter.length > 0
             if (hidden) {
               setQuery('')
@@ -482,30 +512,53 @@ export function TicketPanel(props: TicketPanelProps) {
           onSubmit={event => {
             event.preventDefault()
             const title = createTitle.trim()
-            if (title === '') return
-            void props.createNode({ type: creating.type, title, parentId: creating.parentId, body: createBody.trim() || undefined }, sessionId).then(id => {
-              setCreating(undefined)
-              setCreateTitle('')
-              setCreateBody('')
-              if (id !== undefined) setFocusedId(id)
-            })
+            if (title === '' || createPendingRef.current) return
+            if (creating.parentId === undefined && creating.scope === undefined) return
+            createPendingRef.current = true
+            const requestId = ++createRequestRef.current
+            setCreatePending(true)
+            void (async () => {
+              try {
+                const id = await props.createNode({
+                  type: creating.type,
+                  title,
+                  parentId: creating.parentId,
+                  body: createBody.trim() || undefined,
+                  scope: creating.scope,
+                }, sessionId)
+                if (requestId !== createRequestRef.current || id === undefined) return
+                setCreating(undefined)
+                setCreateTitle('')
+                setCreateBody('')
+                props.refreshTree(sessionId)
+                props.select(id, sessionId, creating.scope)
+                setFocusedId(id)
+              } catch (error) {
+                if (requestId === createRequestRef.current) console.error('[omt] create node failed', error)
+              } finally {
+                if (requestId === createRequestRef.current) {
+                  createPendingRef.current = false
+                  setCreatePending(false)
+                }
+              }
+            })()
           }}
         >
-          <select value={creating.type} onChange={event => setCreating({ ...creating, type: event.target.value as OmtTreeNode['type'] })}>
-            {(creating.parentId === undefined ? (['epic'] as const) : CHILD_TYPES[tree.status === 'ready' ? (function find(nodes: readonly OmtTreeNode[]): OmtTreeNode['type'][] {
-              for (const node of nodes) {
-                if (node.id === creating.parentId) return [...CHILD_TYPES[node.type]]
-                const nested = find(node.children)
-                if (nested.length > 0) return nested
-              }
-              return ['ticket']
-            })(tree.forest) : ['ticket']]).map(type => <option key={type} value={type}>{type}</option>)}
+          <select name="type" value={creating.type} onChange={event => setCreating({ ...creating, type: event.target.value as OmtTreeNode['type'] })}>
+            {createTypeOptions.map(type => <option key={type} value={type}>{type}</option>)}
           </select>
+          {creating.parentId === undefined && (
+            <select name="scope" aria-label={t('drawer.createScope')} value={creating.scope ?? ''} onChange={event => setCreating({ ...creating, scope: event.target.value === '' ? undefined : event.target.value as 'workspace' | 'global' })}>
+              <option value="">{t('drawer.createScope')}</option>
+              {sessionId !== undefined && <option value="workspace">{t('drawer.scopeWorkspace')}</option>}
+              <option value="global">{t('drawer.scopeGlobal')}</option>
+            </select>
+          )}
           <input value={createTitle} placeholder={t('drawer.createTitle')} onChange={event => setCreateTitle(event.target.value)} autoFocus />
           <textarea value={createBody} placeholder={t('drawer.createBody')} onChange={event => setCreateBody(event.target.value)} rows={3} />
           <div>
-            <button type="submit">{t('drawer.createSubmit')}</button>
-            <button type="button" onClick={() => setCreating(undefined)}>{t('drawer.createCancel')}</button>
+            <button type="submit" disabled={createPending}>{t('drawer.createSubmit')}</button>
+            <button type="button" disabled={createPending} onClick={() => setCreating(undefined)}>{t('drawer.createCancel')}</button>
           </div>
         </form>
       )}

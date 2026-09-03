@@ -31,13 +31,25 @@ export function catalogStatusOf(skills: readonly BoundSkillRow[]): Exclude<Catal
   return skills.length === 0 ? 'empty' : 'ready'
 }
 
+export interface PromptSettingsPatch {
+  readonly extraPrompt?: string
+  readonly boundSkillNames?: string[]
+}
+
 export class PromptSettingsModel {
-  private saved: PromptSettingsView = { ...INITIAL_PROMPT_SETTINGS_VIEW }
+  private saved: Pick<PromptSettingsView, 'extraPrompt' | 'skills'> = {
+    extraPrompt: INITIAL_PROMPT_SETTINGS_VIEW.extraPrompt,
+    skills: INITIAL_PROMPT_SETTINGS_VIEW.skills,
+  }
+  private writeQueue: Promise<void> = Promise.resolve()
+  private extraWriteRevision = 0
+  private skillsWriteRevision = 0
+  private loadRevision = 0
   view: PromptSettingsView = { ...INITIAL_PROMPT_SETTINGS_VIEW }
 
   constructor(
     private readonly loadCatalog: () => Promise<{ extraPrompt: string; skills: BoundSkillRow[] }>,
-    private readonly persist: (next: { extraPrompt: string; boundSkillNames: string[] }) => Promise<void>,
+    private readonly persist: (next: PromptSettingsPatch) => Promise<void>,
     private readonly emit: (view: PromptSettingsView) => void = () => {},
   ) {}
 
@@ -46,10 +58,18 @@ export class PromptSettingsModel {
     this.emit(view)
   }
 
+  private enqueuePersist(next: PromptSettingsPatch): Promise<void> {
+    const write = this.writeQueue.then(async () => await this.persist(next))
+    this.writeQueue = write.catch(() => {})
+    return write
+  }
+
   async load(): Promise<void> {
+    const revision = ++this.loadRevision
     this.commit({ ...this.view, catalogStatus: 'loading', catalogError: '', writeError: '' })
     try {
       const data = await this.loadCatalog()
+      if (revision !== this.loadRevision) return
       const next: PromptSettingsView = {
         extraPrompt: data.extraPrompt,
         skills: data.skills,
@@ -60,6 +80,7 @@ export class PromptSettingsModel {
       this.saved = next
       this.commit(next)
     } catch (error) {
+      if (revision !== this.loadRevision) return
       this.commit({
         ...this.view,
         catalogStatus: 'error',
@@ -69,33 +90,42 @@ export class PromptSettingsModel {
   }
 
   setDraftExtra(extraPrompt: string): void {
+    if (this.view.catalogStatus === 'loading') return
     this.commit({ ...this.view, extraPrompt, writeError: '' })
   }
 
   async setExtraPrompt(extraPrompt: string): Promise<void> {
-    const previous = this.view
-    this.commit({ ...this.view, extraPrompt, writeError: '' })
+    if (this.view.catalogStatus === 'loading') return
+    const next = { ...this.view, extraPrompt, writeError: '' }
+    this.commit(next)
+    const revision = ++this.extraWriteRevision
     try {
-      await this.persist({ extraPrompt, boundSkillNames: boundNamesOf(this.view.skills) })
-      this.saved = this.view
+      await this.enqueuePersist({ extraPrompt })
+      this.saved = { ...this.saved, extraPrompt }
     } catch (error) {
+      if (revision !== this.extraWriteRevision) return
       this.commit({
-        ...previous,
+        ...this.view,
+        extraPrompt: this.saved.extraPrompt,
         writeError: error instanceof Error ? error.message : String(error),
       })
     }
   }
 
   async toggle(name: string): Promise<void> {
-    const previous = this.view
+    if (this.view.catalogStatus === 'loading') return
     const skills = toggleBound(this.view.skills, name)
-    this.commit({ ...this.view, skills, writeError: '' })
+    const next = { ...this.view, skills, writeError: '' }
+    this.commit(next)
+    const revision = ++this.skillsWriteRevision
     try {
-      await this.persist({ extraPrompt: this.view.extraPrompt, boundSkillNames: boundNamesOf(skills) })
-      this.saved = this.view
+      await this.enqueuePersist({ boundSkillNames: boundNamesOf(skills) })
+      this.saved = { ...this.saved, skills }
     } catch (error) {
+      if (revision !== this.skillsWriteRevision) return
       this.commit({
-        ...previous,
+        ...this.view,
+        skills: this.saved.skills,
         writeError: error instanceof Error ? error.message : String(error),
       })
     }
