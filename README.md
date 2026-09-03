@@ -92,14 +92,14 @@ run 批次纪律（创建/认领/报告/续跑响应）。
 
 ```sh
 # 本仓库构建并打包：
-pnpm install && pnpm build && npm pack    # → dsh-oh-my-ticket-0.6.1.tgz
+pnpm install && pnpm build && npm pack    # → dsh-oh-my-ticket-0.6.2.tgz
 
 # 安装进目标 DSH profile（profile 的 dsh.profile.bundles 依次为）：
 #   @deepseek-ai/dsh-base, @deepseek-ai/dsh-web-app, dsh-oh-my-ticket
-pnpm dsh plugin --profile <profile> add /path/to/dsh-oh-my-ticket-0.6.1.tgz
+pnpm dsh plugin --profile <profile> add /path/to/dsh-oh-my-ticket-0.6.2.tgz
 
 # 或直接从 npm 安装已发布版本：
-pnpm dsh plugin --profile <profile> add dsh-oh-my-ticket@0.6.1
+pnpm dsh plugin --profile <profile> add dsh-oh-my-ticket@0.6.2
 ```
 
 daemon 二进制随主包以 optionalDependency 自动带入（`@oh-my-ticket/darwin-arm64`），
@@ -130,7 +130,7 @@ pnpm build        # lib/index.js（host 半）+ lib/client.js（浏览器半）
 pnpm watch        # 增量重建
 pnpm typecheck    # tsc --noEmit
 pnpm test         # vitest（314 例）
-pnpm sync-version 0.6.1   # 统一升级四端版本号（Cargo.toml 为权威源）
+pnpm sync-version 0.6.2   # 统一升级四端版本号（Cargo.toml 为权威源）
 ```
 
 ### 仓库结构
@@ -152,7 +152,10 @@ pnpm sync-version 0.6.1   # 统一升级四端版本号（Cargo.toml 为权威�
 │       ├── controller.ts # snapshot stores 与全部异步流
 │       └── components/   # TicketPanel（共享树面板）+ Drawer/FloatWindow/TicketTab 三壳
 │                         # + DocPanel/RunsView/RunPicker/TurnTickets 等
-├── tests/                # vitest 单测（27 文件 / 344 例）
+├── crates/               # Rust 工作区：omt-runtime（daemon）/ omt-client / omt-storage 等
+├── packages/client-ts/   # TS daemon 客户端（discover-or-spawn、握手、RPC、事件流重放）
+├── apps/desktop/         # Tauri 桌面端
+├── tests/                # vitest 单测（连同 packages/client-ts 共 28 文件 / 314 例）
 └── .omt/tickets/         # 本项目的 ticket 库（SQLite 索引已 gitignore，可 omt_reindex 重建）
 ```
 
