@@ -221,6 +221,7 @@ export function TicketPanel(props: TicketPanelProps) {
   const [createTitle, setCreateTitle] = useState('')
   const [createBody, setCreateBody] = useState('')
   const [createPending, setCreatePending] = useState(false)
+  const [createError, setCreateError] = useState('')
   const createPendingRef = useRef(false)
   const createRequestRef = useRef(0)
   const treeRef = useRef<HTMLDivElement>(null)
@@ -243,6 +244,9 @@ export function TicketPanel(props: TicketPanelProps) {
       createPendingRef.current = false
     }
   }, [sessionId])
+  useEffect(() => {
+    setCreateError('')
+  }, [sessionId, creating?.parentId, creating?.type, creating?.scope])
   useEffect(() => {
     void props.refreshTree(sessionId)
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -517,6 +521,7 @@ export function TicketPanel(props: TicketPanelProps) {
             createPendingRef.current = true
             const requestId = ++createRequestRef.current
             setCreatePending(true)
+            setCreateError('')
             void (async () => {
               try {
                 const id = await props.createNode({
@@ -534,7 +539,7 @@ export function TicketPanel(props: TicketPanelProps) {
                 props.select(id, sessionId, creating.scope)
                 setFocusedId(id)
               } catch (error) {
-                if (requestId === createRequestRef.current) console.error('[omt] create node failed', error)
+                if (requestId === createRequestRef.current) setCreateError(error instanceof Error ? error.message : String(error))
               } finally {
                 if (requestId === createRequestRef.current) {
                   createPendingRef.current = false
@@ -557,6 +562,7 @@ export function TicketPanel(props: TicketPanelProps) {
           <input value={createTitle} placeholder={t('drawer.createTitle')} onChange={event => setCreateTitle(event.target.value)} autoFocus />
           <textarea value={createBody} placeholder={t('drawer.createBody')} onChange={event => setCreateBody(event.target.value)} rows={3} />
           <div>
+            {createError !== '' && <div role="alert">{createError}</div>}
             <button type="submit" disabled={createPending}>{t('drawer.createSubmit')}</button>
             <button type="button" disabled={createPending} onClick={() => setCreating(undefined)}>{t('drawer.createCancel')}</button>
           </div>

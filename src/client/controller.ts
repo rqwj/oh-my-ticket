@@ -163,7 +163,7 @@ export class OmtController {
       void this.refreshTree(sessionId).catch(() => {})
       if (sessionId !== undefined) void this.refreshRelated(sessionId).catch(() => {})
       const active = this.active.getSnapshot()
-      if (active !== undefined && !this.bodyEditing) void this.select(active.id, sessionId).catch(() => {})
+      if (active !== undefined && !this.bodyEditing) void this.select(active.id, sessionId, active.scope).catch(() => {})
       // Run views (TICKET-0071): the list refreshes when the window saw a
       // hint or the Runs 区块 is on screen (showRuns fetches on entry, so a
       // tree-only bump with the tickets section staged skips the round
@@ -427,7 +427,7 @@ export class OmtController {
       ...(scope !== undefined ? { scope } : {}),
     })
     if (!result.ok) throw new Error(result.error.message)
-    await this.afterMutation(id, sessionId, scope)
+    await this.afterMutation(id, sessionId, scope, true)
   }
 
   createNode = async (
@@ -435,7 +435,7 @@ export class OmtController {
     sessionId?: string,
   ): Promise<string | undefined> => {
     const result = await this.rpc.call('/omt', 'create', { sessionId, ...input })
-    if (!result.ok) return undefined
+    if (!result.ok) throw new Error(result.error.message)
     const created = result.value as { id: string }
     return created.id
   }
@@ -464,8 +464,11 @@ export class OmtController {
     }
   }
 
-  private async afterMutation(id: string, sessionId?: string, scope?: 'workspace' | 'global'): Promise<void> {
+  private async afterMutation(id: string, sessionId?: string, scope?: 'workspace' | 'global', bodySaved = false): Promise<void> {
     await this.refreshTree(sessionId)
+    // Metadata refresh must not replace an unsaved body; a successful body
+    // save explicitly reloads the committed content even while editing.
+    if (this.bodyEditing && !bodySaved) return
     const active = this.active.getSnapshot()
     if (active?.id === id && (scope === undefined || active.scope === scope)) await this.select(id, sessionId, scope)
   }

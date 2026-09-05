@@ -4,7 +4,7 @@
  * shadow attach, mutations with refetch, and close/dispose flows — all
  * against stub RPC/layout doubles.
  */
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { OmtController } from '../src/client/controller.ts'
 import type { RpcResultLike } from '../src/client/trigger/source.ts'
 
@@ -83,6 +83,42 @@ it('select forwards an explicit home scope for colliding ids', async () => {
   expect(calls.find(call => call.endpoint === 'get')?.payload).toEqual({ sessionId: 's1', id: 'TICKET-0001', scope: 'global' })
 })
 
+it('SSE refresh preserves the selected home and subsequent action scope for colliding ids', async () => {
+  vi.useFakeTimers()
+  let events!: { onmessage?: (message: { data: string }) => void }
+  vi.stubGlobal('EventSource', class {
+    constructor() { events = this }
+    onmessage?: (message: { data: string }) => void
+  })
+  try {
+    const scoped = new OmtController({
+      async call(_channel: string, endpoint: string, payload: any): Promise<RpcResultLike> {
+        calls.push({ endpoint, payload })
+        if (endpoint === 'get') {
+          const scope = payload.scope ?? 'workspace'
+          return { ok: true, value: { ...(GET_OK.value as any), scope, body: `${scope} body` } }
+        }
+        return endpoint === 'tree' ? TREE_OK : { ok: true, value: [] }
+      },
+    }, { openDetails: () => {}, closeDetails: () => {} })
+    scoped.noteSession('s1')
+    await scoped.select('TICKET-0001', 's1', 'global')
+    scoped.connectEvents()
+    calls = []
+    events.onmessage!({ data: '{}' })
+    await vi.advanceTimersByTimeAsync(300)
+    expect(calls.find(call => call.endpoint === 'get')?.payload).toEqual({ id: 'TICKET-0001', sessionId: 's1', scope: 'global' })
+    expect(scoped.doc.getSnapshot()).toMatchObject({ status: 'ready', data: { scope: 'global', body: 'global body' } })
+    const active = scoped.active.getSnapshot()!
+    await scoped.setStatus(active.id, 'done', 's1', active.scope)
+    expect(calls.find(call => call.endpoint === 'update')?.payload.scope).toBe('global')
+    expect(scoped.relatedOf('s1')).toEqual([])
+  } finally {
+    vi.unstubAllGlobals()
+    vi.useRealTimers()
+  }
+})
+
 it('keeps the latest selection when an older request resolves last', async () => {
   const pending = new Map<string, (result: RpcResultLike) => void>()
   const latest = new OmtController({
@@ -139,6 +175,57 @@ it('saveBody qualifies the home and sends the optimistic revision', async () => 
   await controller.saveBody('TICKET-0001', '正文', 7, 's1', 'global')
   expect(calls.find(call => call.endpoint === 'update')?.payload).toEqual({
     sessionId: 's1', id: 'TICKET-0001', body: '正文', expectedRevision: 7, scope: 'global',
+  })
+})
+
+it.each(['priority', 'status'] as const)('defers %s doc refresh while editing but refreshes after successful body save', async field => {
+  await controller.select('TICKET-0001', 's1')
+  controller.setBodyEditing(true)
+  calls = []
+  if (field === 'priority') await controller.setPriority('TICKET-0001', 2, 's1')
+  else await controller.setStatus('TICKET-0001', 'done', 's1')
+  expect(calls.map(call => call.endpoint)).toEqual(expect.arrayContaining(['update', 'tree']))
+  expect(calls.some(call => call.endpoint === 'get')).toBe(false)
+  calls = []
+  await controller.saveBody('TICKET-0001', 'saved draft', 1, 's1')
+  expect(calls.map(call => call.endpoint)).toContain('get')
+  expect(controller.doc.getSnapshot()).toMatchObject({ status: 'ready' })
+})
+
+it.each(['envelope', 'transport'] as const)('does not refresh the editing document after a %s body save failure', async kind => {
+  const failing = new OmtController({
+    async call(_channel: string, endpoint: string): Promise<RpcResultLike> {
+      calls.push({ endpoint, payload: {} })
+      if (endpoint === 'get') return GET_OK
+      if (kind === 'transport') throw new Error('connection lost')
+      return { ok: false, error: { message: 'revision conflict' } }
+    },
+  }, { openDetails: () => {}, closeDetails: () => {} })
+  await failing.select('TICKET-0001')
+  failing.setBodyEditing(true)
+  calls = []
+  await expect(failing.saveBody('TICKET-0001', 'draft', 1)).rejects.toThrow(kind === 'transport' ? 'connection lost' : 'revision conflict')
+  expect(calls.map(call => call.endpoint)).toEqual(['update'])
+  expect(failing.doc.getSnapshot()).toMatchObject({ status: 'ready', data: { body: '## 描述' } })
+})
+
+describe('createNode failures', () => {
+  it.each(['envelope', 'transport'] as const)('rejects %s failures so the form can display them', async kind => {
+    const failing = new OmtController({
+      async call(): Promise<RpcResultLike> {
+        if (kind === 'transport') throw new Error('connection lost')
+        return { ok: false, error: { message: 'creation rejected' } }
+      },
+    }, { openDetails: () => {}, closeDetails: () => {} })
+    await expect(failing.createNode({ type: 'epic', title: 'draft', scope: 'global' }))
+      .rejects.toThrow(kind === 'transport' ? 'connection lost' : 'creation rejected')
+  })
+
+  it('returns the created id on success', async () => {
+    const creating = new OmtController({
+      async call(): Promise<RpcResultLike> { return { ok: true, value: { id: 'EPIC-0099' } } },
+    }, { openDetails: () => {}, closeDetails: () => {} })
+    await expect(creating.createNode({ type: 'epic', title: 'draft', scope: 'global' })).resolves.toBe('EPIC-0099')
   })
 })
 

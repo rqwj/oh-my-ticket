@@ -16,6 +16,8 @@ import { runFixture, runProgress, type RunFixtureOptions } from './mocks/run-fix
 import { RunsView, type RunBindings } from '../src/client/components/RunsView.tsx'
 import { NoticeBar, RunPickerModal } from '../src/client/components/RunPicker.tsx'
 import { TicketPanel } from '../src/client/components/TicketPanel.tsx'
+import { OmtController } from '../src/client/controller.ts'
+import type { RpcResultLike } from '../src/client/trigger/source.ts'
 import { DocPanel, type DocPanelProps } from '../src/client/components/DocPanel.tsx'
 import { zh, type OmtKey, type Translate } from '../src/client/locales.ts'
 import type {
@@ -576,6 +578,42 @@ describe('TicketPanel (TICKET-0067/0069)', () => {
     await act(async () => { resolveCreate(undefined); await pending })
   })
 
+  it.each(['envelope', 'transport'] as const)('shows %s create failure inline, retains drafts, and clears the error on retry', async kind => {
+    let retry = false
+    let resolveRetry!: (result: RpcResultLike) => void
+    const controller = new OmtController({
+      async call(): Promise<RpcResultLike> {
+        if (retry) return await new Promise(resolve => { resolveRetry = resolve })
+        if (kind === 'transport') throw new Error('connection lost')
+        return { ok: false, error: { message: 'creation rejected' } }
+      },
+    }, { openDetails: () => {}, closeDetails: () => {} })
+    const { container, panelSpies } = renderPanel(undefined, undefined, controller.createNode)
+    await settle()
+    click(container.querySelector(`button[title="${zh['drawer.newEpic']}"]`) as HTMLElement)
+    const form = container.querySelector('form') as HTMLFormElement
+    setValue(form.querySelector('input') as HTMLInputElement, 'draft title')
+    setValue(form.querySelector('textarea') as HTMLTextAreaElement, 'draft body')
+    setValue(form.querySelector('select[name="scope"]') as HTMLSelectElement, 'global')
+    await act(async () => { form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })) })
+    expect(form.querySelector('[role="alert"]')?.textContent).toBe(kind === 'transport' ? 'connection lost' : 'creation rejected')
+    expect((form.querySelector('input') as HTMLInputElement).value).toBe('draft title')
+    expect((form.querySelector('textarea') as HTMLTextAreaElement).value).toBe('draft body')
+    expect((form.querySelector('button[type="submit"]') as HTMLButtonElement).disabled).toBe(false)
+    expect(panelSpies.selected).toEqual([])
+    retry = true
+    click(form.querySelector('button[type="submit"]')!)
+    expect(form.querySelector('[role="alert"]')).toBeNull()
+    expect((form.querySelector('button[type="submit"]') as HTMLButtonElement).disabled).toBe(true)
+    await act(async () => { resolveRetry({ ok: true, value: { id: 'EPIC-0099' } }) })
+    expect(container.querySelector('form')).toBeNull()
+    expect(panelSpies.selected).toEqual([{ id: 'EPIC-0099', sessionId: 's1', scope: 'global' }])
+    click(container.querySelector(`button[title="${zh['drawer.newEpic']}"]`) as HTMLElement)
+    expect((container.querySelector('form input') as HTMLInputElement).value).toBe('')
+    expect((container.querySelector('form textarea') as HTMLTextAreaElement).value).toBe('')
+    expect(container.querySelector('form [role="alert"]')).toBeNull()
+  })
+
   it('resets creation state and ignores an old completion after the session changes', async () => {
     const resolvers: Array<(id: string | undefined) => void> = []
     const { container, stores } = renderPanel(undefined, undefined, async () => await new Promise(resolve => { resolvers.push(resolve) }))
@@ -694,6 +732,59 @@ describe('DocPanel (TICKET-0067/0068/0070)', () => {
     act(() => doc.set({ status: 'ready', data: docData({ scope: 'workspace' }) }))
     expect(container.querySelector('textarea[rows="12"]')).toBeNull()
     expect(container.textContent).toContain('正文')
+  })
+
+  it.each(['priority', 'status'] as const)('keeps an unsaved body through %s refresh and loads the saved body after saving', async field => {
+    let data = docData({ scope: 'workspace', node: { ...treeNode('TICKET-0001', 'in_progress'), revision: 1 } })
+    let deferGet = false
+    let finishGet: (() => void) | undefined
+    const controller = new OmtController({
+      async call(_channel: string, endpoint: string, payload: any): Promise<RpcResultLike> {
+        if (endpoint === 'get') {
+          if (deferGet) await new Promise<void>(resolve => { finishGet = resolve })
+          return { ok: true, value: data }
+        }
+        if (endpoint === 'update') {
+          data = {
+            ...data,
+            node: {
+              ...data.node,
+              ...(payload.priority !== undefined ? { priority: payload.priority } : {}),
+              ...(payload.status !== undefined ? { status: payload.status } : {}),
+              ...(payload.body !== undefined ? { revision: 2 } : {}),
+            },
+            ...(payload.body !== undefined ? { body: payload.body } : {}),
+          }
+          return { ok: true, value: {} }
+        }
+        return { ok: true, value: [] }
+      },
+    }, { openDetails: () => {}, closeDetails: () => {} })
+    await controller.select('TICKET-0001', 's1', 'workspace')
+    const { bindings } = makeBindings()
+    const container = render(createElement(DocPanel, {
+      ...bindings, t, sessionId: 's1', useDoc: useStore(controller.doc),
+      executeTicket: controller.executeTicket, closeDoc: controller.closeDoc,
+      setStatus: controller.setStatus, setArchived: controller.setArchived, rename: controller.rename,
+      setPriority: controller.setPriority, appendNote: controller.appendNote,
+      saveBody: controller.saveBody, setBodyEditing: controller.setBodyEditing,
+      select: controller.select, forget: controller.forget,
+    }))
+    click(byText(container, zh['doc.editBody'])!)
+    setValue(container.querySelector('textarea[rows="12"]') as HTMLTextAreaElement, 'unsaved draft')
+    deferGet = true
+    const select = container.querySelectorAll('select')[field === 'status' ? 0 : 1]!
+    setValue(select, field === 'status' ? 'done' : '2')
+    await act(async () => { await Promise.resolve(); await Promise.resolve() })
+    expect((container.querySelector('textarea[rows="12"]') as HTMLTextAreaElement | null)?.value).toBe('unsaved draft')
+    expect(finishGet).toBeUndefined()
+    click(byText(container, zh['doc.saveBody'])!)
+    await act(async () => { await Promise.resolve(); await Promise.resolve() })
+    expect(finishGet).toBeTypeOf('function')
+    await act(async () => { finishGet!() })
+    expect(controller.doc.getSnapshot()).toMatchObject({ status: 'ready', data: { body: 'unsaved draft', node: { revision: 2, [field]: field === 'status' ? 'done' : 2 } } })
+    expect(container.querySelector('textarea[rows="12"]')).toBeNull()
+    expect(container.textContent).toContain('unsaved draft')
   })
 
   it('preserves the body draft when saving fails', async () => {
