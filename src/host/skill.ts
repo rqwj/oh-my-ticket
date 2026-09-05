@@ -15,7 +15,8 @@ export const OMT_SKILL_NAME = 'omt'
 
 export const OMT_SKILL_DESCRIPTION =
   'OMT ticket 体系的操作规范：Epic→Story→[SubStory]→Ticket→[SubTicket] 五层结构的创建、'
-  + '查询、状态流转与进度记录。当用户提到 ticket、epic、story、任务拆解、进度记录，'
+  + '查询、状态流转与进度记录。实质性开发（新功能、重新对接、改造、非琐碎实现）'
+  + '以及用户提到 ticket、epic、story、任务拆解、进度记录，'
   + '或消息中出现 TICKET-/EPIC-/STORY- 等 OMT 节点 id 时使用。'
   + '本 skill 只负责 ticket 管理，不规定开发流程；开发方法论由其它 skill 负责。'
 
@@ -86,6 +87,8 @@ ticket 按工作区归属：当前工作区根目录下存在 \`.omt/\` 时使�
   也不要重开已 done/blocked/skipped 的父级。
 - **归档是独立维度**（archived=true/false），与状态（open/in_progress/done/
   blocked/skipped）正交；归档节点只读——除恢复外的修改都会被拒绝，先恢复再改。
+- **实质性开发先建单**：新功能 / 重新对接 / 改造 / 非琐碎实现，先 omt_create
+  骨架再动手；不要等用户说「拆任务」。
 - **任务拆解**：先建 Epic/Story 骨架，再逐层细化 Ticket；拆解结果落成
   真实的 OMT 节点，而不是只写在回复里。
 - **范围克制**：不为与当前任务无关的节点做变更；不确定归属哪个节点时，

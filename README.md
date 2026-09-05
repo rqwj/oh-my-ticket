@@ -1,7 +1,7 @@
 # Oh-My-Ticket (OMT)
 
-![version](https://img.shields.io/badge/version-0.6.2-blue)
-![tests](https://img.shields.io/badge/tests-314%20passing-brightgreen)
+![version](https://img.shields.io/badge/version-0.6.3-blue)
+![tests](https://img.shields.io/badge/tests-399%20passing-brightgreen)
 ![platform](https://img.shields.io/badge/platform-DeepSeek%20Harness-purple)
 ![dsh](https://img.shields.io/badge/DeepSeek%20Harness%20tested-0.1.2--alpha.3-blue)
 
@@ -9,6 +9,8 @@
 SQLite 存元数据与层级关系，Markdown 存正文。ticket 随项目走（`.omt/` 目录可直接进 git），
 模型通过工具创建/推进，人通过三种可切换的 UI 展现方式浏览与管理；
 run 机制支持把一批 ticket 交给模型批量执行，全程有状态机、进度与信任策略兜底。
+插件启用后，完整 OMT 操作规范默认写入系统提示，不必先 load `omt` skill。
+设置页可追加约定，并从已装 skill 勾选拆票 skill；实质性开发（新功能 / 重新对接 / 改造）以及提到 ticket / 拆任务 / 节点 id 时进入 OMT 阶段并 load 绑定 skill。
 
 ![image-20260819114848240](attachments/README/image-20260819114848240.png)
 
@@ -92,14 +94,14 @@ run 批次纪律（创建/认领/报告/续跑响应）。
 
 ```sh
 # 本仓库构建并打包：
-pnpm install && pnpm build && npm pack    # → dsh-oh-my-ticket-0.6.2.tgz
+pnpm install && pnpm build && npm pack    # → dsh-oh-my-ticket-0.6.3.tgz
 
 # 安装进目标 DSH profile（profile 的 dsh.profile.bundles 依次为）：
 #   @deepseek-ai/dsh-base, @deepseek-ai/dsh-web-app, dsh-oh-my-ticket
-pnpm dsh plugin --profile <profile> add /path/to/dsh-oh-my-ticket-0.6.2.tgz
+pnpm dsh plugin --profile <profile> add /path/to/dsh-oh-my-ticket-0.6.3.tgz
 
 # 或直接从 npm 安装已发布版本：
-pnpm dsh plugin --profile <profile> add dsh-oh-my-ticket@0.6.2
+pnpm dsh plugin --profile <profile> add dsh-oh-my-ticket@0.6.3
 ```
 
 daemon 二进制随主包以 optionalDependency 自动带入（`@oh-my-ticket/darwin-arm64`），

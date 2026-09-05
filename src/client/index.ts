@@ -19,6 +19,10 @@ import { ReferencedBar } from './components/ReferencedBar.tsx'
 import { ToggleButton } from './components/ToggleButton.tsx'
 import { OmtShowRow } from './components/OmtShowRow.tsx'
 import { TurnTickets } from './components/TurnTickets.tsx'
+import { PromptSettings } from './components/PromptSettings.tsx'
+import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
+import { PromptSettingsModel, INITIAL_PROMPT_SETTINGS_VIEW } from './prompt-settings-model.ts'
+import { OMT_PROMPT_SETTINGS_NS, type BoundSkillRow } from '../host/prompt-settings.ts'
 import { en, NS, zh, type Translate } from './locales.ts'
 // Shared tokens + badge/dot/type/status classes (single injected sheet).
 import './omt-shared.css'
@@ -43,7 +47,7 @@ interface ClientContextLike {
   locale: LocaleLike
 }
 
-export const inject = ['slots', 'connection', 'inputTriggers', 'layout', 'locale']
+export const inject = ['slots', 'connection', 'inputTriggers', 'layout', 'locale', 'settingsScope']
 
 export function apply(ctx: ClientContextLike): void {
   const controller = new OmtController(ctx.connection.rpc, ctx.layout)
@@ -118,6 +122,8 @@ export function apply(ctx: ClientContextLike): void {
       saveFilters: controller.saveFilters,
       select: controller.select,
       archive: (id: string, sessionId?: string) => controller.setArchived(id, true, sessionId),
+      createNode: controller.createNode,
+      expandIds: controller.expandIds,
       ...run.callbacks,
     }
   }
@@ -171,6 +177,8 @@ export function apply(ctx: ClientContextLike): void {
             saveFilters: controller.saveFilters,
             select: controller.select,
             archive: (id: string, sessionId?: string) => controller.setArchived(id, true, sessionId),
+            createNode: controller.createNode,
+            expandIds: controller.expandIds,
             setPanelMode: controller.setPanelMode,
             openPanel: controller.openPanel,
             ...run.callbacks,
@@ -245,6 +253,8 @@ export function apply(ctx: ClientContextLike): void {
             rename: controller.rename,
             setPriority: controller.setPriority,
             appendNote: controller.appendNote,
+            saveBody: controller.saveBody,
+            setBodyEditing: controller.setBodyEditing,
             select: controller.select,
             forget: controller.forget,
             ...run.callbacks,
@@ -279,4 +289,53 @@ export function apply(ctx: ClientContextLike): void {
         refreshRelated: controller.refreshRelated,
       }),
     }, TurnTickets))
+
+  const promptView = createSnapshotStore(INITIAL_PROMPT_SETTINGS_VIEW)
+  const settingsScope = (ctx as unknown as {
+    settingsScope?: {
+      bind: (spec: { namespace: string }) => {
+        getSnapshot: () => { value: { extraPrompt?: string; boundSkillNames?: string[] } | undefined }
+        mutate: (ops: readonly { op: 'set'; path: string[]; value: string | string[] }[]) => Promise<void>
+      }
+    }
+  }).settingsScope
+  const promptSettings = settingsScope === undefined ? undefined : settingsScope.bind({ namespace: OMT_PROMPT_SETTINGS_NS })
+  const promptModel = new PromptSettingsModel(
+    async () => {
+      const sessionId = controller.currentSessionId
+      const result = await ctx.connection.rpc.call('/omt', 'skills', sessionId === undefined ? {} : { sessionId })
+      if (!result.ok) throw new Error(result.error.message)
+      const value = result.value as { extraPrompt: string; skills: BoundSkillRow[] }
+      return { extraPrompt: value.extraPrompt, skills: value.skills }
+    },
+    async next => {
+      if (promptSettings === undefined) throw new Error('settings unavailable')
+      const ops: { op: 'set'; path: string[]; value: string | string[] }[] = []
+      if (next.extraPrompt !== undefined) ops.push({ op: 'set', path: ['extraPrompt'], value: next.extraPrompt })
+      if (next.boundSkillNames !== undefined) ops.push({ op: 'set', path: ['boundSkillNames'], value: next.boundSkillNames })
+      await promptSettings.mutate(ops)
+      const persisted = promptSettings.getSnapshot().value
+      if (persisted === undefined
+        || (next.extraPrompt !== undefined && persisted.extraPrompt !== next.extraPrompt)
+        || (next.boundSkillNames !== undefined && JSON.stringify(persisted.boundSkillNames) !== JSON.stringify(next.boundSkillNames))) {
+        throw new Error('settings write was not accepted by the Host')
+      }
+    },
+    view => { promptView.set(view) },
+  )
+  ctx.slots.inject('settings.section', () =>
+    ctx.slots.register({
+      name: 'settings.section',
+      id: 'omt-prompt',
+      order: 80,
+      label: () => ctx.locale.bind(NS)('settings.nav'),
+      locale: NS,
+      inject: () => ({
+        hooks: { view: promptView },
+        setDraftExtra: promptModel.setDraftExtra.bind(promptModel),
+        setExtraPrompt: (value: string) => { void promptModel.setExtraPrompt(value) },
+        toggle: (name: string) => { void promptModel.toggle(name) },
+        retry: () => { void promptModel.load() },
+      }),
+    }, PromptSettings))
 }

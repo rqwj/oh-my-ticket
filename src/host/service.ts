@@ -55,6 +55,7 @@ import {
   type RunReportOutcome,
   type RunStatus,
   type ShowResult,
+  type Status,
 } from './types.ts'
 import { savedFiltersSchema } from './ui-state.ts'
 import { DAEMON_INSTALL_HINT, runtimeUnavailableFromResolution } from './util/daemon-resolve.ts'
@@ -121,6 +122,17 @@ export interface HomeRef {
   readonly path?: string
 }
 
+export interface NodeUpdateInput {
+  id: string
+  title?: string
+  status?: Status
+  archived?: boolean
+  priority?: number
+  body?: string
+  append?: string
+  expectedRevision?: number
+}
+
 export interface OmtServiceOptions {
   /** Explicit runtime dir (tests); default OMT_RUNTIME_DIR then ~/.omt/run. */
   readonly runtimeDir?: string
@@ -157,6 +169,7 @@ function nodeOf(view: NodeView): OmtNode {
     archived: view.archived,
     priority: view.priority,
     path: view.path,
+    revision: view.revision,
     created_at: view.createdAt,
     updated_at: view.updatedAt,
   }
@@ -897,6 +910,10 @@ export class OmtService {
 
   async showNode(id: string, cwd: string | undefined): Promise<ShowResult & { home: HomeRef; runs: Array<{ runId: string; title?: string; status: RunStatus; itemState: string; progress: Record<string, number> }> }> {
     const { home } = await this.resolveNodeHome(id, cwd)
+    return await this.showNodeIn(home, id)
+  }
+
+  async showNodeIn(home: HomeRef, id: string): Promise<ShowResult & { home: HomeRef; runs: Array<{ runId: string; title?: string; status: RunStatus; itemState: string; progress: Record<string, number> }> }> {
     try {
       const result = await this.rpc<{
         node: NodeView
@@ -924,6 +941,17 @@ export class OmtService {
     }
   }
 
+  /** Home-qualified parent lookup used when traversing a resolved node chain. */
+  async parentOfNodeIn(home: HomeRef, id: string): Promise<OmtNode | undefined> {
+    await this.ready()
+    try {
+      const result = await this.rpc<{ parent?: ProtoNodeSummary | null }>('node/get', { homeId: home.homeId, nodeId: id })
+      return result.parent == null ? undefined : summaryAsNode(result.parent)
+    } catch (error) {
+      throw wrap(error)
+    }
+  }
+
   /** Direct ownership probe (cross-home move guard). */
   async getNodeIn(home: HomeRef, id: string): Promise<OmtNode | undefined> {
     await this.ready()
@@ -937,22 +965,23 @@ export class OmtService {
   }
 
   async updateNode(
-    input: {
-      id: string
-      title?: string
-      status?: string
-      archived?: boolean
-      priority?: number
-      body?: string
-      append?: string
-    },
+    input: NodeUpdateInput,
     context: { cwd?: string; sessionId?: string } = {},
   ): Promise<{ node: OmtNode; home: HomeRef }> {
     const { home } = await this.resolveNodeHome(input.id, context.cwd)
+    return await this.updateNodeIn(home, input, context)
+  }
+
+  async updateNodeIn(
+    home: HomeRef,
+    input: NodeUpdateInput,
+    context: { cwd?: string; sessionId?: string } = {},
+  ): Promise<{ node: OmtNode; home: HomeRef }> {
     try {
       const result = await this.rpc<{ node: NodeView }>('node/update', {
         homeId: home.homeId,
         nodeId: input.id,
+        ...(input.expectedRevision !== undefined ? { expectedRevision: input.expectedRevision } : {}),
         changes: {
           ...(input.title !== undefined ? { title: input.title } : {}),
           ...(input.status !== undefined ? { status: input.status } : {}),

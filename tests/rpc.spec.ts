@@ -4,6 +4,7 @@
  * folding. Filter persistence assertions moved from the adapter-side
  * `ui-filters.json` file to daemon-owned storage (documented rewrite).
  */
+import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { registerOmtRpc } from '../src/host/rpc.ts'
 import type { OmtService } from '../src/host/service.ts'
@@ -19,7 +20,7 @@ let handler: Handler
 let capturedChannels: string[] = []
 
 beforeEach(async () => {
-  fixture = await createRuntimeFixture({ label: 'rpc' })
+  fixture = await createRuntimeFixture({ label: 'rpc', workspace: true })
   service = fixture.service
   const stubCtx = {
     connection: {
@@ -78,6 +79,103 @@ it('get folds unknown ids into an error result', async () => {
   expect(result.error.message).toContain('NOT_FOUND')
 })
 
+it('update accepts a full body replace', async () => {
+  const result = await handler('update', { id: 'TICKET-0001', body: '全新正文' }, new AbortController().signal)
+  expect(result.ok).toBe(true)
+  const shown = await handler('get', { id: 'TICKET-0001' }, new AbortController().signal)
+  expect(shown.value.body).toContain('全新正文')
+  expect(shown.value.body).not.toContain('OAuth')
+})
+
+it('rejects a stale full-body replacement by node revision', async () => {
+  const before = await handler('get', { id: 'TICKET-0001' }, new AbortController().signal)
+  expect(typeof before.value.node.revision).toBe('number')
+  await service.updateNode({ id: 'TICKET-0001', append: '\n并发进度' })
+  const stale = await handler('update', {
+    id: 'TICKET-0001',
+    body: '过期正文',
+    expectedRevision: before.value.node.revision,
+  }, new AbortController().signal)
+  expect(stale.ok).toBe(false)
+  const after = await handler('get', { id: 'TICKET-0001' }, new AbortController().signal)
+  expect(after.value.body).toContain('并发进度')
+})
+
+it('get returns ancestors from root to parent', async () => {
+  const result = await handler('get', { id: 'TICKET-0001' }, new AbortController().signal)
+  expect(result.value.ancestors.map((n: { id: string }) => n.id)).toEqual(['EPIC-0001', 'STORY-0001'])
+  const root = await handler('get', { id: 'EPIC-0001' }, new AbortController().signal)
+  expect(root.value.ancestors).toEqual([])
+})
+
+it('keeps ancestor traversal in the resolved home when ids collide', async () => {
+  const workspace = fixture.workspaceHome!
+  const workspaceEpic = await service.createNode(workspace, { type: 'epic', title: '工作区史诗' })
+  const workspaceStory = await service.createNode(workspace, { type: 'story', title: '工作区故事', parentId: workspaceEpic.id })
+  await service.createNode(workspace, { type: 'ticket', title: '工作区同号票', parentId: workspaceStory.id })
+
+  const liveSession = 'workspace-session'
+  let workspaceHandler: Handler | undefined
+  registerOmtRpc({
+    agents: {
+      get: (id: string) => id === liveSession
+        ? { session: { header: { cwd: join(fixture.root, 'workspace') } } }
+        : undefined,
+    },
+    connection: { rpc: { handle: (_channel: string, next: Handler) => { workspaceHandler = next } } },
+  } as never, service)
+
+  const result = await workspaceHandler!('get', {
+    id: 'TICKET-0001',
+    sessionId: liveSession,
+  }, new AbortController().signal)
+  expect(result.ok).toBe(true)
+  expect(result.value.ancestors.map((node: { title: string }) => node.title)).toEqual(['工作区史诗', '工作区故事'])
+
+  const globalResult = await workspaceHandler!('get', {
+    id: 'TICKET-0001',
+    sessionId: liveSession,
+    scope: 'global',
+  }, new AbortController().signal)
+  expect(globalResult.ok).toBe(true)
+  expect(globalResult.value.ancestors.map((node: { title: string }) => node.title)).toEqual(['用户体系', '登录'])
+
+  const updatedGlobal = await workspaceHandler!('update', {
+    id: 'TICKET-0001',
+    sessionId: liveSession,
+    scope: 'global',
+    title: '全局票已更新',
+  }, new AbortController().signal)
+  expect(updatedGlobal.ok).toBe(true)
+  const globalAfter = await workspaceHandler!('get', { id: 'TICKET-0001', sessionId: liveSession, scope: 'global' }, new AbortController().signal)
+  const workspaceAfter = await workspaceHandler!('get', { id: 'TICKET-0001', sessionId: liveSession }, new AbortController().signal)
+  expect(globalAfter.value.node.title).toBe('全局票已更新')
+  expect(workspaceAfter.value.node.title).toBe('工作区同号票')
+})
+
+it('create adds a legal child and a root epic', async () => {
+  const child = await handler('create', { type: 'ticket', title: '新票', parentId: 'STORY-0001' }, new AbortController().signal)
+  expect(child.ok).toBe(true)
+  expect(child.value.type).toBe('ticket')
+  const epic = await handler('create', { type: 'epic', title: '新史诗', scope: 'global' }, new AbortController().signal)
+  expect(epic.ok).toBe(true)
+  expect(epic.value.type).toBe('epic')
+})
+
+it('rejects root epic creation without an explicit scope', async () => {
+  const result = await handler('create', { type: 'epic', title: '无归属史诗' }, new AbortController().signal)
+  expect(result.ok).toBe(false)
+  expect(result.error.code).toBe('bad-request')
+  expect(result.error.message).toContain('scope')
+})
+
+it('rejects workspace Epic creation when no live session supplies a cwd', async () => {
+  const result = await handler('create', { type: 'epic', title: '无工作区史诗', scope: 'workspace' }, new AbortController().signal)
+  expect(result.ok).toBe(false)
+  expect(result.error.code).toBe('bad-request')
+  expect(result.error.message).toContain('live session')
+})
+
 it('update accepts title and priority', async () => {
   const result = await handler('update', { id: 'TICKET-0001', title: '登录接口 v2', priority: 2 }, new AbortController().signal)
   expect(result.ok).toBe(true)
@@ -90,9 +188,40 @@ it('rejects invalid payloads and unknown endpoints', async () => {
   expect(badPayload.ok).toBe(false)
   expect(badPayload.error.code).toBe('bad-request')
 
+  const conflictingUpdate = await handler('update', { id: 'TICKET-0001', body: '正文', append: '进度' }, new AbortController().signal)
+  expect(conflictingUpdate.ok).toBe(false)
+  expect(conflictingUpdate.error.code).toBe('bad-request')
+
   const unknown = await handler('nope', {}, new AbortController().signal)
   expect(unknown.ok).toBe(false)
   expect(unknown.error.code).toBe('bad-request')
+})
+
+it('skills returns catalog rows plus missing binds', async () => {
+  let skillsHandler: Handler | undefined
+  const stubCtx = {
+    connection: {
+      rpc: {
+        handle(_channel: string, h: Handler) {
+          skillsHandler = h
+        },
+      },
+    },
+  }
+  registerOmtRpc(stubCtx as never, service, undefined, undefined, undefined, {
+    getSettings: () => ({ extraPrompt: '拆票标题用中文', boundSkillNames: ['ce-plan', 'gone'] }),
+    listCatalog: async () => [{ name: 'ce-plan', description: 'plan' }, { name: 'omt', description: 'omt' }],
+  })
+  const withSession = await skillsHandler!('skills', { sessionId: 's1' }, new AbortController().signal)
+  expect(withSession.ok).toBe(true)
+  const result = await skillsHandler!('skills', {}, new AbortController().signal)
+  expect(result.ok).toBe(true)
+  expect(result.value.extraPrompt).toBe('拆票标题用中文')
+  expect(result.value.skills).toEqual([
+    { name: 'ce-plan', description: 'plan', bound: true, missing: false },
+    { name: 'omt', description: 'omt', bound: false, missing: false },
+    { name: 'gone', description: '', bound: true, missing: true },
+  ])
 })
 
 // REWRITTEN for U7a: was persisted to <home>/ui-filters.json (disk read
