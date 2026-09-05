@@ -175,8 +175,12 @@ export function DocPanel(props: DocPanelProps) {
   // While a session executes this ticket, mutating actions lock (TICKET-0026);
   // archived nodes stay sealed as before.
   const locked = node.archived || doc.data.running !== undefined
+  const appendDisabled = locked || editingBody
   const scopedRunUnsupported = doc.data.scope === 'global' && props.sessionId !== undefined
   const lockReason = node.archived ? undefined : t('doc.locked')
+  const appendBlockReason = editingBody
+    ? `${t('doc.saveBody')} / ${t('doc.cancelEdit')}`
+    : locked ? lockReason : undefined
   return (
     <div className={css.panel}>
       <div className={css.headerTop}>
@@ -376,15 +380,18 @@ export function DocPanel(props: DocPanelProps) {
           className={css.appendInput}
           placeholder={node.archived ? t('doc.appendPlaceholderArchived') : locked ? t('doc.appendPlaceholderLocked') : t('doc.appendPlaceholder')}
           value={draft}
-          disabled={locked}
+          disabled={appendDisabled}
+          title={appendBlockReason}
           onChange={event => setDraft(event.target.value)}
           rows={2}
         />
         <button
           type="button"
           className={css.appendButton}
-          disabled={locked}
+          disabled={appendDisabled}
+          title={appendBlockReason}
           onClick={() => {
+            if (appendDisabled) return
             props.appendNote(node.id, draft, props.sessionId, doc.data.scope)
             setDraft('')
           }}

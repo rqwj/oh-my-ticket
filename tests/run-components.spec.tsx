@@ -658,6 +658,7 @@ describe('DocPanel (TICKET-0067/0068/0070)', () => {
     const { bindings, spies } = makeBindings()
     const doc = createSnapshotStore({ status: 'ready', data: data ?? docData() } as any)
     const savedBodies: { id: string; body: string; sessionId: string | undefined }[] = []
+    const appended: string[] = []
     const bodyEditing: boolean[] = []
     const container = render(createElement(DocPanel, {
       sessionId: 's1',
@@ -668,7 +669,7 @@ describe('DocPanel (TICKET-0067/0068/0070)', () => {
       setArchived: () => {},
       rename: () => {},
       setPriority: () => {},
-      appendNote: () => {},
+      appendNote: (_id, text) => { appended.push(text) },
       saveBody: async (id, body, expectedRevision, sessionId, scope) => {
         savedBodies.push({ id, body, sessionId })
         await saveBodyOverride?.(id, body, expectedRevision, sessionId, scope)
@@ -679,7 +680,7 @@ describe('DocPanel (TICKET-0067/0068/0070)', () => {
       ...bindings,
       t,
     }))
-    return { container, spies, doc, savedBodies, bodyEditing }
+    return { container, spies, doc, savedBodies, bodyEditing, appended }
   }
 
   it('lists every non-terminal run link with progress; awaiting items carry the 待确认 badge', () => {
@@ -819,6 +820,72 @@ describe('DocPanel (TICKET-0067/0068/0070)', () => {
     })
     expect((container.querySelector('textarea[rows="12"]') as HTMLTextAreaElement).value).toBe('保留这份草稿')
     expect(container.textContent).toContain('RPC failed')
+  })
+
+  it('keeps append draft but cannot submit it while the body is being edited', () => {
+    const { container, appended } = renderDoc()
+    const appendInput = (): HTMLTextAreaElement => container.querySelector('textarea[rows="2"]') as HTMLTextAreaElement
+    const appendButton = (): HTMLButtonElement => byText(container, zh['doc.append']) as HTMLButtonElement
+    setValue(appendInput(), '进度草稿')
+    click(byText(container, zh['doc.editBody']) as HTMLElement)
+    expect(appendInput().value).toBe('进度草稿')
+    expect(appendInput().disabled).toBe(true)
+    expect(appendButton().disabled).toBe(true)
+    click(appendButton())
+    expect(appended).toEqual([])
+    expect(appendInput().value).toBe('进度草稿')
+    click(byText(container, zh['doc.cancelEdit']) as HTMLElement)
+    expect(appendInput().disabled).toBe(false)
+    expect(appendButton().disabled).toBe(false)
+    expect(appendInput().value).toBe('进度草稿')
+  })
+
+  it('cannot append while editing, so the later body save does not conflict with that append', async () => {
+    let data = docData({ scope: 'workspace', node: { ...treeNode('TICKET-0001', 'in_progress'), revision: 1 } })
+    const controller = new OmtController({
+      async call(_channel: string, endpoint: string, payload: any): Promise<RpcResultLike> {
+        if (endpoint === 'get') return { ok: true, value: data }
+        if (endpoint === 'update') {
+          if (payload.expectedRevision !== undefined && payload.expectedRevision !== data.node.revision) {
+            return { ok: false, error: { message: 'revision conflict' } }
+          }
+          data = {
+            ...data,
+            node: { ...data.node, revision: data.node.revision! + 1 },
+            ...(payload.body !== undefined ? { body: payload.body } : {}),
+            ...(payload.append !== undefined ? { body: `${data.body}\n${payload.append}` } : {}),
+          }
+          return { ok: true, value: {} }
+        }
+        return { ok: true, value: [] }
+      },
+    }, { openDetails: () => {}, closeDetails: () => {} })
+    await controller.select('TICKET-0001', 's1', 'workspace')
+    const { bindings } = makeBindings()
+    const container = render(createElement(DocPanel, {
+      ...bindings, t, sessionId: 's1', useDoc: useStore(controller.doc),
+      executeTicket: controller.executeTicket, closeDoc: controller.closeDoc,
+      setStatus: controller.setStatus, setArchived: controller.setArchived, rename: controller.rename,
+      setPriority: controller.setPriority, appendNote: controller.appendNote,
+      saveBody: controller.saveBody, setBodyEditing: controller.setBodyEditing,
+      select: controller.select, forget: controller.forget,
+    }))
+    click(byText(container, zh['doc.editBody'])!)
+    setValue(container.querySelector('textarea[rows="12"]') as HTMLTextAreaElement, 'unsaved draft')
+    setValue(container.querySelector('textarea[rows="2"]') as HTMLTextAreaElement, '并发进度')
+    click(byText(container, zh['doc.append'])!)
+    await act(async () => { await Promise.resolve(); await Promise.resolve() })
+    expect((container.querySelector('textarea[rows="2"]') as HTMLTextAreaElement).value).toBe('并发进度')
+    expect((container.querySelector('textarea[rows="2"]') as HTMLTextAreaElement).disabled).toBe(true)
+    expect((byText(container, zh['doc.append']) as HTMLButtonElement).disabled).toBe(true)
+    expect(data.body).toBe('正文')
+    expect(data.node.revision).toBe(1)
+    click(byText(container, zh['doc.saveBody'])!)
+    await act(async () => { await Promise.resolve(); await Promise.resolve() })
+    expect(container.textContent).not.toContain('revision conflict')
+    expect(controller.doc.getSnapshot()).toMatchObject({ status: 'ready', data: { body: 'unsaved draft', node: { revision: 2 } } })
+    expect((container.querySelector('textarea[rows="2"]') as HTMLTextAreaElement).disabled).toBe(false)
+    expect((container.querySelector('textarea[rows="2"]') as HTMLTextAreaElement).value).toBe('并发进度')
   })
 
   it('ignores an old body-save settlement after selecting another ticket', async () => {
