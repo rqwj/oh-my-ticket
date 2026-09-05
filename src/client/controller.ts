@@ -86,6 +86,8 @@ export class OmtController {
   private events: EventSource | undefined
   private refreshTimer: ReturnType<typeof setTimeout> | undefined
   private selectRevision = 0
+  private docSessionId: string | undefined
+  private sessionRevision = 0
   /** Run-hint ids accumulated across one debounce window (latest-wins #4). */
   private refreshRunHints = new Set<string>()
 
@@ -200,6 +202,7 @@ export class OmtController {
 
   /** Session-scope components report the staged session through here. */
   noteSession = (sessionId: string | undefined): void => {
+    if (this.currentSessionId !== sessionId) this.sessionRevision += 1
     this.currentSessionId = sessionId
   }
 
@@ -318,6 +321,7 @@ export class OmtController {
   /** Select a node: load its doc, pin it active, shadow the details panel. */
   select = async (id: string, sessionId?: string, scope?: 'workspace' | 'global'): Promise<void> => {
     const revision = ++this.selectRevision
+    this.docSessionId = sessionId
     this.doc.set({ status: 'loading', id })
     const result = await this.rpc.call('/omt', 'get', { sessionId, id, ...(scope !== undefined ? { scope } : {}) })
     if (revision !== this.selectRevision) return
@@ -465,10 +469,28 @@ export class OmtController {
   }
 
   private async afterMutation(id: string, sessionId?: string, scope?: 'workspace' | 'global', bodySaved = false): Promise<void> {
+    const base = this.doc.getSnapshot()
+    const selection = this.selectRevision
+    const session = this.sessionRevision
     await this.refreshTree(sessionId)
-    // Metadata refresh must not replace an unsaved body; a successful body
-    // save explicitly reloads the committed content even while editing.
-    if (this.bodyEditing && !bodySaved) return
+    if (this.bodyEditing && !bodySaved) {
+      if (base.status !== 'ready' || base.data.node.id !== id || this.docSessionId !== sessionId
+        || (this.currentSessionId !== undefined && this.currentSessionId !== sessionId)
+        || (scope !== undefined && base.data.scope !== scope)) return
+      // Stay ready so DocPanel retains its draft. A new revision is safe only
+      // when the server's raw body still equals the editor's committed base.
+      const unchanged = (): boolean => this.bodyEditing && this.doc.getSnapshot() === base
+        && this.selectRevision === selection && this.sessionRevision === session
+      if (!unchanged()) return
+      const result = await this.rpc.call('/omt', 'get', { sessionId, id, scope: base.data.scope }).catch(() => undefined)
+      if (!result?.ok || !unchanged()) return
+      const data = result.value as DocData
+      if (data.node.id !== id || data.scope !== base.data.scope || data.home !== base.data.home
+        || data.body !== base.data.body) return
+      this.doc.set({ status: 'ready', data })
+      this.active.set({ id: data.node.id, title: data.node.title, status: data.node.status, priority: data.node.priority, scope: data.scope })
+      return
+    }
     const active = this.active.getSnapshot()
     if (active?.id === id && (scope === undefined || active.scope === scope)) await this.select(id, sessionId, scope)
   }

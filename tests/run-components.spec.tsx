@@ -734,7 +734,10 @@ describe('DocPanel (TICKET-0067/0068/0070)', () => {
     expect(container.textContent).toContain('正文')
   })
 
-  it.each(['priority', 'status'] as const)('keeps an unsaved body through %s refresh and loads the saved body after saving', async field => {
+  it.each([
+    ['priority', 'none'], ['status', 'none'],
+    ['priority', 'before'], ['status', 'before'], ['priority', 'after'],
+  ] as const)('keeps an unsaved body through %s refresh with external body change %s', async (field, externalChange) => {
     let data = docData({ scope: 'workspace', node: { ...treeNode('TICKET-0001', 'in_progress'), revision: 1 } })
     let deferGet = false
     let finishGet: (() => void) | undefined
@@ -745,13 +748,16 @@ describe('DocPanel (TICKET-0067/0068/0070)', () => {
           return { ok: true, value: data }
         }
         if (endpoint === 'update') {
+          if (payload.expectedRevision !== undefined && payload.expectedRevision !== data.node.revision) {
+            return { ok: false, error: { message: 'revision conflict' } }
+          }
           data = {
             ...data,
             node: {
               ...data.node,
               ...(payload.priority !== undefined ? { priority: payload.priority } : {}),
               ...(payload.status !== undefined ? { status: payload.status } : {}),
-              ...(payload.body !== undefined ? { revision: 2 } : {}),
+              revision: data.node.revision! + 1,
             },
             ...(payload.body !== undefined ? { body: payload.body } : {}),
           }
@@ -772,17 +778,32 @@ describe('DocPanel (TICKET-0067/0068/0070)', () => {
     }))
     click(byText(container, zh['doc.editBody'])!)
     setValue(container.querySelector('textarea[rows="12"]') as HTMLTextAreaElement, 'unsaved draft')
+    const externalWrite = (): void => {
+      data = { ...data, body: 'other actor body', node: { ...data.node, revision: data.node.revision! + 1 } }
+    }
+    if (externalChange === 'before') externalWrite()
     deferGet = true
     const select = container.querySelectorAll('select')[field === 'status' ? 0 : 1]!
     setValue(select, field === 'status' ? 'done' : '2')
     await act(async () => { await Promise.resolve(); await Promise.resolve() })
     expect((container.querySelector('textarea[rows="12"]') as HTMLTextAreaElement | null)?.value).toBe('unsaved draft')
-    expect(finishGet).toBeUndefined()
+    // A metadata refresh stays ready, then adopts only an unchanged body's revision.
+    if (finishGet !== undefined) await act(async () => { finishGet!() })
+    expect((container.querySelector('textarea[rows="12"]') as HTMLTextAreaElement).value).toBe('unsaved draft')
+    if (externalChange === 'after') externalWrite()
+    finishGet = undefined
     click(byText(container, zh['doc.saveBody'])!)
     await act(async () => { await Promise.resolve(); await Promise.resolve() })
+    if (externalChange !== 'none') {
+      expect(container.textContent).toContain('revision conflict')
+      expect((container.querySelector('textarea[rows="12"]') as HTMLTextAreaElement).value).toBe('unsaved draft')
+      expect(data.body).toBe('other actor body')
+      expect(finishGet).toBeUndefined()
+      return
+    }
     expect(finishGet).toBeTypeOf('function')
     await act(async () => { finishGet!() })
-    expect(controller.doc.getSnapshot()).toMatchObject({ status: 'ready', data: { body: 'unsaved draft', node: { revision: 2, [field]: field === 'status' ? 'done' : 2 } } })
+    expect(controller.doc.getSnapshot()).toMatchObject({ status: 'ready', data: { body: 'unsaved draft', node: { revision: 3, [field]: field === 'status' ? 'done' : 2 } } })
     expect(container.querySelector('textarea[rows="12"]')).toBeNull()
     expect(container.textContent).toContain('unsaved draft')
   })

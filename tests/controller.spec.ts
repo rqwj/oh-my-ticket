@@ -178,14 +178,18 @@ it('saveBody qualifies the home and sends the optimistic revision', async () => 
   })
 })
 
-it.each(['priority', 'status'] as const)('defers %s doc refresh while editing but refreshes after successful body save', async field => {
+it.each(['priority', 'status'] as const)('keeps %s doc refresh ready while editing and refreshes after successful body save', async field => {
   await controller.select('TICKET-0001', 's1')
   controller.setBodyEditing(true)
   calls = []
+  const states: string[] = []
+  const off = controller.doc.subscribe(() => states.push(controller.doc.getSnapshot().status))
   if (field === 'priority') await controller.setPriority('TICKET-0001', 2, 's1')
   else await controller.setStatus('TICKET-0001', 'done', 's1')
   expect(calls.map(call => call.endpoint)).toEqual(expect.arrayContaining(['update', 'tree']))
-  expect(calls.some(call => call.endpoint === 'get')).toBe(false)
+  expect(calls.some(call => call.endpoint === 'get')).toBe(true)
+  expect(states).toEqual(['ready'])
+  off()
   calls = []
   await controller.saveBody('TICKET-0001', 'saved draft', 1, 's1')
   expect(calls.map(call => call.endpoint)).toContain('get')
@@ -207,6 +211,45 @@ it.each(['envelope', 'transport'] as const)('does not refresh the editing docume
   await expect(failing.saveBody('TICKET-0001', 'draft', 1)).rejects.toThrow(kind === 'transport' ? 'connection lost' : 'revision conflict')
   expect(calls.map(call => call.endpoint)).toEqual(['update'])
   expect(failing.doc.getSnapshot()).toMatchObject({ status: 'ready', data: { body: '## 描述' } })
+})
+
+describe('editing metadata refresh fences', () => {
+  it.each(['ticket', 'scope', 'session', 'session-roundtrip', 'close', 'body', 'home', 'error', 'transport'] as const)('retains the document across %s during a pending refresh', async change => {
+    const base = { ...(GET_OK.value as any), scope: 'workspace', home: '/workspace', node: { ...(GET_OK.value as any).node, revision: 1 } }
+    let pending: ((reply: RpcResultLike) => void) | undefined
+    let rejectGet: ((error: Error) => void) | undefined
+    let hold = false
+    const scoped = new OmtController({
+      async call(_channel: string, endpoint: string, payload: any): Promise<RpcResultLike> {
+        if (endpoint === 'get') {
+          if (hold) return await new Promise((resolve, reject) => { pending = resolve; rejectGet = reject })
+          return { ok: true, value: { ...base, scope: payload.scope, node: { ...base.node, id: payload.id } } }
+        }
+        return { ok: true, value: [] }
+      },
+    }, { openDetails: () => {}, closeDetails: () => {} })
+    scoped.noteSession('s1')
+    await scoped.select('TICKET-0001', 's1', 'workspace')
+    scoped.setBodyEditing(true)
+    hold = true
+    const mutation = scoped.setPriority('TICKET-0001', 2, 's1', 'workspace')
+    await vi.waitFor(() => expect(pending).toBeTypeOf('function'))
+    hold = false
+    if (change === 'ticket') await scoped.select('TICKET-0002', 's1', 'workspace')
+    if (change === 'scope') await scoped.select('TICKET-0001', 's1', 'global')
+    if (change === 'session') { scoped.noteSession('s2'); await scoped.select('TICKET-0001', 's2', 'workspace') }
+    if (change === 'session-roundtrip') { scoped.noteSession('s2'); scoped.noteSession('s1') }
+    if (change === 'close') scoped.closeDoc()
+    const expected = scoped.doc.getSnapshot()
+    const active = scoped.active.getSnapshot()
+    if (change === 'transport') rejectGet!(new Error('offline'))
+    else pending!(change === 'error' ? { ok: false, error: { message: 'offline' } } : {
+      ok: true, value: { ...base, ...(change === 'body' ? { body: 'other actor body' } : {}), ...(change === 'home' ? { home: '/other' } : {}), node: { ...base.node, revision: 2, priority: 2 } },
+    })
+    await mutation
+    expect(scoped.doc.getSnapshot()).toBe(expected)
+    expect(scoped.active.getSnapshot()).toBe(active)
+  })
 })
 
 describe('createNode failures', () => {
