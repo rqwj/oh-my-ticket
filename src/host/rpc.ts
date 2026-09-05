@@ -306,10 +306,10 @@ export function registerOmtRpc(ctx: Context, service: OmtService, recent?: Recen
    * wins while the ticket is still marked running; otherwise fall back to
    * the live session header (gone once the executor session is disposed).
    */
-  const executorOf = (item: OmtRunItem) => {
+  const executorOf = (home: HomeRef, item: OmtRunItem) => {
     const sessionId = item.executor_session_id
     if (sessionId === undefined) return undefined
-    const live = running?.get(item.node_id)
+    const live = running?.get(item.node_id, home.homeId)
     if (live !== undefined && live.sessionId === sessionId) {
       return {
         sessionId,
@@ -327,7 +327,7 @@ export function registerOmtRpc(ctx: Context, service: OmtService, recent?: Recen
     // Full ticket join (id/title/status/archived) — detail views carry only
     // the title, so fetch the node row for the rest (local IPC, cheap).
     const node = await service.getNodeIn(home, item.node_id)
-    const executor = executorOf(item)
+    const executor = executorOf(home, item)
     return {
       node_id: item.node_id,
       position: item.position,
@@ -387,9 +387,7 @@ export function registerOmtRpc(ctx: Context, service: OmtService, recent?: Recen
             ? await service.showNode(parsed.data.id, cwd)
             : await service.showNodeIn(await service.homeForScope(cwd, parsed.data.scope), parsed.data.id)
           recent?.touch(parsed.data.sessionId, parsed.data.id)
-          const runningInfo = parsed.data.scope === 'global' && parsed.data.sessionId !== undefined
-            ? undefined
-            : running?.get(parsed.data.id)
+          const runningInfo = running?.get(parsed.data.id, result.home.homeId)
           // 所属 run 链接 (TICKET-0068): every non-terminal run holding
           // this ticket, with the item state (awaiting_confirmation 标识)
           // and a small progress summary.
@@ -430,14 +428,14 @@ export function registerOmtRpc(ctx: Context, service: OmtService, recent?: Recen
           }
           const input = { id: parsed.data.id, title, status, archived, priority, append, body, expectedRevision }
           const context = { cwd, sessionId: parsed.data.sessionId }
-          const { node } = scope === undefined
+          const { node, home } = scope === undefined
             ? await service.updateNode(input, context)
             : await service.updateNodeIn(await service.homeForScope(cwd, scope), input, context)
           recent?.touch(parsed.data.sessionId, parsed.data.id)
           // Manual status changes never START a running mark — execution is
           // claimed only by the execute endpoint and model tool calls
           // (TICKET-0028). Done/blocked/skipped/archive always clear it.
-          if (endsExecution(status, archived)) running?.stop(parsed.data.id)
+          if (endsExecution(status, archived)) running?.stop(parsed.data.id, home.homeId)
           return ok(summarize(node))
         }
         case 'create': {
@@ -472,7 +470,7 @@ export function registerOmtRpc(ctx: Context, service: OmtService, recent?: Recen
           // Passive observation (TICKET-0061) rides on the daemon update: the
           // execute button dispatches the pending item of every active run
           // holding this ticket, with this session as the recorded executor.
-          const { node } = await service.executeNode(parsed.data.id, {
+          const { node, home } = await service.executeNode(parsed.data.id, {
             cwd: cwdOf(parsed.data.sessionId),
             sessionId: parsed.data.sessionId,
           })
@@ -482,6 +480,7 @@ export function registerOmtRpc(ctx: Context, service: OmtService, recent?: Recen
             sessionLabelOf(parsed.data.sessionId),
             // Executor lineage snapshot (TICKET-0066) from the session header.
             lineageOfHeader(agents?.get(parsed.data.sessionId)?.session.header),
+            home.homeId,
           )
           recent?.touch(parsed.data.sessionId, parsed.data.id)
           return ok(summarize(node))
@@ -638,7 +637,7 @@ export function registerOmtRpc(ctx: Context, service: OmtService, recent?: Recen
             // 确认完成 (TICKET-0070): an explicit done report — item done +
             // ticket done (reported bypasses the trust gate by design).
             item = (await service.reportItem(home, id, nodeId, 'done')).item
-            running?.stop(nodeId)
+            running?.stop(nodeId, home.homeId)
           } else {
             // 打回: reopen the ticket (open over an awaiting_confirmation
             // item is the TICKET-0064 rejection path). The observation

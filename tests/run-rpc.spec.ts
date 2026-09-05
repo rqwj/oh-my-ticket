@@ -151,7 +151,7 @@ describe('run-show', () => {
     const created = await service.createRun(fixture.globalHome, { nodeIds: tickets.map(t => t.id), config: { stopOnFailure: true } })
     await service.controlRun(fixture.globalHome, created.run.id, 'start')
     await service.claimItem(fixture.globalHome, created.run.id, SESSION)
-    running.start(tickets[0]!.id, SESSION, '面板会话', { parentSessionId: 'parent-1', isSubagent: true })
+    running.start(tickets[0]!.id, SESSION, '面板会话', { parentSessionId: 'parent-1', isSubagent: true }, fixture.globalHome.homeId)
 
     const result = await handler('run-show', { id: created.run.id }, new AbortController().signal)
     expect(result.ok).toBe(true)
@@ -384,13 +384,15 @@ describe('run-confirm', () => {
 
   it('confirm lands item done and ticket done, clearing the running mark', async () => {
     const { runId, ticket } = await awaitingFixture()
-    running.start(ticket.id, SESSION, '面板会话', {})
+    running.start(ticket.id, SESSION, '面板会话', {}, fixture.globalHome.homeId)
+    running.start(ticket.id, 'other-session', 'other home', {}, 'other-home')
 
     const result = await handler('run-confirm', { id: runId, nodeId: ticket.id, decision: 'confirm' }, new AbortController().signal)
     expect(result.ok).toBe(true)
     expect(result.value.item.state).toBe('done')
     expect((await service.getNodeIn(fixture.globalHome, ticket.id))?.status).toBe('done')
-    expect(running.get(ticket.id)).toBeUndefined()
+    expect(running.get(ticket.id, fixture.globalHome.homeId)).toBeUndefined()
+    expect(running.forSession('other-session')).toHaveLength(1)
     expect(events.some(event => event.run?.id === runId)).toBe(true)
   })
 

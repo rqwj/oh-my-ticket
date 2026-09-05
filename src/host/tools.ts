@@ -364,12 +364,12 @@ export function registerOmtTools(
     return base !== undefined ? `${base} 的会话` : '未知会话'
   }
   /** Status transitions drive the running marker (model-flow executions). */
-  const trackRunning = (exec: ToolRunContext, id: string, status?: string, archived?: boolean): void => {
+  const trackRunning = (exec: ToolRunContext, homeId: string, id: string, status?: string, archived?: boolean): void => {
     if (running === undefined) return
     // Executor lineage snapshot (TICKET-0066) from the session header.
-    if (status === 'in_progress') running.start(id, sessionOf(exec) ?? '', labelOf(exec), lineageOfHeader(exec.agent?.session.header))
+    if (status === 'in_progress') running.start(id, sessionOf(exec) ?? '', labelOf(exec), lineageOfHeader(exec.agent?.session.header), homeId)
     // done/blocked/skipped/archive all end active execution: clear the mark.
-    if (endsExecution(status, archived)) running.stop(id)
+    if (endsExecution(status, archived)) running.stop(id, homeId)
   }
   ctx.tools.register(defineTool({
     name: 'omt_create',
@@ -497,7 +497,7 @@ export function registerOmtTools(
         append: args.append,
       }, { cwd: exec.agent?.session.header.cwd, sessionId: sessionOf(exec) })
       touch?.(sessionOf(exec), args.id)
-      trackRunning(exec, args.id, args.status, args.archived)
+      trackRunning(exec, home.homeId, args.id, args.status, args.archived)
       changed?.(home.homeId)
       return nodeValue(node)
     },
@@ -777,6 +777,7 @@ export function registerOmtTools(
       const outcome = await service.claimItem(home, args.id, sessionId)
       changed?.(home.homeId)
       if (!outcome.claimed || outcome.item === undefined) return { run_id: args.id, claimed: false }
+      trackRunning(exec, outcome.homeId, outcome.item.node_id, 'in_progress')
       return {
         run_id: args.id,
         claimed: true,
@@ -826,7 +827,7 @@ export function registerOmtTools(
       )
       // A report concludes the current execution: clear the running mark
       // (failed keeps the ticket in_progress; a retry re-marks it).
-      running?.stop(args.nodeId)
+      running?.stop(args.nodeId, result.homeId)
       changed?.(result.homeId)
       return {
         run: runValue(result.run),
