@@ -127,6 +127,11 @@ export interface ClientOptions {
 export class OmtClient {
   private transport: Transport | null = null
   private handshakeResult: HandshakeOutcome | null = null
+  private credentialRenewal: {
+    transport: Transport
+    token: string
+    promise: Promise<void>
+  } | null = null
   private readonly options: ClientOptions
   /** connect() arguments retained for automatic reconnection (U5c). */
   private connectArgs: {
@@ -381,6 +386,41 @@ export class OmtClient {
 
   // ── calls ────────────────────────────────────────────────────────────
 
+  /** Renew only the rejected credential, without closing a socket carrying
+   * unrelated writes or event subscriptions. The server rejects these tokens
+   * before routing the method, so one replay is safe (unlike network errors). */
+  private async renewCredential(transport: Transport, token: string): Promise<void> {
+    if (this.closedByCaller || this.transport !== transport || !this.connected || !this.connectArgs) {
+      throw new Error('connection changed during credential renewal')
+    }
+    // A delayed failure for the old token can reuse the completed renewal.
+    if (this.credential?.token !== token) return
+    const active = this.credentialRenewal
+    if (active?.transport === transport && active.token === token) return active.promise
+
+    const { kind, scopes, name, sessionId } = this.connectArgs
+    const promise = (async () => {
+      const handshake = await transport.call('handshake/request', {
+        protocolVersion: '1.0',
+        client: { kind, name: name ?? `client-ts-${process.pid}`, ...(sessionId ? { sessionId } : {}) },
+        requestedScopes: scopes,
+      }) as HandshakeOutcome
+      if (this.closedByCaller || this.transport !== transport || !transport.isConnected) {
+        throw new Error('connection changed during credential renewal')
+      }
+      this.handshakeResult = handshake
+    })()
+    const renewal = { transport, token, promise }
+    this.credentialRenewal = renewal
+    try {
+      await promise
+    } finally {
+      // Failed handshakes must not poison later calls, and an old socket's
+      // completion must not clear a replacement socket's renewal.
+      if (this.credentialRenewal === renewal) this.credentialRenewal = null
+    }
+  }
+
   /**
    * Typed JSON-RPC call: attaches `params.credential.token` automatically,
    * casts the result to T. Rejects with {@link OmtProtocolError} carrying
@@ -403,19 +443,34 @@ export class OmtClient {
     if (!this.connected || !this.credential || !this.transport) {
       throw new Error('client not connected; call connect() first')
     }
-    const authedParams = { ...params, credential: { token: this.credential.token } }
+    const transport = this.transport
+    const token = this.credential.token
     try {
-      return (await this.transport.call(method, authedParams, hooks)) as T
+      return (await transport.call(method, { ...params, credential: { token } }, hooks)) as T
     } catch (error) {
+      if (method === 'handshake/request') throw error
+      const reason = error instanceof OmtProtocolError
+        ? (error.details as { reason?: unknown } | null)?.reason
+        : undefined
       if (
-        method === 'handshake/request' ||
-        this.options.rehandshakeOnHomeScopeHint !== true ||
-        !isHomeScopeRehandshakeHint(error)
+        error instanceof OmtProtocolError && error.problemCode === 'UNAUTHORIZED' &&
+        (reason === 'unknown-credential' || reason === 'expired-credential')
       ) {
+        await this.renewCredential(transport, token)
+        if (this.transport !== transport) throw new Error('connection changed during credential renewal')
+      } else if (this.options.rehandshakeOnHomeScopeHint === true && isHomeScopeRehandshakeHint(error)) {
+        await this.forceReconnect()
+      } else {
         throw error
       }
-      await this.forceReconnect()
-      return (await this.transport!.call(method, authedParams, hooks)) as T
+      if (!this.connected || !this.transport || !this.credential) {
+        throw new Error('client disconnected during credential recovery')
+      }
+      // Rebuild after either recovery path; never replay the rejected token.
+      // This call deliberately sits outside the catch: at most one retry.
+      return (await this.transport.call(method, {
+        ...params, credential: { token: this.credential.token },
+      }, hooks)) as T
     }
   }
 
