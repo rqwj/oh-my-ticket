@@ -71,7 +71,7 @@ describe('composeOmtPrompt', () => {
 
   it('does not instruct loading omt unless the user bound that name', () => {
     const unbound = composeOmtPrompt({ extraPrompt: '', boundSkillNames: [], installedNames: ['omt'] })
-    expect(unbound).not.toMatch(/先 load [`']omt[`']/) 
+    expect(unbound).not.toMatch(/先 load [`']omt[`']/)
     const bound = composeOmtPrompt({ extraPrompt: '', boundSkillNames: ['omt'], installedNames: ['omt'] })
     expect(bound).toContain('`omt`')
   })
