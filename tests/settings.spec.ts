@@ -57,6 +57,99 @@ describe('PromptSettingsModel', () => {
     expect(model.view.extraPrompt).toBe('new')
   })
 
+  it('reloads on remount only after all queued settings writes settle', async () => {
+    let stored = { extraPrompt: '', skills: rows }
+    const writes: Array<() => void> = []
+    const snapshots: typeof stored[] = []
+    const model = new PromptSettingsModel(
+      async () => { snapshots.push(stored); return stored },
+      async patch => await new Promise<void>(resolve => {
+        writes.push(() => {
+          stored = {
+            extraPrompt: patch.extraPrompt ?? stored.extraPrompt,
+            skills: patch.boundSkillNames === undefined ? stored.skills : stored.skills.map(row => ({
+              ...row, bound: patch.boundSkillNames!.includes(row.name),
+            })),
+          }
+          resolve()
+        })
+      }),
+    )
+    await model.load()
+    const toggle = model.toggle('ce-plan')
+    const prompt = model.setExtraPrompt('queued prompt')
+    await Promise.resolve()
+    const remount = model.load()
+    await Promise.resolve()
+    expect(snapshots).toHaveLength(1)
+    expect(boundNamesOf(model.view.skills)).toEqual(['ce-plan', 'gone'])
+    writes[0]!()
+    await toggle
+    await Promise.resolve()
+    expect(snapshots).toHaveLength(1)
+    writes[1]!()
+    await Promise.all([prompt, remount])
+    expect(model.view.extraPrompt).toBe(stored.extraPrompt)
+    expect(model.view.skills).toEqual(stored.skills)
+    expect(model.view.catalogStatus).toBe('ready')
+  })
+
+  it('retries a stale read when an optimistic update queues its save during reload', async () => {
+    let stored = { extraPrompt: '', skills: rows }
+    let finishRead!: () => void
+    let finishWrite!: () => void
+    let reads = 0
+    let reload: Promise<void> | undefined
+    let reloadOnUpdate = false
+    const model = new PromptSettingsModel(
+      async () => {
+        const snapshot = stored
+        if (++reads === 2) await new Promise<void>(resolve => { finishRead = resolve })
+        return snapshot
+      },
+      async patch => {
+        await new Promise<void>(resolve => { finishWrite = resolve })
+        stored = { ...stored, extraPrompt: patch.extraPrompt! }
+      },
+      view => {
+        // A remount triggered by publishing optimistic state can precede enqueuePersist.
+        if (reloadOnUpdate && view.catalogStatus === 'ready') {
+          reloadOnUpdate = false
+          reload = model.load()
+        }
+      },
+    )
+    await model.load()
+    reloadOnUpdate = true
+    const save = model.setExtraPrompt('latest')
+    await Promise.resolve()
+    finishRead()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(model.view.extraPrompt).toBe('latest')
+    finishWrite()
+    await Promise.all([save, reload])
+    expect(model.view.extraPrompt).toBe(stored.extraPrompt)
+    expect(reads).toBe(3)
+  })
+
+  it('allows retry after a pending write fails without restoring its optimistic bindings', async () => {
+    let rejectWrite!: (error: Error) => void
+    const model = new PromptSettingsModel(
+      async () => ({ extraPrompt: '', skills: rows }),
+      async () => await new Promise<void>((_resolve, reject) => { rejectWrite = reject }),
+    )
+    await model.load()
+    const save = model.toggle('ce-plan')
+    await Promise.resolve()
+    const retry = model.load()
+    rejectWrite(new Error('persist failed'))
+    await Promise.all([save, retry])
+    expect(model.view.catalogStatus).toBe('ready')
+    expect(boundNamesOf(model.view.skills)).toEqual(['gone'])
+    expect(model.view.writeError).toBe('')
+  })
+
   it('keeps extra prompt editable after a catalog error without clearing unknown skill bindings', async () => {
     const writes: unknown[] = []
     const model = new PromptSettingsModel(async () => { throw new Error('rpc down') }, async value => { writes.push(value) })

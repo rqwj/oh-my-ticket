@@ -41,7 +41,7 @@ export class PromptSettingsModel {
     extraPrompt: INITIAL_PROMPT_SETTINGS_VIEW.extraPrompt,
     skills: INITIAL_PROMPT_SETTINGS_VIEW.skills,
   }
-  private writeQueue: Promise<void> = Promise.resolve()
+  private writeQueue: Promise<void> | undefined
   private extraWriteRevision = 0
   private skillsWriteRevision = 0
   private loadRevision = 0
@@ -59,7 +59,7 @@ export class PromptSettingsModel {
   }
 
   private enqueuePersist(next: PromptSettingsPatch): Promise<void> {
-    const write = this.writeQueue.then(async () => await this.persist(next))
+    const write = (this.writeQueue ?? Promise.resolve()).then(async () => await this.persist(next))
     this.writeQueue = write.catch(() => {})
     return write
   }
@@ -68,17 +68,26 @@ export class PromptSettingsModel {
     const revision = ++this.loadRevision
     this.commit({ ...this.view, catalogStatus: 'loading', catalogError: '', writeError: '' })
     try {
-      const data = await this.loadCatalog()
-      if (revision !== this.loadRevision) return
-      const next: PromptSettingsView = {
-        extraPrompt: data.extraPrompt,
-        skills: data.skills,
-        catalogStatus: catalogStatusOf(data.skills),
-        catalogError: '',
-        writeError: '',
+      while (true) {
+        const pendingWrites = this.writeQueue
+        if (pendingWrites !== undefined) await pendingWrites
+        if (revision !== this.loadRevision) return
+        const data = await this.loadCatalog()
+        if (revision !== this.loadRevision) return
+        // An optimistic update can publish a reload before it enqueues its save.
+        // Discard that read and wait for the new queue before fetching again.
+        if (pendingWrites !== this.writeQueue) continue
+        const next: PromptSettingsView = {
+          extraPrompt: data.extraPrompt,
+          skills: data.skills,
+          catalogStatus: catalogStatusOf(data.skills),
+          catalogError: '',
+          writeError: '',
+        }
+        this.saved = next
+        this.commit(next)
+        return
       }
-      this.saved = next
-      this.commit(next)
     } catch (error) {
       if (revision !== this.loadRevision) return
       this.commit({
