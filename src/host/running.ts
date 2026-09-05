@@ -41,32 +41,42 @@ export function lineageOfHeader(header: { parentSession?: string; origin?: strin
 }
 
 export class RunningRegistry {
-  private readonly running = new Map<string, RunningInfo>()
+  private readonly running = new Map<string, { id: string; homeId?: string; info: RunningInfo }>()
 
-  start(id: string, sessionId: string, sessionLabel: string, lineage: RunningLineage = {}): void {
-    this.running.set(id, {
-      sessionId,
-      sessionLabel,
-      since: new Date().toISOString(),
-      ...(lineage.parentSessionId !== undefined ? { parentSessionId: lineage.parentSessionId } : {}),
-      ...(lineage.isSubagent === true ? { isSubagent: true } : {}),
+  private key(id: string, homeId?: string): string {
+    return JSON.stringify([homeId ?? null, id])
+  }
+
+  // Optional home supports legacy registry-only callers. Host paths must pass
+  // the resolved home, never cwd or an ID-derived guess.
+  start(id: string, sessionId: string, sessionLabel: string, lineage: RunningLineage = {}, homeId?: string): void {
+    this.running.set(this.key(id, homeId), {
+      id,
+      ...(homeId !== undefined ? { homeId } : {}),
+      info: {
+        sessionId,
+        sessionLabel,
+        since: new Date().toISOString(),
+        ...(lineage.parentSessionId !== undefined ? { parentSessionId: lineage.parentSessionId } : {}),
+        ...(lineage.isSubagent === true ? { isSubagent: true } : {}),
+      },
     })
   }
 
-  stop(id: string): void {
-    this.running.delete(id)
+  // Unscoped cleanup only owns legacy entries; it cannot erase scoped work.
+  stop(id: string, homeId?: string): void {
+    this.running.delete(this.key(id, homeId))
   }
 
-  get(id: string): RunningInfo | undefined {
-    return this.running.get(id)
+  get(id: string, homeId?: string): RunningInfo | undefined {
+    if (homeId !== undefined) return this.running.get(this.key(id, homeId))?.info
+    // Preserve unambiguous legacy reads without selecting a colliding home.
+    const matches = [...this.running.values()].filter(entry => entry.id === id)
+    return matches.length === 1 ? matches[0]!.info : undefined
   }
 
-  /** Reverse lookup (idle hook): every ticket currently running under one session. */
-  forSession(sessionId: string): { id: string; info: RunningInfo }[] {
-    const matches: { id: string; info: RunningInfo }[] = []
-    for (const [id, info] of this.running) {
-      if (info.sessionId === sessionId) matches.push({ id, info })
-    }
-    return matches
+  /** Reverse lookup (idle/disposed hooks): retain home identity for cleanup. */
+  forSession(sessionId: string): { id: string; homeId?: string; info: RunningInfo }[] {
+    return [...this.running.values()].filter(entry => entry.info.sessionId === sessionId)
   }
 }

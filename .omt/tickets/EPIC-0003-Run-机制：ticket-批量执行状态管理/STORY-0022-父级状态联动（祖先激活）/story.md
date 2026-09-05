@@ -35,7 +35,7 @@ ticket 无论单个执行还是 run 批量执行，其所在祖先链自动进�
 <!-- omt:children -->
 ## 子节点
 
-- [TICKET-0090 实现祖先激活级联与 claim 兜底](TICKET-0090-实现祖先激活级联与-claim-兜底/ticket.md) — open
+- [TICKET-0090 实现祖先激活级联与 claim 兜底](TICKET-0090-实现祖先激活级联与-claim-兜底/ticket.md) — done
 <!-- /omt:children -->
 
 能力已交付：TICKET-0090 完成祖先激活级联与 claim 兜底，单个执行与批量执行两条路径均验证通过。

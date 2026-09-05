@@ -3,7 +3,7 @@
  * priority shadowing while a ticket doc is active. Disposing the
  * registration (closeDoc) restores the stock tool-details panel.
  */
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { MarkdownText } from '@deepseek-ai/dsh-client-ui-primitives'
 import { formatRelative } from '../relative-time.ts'
 import { priorityOptionLabel } from '../priority.ts'
@@ -34,12 +34,14 @@ export interface DocPanelProps extends RunBindings {
   readonly executeTicket: (id: string, sessionId?: string) => void
   readonly useDoc: Selector<DocState>
   readonly closeDoc: () => void
-  readonly setStatus: (id: string, status: OmtTreeNode['status'], sessionId?: string) => void
-  readonly setArchived: (id: string, archived: boolean, sessionId?: string) => void
-  readonly rename: (id: string, title: string, sessionId?: string) => void
-  readonly setPriority: (id: string, priority: number, sessionId?: string) => void
-  readonly appendNote: (id: string, text: string, sessionId?: string) => void
-  readonly select: (id: string, sessionId?: string) => void
+  readonly setStatus: (id: string, status: OmtTreeNode['status'], sessionId?: string, scope?: 'workspace' | 'global') => void
+  readonly setArchived: (id: string, archived: boolean, sessionId?: string, scope?: 'workspace' | 'global') => void
+  readonly rename: (id: string, title: string, sessionId?: string, scope?: 'workspace' | 'global') => void
+  readonly setPriority: (id: string, priority: number, sessionId?: string, scope?: 'workspace' | 'global') => void
+  readonly appendNote: (id: string, text: string, sessionId?: string, scope?: 'workspace' | 'global') => void
+  readonly saveBody: (id: string, body: string, expectedRevision: number | undefined, sessionId?: string, scope?: 'workspace' | 'global') => Promise<void>
+  readonly setBodyEditing: (editing: boolean) => void
+  readonly select: (id: string, sessionId?: string, scope?: 'workspace' | 'global') => void
   /** NOT_FOUND cleanup: unpin + drop from related + close. */
   readonly forget: (id: string, sessionId?: string) => void
   /** Framework-injected translate seat (registration declares locale: NS). */
@@ -104,6 +106,22 @@ export function DocPanel(props: DocPanelProps) {
   const [draft, setDraft] = useState('')
   const [copied, setCopied] = useState<string | undefined>(undefined)
   const [editingTitle, setEditingTitle] = useState(false)
+  const [editingBody, setEditingBody] = useState(false)
+  const [bodyDraft, setBodyDraft] = useState('')
+  const [bodySavePending, setBodySavePending] = useState(false)
+  const [bodySaveError, setBodySaveError] = useState('')
+  const bodySaveRequestRef = useRef(0)
+  const readyNodeKey = doc.status === 'ready' ? `${doc.data.scope ?? 'auto'}:${doc.data.node.id}` : undefined
+
+  useEffect(() => {
+    bodySaveRequestRef.current += 1
+    setEditingBody(false)
+    setBodyDraft('')
+    setBodySavePending(false)
+    setBodySaveError('')
+    props.setBodyEditing(false)
+    return () => props.setBodyEditing(false)
+  }, [readyNodeKey, props.setBodyEditing])
 
   const copy = (key: string, text: string): void => {
     void navigator.clipboard?.writeText(text)
@@ -153,10 +171,16 @@ export function DocPanel(props: DocPanelProps) {
   }
 
   const { node, parent, children, body } = doc.data
+  const ancestors = doc.data.ancestors ?? (parent === undefined ? [] : [parent])
   // While a session executes this ticket, mutating actions lock (TICKET-0026);
   // archived nodes stay sealed as before.
   const locked = node.archived || doc.data.running !== undefined
+  const appendDisabled = locked || editingBody
+  const scopedRunUnsupported = doc.data.scope === 'global' && props.sessionId !== undefined
   const lockReason = node.archived ? undefined : t('doc.locked')
+  const appendBlockReason = editingBody
+    ? `${t('doc.saveBody')} / ${t('doc.cancelEdit')}`
+    : locked ? lockReason : undefined
   return (
     <div className={css.panel}>
       <div className={css.headerTop}>
@@ -167,7 +191,7 @@ export function DocPanel(props: DocPanelProps) {
           value={node.status}
           disabled={node.archived}
           title={node.archived ? t('doc.statusReadonly') : undefined}
-          onChange={event => props.setStatus(node.id, event.target.value as OmtTreeNode['status'], props.sessionId)}
+          onChange={event => props.setStatus(node.id, event.target.value as OmtTreeNode['status'], props.sessionId, doc.data.scope)}
         >
           {STATUS_OPTIONS.map(option => (
             <option key={option.value} value={option.value}>{option.icon} {t(STATUS_KEY[option.value])}</option>
@@ -178,7 +202,7 @@ export function DocPanel(props: DocPanelProps) {
           value={node.priority}
           disabled={node.archived}
           title={t('priority.selectTitle')}
-          onChange={event => props.setPriority(node.id, Number(event.target.value), props.sessionId)}
+          onChange={event => props.setPriority(node.id, Number(event.target.value), props.sessionId, doc.data.scope)}
         >
           {[0, 1, 2, 3].map(p => (
             <option key={p} value={p}>{priorityOptionLabel(t, p)}</option>
@@ -195,7 +219,7 @@ export function DocPanel(props: DocPanelProps) {
           autoFocus
           onKeyDown={event => {
             if (event.key === 'Enter') {
-              props.rename(node.id, event.currentTarget.value, props.sessionId)
+              props.rename(node.id, event.currentTarget.value, props.sessionId, doc.data.scope)
               setEditingTitle(false)
             }
             if (event.key === 'Escape') setEditingTitle(false)
@@ -227,17 +251,24 @@ export function DocPanel(props: DocPanelProps) {
         </div>
       )}
 
-      {parent !== undefined && (
+      {ancestors.length > 0 && (
         <div className={css.relation}>
-          <span className={css.relationLabel}>{t('doc.parent')}</span>
-          <RelationChip node={parent} onSelect={id => props.select(id, props.sessionId)} t={t} />
+          <span className={css.relationLabel}>{t('doc.breadcrumb')}</span>
+          <div className={css.chipRow}>
+            {ancestors.map((item, index) => (
+              <span key={item.id}>
+                {index > 0 ? <span aria-hidden> › </span> : null}
+                <RelationChip node={item} onSelect={id => props.select(id, props.sessionId, doc.data.scope)} t={t} />
+              </span>
+            ))}
+          </div>
         </div>
       )}
       {children.length > 0 && (
         <div className={css.relation}>
           <span className={css.relationLabel}>{t('doc.children')}</span>
           <div className={css.chipRow}>
-            {children.map(child => <RelationChip key={child.id} node={child} onSelect={id => props.select(id, props.sessionId)} t={t} />)}
+            {children.map(child => <RelationChip key={child.id} node={child} onSelect={id => props.select(id, props.sessionId, doc.data.scope)} t={t} />)}
           </div>
         </div>
       )}
@@ -256,8 +287,8 @@ export function DocPanel(props: DocPanelProps) {
         <button
           type="button"
           className={css.actionPrimary}
-          disabled={props.inputActions === undefined || locked}
-          title={node.archived ? t('doc.executeArchived') : locked ? lockReason : t('doc.executeTitle')}
+          disabled={props.inputActions === undefined || locked || scopedRunUnsupported}
+          title={scopedRunUnsupported ? t('doc.globalRunUnavailable') : node.archived ? t('doc.executeArchived') : locked ? lockReason : t('doc.executeTitle')}
           onClick={() => {
             // Execute first: status/running mark + SSE broadcast refresh the
             // panel immediately; the conversation submit follows.
@@ -271,8 +302,8 @@ export function DocPanel(props: DocPanelProps) {
         <button
           type="button"
           className={css.action}
-          disabled={node.archived}
-          title={node.archived ? t('run.joinArchived') : t('run.joinTitle')}
+          disabled={node.archived || scopedRunUnsupported}
+          title={scopedRunUnsupported ? t('doc.globalRunUnavailable') : node.archived ? t('run.joinArchived') : t('run.joinTitle')}
           onClick={() => props.joinRun(node.id, props.sessionId)}
         >
           {t('run.join')}
@@ -282,7 +313,7 @@ export function DocPanel(props: DocPanelProps) {
           className={css.action}
           disabled={!node.archived && doc.data.running !== undefined}
           title={!node.archived && doc.data.running !== undefined ? lockReason : undefined}
-          onClick={() => props.setArchived(node.id, !node.archived, props.sessionId)}
+          onClick={() => props.setArchived(node.id, !node.archived, props.sessionId, doc.data.scope)}
         >
           {node.archived ? t('doc.restore') : t('doc.archive')}
         </button>
@@ -301,7 +332,46 @@ export function DocPanel(props: DocPanelProps) {
       </div>
 
       <div className={css.bodyScroll}>
-        <MarkdownText text={stripChildrenBlock(body)} />
+        {editingBody && !locked ? (
+          <>
+            <textarea className={css.appendInput} value={bodyDraft} rows={12} onChange={event => setBodyDraft(event.target.value)} />
+            <div className={css.actions}>
+              <button type="button" className={css.actionPrimary} disabled={bodySavePending} onClick={() => {
+                const requestId = ++bodySaveRequestRef.current
+                setBodySavePending(true)
+                setBodySaveError('')
+                void props.saveBody(node.id, bodyDraft, node.revision, props.sessionId, doc.data.scope).then(() => {
+                  if (requestId !== bodySaveRequestRef.current) return
+                  setEditingBody(false)
+                  setBodyDraft('')
+                  props.setBodyEditing(false)
+                }).catch(error => {
+                  if (requestId === bodySaveRequestRef.current) setBodySaveError(error instanceof Error ? error.message : String(error))
+                }).finally(() => {
+                  if (requestId === bodySaveRequestRef.current) setBodySavePending(false)
+                })
+              }}>{t('doc.saveBody')}</button>
+              <button type="button" className={css.action} disabled={bodySavePending} onClick={() => {
+                setEditingBody(false)
+                setBodyDraft('')
+                setBodySaveError('')
+                props.setBodyEditing(false)
+              }}>{t('doc.cancelEdit')}</button>
+            </div>
+            {bodySaveError !== '' && <p className={css.errorDetail}>{bodySaveError}</p>}
+          </>
+        ) : (
+          <>
+            {!locked && (
+              <button type="button" className={css.action} onClick={() => {
+                setBodyDraft(stripChildrenBlock(body))
+                setEditingBody(true)
+                props.setBodyEditing(true)
+              }}>{t('doc.editBody')}</button>
+            )}
+            <MarkdownText text={stripChildrenBlock(body)} />
+          </>
+        )}
       </div>
 
       <div className={css.appendArea}>
@@ -310,16 +380,19 @@ export function DocPanel(props: DocPanelProps) {
           className={css.appendInput}
           placeholder={node.archived ? t('doc.appendPlaceholderArchived') : locked ? t('doc.appendPlaceholderLocked') : t('doc.appendPlaceholder')}
           value={draft}
-          disabled={locked}
+          disabled={appendDisabled}
+          title={appendBlockReason}
           onChange={event => setDraft(event.target.value)}
           rows={2}
         />
         <button
           type="button"
           className={css.appendButton}
-          disabled={locked}
+          disabled={appendDisabled}
+          title={appendBlockReason}
           onClick={() => {
-            props.appendNote(node.id, draft, props.sessionId)
+            if (appendDisabled) return
+            props.appendNote(node.id, draft, props.sessionId, doc.data.scope)
             setDraft('')
           }}
         >

@@ -55,6 +55,8 @@ export interface OmtNode {
   readonly priority: number
   /** Markdown file path relative to OMT home, e.g. `tickets/EPIC-0001-x/epic.md`. */
   readonly path: string
+  /** Daemon optimistic-concurrency revision; absent on summary-only views. */
+  readonly revision?: number
   readonly created_at: string
   readonly updated_at: string
 }

@@ -1,6 +1,6 @@
 {
   "name": "dsh-oh-my-ticket",
-  "version": "0.6.2",
+  "version": "0.6.4",
   "description": "DSH ticket management plugin: Epic/Story/Ticket hierarchy backed by SQLite + Markdown",
   "license": "MIT",
   "type": "module",

@@ -42,7 +42,7 @@ describe('tool registration and node tools', () => {
 
   it('omt_create creates nodes and renders the node line', async () => {
     const create = tools.get('omt_create')!
-    const epic = await create.execute({ type: 'epic', title: '用户体系' }, {})
+    const epic = await create.execute({ type: 'epic', title: '用户体系', scope: 'global' }, {})
     expect(epic.id).toBe('EPIC-0001')
     expect(renderText('omt_create', {}, epic)).toContain('EPIC-0001 [epic · open] 用户体系')
 
@@ -62,7 +62,7 @@ describe('tool registration and node tools', () => {
 
   it('omt_list filters and searches', async () => {
     const create = tools.get('omt_create')!
-    const epic = await create.execute({ type: 'epic', title: '用户体系' }, {})
+    const epic = await create.execute({ type: 'epic', title: '用户体系', scope: 'global' }, {})
     await create.execute({ type: 'story', title: '登录', parentId: epic.id }, {})
 
     const list = tools.get('omt_list')!
@@ -73,7 +73,7 @@ describe('tool registration and node tools', () => {
 
   it('omt_show returns structured detail and renders markdown', async () => {
     const create = tools.get('omt_create')!
-    const epic = await create.execute({ type: 'epic', title: '用户体系' }, {})
+    const epic = await create.execute({ type: 'epic', title: '用户体系', scope: 'global' }, {})
     const story = await create.execute({ type: 'story', title: '登录', parentId: epic.id }, {})
 
     const show = tools.get('omt_show')!
@@ -88,7 +88,7 @@ describe('tool registration and node tools', () => {
 
   it('omt_update requires at least one change and appends progress', async () => {
     const create = tools.get('omt_create')!
-    const epic = await create.execute({ type: 'epic', title: '用户体系' }, {})
+    const epic = await create.execute({ type: 'epic', title: '用户体系', scope: 'global' }, {})
 
     const update = tools.get('omt_update')!
     await expect(update.execute({ id: epic.id }, {})).rejects.toThrow(/至少需要一项变更/)
@@ -101,7 +101,7 @@ describe('tool registration and node tools', () => {
 
   it('omt_move relocates a subtree', async () => {
     const create = tools.get('omt_create')!
-    const epic = await create.execute({ type: 'epic', title: '用户体系' }, {})
+    const epic = await create.execute({ type: 'epic', title: '用户体系', scope: 'global' }, {})
     const s1 = await create.execute({ type: 'story', title: '登录', parentId: epic.id }, {})
     const s2 = await create.execute({ type: 'story', title: '注册', parentId: epic.id }, {})
     const ticket = await create.execute({ type: 'ticket', title: '接口', parentId: s1.id }, {})
@@ -112,7 +112,7 @@ describe('tool registration and node tools', () => {
 
   it('omt_reindex reports counts (admin grant self-issued by the service)', async () => {
     const create = tools.get('omt_create')!
-    const epic = await create.execute({ type: 'epic', title: '用户体系' }, {})
+    const epic = await create.execute({ type: 'epic', title: '用户体系', scope: 'global' }, {})
     await create.execute({ type: 'story', title: '登录', parentId: epic.id }, {})
 
     const result = await tools.get('omt_reindex')!.execute({}, {})

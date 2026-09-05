@@ -16,11 +16,14 @@ import { registerOmtDisposedHook } from './host/disposed-hook.ts'
 import { registerOmtEvents } from './host/events.ts'
 import { registerOmtIdleHook } from './host/idle-hook.ts'
 import { createOmtRunNotifier } from './host/notify-hook.ts'
+import { DEFAULT_PROMPT_SETTINGS, InstalledSkillCache, OMT_PROMPT_SETTINGS_NS, refreshInstalledSkillCache, resolveLiveAgent, selectBindableSkills, type PromptSettings } from './host/prompt-settings.ts'
+import { liveBoundNames, registerOmtPrompt } from './host/prompt.ts'
 import { RecentRegistry } from './host/recent.ts'
-import { RunningRegistry } from './host/running.ts'
 import { registerOmtRpc } from './host/rpc.ts'
+import { RunningRegistry } from './host/running.ts'
 import { registerOmtRunsSkill, registerOmtSkill } from './host/skill.ts'
 import { OmtService, RECENT_SHARED_KEY } from './host/service.ts'
+import { registerOmtSkillGate } from './host/skill-gate.ts'
 import { registerOmtTools } from './host/tools.ts'
 
 // Zero-config daemon resolution (U13/KTD7): re-exported so packed-package
@@ -34,7 +37,7 @@ export {
 export type { DaemonBinary, DaemonSource } from '@omt/client-ts'
 
 export const name = 'oh-my-ticket'
-export const inject = ['tools', 'skills', 'connection', 'agents', 'userQuestions', 'webServer']
+export const inject = ['tools', 'skills', 'connection', 'agents', 'userQuestions', 'webServer', 'systemPrompt']
 
 export interface Config {
   /** OMT home directory; empty falls back to OMT_HOME env, then ~/.omt. */
@@ -54,8 +57,32 @@ export function resolveHome(configHome: string, env: NodeJS.ProcessEnv = process
   return join(homedir(), '.omt')
 }
 
-/** Structural agent shape used here: just the session header (see rpc.ts). */
-type HeaderAgent = { session: { header: { cwd?: string } } }
+function normalizePromptSettings(value: unknown): PromptSettings {
+  const raw = value as Partial<PromptSettings> | undefined
+  const extra = typeof raw?.extraPrompt === 'string' ? raw.extraPrompt : ''
+  const bound = Array.isArray(raw?.boundSkillNames) ? raw.boundSkillNames.filter((name): name is string => typeof name === 'string') : []
+  return { extraPrompt: extra, boundSkillNames: bound }
+}
+
+function attachPromptSettings(ctx: Context, setValue: (value: PromptSettings) => void): void {
+  const inject = (ctx as unknown as { inject?: (deps: string[], cb: (scoped: Context) => void) => void }).inject
+  if (typeof inject !== 'function') return
+  inject.call(ctx, ['settings'], scoped => {
+    const settings = (scoped as unknown as { settings?: { register: (ns: string, schema: unknown, opts?: unknown) => { get(): unknown; watch?: (fn: () => void) => void } } }).settings
+    if (settings === undefined) return
+    const schema = Schema.object({
+      extraPrompt: Schema.string().default(''),
+      boundSkillNames: Schema.array(Schema.string()).default([]),
+    })
+    const scope = settings.register(OMT_PROMPT_SETTINGS_NS, schema, { base: DEFAULT_PROMPT_SETTINGS, applies: 'live' })
+    const pull = () => setValue(normalizePromptSettings(scope.get()))
+    pull()
+    scope.watch?.(pull)
+  })
+}
+
+/** Structural live-agent shape used for catalog cwd and subagent lineage. */
+type HeaderAgent = { id: string; session: { header?: { id?: string; cwd?: string; parentSession?: string } } }
 
 export function apply(ctx: Context, config: Config): void {
   const globalHome = resolveHome(config.home)
@@ -65,7 +92,7 @@ export function apply(ctx: Context, config: Config): void {
   // spawned/discovered daemon learns the global home from OMT_HOME (or its
   // own --home args); this adapter resolves workspace homes against the
   // registry learned at handshake.
-  const service = new OmtService({ name: 'oh-my-ticket-dsh' })
+  const service = new OmtService({ name: 'oh-my-ticket-dsh', daemonArgs: ['--home', globalHome] })
 
   // Optional-inject Cordis service `omt` (ctx.get('omt')); tied to this
   // fiber via reflect.provide and disposed with it.
@@ -91,16 +118,57 @@ export function apply(ctx: Context, config: Config): void {
       await service.recentSet(RECENT_SHARED_KEY, ids)
     },
   })
+  const installed = new InstalledSkillCache()
+  let promptSettings: PromptSettings = { ...DEFAULT_PROMPT_SETTINGS }
+  const promptInputs = () => ({
+    extraPrompt: promptSettings.extraPrompt,
+    boundSkillNames: promptSettings.boundSkillNames,
+    installedNames: [...installed.names()],
+  })
+
+  registerOmtSkillGate(ctx, {
+    // Runtime enforcement follows explicit persisted bindings. Catalog snapshots
+    // can be plugin-only before workspace skills warm and must never disable gates.
+    getBoundSkillNames: () => promptSettings.boundSkillNames,
+    running,
+    agents,
+  })
+
   // SSE refresh is fed by daemon event envelopes through the service-owned
   // hub (single source of truth); only reindex — which rebuilds silently —
   // bumps explicitly via the RPC layer.
   registerOmtTools(ctx, service, (sessionId, id) => recent.touch(sessionId, id), undefined, running)
   registerOmtSkill(ctx)
   registerOmtRunsSkill(ctx)
-  registerOmtRpc(ctx, service, recent, service.hub, running)
+  registerOmtPrompt(ctx, promptInputs)
+  const listCatalog = async (sessionId?: string) => {
+    const live = resolveLiveAgent(sessionId, id => agents?.get(id), () => (agents?.list() ?? []).flatMap(({ id }) => {
+      const agent = agents?.get(id)
+      return agent === undefined ? [] : [agent]
+    }))
+    const presets = ctx.get('agentPresets') as { serviceFor?: (agent: unknown, name: string) => { list: (opts: { cwd?: string; scope?: unknown }) => Promise<{ name: string; description: string; invocation?: { modelInvocable?: boolean } }[]> } | undefined } | undefined
+    const registry = (live === undefined ? undefined : presets?.serviceFor?.(live, 'skills')) ?? ctx.skills
+    const cwd = live?.session?.header?.cwd
+    const skills = await registry.list(live === undefined ? {} : { cwd, scope: live })
+    const catalog = selectBindableSkills(skills)
+    console.log(`[omt] skill catalog ${catalog.length}: ${catalog.map(row => row.name).join(', ')}`)
+    return catalog
+  }
+  registerOmtRpc(ctx, service, recent, service.hub, running, {
+    getSettings: () => promptSettings,
+    listCatalog,
+  })
   registerOmtEvents(ctx, service.hub)
   registerOmtIdleHook(ctx, service, running)
   registerOmtDisposedHook(ctx, service, running)
+  const refreshInstalled = () => refreshInstalledSkillCache(
+    installed,
+    async () => await listCatalog(),
+    error => console.warn('[omt] failed to refresh skill catalog', error),
+  )
+  void refreshInstalled()
+  ctx.on('skills/change', () => { void refreshInstalled() })
+  attachPromptSettings(ctx, value => { promptSettings = value })
 
   const detachNotifier = notifier.attach(service)
 

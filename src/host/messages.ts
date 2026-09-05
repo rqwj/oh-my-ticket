@@ -6,14 +6,23 @@
  */
 import { randomUUID } from 'node:crypto'
 
-/** Plugin-sourced user message (wire shape shared by every delivery site). */
-export function pluginUserMessage(text: string): unknown {
+function pluginMessage(content: readonly unknown[], form?: string): unknown {
   return {
     id: randomUUID(),
     role: 'user',
-    content: [{ type: 'text', text }],
-    source: { kind: 'plugin', plugin: 'oh-my-ticket' },
+    content: [...content],
+    source: { kind: 'plugin', plugin: 'oh-my-ticket', ...(form === undefined ? {} : { form }) },
   }
+}
+
+/** Plugin-sourced user message (wire shape shared by every delivery site). */
+export function pluginUserMessage(text: string): unknown {
+  return pluginMessage([{ type: 'text', text }])
+}
+
+/** Identified instruction context used to ferry nested skill output into the next model request. */
+export function pluginInstructionMessage(content: readonly unknown[]): unknown {
+  return pluginMessage(content, 'instructions')
 }
 
 /** Structural face of a followup target (idle/disposed hooks). */

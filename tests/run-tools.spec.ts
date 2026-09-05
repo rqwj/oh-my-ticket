@@ -81,6 +81,13 @@ describe('TICKET-0060 node status extension', () => {
     await expect(tool('omt_update').execute({ id: ticket, status: 'failed' }, NO_EXEC)).rejects.toThrow(/status/i)
   })
 
+  it('does not start a running marker when the node update fails', async () => {
+    const [ticket] = await ticketFixture(1)
+    await tool('omt_update').execute({ id: ticket, archived: true }, NO_EXEC)
+    await expect(tool('omt_update').execute({ id: ticket, status: 'in_progress' }, agentExec('sess-failed-update'))).rejects.toThrow()
+    expect(running.forSession('sess-failed-update')).toEqual([])
+  })
+
   it('omt_list filters by the new statuses', async () => {
     const [a, b] = await ticketFixture(2)
     await tool('omt_update').execute({ id: a, status: 'blocked' }, NO_EXEC)
@@ -125,7 +132,7 @@ describe('TICKET-0057 omt_run_create', () => {
     registerOmtTools(stubToolCtx(tools) as never, service, undefined, undefined, running)
 
     const create = tools.get('omt_create')!
-    const globalEpic = await create.execute({ type: 'epic', title: '全局' }, NO_EXEC)
+    const globalEpic = await create.execute({ type: 'epic', title: '全局', scope: 'global' }, NO_EXEC)
     const globalStory = await create.execute({ type: 'story', title: '全局批', parentId: globalEpic.id }, NO_EXEC)
     // Three tickets here → the global member is TICKET-0003, an id the
     // single-ticket workspace home cannot resolve, so ownership splits.
@@ -261,7 +268,7 @@ describe('TICKET-0058 omt_run_claim', () => {
   })
 
   it('returns the latest ancestor bodies as read-only context and the full current ticket', async () => {
-    const epic = await tool('omt_create').execute({ type: 'epic', title: '运行平台', body: 'Epic 全局目标' }, NO_EXEC)
+    const epic = await tool('omt_create').execute({ type: 'epic', title: '运行平台', scope: 'global', body: 'Epic 全局目标' }, NO_EXEC)
     const story = await tool('omt_create').execute({ type: 'story', title: '批量执行', parentId: epic.id, body: 'Story 初始约束' }, NO_EXEC)
     const substory = await tool('omt_create').execute({ type: 'substory', title: '失败恢复', parentId: story.id, body: 'SubStory 局部规则' }, NO_EXEC)
     const parentTicket = await tool('omt_create').execute({ type: 'ticket', title: '实现重试', parentId: substory.id, body: '父 Ticket 约束' }, NO_EXEC)
@@ -298,7 +305,7 @@ describe('TICKET-0058 omt_run_claim', () => {
     // is identical.
     const epicBody = `EPIC:${'E'.repeat(12_000)}`
     const storyBody = `STORY:${'S'.repeat(12_000)}`
-    const epic = await tool('omt_create').execute({ type: 'epic', title: '大背景', body: epicBody }, NO_EXEC)
+    const epic = await tool('omt_create').execute({ type: 'epic', title: '大背景', scope: 'global', body: epicBody }, NO_EXEC)
     const story = await tool('omt_create').execute({ type: 'story', title: '近端背景', parentId: epic.id, body: storyBody }, NO_EXEC)
     const ticket = await tool('omt_create').execute({ type: 'ticket', title: '当前任务', parentId: story.id, body: '完整 Ticket 正文' }, NO_EXEC)
     const run = await startedRun([ticket.id])
@@ -317,7 +324,7 @@ describe('TICKET-0058 omt_run_claim', () => {
   })
 
   it('claim alone activates open ancestors without executor bookkeeping', async () => {
-    const epic = await tool('omt_create').execute({ type: 'epic', title: '联动平台', body: 'E' }, NO_EXEC)
+    const epic = await tool('omt_create').execute({ type: 'epic', title: '联动平台', scope: 'global', body: 'E' }, NO_EXEC)
     const story = await tool('omt_create').execute({ type: 'story', title: '联动批次', parentId: epic.id, body: 'S' }, NO_EXEC)
     const ticket = await tool('omt_create').execute({ type: 'ticket', title: '联动任务', parentId: story.id, body: 'T' }, NO_EXEC)
     const run = await startedRun([ticket.id])

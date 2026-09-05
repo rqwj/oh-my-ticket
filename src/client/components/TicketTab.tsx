@@ -26,6 +26,8 @@ export interface TicketTabProps extends RunBindings {
   readonly saveFilters: (sessionId: string | undefined, filters: SavedFilters) => Promise<void>
   readonly select: (id: string, sessionId?: string) => void
   readonly archive: (id: string, sessionId?: string) => void
+  readonly createNode: import('./TicketPanel.tsx').TicketPanelProps['createNode']
+  readonly expandIds: (ids: readonly string[]) => void
   /** Pop-out seats: switch the overlay to float mode and open it. */
   readonly setPanelMode: (mode: PanelMode) => void
   readonly openPanel: (sessionId?: string) => void
@@ -49,6 +51,8 @@ export function TicketTab(props: TicketTabProps) {
         saveFilters={props.saveFilters}
         select={props.select}
         archive={props.archive}
+        createNode={props.createNode}
+        expandIds={props.expandIds}
         runView={props}
         sessionId={sessionId}
         headerActions={

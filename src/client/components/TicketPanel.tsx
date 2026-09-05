@@ -7,9 +7,10 @@
  * The owning shell supplies positioning, sizing, and drag furniture; the
  * panel fills whatever box it is given (flex column, min-height 0).
  */
-import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react'
 import type { ActiveInfo, OmtTreeNode, TreeState } from '../store.ts'
 import { filterForest, sortForest, type TreeFilter, type TreeSortOrder } from '../tree-filter.ts'
+import { ancestorIdsOf, CHILD_TYPES, flattenVisible, navigateVisible } from '../tree-nav.ts'
 import { DEFAULT_SAVED_FILTERS, type SavedFilters } from '../saved-filters.ts'
 import { priorityMeta } from '../priority.ts'
 import { STATUS_KEY, type Translate } from '../locales.ts'
@@ -39,8 +40,10 @@ export interface TicketPanelProps {
   readonly loadFilters: (sessionId?: string) => Promise<SavedFilters>
   /** Persist a full filter bag; called debounced on change, immediate on reset. */
   readonly saveFilters: (sessionId: string | undefined, filters: SavedFilters) => Promise<void>
-  readonly select: (id: string, sessionId?: string) => void
+  readonly select: (id: string, sessionId?: string, scope?: 'workspace' | 'global') => void
   readonly archive: (id: string, sessionId?: string) => void
+  readonly createNode: (input: { type: OmtTreeNode['type']; title: string; parentId?: string; body?: string; scope?: 'workspace' | 'global' }, sessionId?: string) => Promise<string | undefined>
+  readonly expandIds: (ids: readonly string[]) => void
   /** Run 区块 bindings (STORY-0013): section nav, RunsView, picker, notice. */
   readonly runView: RunBindings
   /** Session whose workspace home the tree follows. */
@@ -75,12 +78,23 @@ function statusText(t: Translate, node: { status: OmtTreeNode['status']; archive
     : t(STATUS_KEY[node.status])
 }
 
+function childTypesOf(nodes: readonly OmtTreeNode[], parentId: string): readonly OmtTreeNode['type'][] {
+  for (const node of nodes) {
+    if (node.id === parentId) return CHILD_TYPES[node.type]
+    const nested = childTypesOf(node.children, parentId)
+    if (nested.length > 0) return nested
+  }
+  return []
+}
+
 interface TreeRowProps {
   readonly node: OmtTreeNode
   readonly depth: number
   readonly activeId: string | undefined
+  readonly focusedId: string | undefined
   readonly onSelect: (id: string) => void
   readonly onArchive: (id: string) => void
+  readonly onCreateChild: (parent: OmtTreeNode) => void
   readonly onJoinRun: (id: string) => void
   readonly useCollapsed: Selector<Record<string, boolean>>
   readonly onToggleCollapsed: (id: string) => void
@@ -88,14 +102,15 @@ interface TreeRowProps {
   readonly t: Translate
 }
 
-function TreeRow({ node, depth, activeId, onSelect, onArchive, onJoinRun, useCollapsed, onToggleCollapsed, showId, t }: TreeRowProps) {
+function TreeRow({ node, depth, activeId, focusedId, onSelect, onArchive, onCreateChild, onJoinRun, useCollapsed, onToggleCollapsed, showId, t }: TreeRowProps) {
   // Collapse state persists across sessions (shared store, TICKET-0011).
   const collapsed = useCollapsed(snapshot => snapshot[node.id] === true)
   const hasChildren = node.children.length > 0
   return (
     <div>
       <div
-        className={`${css.row} ${node.id === activeId ? css.rowActive : ''}`}
+        className={`${css.row} ${node.id === activeId ? css.rowActive : ''} ${node.id === focusedId ? css.rowFocus : ''}`}
+        data-omt-id={node.id}
         style={{ paddingLeft: 8 + depth * 14 }}
         onClick={() => onSelect(node.id)}
         title={t('node.titleWithStatus', { id: node.id, title: node.title, status: statusText(t, node) })}
@@ -139,10 +154,21 @@ function TreeRow({ node, depth, activeId, onSelect, onArchive, onJoinRun, useCol
             ⛁
           </button>
         )}
+        {CHILD_TYPES[node.type].length > 0 && !node.archived && (
+          <button
+            type="button"
+            className={css.addChild}
+            title={t('drawer.addChild')}
+            onClick={event => {
+              event.stopPropagation()
+              onCreateChild(node)
+            }}
+          >+</button>
+        )}
         <span className={`omt-dot omt-dot--lg ${dotClass(node)}`} />
       </div>
       {!collapsed && node.children.map(child => (
-        <TreeRow key={child.id} node={child} depth={depth + 1} activeId={activeId} onSelect={onSelect} onArchive={onArchive} onJoinRun={onJoinRun} useCollapsed={useCollapsed} onToggleCollapsed={onToggleCollapsed} showId={showId} t={t} />
+        <TreeRow key={child.id} node={child} depth={depth + 1} activeId={activeId} focusedId={focusedId} onSelect={onSelect} onArchive={onArchive} onCreateChild={onCreateChild} onJoinRun={onJoinRun} useCollapsed={useCollapsed} onToggleCollapsed={onToggleCollapsed} showId={showId} t={t} />
       ))}
     </div>
   )
@@ -179,6 +205,7 @@ export function TicketPanel(props: TicketPanelProps) {
   const t = props.t
   const tree = props.useTree(snapshot => snapshot)
   const active = props.useActive(snapshot => snapshot)
+  const collapsed = props.useCollapsed(snapshot => snapshot)
   const section = props.runView.usePanelSection(snapshot => snapshot)
   // Viewing-only filter state (search keyword + archived + type/status chips).
   const [query, setQuery] = useState('')
@@ -188,6 +215,16 @@ export function TicketPanel(props: TicketPanelProps) {
   const [priorityFilter, setPriorityFilter] = useState<readonly number[]>([])
   const [showId, setShowId] = useState(false)
   const [sortOrder, setSortOrder] = useState<TreeSortOrder>('none')
+  const [focusedId, setFocusedId] = useState<string | undefined>(undefined)
+  const [flashId, setFlashId] = useState<string | undefined>(undefined)
+  const [creating, setCreating] = useState<{ type: OmtTreeNode['type']; parentId?: string; scope?: 'workspace' | 'global' } | undefined>(undefined)
+  const [createTitle, setCreateTitle] = useState('')
+  const [createBody, setCreateBody] = useState('')
+  const [createPending, setCreatePending] = useState(false)
+  const [createError, setCreateError] = useState('')
+  const createPendingRef = useRef(false)
+  const createRequestRef = useRef(0)
+  const treeRef = useRef<HTMLDivElement>(null)
   const toggleNum = (list: readonly number[], value: number): readonly number[] =>
     list.includes(value) ? list.filter(item => item !== value) : [...list, value]
   const toggleIn = (list: readonly string[], value: string): readonly string[] =>
@@ -195,6 +232,21 @@ export function TicketPanel(props: TicketPanelProps) {
   // The tree follows the session whose shell this panel lives in. The panel
   // mounts only while its shell is visible, so mount == (re)open.
   const sessionId = props.sessionId
+  useEffect(() => {
+    createRequestRef.current += 1
+    createPendingRef.current = false
+    setCreatePending(false)
+    setCreating(undefined)
+    setCreateTitle('')
+    setCreateBody('')
+    return () => {
+      createRequestRef.current += 1
+      createPendingRef.current = false
+    }
+  }, [sessionId])
+  useEffect(() => {
+    setCreateError('')
+  }, [sessionId, creating?.parentId, creating?.type, creating?.scope])
   useEffect(() => {
     void props.refreshTree(sessionId)
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -251,6 +303,13 @@ export function TicketPanel(props: TicketPanelProps) {
   }
 
   const filter: TreeFilter = { query, showArchived, types: typeFilter, statuses: statusFilter, priorities: priorityFilter }
+  const createTypeOptions: readonly OmtTreeNode['type'][] = creating === undefined
+    ? []
+    : creating.parentId === undefined
+      ? ['epic']
+      : tree.status === 'ready'
+        ? childTypesOf(tree.forest, creating.parentId)
+        : []
 
   return (
     <div className={css.root}>
@@ -260,6 +319,30 @@ export function TicketPanel(props: TicketPanelProps) {
         {...(props.headerDrag ?? {})}
       >
         <span className={css.headerTitle}>OMT Tickets</span>
+        <button type="button" className={css.headerButton} onClick={() => setCreating({ type: 'epic' })} title={t('drawer.newEpic')}>+</button>
+        <button
+          type="button"
+          className={css.headerButton}
+          disabled={active === undefined}
+          title={t('drawer.locate')}
+          onClick={() => {
+            if (active === undefined || tree.status !== 'ready') return
+            const hidden = query !== '' || typeFilter.length > 0 || statusFilter.length > 0 || priorityFilter.length > 0
+            if (hidden) {
+              setQuery('')
+              setTypeFilter([])
+              setStatusFilter([])
+              setPriorityFilter([])
+            }
+            props.expandIds(ancestorIdsOf(tree.forest, active.id))
+            setFocusedId(active.id)
+            setFlashId(active.id)
+            window.setTimeout(() => setFlashId(undefined), 800)
+            window.requestAnimationFrame(() => {
+              treeRef.current?.querySelector(`[data-omt-id="${active.id}"]`)?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+            })
+          }}
+        >◎</button>
         <button type="button" className={css.headerButton} onClick={() => props.refreshTree(sessionId)} title={t('drawer.refresh')}>
           ↻
         </button>
@@ -384,32 +467,107 @@ export function TicketPanel(props: TicketPanelProps) {
         ) : tree.status === 'error' ? (
           <div className={css.placeholder}>{t('drawer.loadFailed', { message: tree.message })}</div>
         ) : tree.forest.length === 0 ? (
-          <div className={css.placeholder}>{t('drawer.empty')}</div>
+          <div className={css.placeholder}>
+            {t('drawer.empty')}
+            <button type="button" className={css.action} onClick={() => setCreating({ type: 'epic' })}>{t('drawer.newEpic')}</button>
+          </div>
         ) : (
           (() => {
             const visible = sortForest(filterForest(tree.forest, filter), sortOrder)
+            const rows = flattenVisible(visible, collapsed)
+            const onKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>): void => {
+              const result = navigateVisible(rows, focusedId ?? active?.id, event.key)
+              if (result.focusId === focusedId && result.expandId === undefined && result.collapseId === undefined && result.openId === undefined) return
+              event.preventDefault()
+              setFocusedId(result.focusId)
+              if (result.expandId !== undefined && collapsed[result.expandId] === true) props.toggleCollapsed(result.expandId)
+              if (result.collapseId !== undefined && collapsed[result.collapseId] !== true) props.toggleCollapsed(result.collapseId)
+              if (result.openId !== undefined) props.select(result.openId, sessionId)
+            }
             return visible.length === 0 ? (
               <div className={css.placeholder}>{t('drawer.noMatch')}</div>
             ) : (
-              visible.map(node => (
-                <TreeRow
-                  key={node.id}
-                  node={node}
-                  depth={0}
-                  activeId={active?.id}
-                  onSelect={id => props.select(id, sessionId)}
-                  onArchive={id => props.archive(id, sessionId)}
-                  onJoinRun={id => props.runView.joinRun(id, sessionId)}
-                  useCollapsed={props.useCollapsed}
-                  onToggleCollapsed={props.toggleCollapsed}
-                  showId={showId}
-                  t={t}
-                />
-              ))
+              <div ref={treeRef} className={css.treeNav} tabIndex={0} onKeyDown={onKeyDown}>
+                {visible.map(node => (
+                  <TreeRow
+                    key={node.id}
+                    node={node}
+                    depth={0}
+                    activeId={active?.id}
+                    focusedId={flashId ?? focusedId}
+                    onSelect={id => props.select(id, sessionId)}
+                    onArchive={id => props.archive(id, sessionId)}
+                    onCreateChild={parent => setCreating({ type: CHILD_TYPES[parent.type][0]!, parentId: parent.id })}
+                    onJoinRun={id => props.runView.joinRun(id, sessionId)}
+                    useCollapsed={props.useCollapsed}
+                    onToggleCollapsed={props.toggleCollapsed}
+                    showId={showId}
+                    t={t}
+                  />
+                ))}
+              </div>
             )
           })()
         )}
       </div>
+      {creating !== undefined && (
+        <form
+          className={css.createForm}
+          onSubmit={event => {
+            event.preventDefault()
+            const title = createTitle.trim()
+            if (title === '' || createPendingRef.current) return
+            if (creating.parentId === undefined && creating.scope === undefined) return
+            createPendingRef.current = true
+            const requestId = ++createRequestRef.current
+            setCreatePending(true)
+            setCreateError('')
+            void (async () => {
+              try {
+                const id = await props.createNode({
+                  type: creating.type,
+                  title,
+                  parentId: creating.parentId,
+                  body: createBody.trim() || undefined,
+                  scope: creating.scope,
+                }, sessionId)
+                if (requestId !== createRequestRef.current || id === undefined) return
+                setCreating(undefined)
+                setCreateTitle('')
+                setCreateBody('')
+                props.refreshTree(sessionId)
+                props.select(id, sessionId, creating.scope)
+                setFocusedId(id)
+              } catch (error) {
+                if (requestId === createRequestRef.current) setCreateError(error instanceof Error ? error.message : String(error))
+              } finally {
+                if (requestId === createRequestRef.current) {
+                  createPendingRef.current = false
+                  setCreatePending(false)
+                }
+              }
+            })()
+          }}
+        >
+          <select name="type" value={creating.type} onChange={event => setCreating({ ...creating, type: event.target.value as OmtTreeNode['type'] })}>
+            {createTypeOptions.map(type => <option key={type} value={type}>{type}</option>)}
+          </select>
+          {creating.parentId === undefined && (
+            <select name="scope" aria-label={t('drawer.createScope')} value={creating.scope ?? ''} onChange={event => setCreating({ ...creating, scope: event.target.value === '' ? undefined : event.target.value as 'workspace' | 'global' })}>
+              <option value="">{t('drawer.createScope')}</option>
+              {sessionId !== undefined && <option value="workspace">{t('drawer.scopeWorkspace')}</option>}
+              <option value="global">{t('drawer.scopeGlobal')}</option>
+            </select>
+          )}
+          <input value={createTitle} placeholder={t('drawer.createTitle')} onChange={event => setCreateTitle(event.target.value)} autoFocus />
+          <textarea value={createBody} placeholder={t('drawer.createBody')} onChange={event => setCreateBody(event.target.value)} rows={3} />
+          <div>
+            {createError !== '' && <div role="alert">{createError}</div>}
+            <button type="submit" disabled={createPending}>{t('drawer.createSubmit')}</button>
+            <button type="button" disabled={createPending} onClick={() => setCreating(undefined)}>{t('drawer.createCancel')}</button>
+          </div>
+        </form>
+      )}
         </>
       )}
       <RunFlowExtras

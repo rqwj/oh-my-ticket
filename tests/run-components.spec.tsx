@@ -16,7 +16,9 @@ import { runFixture, runProgress, type RunFixtureOptions } from './mocks/run-fix
 import { RunsView, type RunBindings } from '../src/client/components/RunsView.tsx'
 import { NoticeBar, RunPickerModal } from '../src/client/components/RunPicker.tsx'
 import { TicketPanel } from '../src/client/components/TicketPanel.tsx'
-import { DocPanel } from '../src/client/components/DocPanel.tsx'
+import { OmtController } from '../src/client/controller.ts'
+import type { RpcResultLike } from '../src/client/trigger/source.ts'
+import { DocPanel, type DocPanelProps } from '../src/client/components/DocPanel.tsx'
 import { zh, type OmtKey, type Translate } from '../src/client/locales.ts'
 import type {
   DocData,
@@ -72,6 +74,14 @@ function mount(element: ReactElement): Mounted {
 function click(element: Element): void {
   act(() => {
     element.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+  })
+}
+
+function setValue(element: HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement, value: string): void {
+  const setter = Object.getOwnPropertyDescriptor(element.constructor.prototype, 'value')?.set
+  act(() => {
+    setter?.call(element, value)
+    element.dispatchEvent(new Event(element instanceof HTMLSelectElement ? 'change' : 'input', { bubbles: true }))
   })
 }
 
@@ -378,16 +388,24 @@ describe('RunPickerModal + NoticeBar (TICKET-0067)', () => {
   })
 })
 
-function treeNode(id: string, status: OmtTreeNode['status'], children: OmtTreeNode[] = []): OmtTreeNode {
-  return { id, type: 'ticket', title: `节点 ${id}`, status, archived: false, priority: 0, path: 'p', created_at: '', updated_at: '', children }
+function treeNode(id: string, status: OmtTreeNode['status'], children: OmtTreeNode[] = [], type: OmtTreeNode['type'] = 'ticket'): OmtTreeNode {
+  return { id, type, title: `节点 ${id}`, status, archived: false, priority: 0, path: 'p', created_at: '', updated_at: '', children }
 }
 
 describe('TicketPanel (TICKET-0067/0069)', () => {
   interface PanelSpies {
     readonly saved: { filters: any; sessionId: string | undefined }[]
+    readonly created: { input: any; sessionId: string | undefined }[]
+    readonly selected: { id: string; sessionId: string | undefined; scope: string | undefined }[]
     loadFilters: (sessionId?: string) => Promise<any>
   }
-  function renderPanel(treeState?: TreeState, saved: any = undefined) {
+  function renderPanel(
+    treeState?: TreeState,
+    saved: any = undefined,
+    createNode: (input: any, sessionId?: string) => Promise<string | undefined> = async () => undefined,
+    sessionId?: string,
+  ) {
+    const resolvedSessionId = arguments.length >= 4 ? sessionId : 's1'
     const { bindings, spies, stores } = makeBindings()
     const tree = createSnapshotStore<TreeState>(treeState ?? {
       status: 'ready',
@@ -395,31 +413,45 @@ describe('TicketPanel (TICKET-0067/0069)', () => {
     })
     const active = createSnapshotStore(undefined)
     const collapsed = createSnapshotStore<Record<string, boolean>>({})
+    const session = createSnapshotStore<string | undefined>(resolvedSessionId)
+    const useSession = useStore(session)
     const panelSpies: PanelSpies = {
       saved: [],
+      created: [],
+      selected: [],
       loadFilters: () => Promise.resolve(saved ?? {
         query: '', showArchived: false, types: [], statuses: [], priorities: [], showId: false, sortOrder: 'none',
       }),
     }
-    const mounted = render(createElement(TicketPanel, {
-      useTree: useStore(tree),
-      useActive: useStore(active),
-      useCollapsed: useStore(collapsed),
-      toggleCollapsed: () => {},
-      refreshTree: () => {},
-      reindex: () => {},
-      loadFilters: panelSpies.loadFilters,
-      saveFilters: (sessionId, filters) => {
-        panelSpies.saved.push({ sessionId, filters })
-        return Promise.resolve()
-      },
-      select: () => {},
-      archive: () => {},
-      runView: bindings,
-      sessionId: 's1',
-      t,
-    }))
-    return { container: mounted, spies, stores, panelSpies }
+    function PanelHarness() {
+      const currentSessionId = useSession(value => value)
+      return createElement(TicketPanel, {
+        useTree: useStore(tree),
+        useActive: useStore(active),
+        useCollapsed: useStore(collapsed),
+        toggleCollapsed: () => {},
+        refreshTree: () => {},
+        reindex: () => {},
+        loadFilters: panelSpies.loadFilters,
+        saveFilters: (targetSessionId, filters) => {
+          panelSpies.saved.push({ sessionId: targetSessionId, filters })
+          return Promise.resolve()
+        },
+        select: (id, targetSessionId, scope) => { panelSpies.selected.push({ id, sessionId: targetSessionId, scope }) },
+        archive: () => {},
+        createNode: async (input, targetSessionId) => {
+          panelSpies.created.push({ input, sessionId: targetSessionId })
+          return await createNode(input, targetSessionId)
+        },
+        expandIds: () => {},
+        runView: bindings,
+        sessionId: currentSessionId,
+        t,
+      })
+    }
+    const mounted = render(createElement(PanelHarness))
+    const panelStores: Record<string, SnapshotStore<any>> = { ...stores, session }
+    return { container: mounted, spies, stores: panelStores, panelSpies }
   }
 
   const flush = async (): Promise<void> => { await act(async () => { await new Promise(resolve => setTimeout(resolve, 400)) }) }
@@ -490,6 +522,122 @@ describe('TicketPanel (TICKET-0067/0069)', () => {
     expect(searchInput(container).value).toBe('')
     expect(panelSpies.saved.length).toBeGreaterThanOrEqual(savedBefore + 1)
   })
+
+  it('offers the direct legal child types for a story parent', async () => {
+    const story = treeNode('STORY-0001', 'open', [], 'story')
+    const { container } = renderPanel({ status: 'ready', forest: [story] })
+    await settle()
+    click(container.querySelector(`button[title="${zh['drawer.addChild']}"]`) as HTMLElement)
+    const typeSelect = container.querySelector('form select[name="type"]') as HTMLSelectElement
+    expect(Array.from(typeSelect.options).map(option => option.value)).toEqual(['substory', 'ticket'])
+  })
+
+  it('requires an explicit home scope when creating a root Epic', async () => {
+    const { container, panelSpies } = renderPanel(undefined, undefined, async () => 'EPIC-0099')
+    await settle()
+    click(container.querySelector(`button[title="${zh['drawer.newEpic']}"]`) as HTMLElement)
+    const form = container.querySelector('form') as HTMLFormElement
+    setValue(form.querySelector('input') as HTMLInputElement, '根 Epic')
+    act(() => { form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })) })
+    expect(panelSpies.created).toEqual([])
+
+    const scope = form.querySelector('select[name="scope"]') as HTMLSelectElement
+    expect(Array.from(scope.options).map(option => option.value)).toEqual(['', 'workspace', 'global'])
+    setValue(scope, 'global')
+    await act(async () => {
+      form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
+      await Promise.resolve()
+    })
+    expect(panelSpies.created).toEqual([{ input: { type: 'epic', title: '根 Epic', scope: 'global', parentId: undefined, body: undefined }, sessionId: 's1' }])
+    expect(panelSpies.selected).toEqual([{ id: 'EPIC-0099', sessionId: 's1', scope: 'global' }])
+  })
+
+  it('does not offer workspace scope without a live session', async () => {
+    const { container } = renderPanel(undefined, undefined, async () => undefined, undefined)
+    await settle()
+    click(container.querySelector(`button[title="${zh['drawer.newEpic']}"]`) as HTMLElement)
+    const scope = container.querySelector('select[name="scope"]') as HTMLSelectElement
+    expect(Array.from(scope.options).map(option => option.value)).toEqual(['', 'global'])
+  })
+
+  it('submits a create request only once while it is pending', async () => {
+    let resolveCreate!: (id: string | undefined) => void
+    const pending = new Promise<string | undefined>(resolve => { resolveCreate = resolve })
+    const { container, panelSpies } = renderPanel(undefined, undefined, async () => await pending)
+    await settle()
+    click(container.querySelector(`button[title="${zh['drawer.newEpic']}"]`) as HTMLElement)
+    const form = container.querySelector('form') as HTMLFormElement
+    setValue(form.querySelector('input') as HTMLInputElement, '唯一 Epic')
+    setValue(form.querySelector('select[name="scope"]') as HTMLSelectElement, 'workspace')
+    act(() => {
+      form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
+      form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
+    })
+    expect(panelSpies.created).toHaveLength(1)
+    expect((form.querySelector('button[type="submit"]') as HTMLButtonElement).disabled).toBe(true)
+    await act(async () => { resolveCreate(undefined); await pending })
+  })
+
+  it.each(['envelope', 'transport'] as const)('shows %s create failure inline, retains drafts, and clears the error on retry', async kind => {
+    let retry = false
+    let resolveRetry!: (result: RpcResultLike) => void
+    const controller = new OmtController({
+      async call(): Promise<RpcResultLike> {
+        if (retry) return await new Promise(resolve => { resolveRetry = resolve })
+        if (kind === 'transport') throw new Error('connection lost')
+        return { ok: false, error: { message: 'creation rejected' } }
+      },
+    }, { openDetails: () => {}, closeDetails: () => {} })
+    const { container, panelSpies } = renderPanel(undefined, undefined, controller.createNode)
+    await settle()
+    click(container.querySelector(`button[title="${zh['drawer.newEpic']}"]`) as HTMLElement)
+    const form = container.querySelector('form') as HTMLFormElement
+    setValue(form.querySelector('input') as HTMLInputElement, 'draft title')
+    setValue(form.querySelector('textarea') as HTMLTextAreaElement, 'draft body')
+    setValue(form.querySelector('select[name="scope"]') as HTMLSelectElement, 'global')
+    await act(async () => { form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })) })
+    expect(form.querySelector('[role="alert"]')?.textContent).toBe(kind === 'transport' ? 'connection lost' : 'creation rejected')
+    expect((form.querySelector('input') as HTMLInputElement).value).toBe('draft title')
+    expect((form.querySelector('textarea') as HTMLTextAreaElement).value).toBe('draft body')
+    expect((form.querySelector('button[type="submit"]') as HTMLButtonElement).disabled).toBe(false)
+    expect(panelSpies.selected).toEqual([])
+    retry = true
+    click(form.querySelector('button[type="submit"]')!)
+    expect(form.querySelector('[role="alert"]')).toBeNull()
+    expect((form.querySelector('button[type="submit"]') as HTMLButtonElement).disabled).toBe(true)
+    await act(async () => { resolveRetry({ ok: true, value: { id: 'EPIC-0099' } }) })
+    expect(container.querySelector('form')).toBeNull()
+    expect(panelSpies.selected).toEqual([{ id: 'EPIC-0099', sessionId: 's1', scope: 'global' }])
+    click(container.querySelector(`button[title="${zh['drawer.newEpic']}"]`) as HTMLElement)
+    expect((container.querySelector('form input') as HTMLInputElement).value).toBe('')
+    expect((container.querySelector('form textarea') as HTMLTextAreaElement).value).toBe('')
+    expect(container.querySelector('form [role="alert"]')).toBeNull()
+  })
+
+  it('resets creation state and ignores an old completion after the session changes', async () => {
+    const resolvers: Array<(id: string | undefined) => void> = []
+    const { container, stores } = renderPanel(undefined, undefined, async () => await new Promise(resolve => { resolvers.push(resolve) }))
+    await settle()
+    click(container.querySelector(`button[title="${zh['drawer.newEpic']}"]`) as HTMLElement)
+    let form = container.querySelector('form') as HTMLFormElement
+    setValue(form.querySelector('input') as HTMLInputElement, '旧会话 Epic')
+    setValue(form.querySelector('select[name="scope"]') as HTMLSelectElement, 'workspace')
+    act(() => { form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })) })
+
+    act(() => stores.session.set('s2'))
+    expect(container.querySelector('form')).toBeNull()
+
+    click(container.querySelector(`button[title="${zh['drawer.newEpic']}"]`) as HTMLElement)
+    form = container.querySelector('form') as HTMLFormElement
+    setValue(form.querySelector('input') as HTMLInputElement, '新会话 Epic')
+    setValue(form.querySelector('select[name="scope"]') as HTMLSelectElement, 'workspace')
+    act(() => { form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })) })
+    expect(resolvers).toHaveLength(2)
+
+    await act(async () => { resolvers[0]!(undefined); await Promise.resolve() })
+    expect((form.querySelector('button[type="submit"]') as HTMLButtonElement).disabled).toBe(true)
+    await act(async () => { resolvers[1]!(undefined); await Promise.resolve() })
+  })
 })
 
 describe('DocPanel (TICKET-0067/0068/0070)', () => {
@@ -506,9 +654,12 @@ describe('DocPanel (TICKET-0067/0068/0070)', () => {
     }
   }
 
-  function renderDoc(data?: DocData) {
+  function renderDoc(data?: DocData, saveBodyOverride?: DocPanelProps['saveBody']) {
     const { bindings, spies } = makeBindings()
     const doc = createSnapshotStore({ status: 'ready', data: data ?? docData() } as any)
+    const savedBodies: { id: string; body: string; sessionId: string | undefined }[] = []
+    const appended: string[] = []
+    const bodyEditing: boolean[] = []
     const container = render(createElement(DocPanel, {
       sessionId: 's1',
       executeTicket: () => {},
@@ -518,13 +669,18 @@ describe('DocPanel (TICKET-0067/0068/0070)', () => {
       setArchived: () => {},
       rename: () => {},
       setPriority: () => {},
-      appendNote: () => {},
+      appendNote: (_id, text) => { appended.push(text) },
+      saveBody: async (id, body, expectedRevision, sessionId, scope) => {
+        savedBodies.push({ id, body, sessionId })
+        await saveBodyOverride?.(id, body, expectedRevision, sessionId, scope)
+      },
+      setBodyEditing: editing => { bodyEditing.push(editing) },
       select: () => {},
       forget: () => {},
       ...bindings,
       t,
     }))
-    return { container, spies }
+    return { container, spies, doc, savedBodies, bodyEditing, appended }
   }
 
   it('lists every non-terminal run link with progress; awaiting items carry the 待确认 badge', () => {
@@ -550,5 +706,201 @@ describe('DocPanel (TICKET-0067/0068/0070)', () => {
     const options = Array.from(container.querySelectorAll('option')).map(el => el.value)
     expect(options).toContain('blocked')
     expect(options).toContain('skipped')
+  })
+
+  it('cancels a body draft when selecting another ticket', () => {
+    const { container, doc, savedBodies, bodyEditing } = renderDoc()
+    click(byText(container, zh['doc.editBody']) as HTMLElement)
+    setValue(container.querySelector('textarea[rows="12"]') as HTMLTextAreaElement, 'TICKET-0001 草稿')
+    act(() => doc.set({ status: 'ready', data: docData({ node: treeNode('TICKET-0002', 'open'), body: '第二份正文' }) }))
+    const save = byText(container, zh['doc.saveBody'])
+    if (save !== undefined) click(save)
+    expect(savedBodies).toEqual([])
+    expect(container.querySelector('textarea[rows="12"]')).toBeNull()
+    expect(bodyEditing.at(-1)).toBe(false)
+  })
+
+  it('disables unqualified run actions for a global node in a workspace session', () => {
+    const { container } = renderDoc(docData({ scope: 'global' }))
+    expect((byText(container, zh['doc.execute']) as HTMLButtonElement).disabled).toBe(true)
+    expect((byText(container, zh['run.join']) as HTMLButtonElement).disabled).toBe(true)
+  })
+
+  it('cancels a body draft when the same id switches to another home', () => {
+    const { container, doc } = renderDoc(docData({ scope: 'global' }))
+    click(byText(container, zh['doc.editBody']) as HTMLElement)
+    setValue(container.querySelector('textarea[rows="12"]') as HTMLTextAreaElement, '全局草稿')
+    act(() => doc.set({ status: 'ready', data: docData({ scope: 'workspace' }) }))
+    expect(container.querySelector('textarea[rows="12"]')).toBeNull()
+    expect(container.textContent).toContain('正文')
+  })
+
+  it.each([
+    ['priority', 'none'], ['status', 'none'],
+    ['priority', 'before'], ['status', 'before'], ['priority', 'after'],
+  ] as const)('keeps an unsaved body through %s refresh with external body change %s', async (field, externalChange) => {
+    let data = docData({ scope: 'workspace', node: { ...treeNode('TICKET-0001', 'in_progress'), revision: 1 } })
+    let deferGet = false
+    let finishGet: (() => void) | undefined
+    const controller = new OmtController({
+      async call(_channel: string, endpoint: string, payload: any): Promise<RpcResultLike> {
+        if (endpoint === 'get') {
+          if (deferGet) await new Promise<void>(resolve => { finishGet = resolve })
+          return { ok: true, value: data }
+        }
+        if (endpoint === 'update') {
+          if (payload.expectedRevision !== undefined && payload.expectedRevision !== data.node.revision) {
+            return { ok: false, error: { message: 'revision conflict' } }
+          }
+          data = {
+            ...data,
+            node: {
+              ...data.node,
+              ...(payload.priority !== undefined ? { priority: payload.priority } : {}),
+              ...(payload.status !== undefined ? { status: payload.status } : {}),
+              revision: data.node.revision! + 1,
+            },
+            ...(payload.body !== undefined ? { body: payload.body } : {}),
+          }
+          return { ok: true, value: {} }
+        }
+        return { ok: true, value: [] }
+      },
+    }, { openDetails: () => {}, closeDetails: () => {} })
+    await controller.select('TICKET-0001', 's1', 'workspace')
+    const { bindings } = makeBindings()
+    const container = render(createElement(DocPanel, {
+      ...bindings, t, sessionId: 's1', useDoc: useStore(controller.doc),
+      executeTicket: controller.executeTicket, closeDoc: controller.closeDoc,
+      setStatus: controller.setStatus, setArchived: controller.setArchived, rename: controller.rename,
+      setPriority: controller.setPriority, appendNote: controller.appendNote,
+      saveBody: controller.saveBody, setBodyEditing: controller.setBodyEditing,
+      select: controller.select, forget: controller.forget,
+    }))
+    click(byText(container, zh['doc.editBody'])!)
+    setValue(container.querySelector('textarea[rows="12"]') as HTMLTextAreaElement, 'unsaved draft')
+    const externalWrite = (): void => {
+      data = { ...data, body: 'other actor body', node: { ...data.node, revision: data.node.revision! + 1 } }
+    }
+    if (externalChange === 'before') externalWrite()
+    deferGet = true
+    const select = container.querySelectorAll('select')[field === 'status' ? 0 : 1]!
+    setValue(select, field === 'status' ? 'done' : '2')
+    await act(async () => { await Promise.resolve(); await Promise.resolve() })
+    expect((container.querySelector('textarea[rows="12"]') as HTMLTextAreaElement | null)?.value).toBe('unsaved draft')
+    // A metadata refresh stays ready, then adopts only an unchanged body's revision.
+    if (finishGet !== undefined) await act(async () => { finishGet!() })
+    expect((container.querySelector('textarea[rows="12"]') as HTMLTextAreaElement).value).toBe('unsaved draft')
+    if (externalChange === 'after') externalWrite()
+    finishGet = undefined
+    click(byText(container, zh['doc.saveBody'])!)
+    await act(async () => { await Promise.resolve(); await Promise.resolve() })
+    if (externalChange !== 'none') {
+      expect(container.textContent).toContain('revision conflict')
+      expect((container.querySelector('textarea[rows="12"]') as HTMLTextAreaElement).value).toBe('unsaved draft')
+      expect(data.body).toBe('other actor body')
+      expect(finishGet).toBeUndefined()
+      return
+    }
+    expect(finishGet).toBeTypeOf('function')
+    await act(async () => { finishGet!() })
+    expect(controller.doc.getSnapshot()).toMatchObject({ status: 'ready', data: { body: 'unsaved draft', node: { revision: 3, [field]: field === 'status' ? 'done' : 2 } } })
+    expect(container.querySelector('textarea[rows="12"]')).toBeNull()
+    expect(container.textContent).toContain('unsaved draft')
+  })
+
+  it('preserves the body draft when saving fails', async () => {
+    const { container } = renderDoc(undefined, async () => { throw new Error('RPC failed') })
+    click(byText(container, zh['doc.editBody']) as HTMLElement)
+    const editor = container.querySelector('textarea[rows="12"]') as HTMLTextAreaElement
+    setValue(editor, '保留这份草稿')
+    await act(async () => {
+      byText(container, zh['doc.saveBody'])!.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      await Promise.resolve()
+    })
+    expect((container.querySelector('textarea[rows="12"]') as HTMLTextAreaElement).value).toBe('保留这份草稿')
+    expect(container.textContent).toContain('RPC failed')
+  })
+
+  it('keeps append draft but cannot submit it while the body is being edited', () => {
+    const { container, appended } = renderDoc()
+    const appendInput = (): HTMLTextAreaElement => container.querySelector('textarea[rows="2"]') as HTMLTextAreaElement
+    const appendButton = (): HTMLButtonElement => byText(container, zh['doc.append']) as HTMLButtonElement
+    setValue(appendInput(), '进度草稿')
+    click(byText(container, zh['doc.editBody']) as HTMLElement)
+    expect(appendInput().value).toBe('进度草稿')
+    expect(appendInput().disabled).toBe(true)
+    expect(appendButton().disabled).toBe(true)
+    click(appendButton())
+    expect(appended).toEqual([])
+    expect(appendInput().value).toBe('进度草稿')
+    click(byText(container, zh['doc.cancelEdit']) as HTMLElement)
+    expect(appendInput().disabled).toBe(false)
+    expect(appendButton().disabled).toBe(false)
+    expect(appendInput().value).toBe('进度草稿')
+  })
+
+  it('cannot append while editing, so the later body save does not conflict with that append', async () => {
+    let data = docData({ scope: 'workspace', node: { ...treeNode('TICKET-0001', 'in_progress'), revision: 1 } })
+    const controller = new OmtController({
+      async call(_channel: string, endpoint: string, payload: any): Promise<RpcResultLike> {
+        if (endpoint === 'get') return { ok: true, value: data }
+        if (endpoint === 'update') {
+          if (payload.expectedRevision !== undefined && payload.expectedRevision !== data.node.revision) {
+            return { ok: false, error: { message: 'revision conflict' } }
+          }
+          data = {
+            ...data,
+            node: { ...data.node, revision: data.node.revision! + 1 },
+            ...(payload.body !== undefined ? { body: payload.body } : {}),
+            ...(payload.append !== undefined ? { body: `${data.body}\n${payload.append}` } : {}),
+          }
+          return { ok: true, value: {} }
+        }
+        return { ok: true, value: [] }
+      },
+    }, { openDetails: () => {}, closeDetails: () => {} })
+    await controller.select('TICKET-0001', 's1', 'workspace')
+    const { bindings } = makeBindings()
+    const container = render(createElement(DocPanel, {
+      ...bindings, t, sessionId: 's1', useDoc: useStore(controller.doc),
+      executeTicket: controller.executeTicket, closeDoc: controller.closeDoc,
+      setStatus: controller.setStatus, setArchived: controller.setArchived, rename: controller.rename,
+      setPriority: controller.setPriority, appendNote: controller.appendNote,
+      saveBody: controller.saveBody, setBodyEditing: controller.setBodyEditing,
+      select: controller.select, forget: controller.forget,
+    }))
+    click(byText(container, zh['doc.editBody'])!)
+    setValue(container.querySelector('textarea[rows="12"]') as HTMLTextAreaElement, 'unsaved draft')
+    setValue(container.querySelector('textarea[rows="2"]') as HTMLTextAreaElement, '并发进度')
+    click(byText(container, zh['doc.append'])!)
+    await act(async () => { await Promise.resolve(); await Promise.resolve() })
+    expect((container.querySelector('textarea[rows="2"]') as HTMLTextAreaElement).value).toBe('并发进度')
+    expect((container.querySelector('textarea[rows="2"]') as HTMLTextAreaElement).disabled).toBe(true)
+    expect((byText(container, zh['doc.append']) as HTMLButtonElement).disabled).toBe(true)
+    expect(data.body).toBe('正文')
+    expect(data.node.revision).toBe(1)
+    click(byText(container, zh['doc.saveBody'])!)
+    await act(async () => { await Promise.resolve(); await Promise.resolve() })
+    expect(container.textContent).not.toContain('revision conflict')
+    expect(controller.doc.getSnapshot()).toMatchObject({ status: 'ready', data: { body: 'unsaved draft', node: { revision: 2 } } })
+    expect((container.querySelector('textarea[rows="2"]') as HTMLTextAreaElement).disabled).toBe(false)
+    expect((container.querySelector('textarea[rows="2"]') as HTMLTextAreaElement).value).toBe('并发进度')
+  })
+
+  it('ignores an old body-save settlement after selecting another ticket', async () => {
+    let resolveSave!: () => void
+    const pendingSave = new Promise<void>(resolve => { resolveSave = resolve })
+    const { container, doc } = renderDoc(undefined, async () => await pendingSave)
+    click(byText(container, zh['doc.editBody']) as HTMLElement)
+    setValue(container.querySelector('textarea[rows="12"]') as HTMLTextAreaElement, '旧草稿')
+    click(byText(container, zh['doc.saveBody']) as HTMLElement)
+
+    act(() => doc.set({ status: 'ready', data: docData({ node: treeNode('TICKET-0002', 'open'), body: '第二份正文' }) }))
+    click(byText(container, zh['doc.editBody']) as HTMLElement)
+    setValue(container.querySelector('textarea[rows="12"]') as HTMLTextAreaElement, '新草稿')
+    await act(async () => { resolveSave(); await pendingSave })
+
+    expect((container.querySelector('textarea[rows="12"]') as HTMLTextAreaElement).value).toBe('新草稿')
   })
 })

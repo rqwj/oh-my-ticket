@@ -308,8 +308,8 @@ const GLOBAL_LABEL = '全局（所有项目共享）'
 
 /**
  * Resolve the create target home. Children always land in their parent's
- * home; root epics honor an explicit scope, then ask the user (UI-backed),
- * then fall back to the automatic rule when no answerer is available.
+ * home; root epics honor an explicit scope or require a completed UI-backed
+ * choice. They never guess a storage location when the choice is unavailable.
  */
 async function homeForCreate(
   service: OmtService,
@@ -319,10 +319,14 @@ async function homeForCreate(
 ): Promise<HomeRef> {
   const cwd = exec.agent?.session.header.cwd
   if (args.parentId !== undefined) return (await service.resolveNodeHome(args.parentId, cwd)).home
+  if (args.type !== 'epic') return service.homeFor(cwd)
   if (args.scope !== undefined) return service.homeForScope(cwd, args.scope)
-  if (cwd === undefined || userQuestions === undefined) return service.homeFor(cwd)
+  if (cwd === undefined || userQuestions === undefined) {
+    throw new Error('Epic scope selection is required; pass scope=workspace|global or use a live session with an answerer')
+  }
+  let answer: Awaited<ReturnType<UserQuestionsLike['ask']>>
   try {
-    const answer = await userQuestions.ask({
+    answer = await userQuestions.ask({
       questions: [{
         id: 'scope',
         header: '创建位置',
@@ -335,14 +339,13 @@ async function homeForCreate(
       agent: exec.agent,
       signal: exec.signal,
     })
-    const selected = answer.answers.find(item => item.id === 'scope')?.selected[0]
-    if (selected === WORKSPACE_LABEL) return service.homeForScope(cwd, 'workspace')
-    if (selected === GLOBAL_LABEL) return service.homeForScope(cwd, 'global')
-    return service.homeFor(cwd)
-  } catch {
-    // No UI provider / not a live agent / aborted: automatic rule applies.
-    return service.homeFor(cwd)
+  } catch (error) {
+    throw new Error('Epic scope selection was not completed; pass scope=workspace|global to retry', { cause: error })
   }
+  const selected = answer.answers.find(item => item.id === 'scope')?.selected[0]
+  if (selected === WORKSPACE_LABEL) return service.homeForScope(cwd, 'workspace')
+  if (selected === GLOBAL_LABEL) return service.homeForScope(cwd, 'global')
+  throw new Error('Epic scope selection was not completed; pass scope=workspace|global to retry')
 }
 
 /** Register all omt_* tools; executes route through the runtime service. */
@@ -361,12 +364,12 @@ export function registerOmtTools(
     return base !== undefined ? `${base} 的会话` : '未知会话'
   }
   /** Status transitions drive the running marker (model-flow executions). */
-  const trackRunning = (exec: ToolRunContext, id: string, status?: string, archived?: boolean): void => {
+  const trackRunning = (exec: ToolRunContext, homeId: string, id: string, status?: string, archived?: boolean): void => {
     if (running === undefined) return
     // Executor lineage snapshot (TICKET-0066) from the session header.
-    if (status === 'in_progress') running.start(id, sessionOf(exec) ?? '', labelOf(exec), lineageOfHeader(exec.agent?.session.header))
+    if (status === 'in_progress') running.start(id, sessionOf(exec) ?? '', labelOf(exec), lineageOfHeader(exec.agent?.session.header), homeId)
     // done/blocked/skipped/archive all end active execution: clear the mark.
-    if (endsExecution(status, archived)) running.stop(id)
+    if (endsExecution(status, archived)) running.stop(id, homeId)
   }
   ctx.tools.register(defineTool({
     name: 'omt_create',
@@ -484,8 +487,6 @@ export function registerOmtTools(
       if ([args.title, args.status, args.archived, args.priority, args.body, args.append].every(v => v === undefined)) {
         throw new Error('omt_update 至少需要一项变更（title/status/archived/priority/body/append）')
       }
-      touch?.(sessionOf(exec), args.id)
-      trackRunning(exec, args.id, args.status, args.archived)
       const { node, home } = await service.updateNode({
         id: args.id,
         title: args.title,
@@ -495,6 +496,8 @@ export function registerOmtTools(
         body: args.body,
         append: args.append,
       }, { cwd: exec.agent?.session.header.cwd, sessionId: sessionOf(exec) })
+      touch?.(sessionOf(exec), args.id)
+      trackRunning(exec, home.homeId, args.id, args.status, args.archived)
       changed?.(home.homeId)
       return nodeValue(node)
     },
@@ -774,6 +777,7 @@ export function registerOmtTools(
       const outcome = await service.claimItem(home, args.id, sessionId)
       changed?.(home.homeId)
       if (!outcome.claimed || outcome.item === undefined) return { run_id: args.id, claimed: false }
+      trackRunning(exec, outcome.homeId, outcome.item.node_id, 'in_progress')
       return {
         run_id: args.id,
         claimed: true,
@@ -823,7 +827,7 @@ export function registerOmtTools(
       )
       // A report concludes the current execution: clear the running mark
       // (failed keeps the ticket in_progress; a retry re-marks it).
-      running?.stop(args.nodeId)
+      running?.stop(args.nodeId, result.homeId)
       changed?.(result.homeId)
       return {
         run: runValue(result.run),

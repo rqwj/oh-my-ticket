@@ -10,7 +10,7 @@ import type { PanelMode } from '../controller.ts'
 import type { ActiveInfo, TreeState } from '../store.ts'
 import type { SavedFilters } from '../saved-filters.ts'
 import type { Translate } from '../locales.ts'
-import { TicketPanel, type Selector } from './TicketPanel.tsx'
+import { TicketPanel, type Selector, type TicketPanelProps } from './TicketPanel.tsx'
 import type { RunBindings } from './RunsView.tsx'
 import css from './Drawer.module.css'
 
@@ -39,6 +39,8 @@ export interface DrawerProps extends RunBindings {
   readonly saveFilters: (sessionId: string | undefined, filters: SavedFilters) => Promise<void>
   readonly select: (id: string, sessionId?: string) => void
   readonly archive: (id: string, sessionId?: string) => void
+  readonly createNode: TicketPanelProps['createNode']
+  readonly expandIds: (ids: readonly string[]) => void
   readonly useDrawerWidth: Selector<number>
   readonly setDrawerWidth: (px: number) => void
   readonly useCollapsed: Selector<Record<string, boolean>>
@@ -165,6 +167,8 @@ export function Drawer(props: DrawerProps) {
         saveFilters={props.saveFilters}
         select={props.select}
         archive={props.archive}
+        createNode={props.createNode}
+        expandIds={props.expandIds}
         runView={props}
         sessionId={current}
         headerActions={

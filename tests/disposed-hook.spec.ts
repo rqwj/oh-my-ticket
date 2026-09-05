@@ -296,14 +296,17 @@ describe('main-session executor', () => {
 
   it('clears the running marks of a disposed session with NO run involvement', async () => {
     // 无 run 项的会话：执行中标记也必须清理（不能因早退而泄漏）。
-    running.start('TICKET-0001', 's1', 'demo 的会话')
+    running.start('TICKET-0001', 's1', 'demo 的会话', {}, 'home-a')
+    running.start('TICKET-0001', 's2', 'other 的会话', {}, 'home-b')
+    running.start('TICKET-0001', 's1', 'demo 的会话', {}, 'home-c')
     const main = makeAgent('s1')
     liveAgents.set('s1', main)
 
     emitDisposed(main)
     await settle()
 
-    expect(running.get('TICKET-0001')).toBeUndefined()
+    expect(running.forSession('s1')).toEqual([])
+    expect(running.get('TICKET-0001', 'home-b')?.sessionId).toBe('s2')
   })
 
   it('leaves runs alone when the disposed session has no involvement', async () => {

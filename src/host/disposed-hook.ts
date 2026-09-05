@@ -99,7 +99,7 @@ export function registerOmtDisposedHook(ctx: Context, service: OmtService, runni
     const header = agent.session.header
     // The dead session's running marks are stale by definition — always
     // clean them, regardless of run involvement.
-    for (const { id } of running.forSession(agent.id)) running.stop(id)
+    for (const { id, homeId } of running.forSession(agent.id)) running.stop(id, homeId)
 
     const owned = await service.executorItems(agent.id, header.cwd)
     // A session with no run involvement and no outstanding handoff changes

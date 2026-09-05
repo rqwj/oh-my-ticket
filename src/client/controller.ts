@@ -85,6 +85,9 @@ export class OmtController {
   private yieldListener: (() => void) | undefined
   private events: EventSource | undefined
   private refreshTimer: ReturnType<typeof setTimeout> | undefined
+  private selectRevision = 0
+  private docSessionId: string | undefined
+  private sessionRevision = 0
   /** Run-hint ids accumulated across one debounce window (latest-wins #4). */
   private refreshRunHints = new Set<string>()
 
@@ -162,7 +165,7 @@ export class OmtController {
       void this.refreshTree(sessionId).catch(() => {})
       if (sessionId !== undefined) void this.refreshRelated(sessionId).catch(() => {})
       const active = this.active.getSnapshot()
-      if (active !== undefined) void this.select(active.id, sessionId).catch(() => {})
+      if (active !== undefined && !this.bodyEditing) void this.select(active.id, sessionId, active.scope).catch(() => {})
       // Run views (TICKET-0071): the list refreshes when the window saw a
       // hint or the Runs 区块 is on screen (showRuns fetches on entry, so a
       // tree-only bump with the tickets section staged skips the round
@@ -199,6 +202,7 @@ export class OmtController {
 
   /** Session-scope components report the staged session through here. */
   noteSession = (sessionId: string | undefined): void => {
+    if (this.currentSessionId !== sessionId) this.sessionRevision += 1
     this.currentSessionId = sessionId
   }
 
@@ -262,6 +266,12 @@ export class OmtController {
     void this.refreshTree(sessionId)
   }
 
+  expandIds = (ids: readonly string[]): void => {
+    this.collapsed.update(draft => {
+      for (const id of ids) delete draft[id]
+    })
+  }
+
   toggleCollapsed = (id: string): void => {
     this.collapsed.update(draft => {
       draft[id] = draft[id] !== true
@@ -309,17 +319,20 @@ export class OmtController {
 
 
   /** Select a node: load its doc, pin it active, shadow the details panel. */
-  select = async (id: string, sessionId?: string): Promise<void> => {
+  select = async (id: string, sessionId?: string, scope?: 'workspace' | 'global'): Promise<void> => {
+    const revision = ++this.selectRevision
+    this.docSessionId = sessionId
     this.doc.set({ status: 'loading', id })
-    const result = await this.rpc.call('/omt', 'get', { sessionId, id })
+    const result = await this.rpc.call('/omt', 'get', { sessionId, id, ...(scope !== undefined ? { scope } : {}) })
+    if (revision !== this.selectRevision) return
     if (!result.ok) {
       this.doc.set({ status: 'error', id, message: errorMessage(result) })
       return
     }
     const data = result.value as DocData
     this.doc.set({ status: 'ready', data })
-    this.active.set({ id: data.node.id, title: data.node.title, status: data.node.status, priority: data.node.priority })
-    if (sessionId !== undefined) {
+    this.active.set({ id: data.node.id, title: data.node.title, status: data.node.status, priority: data.node.priority, scope: data.scope })
+    if (sessionId !== undefined && data.scope !== 'global') {
       this.noteRelated(sessionId, [{ id: data.node.id, type: data.node.type, title: data.node.title, status: data.node.status, archived: data.node.archived, priority: data.node.priority }])
     }
     this.ensureDetailsShadow()
@@ -344,6 +357,7 @@ export class OmtController {
   }
 
   closeDoc = (): void => {
+    this.selectRevision += 1
     this.releaseShadow()
     this.doc.set({ status: 'idle' })
     // Closing the doc closes the details column too — the stock tool-details
@@ -380,33 +394,61 @@ export class OmtController {
     await this.afterMutation(id, sessionId)
   }
 
-  rename = async (id: string, title: string, sessionId?: string): Promise<void> => {
+  rename = async (id: string, title: string, sessionId?: string, scope?: 'workspace' | 'global'): Promise<void> => {
     const trimmed = title.trim()
     if (trimmed === '') return
-    await this.rpc.call('/omt', 'update', { sessionId, id, title: trimmed })
-    await this.afterMutation(id, sessionId)
+    await this.rpc.call('/omt', 'update', { sessionId, id, title: trimmed, ...(scope !== undefined ? { scope } : {}) })
+    await this.afterMutation(id, sessionId, scope)
   }
 
-  setPriority = async (id: string, priority: number, sessionId?: string): Promise<void> => {
-    await this.rpc.call('/omt', 'update', { sessionId, id, priority })
-    await this.afterMutation(id, sessionId)
+  setPriority = async (id: string, priority: number, sessionId?: string, scope?: 'workspace' | 'global'): Promise<void> => {
+    await this.rpc.call('/omt', 'update', { sessionId, id, priority, ...(scope !== undefined ? { scope } : {}) })
+    await this.afterMutation(id, sessionId, scope)
   }
 
-  setArchived = async (id: string, archived: boolean, sessionId?: string): Promise<void> => {
-    await this.rpc.call('/omt', 'update', { sessionId, id, archived })
-    await this.afterMutation(id, sessionId)
+  setArchived = async (id: string, archived: boolean, sessionId?: string, scope?: 'workspace' | 'global'): Promise<void> => {
+    await this.rpc.call('/omt', 'update', { sessionId, id, archived, ...(scope !== undefined ? { scope } : {}) })
+    await this.afterMutation(id, sessionId, scope)
   }
 
-  setStatus = async (id: string, status: ActiveInfo['status'], sessionId?: string): Promise<void> => {
-    await this.rpc.call('/omt', 'update', { sessionId, id, status })
-    await this.afterMutation(id, sessionId)
+  setStatus = async (id: string, status: ActiveInfo['status'], sessionId?: string, scope?: 'workspace' | 'global'): Promise<void> => {
+    await this.rpc.call('/omt', 'update', { sessionId, id, status, ...(scope !== undefined ? { scope } : {}) })
+    await this.afterMutation(id, sessionId, scope)
   }
 
-  appendNote = async (id: string, text: string, sessionId?: string): Promise<void> => {
+  private bodyEditing = false
+
+  setBodyEditing = (editing: boolean): void => {
+    this.bodyEditing = editing
+  }
+
+  saveBody = async (id: string, body: string, expectedRevision: number | undefined, sessionId?: string, scope?: 'workspace' | 'global'): Promise<void> => {
+    const result = await this.rpc.call('/omt', 'update', {
+      sessionId,
+      id,
+      body,
+      ...(expectedRevision !== undefined ? { expectedRevision } : {}),
+      ...(scope !== undefined ? { scope } : {}),
+    })
+    if (!result.ok) throw new Error(result.error.message)
+    await this.afterMutation(id, sessionId, scope, true)
+  }
+
+  createNode = async (
+    input: { type: OmtTreeNode['type']; title: string; parentId?: string; body?: string; scope?: 'workspace' | 'global' },
+    sessionId?: string,
+  ): Promise<string | undefined> => {
+    const result = await this.rpc.call('/omt', 'create', { sessionId, ...input })
+    if (!result.ok) throw new Error(result.error.message)
+    const created = result.value as { id: string }
+    return created.id
+  }
+
+  appendNote = async (id: string, text: string, sessionId?: string, scope?: 'workspace' | 'global'): Promise<void> => {
     const trimmed = text.trim()
     if (trimmed === '') return
-    await this.rpc.call('/omt', 'update', { sessionId, id, append: trimmed })
-    await this.afterMutation(id, sessionId)
+    await this.rpc.call('/omt', 'update', { sessionId, id, append: trimmed, ...(scope !== undefined ? { scope } : {}) })
+    await this.afterMutation(id, sessionId, scope)
   }
 
   private ensureDetailsShadow(): void {
@@ -426,9 +468,31 @@ export class OmtController {
     }
   }
 
-  private async afterMutation(id: string, sessionId?: string): Promise<void> {
+  private async afterMutation(id: string, sessionId?: string, scope?: 'workspace' | 'global', bodySaved = false): Promise<void> {
+    const base = this.doc.getSnapshot()
+    const selection = this.selectRevision
+    const session = this.sessionRevision
     await this.refreshTree(sessionId)
-    if (this.active.getSnapshot()?.id === id) await this.select(id, sessionId)
+    if (this.bodyEditing && !bodySaved) {
+      if (base.status !== 'ready' || base.data.node.id !== id || this.docSessionId !== sessionId
+        || (this.currentSessionId !== undefined && this.currentSessionId !== sessionId)
+        || (scope !== undefined && base.data.scope !== scope)) return
+      // Stay ready so DocPanel retains its draft. A new revision is safe only
+      // when the server's raw body still equals the editor's committed base.
+      const unchanged = (): boolean => this.bodyEditing && this.doc.getSnapshot() === base
+        && this.selectRevision === selection && this.sessionRevision === session
+      if (!unchanged()) return
+      const result = await this.rpc.call('/omt', 'get', { sessionId, id, scope: base.data.scope }).catch(() => undefined)
+      if (!result?.ok || !unchanged()) return
+      const data = result.value as DocData
+      if (data.node.id !== id || data.scope !== base.data.scope || data.home !== base.data.home
+        || data.body !== base.data.body) return
+      this.doc.set({ status: 'ready', data })
+      this.active.set({ id: data.node.id, title: data.node.title, status: data.node.status, priority: data.node.priority, scope: data.scope })
+      return
+    }
+    const active = this.active.getSnapshot()
+    if (active?.id === id && (scope === undefined || active.scope === scope)) await this.select(id, sessionId, scope)
   }
 
   // ── run flows (STORY-0013) ─────────────────────────────────────────────

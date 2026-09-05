@@ -33,6 +33,38 @@
   font-size: var(--dsw-font-xs-13-font-size);
 }
 
+.rowFocus {
+  outline: 1px solid var(--dsw-alias-brand, #5b8cff);
+  background: color-mix(in srgb, var(--dsw-alias-brand, #5b8cff) 12%, transparent);
+}
+
+.addChild {
+  font: inherit;
+  line-height: 1;
+  color: var(--dsw-alias-label-secondary);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  opacity: 0;
+}
+
+.row:hover .addChild,
+.rowFocus .addChild {
+  opacity: 1;
+}
+
+.treeNav {
+  outline: none;
+}
+
+.createForm {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border-top: 1px solid var(--dsw-alias-border-l1);
+}
+
 .headerButton {
   font: inherit;
   color: var(--dsw-alias-label-secondary);

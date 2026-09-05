@@ -40,6 +40,7 @@ import {
 import { DSH_FILTERS_KEY, type ChangeHub, type HomeRef, type OmtService } from './service.ts'
 import type { RecentRegistry } from './recent.ts'
 import { endsExecution, lineageOfHeader, type RunningRegistry } from './running.ts'
+import { describeBoundCatalog, type SkillCatalogEntry } from './prompt-settings.ts'
 import {
   isRunActive,
   isRunHistory,
@@ -53,6 +54,11 @@ import {
   type OmtTreeNode,
   type RunItemState,
 } from './types.ts'
+
+export interface PromptRpcHost {
+  getSettings(): { extraPrompt: string; boundSkillNames: string[] }
+  listCatalog(sessionId?: string): Promise<readonly SkillCatalogEntry[]>
+}
 
 /** Structural agent face: sessionId → agent → session header (+ wake for run start). */
 interface SessionAgent {
@@ -69,7 +75,7 @@ const searchPayloadSchema = z.object({
   limit: z.number().int().min(1).max(100).default(20),
   ...sessionField,
 }).strict()
-const getPayloadSchema = z.object({ id: z.string().min(1), ...sessionField }).strict()
+const getPayloadSchema = z.object({ id: z.string().min(1), scope: z.enum(['workspace', 'global']).optional(), ...sessionField }).strict()
 const updatePayloadSchema = z.object({
   id: z.string().min(1),
   title: z.string().min(1).optional(),
@@ -77,11 +83,23 @@ const updatePayloadSchema = z.object({
   archived: z.boolean().optional(),
   priority: z.number().int().optional(),
   append: z.string().min(1).optional(),
+  body: z.string().optional(),
+  expectedRevision: z.number().int().nonnegative().optional(),
+  scope: z.enum(['workspace', 'global']).optional(),
   ...sessionField,
 }).strict()
 const reindexPayloadSchema = z.object({ ...sessionField }).strict()
+const skillsPayloadSchema = z.object({ ...sessionField }).strict()
 const recentPayloadSchema = z.object({ sessionId: z.string().min(1) }).strict()
 const executePayloadSchema = z.object({ id: z.string().min(1), sessionId: z.string().min(1) }).strict()
+const createPayloadSchema = z.object({
+  type: z.enum(['epic', 'story', 'substory', 'ticket', 'subticket']),
+  title: z.string().min(1),
+  parentId: z.string().min(1).optional(),
+  body: z.string().optional(),
+  scope: z.enum(['workspace', 'global']).optional(),
+  ...sessionField,
+}).strict()
 
 // ── run endpoints (STORY-0013 UI channel) ────────────────────────────────
 const runListPayloadSchema = z.object({ ...sessionField }).strict()
@@ -254,7 +272,7 @@ function badRequest(message: string, issues: z.core.$ZodIssue[]): RpcResult<unkn
 }
 
 /** Register the `/omt` RPC channel (loopback authority: local GUI only). */
-export function registerOmtRpc(ctx: Context, service: OmtService, recent?: RecentRegistry, changes?: ChangeHub, running?: RunningRegistry): void {
+export function registerOmtRpc(ctx: Context, service: OmtService, recent?: RecentRegistry, changes?: ChangeHub, running?: RunningRegistry, prompt?: PromptRpcHost): void {
   const agents = (ctx as unknown as { agents?: AgentsLike<SessionAgent> }).agents
   const sessionLabelOf = (sessionId: string): string => {
     const cwd = agents?.get(sessionId)?.session.header.cwd
@@ -288,10 +306,10 @@ export function registerOmtRpc(ctx: Context, service: OmtService, recent?: Recen
    * wins while the ticket is still marked running; otherwise fall back to
    * the live session header (gone once the executor session is disposed).
    */
-  const executorOf = (item: OmtRunItem) => {
+  const executorOf = (home: HomeRef, item: OmtRunItem) => {
     const sessionId = item.executor_session_id
     if (sessionId === undefined) return undefined
-    const live = running?.get(item.node_id)
+    const live = running?.get(item.node_id, home.homeId)
     if (live !== undefined && live.sessionId === sessionId) {
       return {
         sessionId,
@@ -309,7 +327,7 @@ export function registerOmtRpc(ctx: Context, service: OmtService, recent?: Recen
     // Full ticket join (id/title/status/archived) — detail views carry only
     // the title, so fetch the node row for the rest (local IPC, cheap).
     const node = await service.getNodeIn(home, item.node_id)
-    const executor = executorOf(item)
+    const executor = executorOf(home, item)
     return {
       node_id: item.node_id,
       position: item.position,
@@ -324,6 +342,16 @@ export function registerOmtRpc(ctx: Context, service: OmtService, recent?: Recen
         ? { node: { id: node.id, title: node.title, status: node.status, archived: node.archived } }
         : item.title !== undefined ? { node: { id: item.node_id, title: item.title } } : {}),
     }
+  }
+
+  const ancestorSummaries = async (home: HomeRef, firstParent: OmtNode | undefined): Promise<NodeSummary[]> => {
+    const ancestors: NodeSummary[] = []
+    let current = firstParent
+    while (current !== undefined) {
+      ancestors.unshift(summarize(current))
+      current = await service.parentOfNodeIn(home, current.id)
+    }
+    return ancestors
   }
 
   ctx.connection.rpc.handle('/omt', async (endpoint, payload) => {
@@ -351,9 +379,15 @@ export function registerOmtRpc(ctx: Context, service: OmtService, recent?: Recen
         case 'get': {
           const parsed = getPayloadSchema.safeParse(payload)
           if (!parsed.success) return badRequest('invalid get payload', parsed.error.issues)
-          const result = await service.showNode(parsed.data.id, cwdOf(parsed.data.sessionId))
+          const cwd = cwdOf(parsed.data.sessionId)
+          if (parsed.data.scope === 'workspace' && cwd === undefined) {
+            return badRequest('workspace scope requires a live session with a cwd', [])
+          }
+          const result = parsed.data.scope === undefined
+            ? await service.showNode(parsed.data.id, cwd)
+            : await service.showNodeIn(await service.homeForScope(cwd, parsed.data.scope), parsed.data.id)
           recent?.touch(parsed.data.sessionId, parsed.data.id)
-          const runningInfo = running?.get(parsed.data.id)
+          const runningInfo = running?.get(parsed.data.id, result.home.homeId)
           // 所属 run 链接 (TICKET-0068): every non-terminal run holding
           // this ticket, with the item state (awaiting_confirmation 标识)
           // and a small progress summary.
@@ -365,33 +399,68 @@ export function registerOmtRpc(ctx: Context, service: OmtService, recent?: Recen
             progress: progressFromCounts(link.progress),
           }))
           return ok({
-            home: result.home.homeId,
+            ...(result.home.path !== undefined ? { home: result.home.path } : {}),
+            ...(result.home.kind !== undefined ? { scope: result.home.kind } : {}),
             ...(runningInfo !== undefined ? { running: runningInfo } : {}),
             node: result.node,
             ...(result.parent != null ? { parent: summarize(result.parent) } : {}),
             children: result.children.map(summarize),
             body: result.body,
+            ancestors: await ancestorSummaries(result.home, result.parent),
             runs,
           })
         }
         case 'update': {
           const parsed = updatePayloadSchema.safeParse(payload)
           if (!parsed.success) return badRequest('invalid update payload', parsed.error.issues)
-          const { title, status, archived, priority, append } = parsed.data
-          if ([title, status, archived, priority, append].every(v => v === undefined)) {
-            return badRequest('update requires at least one change (title/status/archived/priority/append)', [])
+          const { title, status, archived, priority, append, body, expectedRevision, scope } = parsed.data
+          if ([title, status, archived, priority, append, body].every(v => v === undefined)) {
+            return badRequest('update requires at least one change (title/status/archived/priority/append/body)', [])
+          }
+          if (append !== undefined && body !== undefined) {
+            return badRequest('update body and append are mutually exclusive', [])
           }
           // Passive observation (TICKET-0061) rides on the daemon update;
           // the session is recorded adapter-side for hook attribution.
-          const { node } = await service.updateNode(
-            { id: parsed.data.id, title, status, archived, priority, append },
-            { cwd: cwdOf(parsed.data.sessionId), sessionId: parsed.data.sessionId },
-          )
+          const cwd = cwdOf(parsed.data.sessionId)
+          if (scope === 'workspace' && cwd === undefined) {
+            return badRequest('workspace scope requires a live session with a cwd', [])
+          }
+          const input = { id: parsed.data.id, title, status, archived, priority, append, body, expectedRevision }
+          const context = { cwd, sessionId: parsed.data.sessionId }
+          const { node, home } = scope === undefined
+            ? await service.updateNode(input, context)
+            : await service.updateNodeIn(await service.homeForScope(cwd, scope), input, context)
           recent?.touch(parsed.data.sessionId, parsed.data.id)
           // Manual status changes never START a running mark — execution is
           // claimed only by the execute endpoint and model tool calls
           // (TICKET-0028). Done/blocked/skipped/archive always clear it.
-          if (endsExecution(status, archived)) running?.stop(parsed.data.id)
+          if (endsExecution(status, archived)) running?.stop(parsed.data.id, home.homeId)
+          return ok(summarize(node))
+        }
+        case 'create': {
+          const parsed = createPayloadSchema.safeParse(payload)
+          if (!parsed.success) return badRequest('invalid create payload', parsed.error.issues)
+          if (parsed.data.parentId === undefined && parsed.data.scope === undefined) {
+            return badRequest('scope is required when creating a root Epic', [])
+          }
+          if (parsed.data.parentId !== undefined && parsed.data.scope !== undefined) {
+            return badRequest('scope is only valid when creating a root Epic', [])
+          }
+          const cwd = cwdOf(parsed.data.sessionId)
+          if (parsed.data.scope === 'workspace' && cwd === undefined) {
+            return badRequest('workspace scope requires a live session with a cwd', [])
+          }
+          const home = parsed.data.parentId !== undefined
+            ? (await service.resolveNodeHome(parsed.data.parentId, cwd)).home
+            : await service.homeForScope(cwd, parsed.data.scope!)
+          const node = await service.createNode(home, {
+            type: parsed.data.type,
+            title: parsed.data.title,
+            parentId: parsed.data.parentId,
+            body: parsed.data.body,
+          })
+          recent?.touch(parsed.data.sessionId, node.id)
           return ok(summarize(node))
         }
         case 'execute': {
@@ -401,7 +470,7 @@ export function registerOmtRpc(ctx: Context, service: OmtService, recent?: Recen
           // Passive observation (TICKET-0061) rides on the daemon update: the
           // execute button dispatches the pending item of every active run
           // holding this ticket, with this session as the recorded executor.
-          const { node } = await service.executeNode(parsed.data.id, {
+          const { node, home } = await service.executeNode(parsed.data.id, {
             cwd: cwdOf(parsed.data.sessionId),
             sessionId: parsed.data.sessionId,
           })
@@ -411,6 +480,7 @@ export function registerOmtRpc(ctx: Context, service: OmtService, recent?: Recen
             sessionLabelOf(parsed.data.sessionId),
             // Executor lineage snapshot (TICKET-0066) from the session header.
             lineageOfHeader(agents?.get(parsed.data.sessionId)?.session.header),
+            home.homeId,
           )
           recent?.touch(parsed.data.sessionId, parsed.data.id)
           return ok(summarize(node))
@@ -430,6 +500,16 @@ export function registerOmtRpc(ctx: Context, service: OmtService, recent?: Recen
             }
           }
           return ok(summaries)
+        }
+        case 'skills': {
+          const parsed = skillsPayloadSchema.safeParse(payload ?? {})
+          if (!parsed.success) return badRequest('invalid skills payload', parsed.error.issues)
+          const settings = prompt?.getSettings() ?? { extraPrompt: '', boundSkillNames: [] }
+          const catalog = prompt === undefined ? [] : await prompt.listCatalog(parsed.data.sessionId)
+          return ok({
+            extraPrompt: settings.extraPrompt,
+            skills: describeBoundCatalog(catalog, settings.boundSkillNames),
+          })
         }
         case 'reindex': {
           const parsed = reindexPayloadSchema.safeParse(payload ?? {})
@@ -557,7 +637,7 @@ export function registerOmtRpc(ctx: Context, service: OmtService, recent?: Recen
             // 确认完成 (TICKET-0070): an explicit done report — item done +
             // ticket done (reported bypasses the trust gate by design).
             item = (await service.reportItem(home, id, nodeId, 'done')).item
-            running?.stop(nodeId)
+            running?.stop(nodeId, home.homeId)
           } else {
             // 打回: reopen the ticket (open over an awaiting_confirmation
             // item is the TICKET-0064 rejection path). The observation
