@@ -9,6 +9,9 @@
  * copy externalBin into the target dir (bundler-only behavior, verified
  * in .tmp-tauri-research/TAURI2_DESKTOP_RESEARCH.md).
  *
+ * U3: `omt` CLI (the MCP bridge for dispatched harnesses) is staged the
+ * same way — both binaries come from the same omt-runtime crate build.
+ *
  * Sources (KTD1 same-version rule): workspace target/ build of the
  * omt-runtime crate — release for bundling, debug for --dev.
  *
@@ -25,35 +28,46 @@ const dev = process.argv.includes('--dev')
 
 const triple = execFileSync('rustc', ['--print', 'host-tuple'], { encoding: 'utf8' }).trim()
 const profile = dev ? 'debug' : 'release'
-const source = join(REPO_ROOT, 'target', profile, 'omt-daemon')
+const binDir = join(REPO_ROOT, 'target', profile)
+const sidecars = ['omt-daemon', 'omt']
 
-if (!existsSync(source)) {
+const missing = sidecars
+  .map((bin) => join(binDir, bin))
+  .filter((source) => !existsSync(source))
+
+if (missing.length > 0) {
   console.error(
-    `sidecar source missing: ${source}\n` +
-      `build it first: cargo build ${dev ? '' : '--release '}-p omt-runtime --bin omt-daemon`,
+    `sidecar source missing: ${missing.join(', ')}\n` +
+      `build it first: cargo build ${dev ? '' : '--release '}-p omt-runtime --bin omt-daemon --bin omt`,
   )
   process.exit(1)
 }
 
-// 1. Bundler staging (always): binaries/omt-daemon-<triple>
+// 1. Bundler staging (always): binaries/<name>-<triple>
 const stagingDir = join(SRC_TAURI, 'binaries')
 mkdirSync(stagingDir, { recursive: true })
-const staged = join(stagingDir, `omt-daemon-${triple}`)
-copyFileSync(source, staged)
-chmodSync(staged, 0o755)
-console.log(`sidecar staged: ${staged} (from ${profile})`)
+for (const bin of sidecars) {
+  const source = join(binDir, bin)
+  const staged = join(stagingDir, `${bin}-${triple}`)
+  copyFileSync(source, staged)
+  chmodSync(staged, 0o755)
+  console.log(`sidecar staged: ${staged} (from ${profile})`)
+}
 
 // 2. Dev-mode placement: next to the dev executable (current_exe().parent()).
 if (dev) {
   const devDir = join(REPO_ROOT, 'target', 'debug')
-  const devCopy = join(devDir, 'omt-daemon')
-  // The workspace debug build IS the target/debug/omt-daemon path already —
-  // the desktop dev binary lives in the same target/debug under the shared
-  // workspace target dir, so no copy is needed when they coincide. If a
-  // future layout splits target dirs, copy here.
-  if (devCopy !== source) {
-    copyFileSync(source, devCopy)
-    chmodSync(devCopy, 0o755)
+  for (const bin of sidecars) {
+    const source = join(binDir, bin)
+    const devCopy = join(devDir, bin)
+    // The workspace debug build IS the target/debug path already — the
+    // desktop dev binary lives in the same target/debug under the shared
+    // workspace target dir, so no copy is needed when they coincide. If a
+    // future layout splits target dirs, copy here.
+    if (devCopy !== source) {
+      copyFileSync(source, devCopy)
+      chmodSync(devCopy, 0o755)
+    }
   }
-  console.log(`dev sidecar in place: ${devCopy}`)
+  console.log(`dev sidecars in place: ${sidecars.join(', ')} under ${devDir}`)
 }

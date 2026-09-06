@@ -91,10 +91,11 @@ pub fn serve(globals: &GlobalArgs) -> Result<i32, Problem> {
 
     // Restricted enrollment: node/run/events only — home administration
     // and adapter UI bags stay outside the agent surface (R7).
+    let (actor, name) = enroll_identity(globals);
     let options = omt_client::EnrollOptions {
         kind: "mcp".into(),
-        name: Some("omt-mcp".into()),
-        actor_namespace: Some(format!("mcp:{}", std::process::id())),
+        name: Some(name),
+        actor_namespace: Some(actor),
         operations: None,
         credential_path: None,
     };
@@ -281,4 +282,43 @@ fn read_frame(reader: &mut impl BufRead) -> Result<Option<String>, Problem> {
 fn write_frame(writer: &mut impl Write, body: &str) -> std::io::Result<()> {
     write!(writer, "Content-Length: {}\r\n\r\n{}", body.len(), body)?;
     writer.flush()
+}
+
+/// U3: enrollment 身份——desktop 派发时经 `--actor exec:<execId>` 指定执行者
+/// 身份，使 `run_items.executor_session_id` 可精确定位派发方（§3.3 身份纪律）；
+/// 未指定时保持 `mcp:<pid>` 兼容（F18/F19：原为硬编码）。返回 (actor, name)。
+fn enroll_identity(globals: &GlobalArgs) -> (String, String) {
+    let actor = globals
+        .actor
+        .clone()
+        .unwrap_or_else(|| format!("mcp:{}", std::process::id()));
+    let name = format!("omt-mcp-{actor}");
+    (actor, name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn globals(actor: Option<&str>) -> GlobalArgs {
+        GlobalArgs {
+            runtime_dir: None,
+            homes: Vec::new(),
+            json: false,
+            actor: actor.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn enroll_identity_honors_explicit_actor() {
+        let (actor, name) = enroll_identity(&globals(Some("exec:e1")));
+        assert_eq!(actor, "exec:e1");
+        assert_eq!(name, "omt-mcp-exec:e1");
+    }
+
+    #[test]
+    fn enroll_identity_defaults_to_mcp_pid_namespace() {
+        let (actor, _name) = enroll_identity(&globals(None));
+        assert!(actor.starts_with("mcp:"), "{actor}");
+    }
 }

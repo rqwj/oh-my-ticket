@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use crate::agents::{self, AgentAttachment, AgentRecordStatus};
 use crate::daemon;
 use crate::harness;
+use crate::mcp_injection::McpInjection;
 
 const STARTUP_WINDOW: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_DURATION: Duration = Duration::from_secs(120 * 60);
@@ -68,6 +69,8 @@ pub struct SpawnRequest {
     pub args: Vec<String>,
     /// 用户配置的 env（字面量；保留键已在保存时拒绝，这里再防御一次）
     pub env_additions: BTreeMap<String, String>,
+    /// MCP 桥接注入（U3）：spawn 时生效 env，终态时释放 workspace 注入
+    pub mcp: McpInjection,
 }
 
 /// 事件回调（tauri Channel 的 mpsc 替身）。
@@ -90,6 +93,8 @@ pub struct ExecSession {
     /// （F-U4a-6）
     pub started_at_epoch_ms: String,
     pub raw_log: PathBuf,
+    pub runtime_dir: PathBuf,
+    pub mcp: McpInjection,
     first_event_seen: AtomicBool,
     stop_requested: AtomicBool,
     terminal: Mutex<Option<Terminal>>,
@@ -195,6 +200,11 @@ impl ExecutionManager {
             Err(err) => eprintln!("启动 demote 失败：{err}"),
             _ => {}
         }
+        match crate::mcp_injection::sweep_omp_crash_residue(&daemon::runtime_dir()) {
+            Ok(n) if n > 0 => eprintln!("启动清扫：{n} 个 workspace 的 omp MCP 注入残留已恢复"),
+            Err(err) => eprintln!("omp 注入残留清扫失败：{err}"),
+            _ => {}
+        }
         mgr
     }
 
@@ -254,6 +264,9 @@ impl ExecutionManager {
         for (k, v) in &req.env_additions {
             cmd.env(k, v);
         }
+        if let Some((key, value)) = req.mcp.env_entry() {
+            cmd.env(key, value);
+        }
         // 子进程自成进程组（§3.6.3：setpgid 而非 setsid——退出钩子要能 killpg）
         use std::os::unix::process::CommandExt;
         unsafe {
@@ -283,6 +296,8 @@ impl ExecutionManager {
             cwd: cwd.clone(),
             started_at_epoch_ms,
             raw_log,
+            runtime_dir: runtime_dir.to_path_buf(),
+            mcp: req.mcp.clone(),
             first_event_seen: AtomicBool::new(false),
             stop_requested: AtomicBool::new(false),
             terminal: Mutex::new(None),
@@ -521,14 +536,21 @@ fn finish_terminal(
         }
         *guard = Some(terminal.clone());
     }
-    let runtime_dir = daemon::runtime_dir();
+    let runtime_dir = &session.runtime_dir;
     let (status, detail) = match terminal {
         Terminal::Exited(_) => (AgentRecordStatus::Exited, None),
         Terminal::Failed(detail) => (AgentRecordStatus::Failed, Some(detail.clone())),
         Terminal::Killed(_) => (AgentRecordStatus::Killed, None),
     };
+    // omp workspace 注入的恢复（env 注入随进程消失；persistent 为 no-op）
+    if let Err(err) = crate::mcp_injection::release(runtime_dir, &session.mcp) {
+        eprintln!(
+            "MCP 注入释放失败（exec {}）：{err}（残留由启动 sweep 兜底）",
+            session.exec_id
+        );
+    }
     let _ = agents::update_agent_status(
-        &runtime_dir,
+        runtime_dir,
         &session.home_id,
         &session.agent_id,
         status,
@@ -537,7 +559,7 @@ fn finish_terminal(
     if let Some(detail) = detail {
         let exec_id = session.exec_id.clone();
         let _ = agents::update_exec(
-            &runtime_dir,
+            runtime_dir,
             &session.home_id,
             &session.agent_id,
             &exec_id,
@@ -635,6 +657,7 @@ mod tests {
                     program: script,
                     args: vec![],
                     env_additions: BTreeMap::new(),
+                    mcp: McpInjection::None,
                 },
                 sink,
             )
@@ -698,6 +721,7 @@ mod tests {
                     program: script,
                     args: vec![],
                     env_additions: BTreeMap::new(),
+                    mcp: McpInjection::None,
                 },
                 sink,
             )
@@ -739,6 +763,7 @@ mod tests {
                     program: script,
                     args: vec![],
                     env_additions: BTreeMap::new(),
+                    mcp: McpInjection::None,
                 },
                 sink,
             )
@@ -788,6 +813,7 @@ mod tests {
                 program: script.clone(),
                 args: vec![],
                 env_additions: env,
+                mcp: McpInjection::None,
             },
             sink.clone(),
         );
@@ -817,6 +843,7 @@ mod tests {
                     program: script,
                     args: vec![],
                     env_additions: env,
+                    mcp: McpInjection::None,
                 },
                 sink,
             )
@@ -865,6 +892,7 @@ mod tests {
                     program: script,
                     args: vec![],
                     env_additions: BTreeMap::new(),
+                    mcp: McpInjection::None,
                 },
                 sink,
             )
@@ -902,6 +930,7 @@ mod tests {
                     program: script,
                     args: vec![],
                     env_additions: BTreeMap::new(),
+                    mcp: McpInjection::None,
                 },
                 sink,
             )

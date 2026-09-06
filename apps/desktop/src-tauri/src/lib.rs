@@ -11,6 +11,9 @@ mod daemon;
 #[allow(dead_code)]
 mod executor;
 mod harness;
+// MCP 注入的 omp 路径在 U4 派发链接线前是死代码
+#[allow(dead_code)]
+mod mcp_injection;
 mod rpc_bridge;
 mod state;
 

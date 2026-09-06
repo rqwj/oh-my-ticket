@@ -34,7 +34,8 @@
       "minimumSystemVersion": "11.0"
     },
     "externalBin": [
-      "binaries/omt-daemon"
+      "binaries/omt-daemon",
+      "binaries/omt"
     ]
   }
 }

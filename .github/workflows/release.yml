@@ -119,13 +119,14 @@ jobs:
           name: release-binaries-${{ github.ref_name }}
           path: dist/release
 
-      - name: Stage daemon sidecar for tauri externalBin
+      - name: Stage daemon and omt-CLI sidecars for tauri externalBin
         run: |
           stage="apps/desktop/src-tauri/binaries"
           mkdir -p "$stage"
           tmp="$(mktemp -d)"
           tar -xzf dist/release/*.tar.gz -C "$tmp"
           cp "$tmp"/*/omt-daemon "$stage/omt-daemon-aarch64-apple-darwin"
+          cp "$tmp"/*/omt "$stage/omt-aarch64-apple-darwin"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
