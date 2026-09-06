@@ -33,16 +33,16 @@ branch: feat/desktop-agents-dispatch
 | F-U3-14 | P2 | manual | U3 | `mcp.rs::enroll_identity` :300 × 计划 §3.3 | 嵌套 `mcp:<pid>/exec:<id>` 把 pid 重新绑进身份：MCP 进程重启 → 新 pid → 租约 actor 不匹配、report 被拒——F-U3-2 原本承诺的「MCP 重启不丢身份」不再成立；计划文案仍写精确匹配 `exec:<id>`；enroll 后未核对 daemon 实际授予值（64 字符上限超限同样静默降级） | fixed(d53b191)（方案 a：接受 pid 绑定，加静默降级检测；见 §11） | — |
 | F-U3-17 | P2 | gated_auto | U3 | `mcp_injection.rs::sweep_omp_crash_residue` :448 | sweep 循环内 `?`：一个 workspace 恢复失败即中止全部后续恢复与 launcher 清理，且每次启动都如此（556c1d2 引入） | fixed(d53b191) | — |
 | F-U3-18 | P3 | gated_auto | U3 | `mcp_injection.rs::sweep_omp_crash_residue` :460 | sweep 在**每次**启动（非仅 crash 后）删光 launcher 目录，persistent.sh 一并被删 → persistent 模式每次重启后 mcp.json 悬空；代码注释已记为 v1 限制，但修法只是「逐文件删、跳过 persistent.sh」 | fixed(d53b191) | — |
-| F-U2-1 | P2 | gated_auto | U2 | `executor.rs::kill_all` / `finish_terminal` | app 退出路径**不落盘**：`kill_all` 预置 terminal → 等待线程的 `finish_terminal` 早退，agents.json 永远收不到 Killed(AppExit)，下次启动被 demote 记成 Failed | open | — |
-| F-U2-2 | P2 | gated_auto | U2 | `executor.rs::classify` | 起动窗判据用「elapsed < 30s && code != 0」而非计划 §3.2 的「未产出任何 transcript 事件」；`first_event_seen` 有写无读——正常输出 20s 后 exit 1 会被记成 Failed「起动窗内退出」 | open | — |
-| F-U2-3 | P3 | gated_auto | U2 | `executor.rs::finish_terminal` | `ExecRecord.exit_code` / `kill_reason` 从未回写（只写 failure_detail） | open | — |
-| F-U2-4 | P3 | gated_auto | U2 | `executor.rs::spawn` / waiter | setpgid 只在子进程侧做，spawn 后立即 stop 有 ESRCH 窗口；正常退出后不清残留 pgid 成员 → 孙进程持管道时 reader 永不 EOF、waiter 线程泄漏 | open | — |
-| F-U2-5 | P3 | gated_auto | U2 | `executor.rs::classify` | 信号死亡（`code()==None`）被映射成 -1：窗内 Failed / 窗外 Exited(-1)，应读 `status.signal()` | open | — |
+| F-U2-1 | P2 | gated_auto | U2 | `executor.rs::kill_all` / `finish_terminal` | app 退出路径**不落盘**：`kill_all` 预置 terminal → 等待线程的 `finish_terminal` 早退，agents.json 永远收不到 Killed(AppExit)，下次启动被 demote 记成 Failed | fixed(12e4d91)（同步收口 + 幂等 guard；测试扩至 agents.json 断言 Killed/appexit） | — |
+| F-U2-2 | P2 | gated_auto | U2 | `executor.rs::classify` | 起动窗判据用「elapsed < 30s && code != 0」而非计划 §3.2 的「未产出任何 transcript 事件」；`first_event_seen` 有写无读——正常输出 20s 后 exit 1 会被记成 Failed「起动窗内退出」 | fixed(12e4d91)（classify 改 first_event_seen + 收割后 ≤300ms 落账窗口；新增「先输出再 exit 1 → Exited(1)」回归测试） | — |
+| F-U2-3 | P3 | gated_auto | U2 | `executor.rs::finish_terminal` | `ExecRecord.exit_code` / `kill_reason` 从未回写（只写 failure_detail） | fixed(12e4d91)（finish_terminal 一次 update_exec 写齐 exit_code/kill_reason/failure_detail） | — |
+| F-U2-4 | P3 | gated_auto | U2 | `executor.rs::spawn` / waiter | setpgid 只在子进程侧做，spawn 后立即 stop 有 ESRCH 窗口；正常退出后不清残留 pgid 成员 → 孙进程持管道时 reader 永不 EOF、waiter 线程泄漏 | fixed(12e4d91)（父侧 setpgid 双保险 + 退出后对 pgid 补 SIGKILL 清孤儿） | — |
+| F-U2-5 | P3 | gated_auto | U2 | `executor.rs::classify` | 信号死亡（`code()==None`）被映射成 -1：窗内 Failed / 窗外 Exited(-1)，应读 `status.signal()` | fixed(12e4d91)（ExitStatusExt::signal → Killed(External(sig))，KillReason 加 External） | — |
 | F-U2-6 | P3 | advisory | U2 | `executor.rs` 事件 | envelope 不统一：`session_start`/`exit` 无 `seq`/`ts`，与 design §5.3 `{seq, ts, execId, kind, payload}` 不符；U5 消费前统一 | open（U5 前） | — |
 | F-U2-7 | P3 | advisory | U2/U12 | 计划 §3.2 / design §5.6 | transcript `.jsonl`（header + 事件）写入未落地，仅 raw.log；U10 reconcile 依赖 header——归属未定 | open（计划定归属） | — |
-| F-U2-8 | P3 | gated_auto | U2 | `executor.rs::sanitize_line` / `session_start.args` | `to_lowercase()` 索引原串，非 ASCII 行偏移错位可能欠脱敏（改 `to_ascii_lowercase`）；`args` 事件/日志未脱敏（extra_args 可含 `--api-key`） | open | — |
+| F-U2-8 | P3 | gated_auto | U2 | `executor.rs::sanitize_line` / `session_start.args` | `to_lowercase()` 索引原串，非 ASCII 行偏移错位可能欠脱敏（改 `to_ascii_lowercase`）；`args` 事件/日志未脱敏（extra_args 可含 `--api-key`） | fixed(12e4d91)（sanitize_line 改 ascii lowercase；新增 sanitize_args 并用于 session_start 事件与会话记录） | — |
 | F-U2-9 | P3 | advisory | U2 | `agents::demote_live_agents` × dev 多实例 | `OMT_ALLOW_MULTI_INSTANCE` 下第二实例启动 demote 会把首实例的 Live agent 标 Failed；dev-notes 需补「同时隔离 `OMT_RUNTIME_DIR`」 | open | — |
-| F-U2-10 | P3 | gated_auto | U2 | `executor.rs::spawn` raw_log 路径 | `home_id` 未经 `validate_home_id` 即拼路径 | open | — |
+| F-U2-10 | P3 | gated_auto | U2 | `executor.rs::spawn` raw_log 路径 | `home_id` 未经 `validate_home_id` 即拼路径 | fixed(12e4d91)（spawn 入口复用 agents::validate_home_id（提为 pub(crate)）） | — |
 | F-U2-11 | P3 | advisory | U2 | `harness.rs::probe_descriptor` | 探针失败重试一次把 `harness_list` 最坏延迟翻倍（8s）；注释归因「fork→exec 卡死」需复现记录 | open | — |
 | F-U4a-1 | P2 | manual | U4a | `atomic_json::read_json_locked` / `agents::agents_list` | `parseFailed` 是**瞬态**信号（损坏文件被 rename 后第二次读即 false + 空列表），U9「解析失败期间冻结 GC」硬规则会失效并清空全部绑定 | open（U9 前置） | — |
 | F-U4a-2 | P2 | gated_auto | U4a→U2 | `agents::register_agent` 写 `attachment: Live` | Live 持久化后跨重启失真：U10（P1）才 reconcile，P0 期间重启/崩溃后 `agents_list` 仍报 Live+Starting/Running | fixed(b8b00f8)（`demote_live_agents` + ExecutionManager::new 启动 demote + 测试） | — |
@@ -515,35 +515,35 @@ U4a 达成计划目标，**不阻塞 U2 开工**。U2 入参：F-U4a-2（启动 
 `kill_all` 先把 `session.terminal` 预置为 `Killed(AppExit)`，再依赖等待线程收割。但 `finish_terminal` 开头 `if guard.is_some() { return; }`——等待线程看到已预置，**直接返回，不写 agents.json、不发 exit 事件**；而且 app 退出后等待线程根本活不到那一步。结果：agents.json 里该 agent 永远停在 `Running/Live`，下次启动被 demote 记成 `Failed("app restarted before exec finished")`——语义错（用户是正常退出 app），且 `ExecRecord.kill_reason` 永远拿不到 `appexit`。测试 `kill_all_marks_app_exit` 只断言内存态，没覆盖落盘。
 
 - **建议**：`kill_all` 不预置 terminal，改为**同步**对每个存活 session：`stop_reason = AppExit` → `kill_tree(SIGTERM)` → `finish_terminal(session, Killed(AppExit), …)`（幂等 guard 天然处理与等待线程的竞争）；等待线程用 `stop_reason` 而非固定 `User` 分类。测试补：`kill_all` 后读 agents.json 断言 `status == Killed` 且 exec `kill_reason == "appexit"`。
-- **状态**：open（U4 前）
+- **状态**：fixed(12e4d91) —— kill_all 改同步收口（stop_reason → SIGTERM → 有界等待 → 超时直接 finish_terminal），幂等 guard 防双写；测试扩为读 agents.json 断言 status=Killed 且 exec kill_reason=appexit
 
 #### F-U2-2 · P2 · gated_auto · `classify` · 起动窗判据与计划不符，`first_event_seen` 有写无读
 
 计划 §3.2：「起动窗内退出（默认 30s，**判据=未产出任何 transcript 事件**）→ Failed」。实现是 `started.elapsed() < startup_window && code != 0`，`first_event_seen` 只在 reader 里 `store(true)`，从未 `load`。后果：harness 正常跑了 20s、输出了一堆、因 claim 被拒按 prompt 纪律 `exit 1`——被记成 Failed「harness 在起动窗内退出」而不是 `Exited(1)`（后者才会联动 run item 统计）。另一个隐患：子进程退出时 reader 线程可能还没处理完缓冲的行，即便改用 `first_event_seen` 也可能读到 false。
 
 - **建议**：`classify` 改为 `!first_event_seen.load() && code != 0`（elapsed 上界可保留为「且」条件）；等待线程在 `try_wait` 返回 Some 后先轮询 `first_event_seen` ≤300ms 再分类；测试补「先 echo 再 exit 1 → Exited(1) 非 Failed」。
-- **状态**：open（U4 前）
+- **状态**：fixed(12e4d91) —— classify 改 `!first_event_seen && code != 0`（elapsed 保留为且条件），等待线程收割后 ≤300ms 等首事件落账；新增「先 echo 再 exit 1 → Exited(1)」回归
 
 #### F-U2-3 · P3 · gated_auto · `finish_terminal` · `exit_code` / `kill_reason` 未回写
 
 `ExecRecord` 有 `exit_code`/`kill_reason`/`failure_detail` 三个字段，`finish_terminal` 只写 `failure_detail`。U5 列表要显示退出码、U10 reconcile 要靠 execs[] 回填终态，两者都缺数据。
 
 - **建议**：`finish_terminal` 一次 `update_exec` 写齐：`Exited(c)` → `exit_code=Some(c)`；`Killed(r)` → `kill_reason=Some(r.as_str())`；`Failed(d)` → `failure_detail`。
-- **状态**：open
+- **状态**：fixed(12e4d91) —— finish_terminal 一次 update_exec 写 exit_code/kill_reason/failure_detail
 
 #### F-U2-4 · P3 · gated_auto · `spawn` / waiter · setpgid 竞态与残留 pgid 成员
 
 (a) `setpgid(0,0)` 只在子进程 `pre_exec` 里做；父进程 spawn 返回后立刻 `exec_stop` 时，子进程可能尚未执行到 pre_exec，`kill(-pid)` 得 ESRCH，harness 存活。经典解法是父子两侧都调 `setpgid(pid, pid)`（父侧忽略 EACCES）。(b) 子进程正常退出后，等待线程无条件 `join` reader——若 harness 留下了继承 stdout 的后台孙进程，管道永不 EOF，reader 与 waiter 线程永久泄漏。
 
 - **建议**：(a) spawn 后父侧补 `libc::setpgid(pid as i32, pid as i32)`；(b) `try_wait` 返回 Some 后对 pgid 补一次 `SIGKILL`（harness 已退出，残留成员就是孤儿，KD-D7 语义），再 join。
-- **状态**：open
+- **状态**：fixed(12e4d91) —— (a) 父侧 spawn 后同步 setpgid（EACCES 忽略）；(b) try_wait 命中后对 pgid 补 SIGKILL 再 join reader
 
 #### F-U2-5 · P3 · gated_auto · `classify` · 信号死亡映射成 -1
 
 外部 `kill -9 <harness>`（非 desktop 发起）→ `status.code() == None` → `-1`：窗内记 Failed「code -1」、窗外记 `Exited(-1)`。
 
 - **建议**：读 `std::os::unix::process::ExitStatusExt::signal()`，非 desktop 发起的信号死亡归 `Killed(External(sig))` 或 `Exited` 附 `signal` 字段；`KillReason` 加 `External`。
-- **状态**：open
+- **状态**：fixed(12e4d91) —— unix `ExitStatusExt::signal()` → `Terminal::Killed(KillReason::External(sig))`，`key()` 序列化为 external-<sig>
 
 #### F-U2-6 · P3 · advisory · 事件 envelope 不统一
 
@@ -564,7 +564,7 @@ commit message 说「transcript headers will use the same epoch-ms format」，�
 (a) `line.to_lowercase()` 后用其字节偏移切原串，非 ASCII（如土耳其 İ）会改变字节长度；`is_char_boundary` 只防 panic，不防错位——可能欠脱敏。(b) `session_start.args`、`ExecSession.args`、未来 header 的 argv 都原样记录；用户 `extra_args` 完全可能含 `--api-key xxx`，§3.1「只记非敏感 args」没有执行点。
 
 - **建议**：(a) 改 `to_ascii_lowercase()`（长度不变）；(b) `args` 进事件/日志前逐项过 `sanitize_line`（对 `--key=val` 与 `--key val` 两种形态：值项前一项若含 key/token/secret 关键字则替换值）。
-- **状态**：open
+- **状态**：fixed(12e4d91) —— (a) `to_ascii_lowercase`（字节长度不变）；(b) `sanitize_args` 应用于 session_start 事件与 ExecSession.args，`--key val`/`--key=val` 两形态均覆盖（测试）
 
 #### F-U2-9 · P3 · advisory · dev 多实例 × 启动 demote
 
@@ -578,7 +578,7 @@ commit message 说「transcript headers will use the same epoch-ms format」，�
 `runtime_dir/transcripts/<home_id>/…` 直接拼接，`agents_path` 有 `validate_home_id` 而这里没有。来源虽是 daemon handshake，防御应一致。
 
 - **建议**：复用 `agents::validate_home_id`（提为 `pub(crate)`）。
-- **状态**：open
+- **状态**：fixed(12e4d91) —— spawn 入口 `agents::validate_home_id`（提为 pub(crate)）
 
 #### F-U2-11 · P3 · advisory · `probe_descriptor` 重试
 
