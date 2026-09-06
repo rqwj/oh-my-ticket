@@ -210,80 +210,33 @@ fn harness_config_path(runtime_dir: &Path) -> PathBuf {
 }
 
 /// 读取全部 provider 配置。文件损坏 → 改名 `.corrupt-<ts>` 留证后从空开始
-/// （§3.6.6 写纪律）；目录不存在等其它 IO 错误同样按空配置处理（首次启动）。
+/// （§3.6.6 写纪律，实现在 atomic_json）；目录不存在等其它 IO 错误同样按
+/// 空配置处理（首次启动）。
 pub fn load_configs(runtime_dir: &Path) -> BTreeMap<String, HarnessUserConfig> {
     let path = harness_config_path(runtime_dir);
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return BTreeMap::new();
-    };
-    match serde_json::from_str(&text) {
-        Ok(configs) => configs,
-        Err(err) => {
-            let stamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or_default();
-            let _ = std::fs::rename(&path, path.with_extension(format!("json.corrupt-{stamp}")));
-            eprintln!("harness config 损坏（{err}），已降级为空配置");
-            BTreeMap::new()
-        }
-    }
+    // 损坏降级（rename 留证 + 返回默认）由 atomic_json 统一负责。
+    let (configs, _parse_failed) =
+        crate::atomic_json::read_json::<BTreeMap<String, HarnessUserConfig>>(&path)
+            .unwrap_or_default();
+    configs
 }
 
-/// tmp 名含 pid + 进程内序号：即使锁失效（未来跨进程共写），并发写也不会
-/// 共用同一 tmp 路径互相截断（F-U1-2）。
-fn unique_tmp_path(path: &Path) -> PathBuf {
-    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    path.with_extension(format!("json.tmp-{}-{seq}", std::process::id()))
-}
-
-/// 原子写全部 provider 配置：0600（凭据可能经 env 注入）+ tmp/rename
-/// （先例 daemon.rs register_admin_grant）。
-pub fn save_configs(
+/// 锁内 read-merge-write（F-U1-2）：进程内锁 + companion flock + 原子替换
+/// 全部由共用 helper 提供（F-U15-1/F-U1-8/F-U1-9 的关闭实现）。
+pub fn upsert_config(
     runtime_dir: &Path,
-    configs: &BTreeMap<String, HarnessUserConfig>,
+    id: &str,
+    config: HarnessUserConfig,
 ) -> Result<(), String> {
     let path = harness_config_path(runtime_dir);
-    let dir = path
-        .parent()
-        .ok_or_else(|| "harness config path has no parent".to_string())?;
-    std::fs::create_dir_all(dir).map_err(|e| format!("create_dir_all: {e}"))?;
-    let text = serde_json::to_string_pretty(configs).map_err(|e| e.to_string())?;
-    let tmp = unique_tmp_path(&path);
-    {
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode_if_unix(0o600)
-            .open(&tmp)
-            .map_err(|e| format!("open tmp: {e}"))?;
-        file.write_all(text.as_bytes())
-            .map_err(|e| format!("write tmp: {e}"))?;
-    }
-    std::fs::rename(&tmp, &path).map_err(|e| format!("rename: {e}"))
-}
-
-/// unix-only 的 0600 打开模式（v1 macOS-only，§3.6.3）。
-trait OpenOptionsUnix {
-    fn mode_if_unix(&mut self, mode: u32) -> &mut Self;
-}
-
-#[cfg(unix)]
-impl OpenOptionsUnix for std::fs::OpenOptions {
-    fn mode_if_unix(&mut self, mode: u32) -> &mut Self {
-        use std::os::unix::fs::OpenOptionsExt;
-        self.mode(mode)
-    }
-}
-
-#[cfg(not(unix))]
-impl OpenOptionsUnix for std::fs::OpenOptions {
-    fn mode_if_unix(&mut self, _mode: u32) -> &mut Self {
-        self
-    }
+    crate::atomic_json::update_json(
+        &path,
+        |configs: &mut BTreeMap<String, HarnessUserConfig>| {
+            configs.insert(id.to_string(), config);
+            true
+        },
+    )
+    .map(|_| ())
 }
 
 /// exec_start 时的 binary 解析：`Detected` 现场重探（不落死路径），
@@ -324,23 +277,6 @@ pub fn resolve_program(cfg: &HarnessUserConfig, binary_name: &str) -> Result<Pat
 // ---------------------------------------------------------------------------
 // tauri commands（设置页数据面；探测可能各至 2s，必须 async）
 // ---------------------------------------------------------------------------
-
-/// 进程内写锁（F-U1-2）：async command 并发进入 read-merge-write 会丢更新。
-/// 跨进程文件锁（fs4 flock，F-U15-1 的关闭条件）在 U4a 与 agents/bindings
-/// 做成共用 helper，不在此重复造。
-static CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// 锁内的 read-merge-write：设置页快速连续保存两个 provider 也不会互相覆盖。
-pub fn upsert_config(
-    runtime_dir: &Path,
-    id: &str,
-    config: HarnessUserConfig,
-) -> Result<(), String> {
-    let _guard = CONFIG_LOCK.lock().map_err(|_| "config lock poisoned")?;
-    let mut configs = load_configs(runtime_dir);
-    configs.insert(id.to_string(), config);
-    save_configs(runtime_dir, &configs)
-}
 
 fn probe_descriptor(detected: Option<&Path>, d: &HarnessDescriptor) -> Option<String> {
     detected.and_then(|path| probe_version(path, d.probe_args, 2))
@@ -551,19 +487,27 @@ mod tests {
     fn saved_config_is_0600_and_parseable() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let mut configs = BTreeMap::new();
-        configs.insert(
+        upsert_config(
+            dir.path(),
+            "opencode",
+            HarnessUserConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let path = dir.path().join("harness").join("config.json");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let mut expected = BTreeMap::new();
+        expected.insert(
             "opencode".to_string(),
             HarnessUserConfig {
                 enabled: true,
                 ..Default::default()
             },
         );
-        save_configs(dir.path(), &configs).unwrap();
-        let path = dir.path().join("harness").join("config.json");
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
-        assert_eq!(load_configs(dir.path()), configs);
+        assert_eq!(load_configs(dir.path()), expected);
         let leftovers: Vec<String> = std::fs::read_dir(path.parent().unwrap())
             .unwrap()
             .filter_map(Result::ok)

@@ -4,6 +4,8 @@
 //! kind:"desktop", single-entry admin-grant refresh, and the Rust-held
 //! connection bridged to the frontend through tauri commands.
 
+mod agents;
+mod atomic_json;
 mod daemon;
 mod harness;
 mod rpc_bridge;
@@ -53,6 +55,7 @@ pub fn run() {
             rpc_bridge::dsh_plugin_install,
             harness::harness_list,
             harness::harness_config_set,
+            agents::agents_list,
         ])
         .run(tauri::generate_context!())
         .expect("error while running oh-my-ticket desktop")
