@@ -285,13 +285,20 @@ fn write_frame(writer: &mut impl Write, body: &str) -> std::io::Result<()> {
 }
 
 /// U3: enrollment 身份——desktop 派发时经 `--actor exec:<execId>` 指定执行者
-/// 身份，使 `run_items.executor_session_id` 可精确定位派发方（§3.3 身份纪律）；
-/// 未指定时保持 `mcp:<pid>` 兼容（F18/F19：原为硬编码）。返回 (actor, name)。
+/// 身份，使 `run_items.executor_session_id` 可精确定位派发方（§3.3 身份纪律）。
+///
+/// **F-U3-2**：`Registry::issue`（auth.rs）只授予等于 base（`mcp:<pid>`）或以
+/// `base/` 为前缀的 actor namespace——一个裸的 `exec:<execId>` 既不等于 base
+/// 也不以其为前缀，会被**静默**降级回 `mcp:<pid>`，且不报错。因此这里把请求
+/// 的 actor 规整成 `mcp:<pid>/exec:<execId>` 这一嵌套形式再送去 enroll，才能
+/// 被 daemon 实际采纳；未指定时保持 `mcp:<pid>` 兼容（F18/F19：原为硬编码）。
+/// 返回 (actor, name)。
 fn enroll_identity(globals: &GlobalArgs) -> (String, String) {
-    let actor = globals
-        .actor
-        .clone()
-        .unwrap_or_else(|| format!("mcp:{}", std::process::id()));
+    let base = format!("mcp:{}", std::process::id());
+    let actor = match globals.actor.as_deref() {
+        Some(requested) if !requested.is_empty() => format!("{base}/{requested}"),
+        _ => base,
+    };
     let name = format!("omt-mcp-{actor}");
     (actor, name)
 }
@@ -310,15 +317,19 @@ mod tests {
     }
 
     #[test]
-    fn enroll_identity_honors_explicit_actor() {
+    fn enroll_identity_nests_explicit_actor_under_mcp_pid_base() {
+        // F-U3-2: must be base or base/nested (auth.rs Registry::issue) —
+        // a bare "exec:e1" would be silently downgraded by the daemon.
         let (actor, name) = enroll_identity(&globals(Some("exec:e1")));
-        assert_eq!(actor, "exec:e1");
-        assert_eq!(name, "omt-mcp-exec:e1");
+        assert!(actor.starts_with("mcp:"), "{actor}");
+        assert!(actor.ends_with("/exec:e1"), "{actor}");
+        assert_eq!(name, format!("omt-mcp-{actor}"));
     }
 
     #[test]
-    fn enroll_identity_defaults_to_mcp_pid_namespace() {
+    fn enroll_identity_defaults_to_bare_mcp_pid_namespace() {
         let (actor, _name) = enroll_identity(&globals(None));
         assert!(actor.starts_with("mcp:"), "{actor}");
+        assert!(!actor.contains('/'), "{actor}");
     }
 }

@@ -55,7 +55,7 @@ jobs:
           cargo build -p omt-runtime --bin omt-daemon --bin omt
           mkdir -p apps/desktop/src-tauri/binaries
           cp target/debug/omt-daemon apps/desktop/src-tauri/binaries/omt-daemon-aarch64-apple-darwin
-cp target/debug/omt apps/desktop/src-tauri/binaries/omt-aarch64-apple-darwin
+          cp target/debug/omt apps/desktop/src-tauri/binaries/omt-aarch64-apple-darwin
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo test

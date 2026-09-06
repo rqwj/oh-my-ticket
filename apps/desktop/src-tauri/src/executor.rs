@@ -226,7 +226,27 @@ impl ExecutionManager {
 
     /// spawn 一个 harness 会话并接入事件泵。`runtime_dir` 用于 OMT_RUNTIME_DIR
     /// 强制注入与 raw.log 落盘。
+    ///
+    /// F-U3-9：`req.mcp` 已在调用方 prepare 完毕；本函数的任何一条错误返回
+    /// 路径都意味着不会有 `ExecSession`、也就不会有 `finish_terminal` 去
+    /// release 它——在这里统一兜底释放，残留仍由启动 sweep 兜底。
     pub fn spawn(
+        &self,
+        runtime_dir: &Path,
+        req: SpawnRequest,
+        on_event: EventSink,
+    ) -> Result<Arc<ExecSession>, String> {
+        let mcp_on_failure = req.mcp.clone();
+        let result = self.spawn_inner(runtime_dir, req, on_event);
+        if result.is_err() {
+            if let Err(err) = crate::mcp_injection::release(runtime_dir, &mcp_on_failure) {
+                eprintln!("MCP 注入释放失败（spawn 失败路径）：{err}（残留由启动 sweep 兜底）");
+            }
+        }
+        result
+    }
+
+    fn spawn_inner(
         &self,
         runtime_dir: &Path,
         req: SpawnRequest,
@@ -950,6 +970,55 @@ mod tests {
             PathBuf::from("/ws")
         );
         assert_eq!(workspace_root_of(Path::new("/ws")), PathBuf::from("/ws"));
+    }
+
+    #[test]
+    fn spawn_failure_releases_mcp_injection() {
+        // F-U3-9: any spawn() error path must release an already-prepared
+        // MCP bridge — nobody else will ever call finish_terminal for a
+        // session that never got created.
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        let home_path = dir.path().join("ws").join(".omt");
+        std::fs::create_dir_all(&home_path).unwrap();
+        // 手工布置一个"已注入"的 omp launcher（模拟 U4 在 spawn 前已调用
+        // mcp_injection::prepare）——只关心 spawn 失败时是否被释放。
+        let launcher_dir = runtime.join("harness").join("omp-launchers");
+        std::fs::create_dir_all(&launcher_dir).unwrap();
+        let launcher_path = launcher_dir.join("test-launcher.sh");
+        std::fs::write(&launcher_path, "#!/bin/sh\n").unwrap();
+        let mcp = McpInjection::Omp {
+            workspace_root: dir.path().join("ws"),
+            persistent: false,
+            launcher_id: "test-launcher".into(),
+        };
+        let manager = ExecutionManager::with_limits(STARTUP_WINDOW, DEFAULT_MAX_DURATION);
+        let (tx, _rx) = mpsc::channel();
+        let sink: EventSink = Arc::new(move |v| {
+            let _ = tx.send(v);
+        });
+        let result = manager.spawn(
+            &runtime,
+            SpawnRequest {
+                exec_id: "exec-mcp-fail".into(),
+                agent_id: "agent-mcp-fail".into(),
+                home_id: "h_test".into(),
+                home_path,
+                harness: "fake".into(),
+                node_id: None,
+                run_id: None,
+                program: dir.path().join("definitely-does-not-exist"),
+                args: vec![],
+                env_additions: BTreeMap::new(),
+                mcp,
+            },
+            sink,
+        );
+        assert!(result.is_err(), "spawn 应因程序不存在而失败");
+        assert!(
+            !launcher_path.exists(),
+            "spawn 失败必须释放已准备的 MCP 注入（F-U3-9）"
+        );
     }
 
     #[test]
