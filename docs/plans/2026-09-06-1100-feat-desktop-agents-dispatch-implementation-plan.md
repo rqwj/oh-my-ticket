@@ -7,6 +7,7 @@ revised: 2026-09-06（二次评审全部修订已应用：阻断项——终止�
 status: 已定稿（Q1–Q4 决策确认 + 三路深化研究整合）
 base_design: docs/plans/2026-09-05-1245-feat-desktop-harness-executor-design.md
 review: docs/plans/2026-09-06-1530-review-desktop-agents-dispatch-plan-review.md
+findings_log: docs/plans/2026-09-06-1245-review-desktop-agents-dispatch-findings-log.md
 ---
 
 # Desktop Agents 面板、Harness 管理与派发模型 - 实施规划

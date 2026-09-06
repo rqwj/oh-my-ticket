@@ -27,15 +27,15 @@ branch: feat/desktop-agents-dispatch
 |---|---|---|---|---|---|---|---|
 | F-U15-1 | P3 | advisory | U15 | `apps/desktop/src-tauri/src/lib.rs:19` | single-instance 为 best-effort 守卫，非正确性保证；需注释点明 U4a 文件锁才是 | open（注释已补 c8d8946；`fixed` 待 U4a 文件锁覆盖三条写路径后复核） | — |
 | F-U15-3 | P3 | testing-gap | U15 | — | 「双开 → 第二实例退出并聚焦」无自动化或记录的手工验证 | open（手工验证排期 P0 链路打通后的桌面冒烟；`OMT_ALLOW_MULTI_INSTANCE` 已就绪，可支撑 dev 自动化双开脚本） | — |
-| F-U15-4 | P3 | gated_auto | U15 | `apps/desktop/src-tauri/src/lib.rs:30` | `OMT_ALLOW_MULTI_INSTANCE` 用 `is_some()` 判定，空值/`0` 也会关掉守卫，违背仓库 env「空即未设置」约定 | fixed | — |
-| F-U15-5 | P3 | advisory | U15 | `docs/dsh-plugin-dev-notes.md §1.4` | `OMT_ALLOW_MULTI_INSTANCE` 只在 lib.rs 注释与本日志可见，开发回路文档未记 | fixed | — |
+| F-U15-4 | P3 | gated_auto | U15 | `apps/desktop/src-tauri/src/lib.rs:30` | `OMT_ALLOW_MULTI_INSTANCE` 用 `is_some()` 判定，空值/`0` 也会关掉守卫，违背仓库 env「空即未设置」约定 | fixed(7be3f76) | — |
+| F-U15-5 | P3 | advisory | U15 | `docs/dsh-plugin-dev-notes.md §1.4` | `OMT_ALLOW_MULTI_INSTANCE` 只在 lib.rs 注释与本日志可见，开发回路文档未记 | fixed(7be3f76) | — |
 | F-U15-2 | P3 | manual | U15 | `apps/desktop/src-tauri/src/lib.rs:19` | dev 实例与打包版共用 single-instance socket，`tauri dev` 被静默吞掉 | fixed(c8d8946) | — |
 
 ## 待办的跨阶段事项（由 findings 派生）
 
 - [ ] U4a 落地时回看 F-U15-1：确认文件锁覆盖 agents.json / bindings.json / harness config 三条写路径后，将 F-U15-1 置 `fixed`。
 - [ ] P0 桌面冒烟时执行 F-U15-3 的手工双开验证并回填记录（可顺手用 `OMT_ALLOW_MULTI_INSTANCE` 写 dev 自动化脚本）。
-- [ ] 下次触碰 lib.rs 时顺手关 F-U15-4；下次改 dev-notes 时顺手关 F-U15-5。
+- [x] ~~下次触碰 lib.rs 时顺手关 F-U15-4；下次改 dev-notes 时顺手关 F-U15-5~~ 已于 7be3f76 关闭。
 
 ---
 
@@ -81,7 +81,7 @@ socket 名仅由 `identifier`（`com.ohmyticket.desktop`）派生。`pnpm tauri:
       builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| { /* … */ }))
   };
   ```
-- **状态**：fixed —— 2026-09-06 按 (b) 落地（debug + env 跳过注册；release 不受 env 影响）。
+- **状态**：fixed(c8d8946) —— 按 (b) 落地（debug + env 跳过注册；release 不受 env 影响）。
 
 #### F-U15-3 · P3 · testing-gap · U15 验收场景无验证记录
 
@@ -130,16 +130,53 @@ socket 名仅由 `identifier`（`com.ohmyticket.desktop`）派生。`pnpm tauri:
       .unwrap_or(false);
   let enable_single_instance = !(cfg!(debug_assertions) && allow_multi);
   ```
-- **状态**：fixed —— 2026-09-06 按建议落地为 `parse_allow_multi_instance`（纯函数 + 单测覆盖 unset/空/空白/`0`/`false`/大小写/有效值）。
+- **状态**：fixed(7be3f76) —— 按建议落地为 `parse_allow_multi_instance`（纯函数 + 单测覆盖 unset/空/空白/`0`/`false`/大小写/有效值）。
 
 #### F-U15-5 · P3 · advisory · `docs/dsh-plugin-dev-notes.md §1.4` · 开发回路文档未记新 env
 
 `OMT_ALLOW_MULTI_INSTANCE` 目前只在 `lib.rs` 注释和本日志出现。`dsh-plugin-dev-notes.md §1.4 开发回路` 已有「多实例开发必须隔离 `DSH_HOME`」条目，是该 env 的自然归宿——多 worktree 并行开发 desktop 时两者要一起设。
 
 - **建议**：§1.4 追加一行：「desktop 多实例/多 worktree 开发：debug 构建设 `OMT_ALLOW_MULTI_INSTANCE=1` 跳过 single-instance 守卫；release 不受影响。」
-- **状态**：fixed —— 2026-09-06 已追加（并注明与 `DSH_HOME` 隔离配合使用）。
+- **状态**：fixed(7be3f76) —— 已追加（并注明与 `DSH_HOME` 隔离配合使用）。
 
 ### Coverage 缺口
 
 - 同 §1：Linux/Windows 分支、供应链审计。
 - 备注：计划 frontmatter 的 `findings_log:` 反向链接行仍在工作区未提交（不影响本 commit 评审）。
+
+---
+
+## 3. `7be3f76` · U15 · 修复 F-U15-4/5（env 解析纯函数 + dev-notes）
+
+- **日期**：2026-09-06
+- **范围**：`lib.rs` +31/−2（`parse_allow_multi_instance` + 单测）、`dsh-plugin-dev-notes.md` +1、本日志 §2 入库 + F-U15-4/5 状态更新
+- **意图**：F-U15-4 env 判定改为仓库约定（空/空白/`0`/`false` = 未设置）；F-U15-5 在开发回路文档记录 `OMT_ALLOW_MULTI_INSTANCE`
+- **评审方式**：单上下文内联；`cargo test -p oh-my-ticket-desktop --lib allow_multi` → 1 passed。**无独立子代理、无跨模型佐证。**
+- **结论**：**Ready to merge**。无新 finding。
+
+### 核验通过
+
+| 检查 | 结果 |
+|---|---|
+| 解析语义 | `trim` 后空 / `0` / `false`（忽略大小写）→ off，其余非空 → on；与 `docs/runtime/config.md` 约定及 §2 建议一致 ✔ |
+| 非 UTF-8 值 | `std::env::var(...).ok()` → `None` → 守卫保持开启（保守方向）✔ |
+| release 不变式 | 仍为 `!(cfg!(debug_assertions) && allow_multi)`，release 恒开 ✔ |
+| 测试 | 纯函数抽出后可单测；用例覆盖 unset/空/空白/`0`/`false`/`False`/`1`/`true`/带空白值，实际运行通过 ✔ |
+| dev-notes | §1.4 追加一行，并点明与 `DSH_HOME` 隔离配合使用——比建议多了一层关联说明 ✔ |
+| 日志维护 | 作者已就地更新 F-U15-4/5 详情状态；本次评审补 sha（`fixed(7be3f76)`）并关闭已过期的待办第三条 |
+
+### Findings
+
+无。
+
+### 当前 U15 收口状态
+
+| ID | 状态 |
+|---|---|
+| F-U15-1 | open，待 U4a 文件锁落地后复核 |
+| F-U15-2 | fixed(c8d8946) |
+| F-U15-3 | open，排期 P0 桌面冒烟 |
+| F-U15-4 | fixed(7be3f76) |
+| F-U15-5 | fixed(7be3f76) |
+
+U15 single-instance 子项可视为完成；剩余两条 open 都有明确触发点，不阻塞下一单元（U1）。
