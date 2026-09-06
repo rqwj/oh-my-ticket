@@ -25,13 +25,16 @@ branch: feat/desktop-agents-dispatch
 
 | ID | 级别 | 类型 | 单元 | 位置 | 摘要 | 状态 | 负责人 |
 |---|---|---|---|---|---|---|---|
+| F-U1b-1 | P3 | advisory | U1b | 计划 U1b Files / 排期 | `store.ts` 的 `harness_list` 封装放在 U1b，但 U6 弹窗选择器先于 U1b 需要它——依赖倒置 | open（计划动作） | — |
+| F-U1-8 | P3 | gated_auto | U1 | `harness.rs::upsert_config` | `CONFIG_LOCK` 一旦 poison，所有后续保存永久失败直至重启 | open | — |
+| F-U1-9 | P3 | advisory | U1 | `harness.rs::save_configs` | 写入与 rename 之间崩溃留下的 `config.json.tmp-*` 无人清扫 | open（U4a 共用 helper 时顺手） | — |
 | F-U1-4 | P3 | testing-gap | U1 | `harness.rs::REGISTRY` omp | omp `--approval-mode write` 无 TTY 实测（计划 U1 必做项）未做，`unattended_flag` 暂记 `--yolo` | open（U6 前置门） | — |
 | F-U1-7 | P3 | advisory | U1 | `harness.rs::probe_version` | stderr 被丢弃，向 stderr 打版本号的 CLI 会被判「待验证」 | open（U1b/U2 用真实 binary 实测后定） | — |
 | F-U15-1 | P3 | advisory | U15 | `apps/desktop/src-tauri/src/lib.rs:19` | single-instance 为 best-effort 守卫，非正确性保证；需注释点明 U4a 文件锁才是 | open（注释已补 c8d8946；`fixed` 待 U4a 文件锁覆盖三条写路径后复核） | — |
 | F-U15-3 | P3 | testing-gap | U15 | — | 「双开 → 第二实例退出并聚焦」无自动化或记录的手工验证 | open（手工验证排期 P0 链路打通后的桌面冒烟；`OMT_ALLOW_MULTI_INSTANCE` 已就绪，可支撑 dev 自动化双开脚本） | — |
 | F-U1-1 | P1 | gated_auto | U1 | `harness.rs`（7 处） | `cargo fmt --check` 失败，CI `rust` job 会红 | fixed(716ce0e) | — |
 | F-U1-2 | P2 | gated_auto | U1 | `harness.rs::harness_config_set` / `save_configs` | 无进程内锁：并发 `harness_config_set` 会丢更新，且 tmp 文件名仅含 pid，同进程并发写会互相截断 | fixed(716ce0e) | — |
-| F-U1-3 | P3 | advisory | U1 | 计划 U1 | U1 前端半（HarnessSelect 移除、bag v2 迁移、store/tests）未落地，计划需记注拆分为 U1b | fixed(716ce0e)（计划已加 U1b 单元，排期 U7 前） | — |
+| F-U1-3 | P3 | advisory | U1 | 计划 U1 | U1 前端半（HarnessSelect 移除、bag v2 迁移、store/tests）未落地，计划需记注拆分为 U1b | fixed(ba0e046)（计划已加 U1b 单元，排期 U7 前） | — |
 | F-U1-5 | P3 | gated_auto | U1 | `harness.rs::harness_entry` | Manual 路径不存在时投影 `installed: true` + `pendingVerification`，语义矛盾 | fixed(716ce0e) | — |
 | F-U1-6 | P3 | gated_auto | U1 | `harness.rs::harness_config_set` | `Manual{path}` 空串/纯空白未拒绝 | fixed(716ce0e) | — |
 | F-U15-4 | P3 | gated_auto | U15 | `apps/desktop/src-tauri/src/lib.rs:30` | `OMT_ALLOW_MULTI_INSTANCE` 用 `is_some()` 判定，空值/`0` 也会关掉守卫，违背仓库 env「空即未设置」约定 | fixed(7be3f76) | — |
@@ -279,3 +282,60 @@ commit message 明示前端消费者（HarnessSelect 移除、bag v2 迁移、st
 ### Coverage 缺口
 
 - 与 §1 同；此外 `harness_list` 的真实 opencode/omp 探测未在评审环境跑（测试仅断言自洽）。
+
+---
+
+## 5. `716ce0e` + `ba0e046` · U1 · 修复 F-U1-1/2/5/6 + 计划拆出 U1b
+
+- **日期**：2026-09-06
+- **范围**：`716ce0e` `harness.rs` +113/−19（fmt、`CONFIG_LOCK` + `upsert_config`、`unique_tmp_path`、`validate_config`、`installed` 语义、2 个新测试）；`ba0e046` 计划 +17（U1b 单元、P0 排序）、日志 §4 入库 + 状态更新
+- **意图**：关闭 §4 的 P1/P2 与三条 P3；把 U1 前端半在计划中显式拆为 U1b
+- **评审方式**：单上下文内联；`cargo fmt --all -- --check` exit 0；`cargo clippy --all-targets -D warnings` 通过；`cargo test -p oh-my-ticket-desktop --lib` → 14 passed。**无独立子代理、无跨模型佐证。**
+- **结论**：**Ready to merge**。四项代码修复均按建议落地且有测试；新增三条 P3（两条代码、一条计划），不阻塞。
+
+### 核验通过
+
+| 项 | 结果 |
+|---|---|
+| F-U1-1 fmt | 全仓 `--check` exit 0；漂移仅在 harness.rs，无历史文件噪声 ✔ |
+| F-U1-2 锁 | `static CONFIG_LOCK: Mutex<()>`；`upsert_config` 锁内 load→insert→save；tmp 名 `tmp-<pid>-<seq>`（AtomicU64）；并发测试 8 线程 × 5 写、8 key 全在 ✔。锁外的二次 `load_configs` 仅用于投影，无正确性影响 ✔ |
+| F-U1-5 | `installed` 对 Manual 改 `Path::is_file()`；pending 用例断言 `installed == false` ✔ |
+| F-U1-6 | `validate_config` 保存时拒绝空/空白 Manual 路径，不要求存在（保留「待验证」态）；测试覆盖两态 ✔ |
+| F-U1-3 → 计划 | U1b 单元含 Files/Approach/Test scenarios/排期；P0 排序行更新为 `… U6 → U9 → U1b → U7 → U8` ✔（依赖顺序问题见 F-U1b-1） |
+| 日志簿记 | §4 入库、状态就地更新 ✔；F-U1-3 的 sha 应为 `ba0e046`（计划改动在该 commit），本次已改正 |
+
+### Findings
+
+#### F-U1b-1 · P3 · advisory · 计划 U1b · `harness_list` store 封装与 U6 依赖倒置
+
+U1b Files 把「`store.ts` 的 `harness_list`/`harness_config_set` 封装」放在 U1b，而 U1b 排在 U6 之后；但 U6 弹窗的「选择器 = 已启用 harness ∪ 空闲 Agent」「默认 = workspace 默认 harness（读取时校验 enabled）」必须消费 `harness_list`。U6 开工时要么临时自造封装（重复），要么被迫先做 U1b 的一半。
+
+- **建议**：把 `store.ts` 的 `harness_list`/`harness_config_set` 封装（含类型 `HarnessEntry`）移入 U6 Files；U1b 只保留 HarnessSelect 退役、bag v2 迁移、SettingsPanel/WorkspaceSwitcher 接线与测试调整。或者反过来把 U1b 提到 U6 之前——但 U1b 的 SettingsPanel 接线又想等 U7，故前者更顺。
+- **状态**：open（计划动作）
+
+#### F-U1-8 · P3 · gated_auto · `upsert_config` · 锁 poison 即永久失败
+
+`CONFIG_LOCK.lock().map_err(|_| "config lock poisoned")`：任何一次持锁期间 panic（如 `serde_json::to_string_pretty` 极端情况、未来 helper 演进）都会让后续所有保存返回错误直到 app 重启。锁保护的是 `()`，没有需要保护的不变量，poison 无意义。
+
+- **建议**：`let _guard = CONFIG_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);`
+- **状态**：open（U4a 抽共用 helper 时一并处理即可）
+
+#### F-U1-9 · P3 · advisory · `save_configs` · tmp 残留无清扫
+
+写入 tmp 与 rename 之间崩溃会留下 `harness/config.json.tmp-<pid>-<seq>`；文件 0600 且很小，无功能影响，但会累积。
+
+- **建议**：U4a 的共用原子写 helper 在 `load` 时顺手清扫同目录 `*.tmp-*`（pid 已死或 mtime 超过 1h）。
+- **状态**：open（U4a 顺手）
+
+### 当前 U1 收口状态
+
+| ID | 状态 |
+|---|---|
+| F-U1-1/2/5/6 | fixed(716ce0e) |
+| F-U1-3 | fixed(ba0e046) |
+| F-U1-4 | open，U6 前置门（omp 审批模式实测） |
+| F-U1-7 | open，U1b/U2 用真实 binary 实测后定 |
+| F-U1-8/9 | open，U4a 共用 helper 时顺手 |
+| F-U1b-1 | open，计划动作 |
+
+U1 后端半可视为完成，**不阻塞 U4a 开工**；U4a 是三条「顺手」项（F-U15-1、F-U1-8、F-U1-9）的汇合点，建议 U4a 的共用原子写 helper 一次把「进程内锁 + flock + poison 容忍 + tmp 清扫」做齐，然后把 harness config 切过去。
