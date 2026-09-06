@@ -25,14 +25,17 @@ branch: feat/desktop-agents-dispatch
 
 | ID | 级别 | 类型 | 单元 | 位置 | 摘要 | 状态 | 负责人 |
 |---|---|---|---|---|---|---|---|
-| F-U15-1 | P3 | advisory | U15 | `apps/desktop/src-tauri/src/lib.rs:19` | single-instance 为 best-effort 守卫，非正确性保证；需注释点明 U4a 文件锁才是 | open（注释已补；`fixed` 待 U4a 文件锁覆盖三条写路径后复核） | — |
+| F-U15-1 | P3 | advisory | U15 | `apps/desktop/src-tauri/src/lib.rs:19` | single-instance 为 best-effort 守卫，非正确性保证；需注释点明 U4a 文件锁才是 | open（注释已补 c8d8946；`fixed` 待 U4a 文件锁覆盖三条写路径后复核） | — |
 | F-U15-3 | P3 | testing-gap | U15 | — | 「双开 → 第二实例退出并聚焦」无自动化或记录的手工验证 | open（手工验证排期 P0 链路打通后的桌面冒烟；`OMT_ALLOW_MULTI_INSTANCE` 已就绪，可支撑 dev 自动化双开脚本） | — |
-| F-U15-2 | P3 | manual | U15 | `apps/desktop/src-tauri/src/lib.rs:19` | dev 实例与打包版共用 single-instance socket，`tauri dev` 被静默吞掉 | fixed | — |
+| F-U15-4 | P3 | gated_auto | U15 | `apps/desktop/src-tauri/src/lib.rs:30` | `OMT_ALLOW_MULTI_INSTANCE` 用 `is_some()` 判定，空值/`0` 也会关掉守卫，违背仓库 env「空即未设置」约定 | fixed | — |
+| F-U15-5 | P3 | advisory | U15 | `docs/dsh-plugin-dev-notes.md §1.4` | `OMT_ALLOW_MULTI_INSTANCE` 只在 lib.rs 注释与本日志可见，开发回路文档未记 | fixed | — |
+| F-U15-2 | P3 | manual | U15 | `apps/desktop/src-tauri/src/lib.rs:19` | dev 实例与打包版共用 single-instance socket，`tauri dev` 被静默吞掉 | fixed(c8d8946) | — |
 
 ## 待办的跨阶段事项（由 findings 派生）
 
 - [ ] U4a 落地时回看 F-U15-1：确认文件锁覆盖 agents.json / bindings.json / harness config 三条写路径后，将 F-U15-1 置 `fixed`。
-- [ ] 首次多 worktree 并行开发前处理 F-U15-2。
+- [ ] P0 桌面冒烟时执行 F-U15-3 的手工双开验证并回填记录（可顺手用 `OMT_ALLOW_MULTI_INSTANCE` 写 dev 自动化脚本）。
+- [ ] 下次触碰 lib.rs 时顺手关 F-U15-4；下次改 dev-notes 时顺手关 F-U15-5。
 
 ---
 
@@ -92,3 +95,51 @@ socket 名仅由 `identifier`（`com.ohmyticket.desktop`）派生。`pnpm tauri:
 - Linux/Windows 分支（v1 macOS-only）
 - `Cargo.lock` 新增 crate 的供应链审计
 - 运行产物：`/tmp/compound-engineering-501/ce-code-review/20260906-124145-da5b7689/`
+
+---
+
+## 2. `c8d8946` · U15 · 修复 F-U15-1/2（best-effort 注释 + debug 多实例开关）
+
+- **日期**：2026-09-06
+- **范围**：`lib.rs` +23/−10；本日志首次入库（含 F-U15-1/2/3 状态更新）
+- **意图**：F-U15-2 按建议 (b) 落地——debug 构建 `OMT_ALLOW_MULTI_INSTANCE` 跳过 single-instance 注册；F-U15-1 补注释点明 best-effort 与 U4a 文件锁；F-U15-3 明确排期、不预造验证记录
+- **评审方式**：单上下文内联；`cargo check -p oh-my-ticket-desktop` 通过。**无独立子代理、无跨模型佐证。**
+- **结论**：**Ready to merge**。两项修复均与 §1 建议一致，逻辑正确；新增两条 P3（一条有具体改法）。
+
+### 核验通过
+
+| 检查 | 结果 |
+|---|---|
+| release 不受 env 影响 | `enable = !(cfg!(debug_assertions) && env)`：release 下 `cfg!` 恒 false → 守卫恒开 ✔ |
+| 未注册时的插件构造 | `init()` 只构造 `TauriPlugin`，socket 操作全在 `setup` 中；disabled 分支构造后即丢弃，无副作用 ✔ |
+| 插件仍首位注册 | enabled 分支 `builder.plugin(single_instance)` 先于 shell/dialog ✔ |
+| F-U15-1 注释 | 明确写了「best-effort」「静默放行」场景与「不要省掉文件锁」——符合建议，状态保持 open 待 U4a 复核 ✔ |
+| F-U15-3 处理 | 未伪造手工验证记录，改为排期 P0 冒烟——正确做法 ✔ |
+| 日志约定 | 总览按 open 在前重排、状态就地更新、ID 稳定 ✔ |
+
+### Findings
+
+#### F-U15-4 · P3 · gated_auto · `lib.rs:30` · env 判定用 `is_some()`，空值/`0` 也关守卫
+
+`std::env::var_os("OMT_ALLOW_MULTI_INSTANCE").is_some()`：`OMT_ALLOW_MULTI_INSTANCE=` 与 `=0` 都会关闭守卫。仓库 env 约定（`docs/runtime/config.md`「环境变量为空字符串或纯空白时视为未设置」，`paths.rs::resolve` 同样 `trim().is_empty()` 判定）是空即未设置；commit message 也写的是 `=1`。
+
+- **建议**（可直接改）：
+  ```rust
+  let allow_multi = std::env::var("OMT_ALLOW_MULTI_INSTANCE")
+      .map(|v| { let v = v.trim(); !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false") })
+      .unwrap_or(false);
+  let enable_single_instance = !(cfg!(debug_assertions) && allow_multi);
+  ```
+- **状态**：fixed —— 2026-09-06 按建议落地为 `parse_allow_multi_instance`（纯函数 + 单测覆盖 unset/空/空白/`0`/`false`/大小写/有效值）。
+
+#### F-U15-5 · P3 · advisory · `docs/dsh-plugin-dev-notes.md §1.4` · 开发回路文档未记新 env
+
+`OMT_ALLOW_MULTI_INSTANCE` 目前只在 `lib.rs` 注释和本日志出现。`dsh-plugin-dev-notes.md §1.4 开发回路` 已有「多实例开发必须隔离 `DSH_HOME`」条目，是该 env 的自然归宿——多 worktree 并行开发 desktop 时两者要一起设。
+
+- **建议**：§1.4 追加一行：「desktop 多实例/多 worktree 开发：debug 构建设 `OMT_ALLOW_MULTI_INSTANCE=1` 跳过 single-instance 守卫；release 不受影响。」
+- **状态**：fixed —— 2026-09-06 已追加（并注明与 `DSH_HOME` 隔离配合使用）。
+
+### Coverage 缺口
+
+- 同 §1：Linux/Windows 分支、供应链审计。
+- 备注：计划 frontmatter 的 `findings_log:` 反向链接行仍在工作区未提交（不影响本 commit 评审）。

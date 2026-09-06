@@ -27,8 +27,9 @@ pub fn run() {
     // F-U15-2：single-instance socket 仅由 identifier 派生，dev 实例会与打包版互判为
     // 第二实例。debug 构建可用 OMT_ALLOW_MULTI_INSTANCE=1 跳过守卫（多 worktree 并行
     // 开发同理）；release 构建不受该 env 影响。
-    let enable_single_instance =
-        !(cfg!(debug_assertions) && std::env::var_os("OMT_ALLOW_MULTI_INSTANCE").is_some());
+    let allow_multi =
+        parse_allow_multi_instance(std::env::var("OMT_ALLOW_MULTI_INSTANCE").ok().as_deref());
+    let enable_single_instance = !(cfg!(debug_assertions) && allow_multi);
     let builder = tauri::Builder::default();
     let builder = if enable_single_instance {
         builder.plugin(single_instance)
@@ -52,4 +53,32 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running oh-my-ticket desktop")
+}
+
+/// F-U15-4：按仓库 env 约定（docs/runtime/config.md「空即未设置」）解析布尔开关——
+/// 未设置/空串/纯空白/`0`/`false`（忽略大小写）均为关，其余非空值为开。
+fn parse_allow_multi_instance(v: Option<&str>) -> bool {
+    v.map(str::trim)
+        .filter(|v| {
+            !v.is_empty() && !v.eq_ignore_ascii_case("0") && !v.eq_ignore_ascii_case("false")
+        })
+        .is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_allow_multi_instance;
+
+    #[test]
+    fn allow_multi_instance_env_treats_empty_as_unset() {
+        assert!(!parse_allow_multi_instance(None));
+        assert!(!parse_allow_multi_instance(Some("")));
+        assert!(!parse_allow_multi_instance(Some("   ")));
+        assert!(!parse_allow_multi_instance(Some("0")));
+        assert!(!parse_allow_multi_instance(Some("false")));
+        assert!(!parse_allow_multi_instance(Some("False")));
+        assert!(parse_allow_multi_instance(Some("1")));
+        assert!(parse_allow_multi_instance(Some("true")));
+        assert!(parse_allow_multi_instance(Some(" yes ")));
+    }
 }
