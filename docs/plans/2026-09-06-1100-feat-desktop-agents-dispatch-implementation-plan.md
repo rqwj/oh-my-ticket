@@ -269,7 +269,20 @@ stateDiagram-v2
   - config.json 写入权限为 0600
   - config.json 损坏 → `.corrupt-<ts>` 降级空配置不崩
   - 旧 bag 含 opencode/dsh 条目 → 迁移为 defaultHarness / 「后续版本支持」提示
-- **Verification**: contract 层——`harness_list` 投影正确、config 读写/迁移/降级用例过、omp 审批模式实测结论已回填（设置页两条路径的验收在 U7）。
+- **Verification**: contract 层——`harness_list` 投影正确、config 读写/迁移/降级用例过、omp 审批模式实测结论已回填（设置页两条路径的验收在 U7）。后端半已落地（`3cf13d9`）；前端接线拆至 **U1b**（F-U1-3）。
+
+### U1b. Harness 前端接线与 bag v2 迁移
+
+- **Goal**: U1 的前端半（F-U1-3 拆分）：设置页/弹窗消费 `harness_list`，旧 `HarnessSelect`/`tauri:harness` 退役，bag v2 迁移落地——避免 P0 验收漏掉迁移用例。
+- **Requirements**: R-A（前端半）。
+- **Dependencies**: U1（后端 contract）、U6（弹窗消费方）。
+- **Files**: 修改 `apps/desktop/src/store.ts`（bag v2 `{defaultHarness, approvalAck}` 迁移 + `harness_list`/`harness_config_set` 封装）、`apps/desktop/src/WorkspaceSwitcher.tsx`、`apps/desktop/src/SettingsPanel.tsx`、`apps/desktop/src/types.ts`；移除 `apps/desktop/src/HarnessSelect.tsx`；调整 `apps/desktop/tests/store.spec.tsx`（HarnessSelect 用例）与 `apps/desktop/tests/settings-install.spec.tsx`（harness_detect mock）。
+- **Approach**: 旧 bag `{type:'dsh'|'opencode', mode, installPath, devPath}` → v2 `{defaultHarness, approvalAck}`：旧 opencode 条目 → `defaultHarness:'opencode'`（binary 由 U1 探测重填）；旧 dsh 条目 → UI 提示「dsh 后续版本支持」，不静默丢弃。`harness_detect` 保留为薄封装（dsh 插件安装流程仍用）。
+- **Test scenarios**:
+  - 旧 bag opencode 条目 → v2 defaultHarness；dsh 条目 → 提示不丢弃
+  - `harness_list` 经 mock 投影进设置页（沿 store.spec mock 边界）
+- **Verification**: P0 验收「设置页检测/指定并启用」；迁移用例过。
+- **排期**: UI 波次，**U7 之前**。
 
 ### U2. ExecutionManager 与 exec 生命周期
 
@@ -491,7 +504,7 @@ stateDiagram-v2
 
 ### 分期与验收
 
-- **P0 = U1→U8 + U4a + U9 + U13（相关部分）+ U15 中的 single-instance**。建议排序：U15(single-instance) → U1(contract 层) → U4a → U2 → U3 → U4，用 Rust 内联测试 + 假 harness（`sh` 脚本调用 `omt --actor exec:x mcp` 完成 claim/report）在无 UI 状态下打通后端链路，再上 U5 → U6 → U9 → U7 → U8。
+- **P0 = U1→U8 + U1b + U4a + U9 + U13（相关部分）+ U15 中的 single-instance**。建议排序：U15(single-instance) → U1(contract 层) → U4a → U2 → U3 → U4，用 Rust 内联测试 + 假 harness（`sh` 脚本调用 `omt --actor exec:x mcp` 完成 claim/report）在无 UI 状态下打通后端链路，再上 U5 → U6 → U9 → **U1b** → U7 → U8。
   P0 验收：设置页检测/指定并启用 opencode 或 omp → ticket（或 Epic 子树）弹窗派发（成员预览）→ run 自动创建并 start → Agents 列表出现条目（Agent N）→ message 流实时可见 → Runs 面可见 claim/report 进度 → 可终止（终止后重派发可推进，租约死区已消）→ 起动失败呈现 Failed + stderr 尾 → 零配置弹窗引导。
 - **P1 = U10→U14 + U15（余项）+ U16**。
   P1 验收：结构化 transcript、title 动态更新、强退重启后 status/attachment 对账正确（Orphan 只读尾随、已死回填终态）、续跑闭环、信任门可处理、线程泄漏修复、失败系统通知。
