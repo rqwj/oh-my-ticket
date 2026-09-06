@@ -160,7 +160,9 @@ pub fn descriptor_of(id: &str) -> Option<&'static HarnessDescriptor> {
 pub enum BinarySource {
     #[default]
     Detected,
-    Manual { path: String },
+    Manual {
+        path: String,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -184,10 +186,23 @@ pub fn validate_env(env: &BTreeMap<String, String>) -> Result<(), String> {
             return Err(format!("非法环境变量名：{key:?}（空键或含 '='）"));
         }
         if RESERVED_ENV_KEYS.iter().any(|r| *r == key) {
-            return Err(format!("环境变量 {key} 为保留键，由 desktop 注入，拒绝保存"));
+            return Err(format!(
+                "环境变量 {key} 为保留键，由 desktop 注入，拒绝保存"
+            ));
         }
     }
     Ok(())
+}
+
+/// 保存前的整份配置校验（F-U1-6：Manual 空路径在这里拒绝，不要求存在——
+/// 允许「待验证」态）。
+pub fn validate_config(config: &HarnessUserConfig) -> Result<(), String> {
+    if let BinarySource::Manual { path } = &config.binary {
+        if path.trim().is_empty() {
+            return Err("手动指定的 binary 路径不能为空".to_string());
+        }
+    }
+    validate_env(&config.env)
 }
 
 fn harness_config_path(runtime_dir: &Path) -> PathBuf {
@@ -215,6 +230,14 @@ pub fn load_configs(runtime_dir: &Path) -> BTreeMap<String, HarnessUserConfig> {
     }
 }
 
+/// tmp 名含 pid + 进程内序号：即使锁失效（未来跨进程共写），并发写也不会
+/// 共用同一 tmp 路径互相截断（F-U1-2）。
+fn unique_tmp_path(path: &Path) -> PathBuf {
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    path.with_extension(format!("json.tmp-{}-{seq}", std::process::id()))
+}
+
 /// 原子写全部 provider 配置：0600（凭据可能经 env 注入）+ tmp/rename
 /// （先例 daemon.rs register_admin_grant）。
 pub fn save_configs(
@@ -227,10 +250,7 @@ pub fn save_configs(
         .ok_or_else(|| "harness config path has no parent".to_string())?;
     std::fs::create_dir_all(dir).map_err(|e| format!("create_dir_all: {e}"))?;
     let text = serde_json::to_string_pretty(configs).map_err(|e| e.to_string())?;
-    let tmp = path.with_extension(format!(
-        "json.tmp-{}",
-        std::process::id()
-    ));
+    let tmp = unique_tmp_path(&path);
     {
         use std::io::Write;
         let mut file = std::fs::OpenOptions::new()
@@ -272,12 +292,16 @@ impl OpenOptionsUnix for std::fs::OpenOptions {
 #[allow(dead_code)]
 pub fn resolve_program(cfg: &HarnessUserConfig, binary_name: &str) -> Result<PathBuf, String> {
     match &cfg.binary {
-        BinarySource::Detected => which_binary(binary_name)
-            .ok_or_else(|| format!("未在 PATH 检测到 {binary_name}（含常见前缀），可在设置中手动指定")),
+        BinarySource::Detected => which_binary(binary_name).ok_or_else(|| {
+            format!("未在 PATH 检测到 {binary_name}（含常见前缀），可在设置中手动指定")
+        }),
         BinarySource::Manual { path } => {
             let candidate = PathBuf::from(path);
             if !candidate.is_file() {
-                return Err(format!("指定的 harness 路径不存在：{}", candidate.display()));
+                return Err(format!(
+                    "指定的 harness 路径不存在：{}",
+                    candidate.display()
+                ));
             }
             #[cfg(unix)]
             {
@@ -300,6 +324,23 @@ pub fn resolve_program(cfg: &HarnessUserConfig, binary_name: &str) -> Result<Pat
 // ---------------------------------------------------------------------------
 // tauri commands（设置页数据面；探测可能各至 2s，必须 async）
 // ---------------------------------------------------------------------------
+
+/// 进程内写锁（F-U1-2）：async command 并发进入 read-merge-write 会丢更新。
+/// 跨进程文件锁（fs4 flock，F-U15-1 的关闭条件）在 U4a 与 agents/bindings
+/// 做成共用 helper，不在此重复造。
+static CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 锁内的 read-merge-write：设置页快速连续保存两个 provider 也不会互相覆盖。
+pub fn upsert_config(
+    runtime_dir: &Path,
+    id: &str,
+    config: HarnessUserConfig,
+) -> Result<(), String> {
+    let _guard = CONFIG_LOCK.lock().map_err(|_| "config lock poisoned")?;
+    let mut configs = load_configs(runtime_dir);
+    configs.insert(id.to_string(), config);
+    save_configs(runtime_dir, &configs)
+}
 
 fn probe_descriptor(detected: Option<&Path>, d: &HarnessDescriptor) -> Option<String> {
     detected.and_then(|path| probe_version(path, d.probe_args, 2))
@@ -340,10 +381,16 @@ fn harness_entry(d: &HarnessDescriptor, cfg: Option<&HarnessUserConfig>) -> serd
         BinarySource::Manual { path } => Some(path.clone()),
         BinarySource::Detected => None,
     };
+    // F-U1-5：installed 表达「binary 文件真实存在」——Manual 路径缺失时
+    // 不得与 pendingVerification 并存出 true。
+    let installed = match &cfg.binary {
+        BinarySource::Detected => detected_path.is_some(),
+        BinarySource::Manual { path } => Path::new(path).is_file(),
+    };
     serde_json::json!({
         "id": d.id,
         "label": d.label,
-        "installed": detected_path.is_some(),
+        "installed": installed,
         "detectedPath": detected_path.map(|p| p.display().to_string()),
         "detectedVersion": detected_version,
         "enabled": cfg.enabled,
@@ -369,20 +416,19 @@ pub fn harness_list() -> Result<serde_json::Value, String> {
     Ok(serde_json::json!({ "harnesses": harnesses }))
 }
 
-/// 保存一个 provider 的用户配置：校验 id + env（保留键/非法键拒绝），
-/// read-merge-write 原子落盘，返回该 provider 的最新投影。
+/// 保存一个 provider 的用户配置：校验 id + 整份配置（Manual 空路径、env
+/// 保留键/非法键拒绝），锁内 read-merge-write 原子落盘，返回最新投影。
 #[tauri::command(async)]
 pub fn harness_config_set(
     harness: String,
     config: HarnessUserConfig,
 ) -> Result<serde_json::Value, String> {
-    let d = descriptor_of(&harness)
-        .ok_or_else(|| format!("unsupported harness type: {harness}"))?;
-    validate_env(&config.env)?;
+    let d =
+        descriptor_of(&harness).ok_or_else(|| format!("unsupported harness type: {harness}"))?;
+    validate_config(&config)?;
     let runtime_dir = daemon::runtime_dir();
-    let mut configs = load_configs(&runtime_dir);
-    configs.insert(harness.clone(), config);
-    save_configs(&runtime_dir, &configs)?;
+    upsert_config(&runtime_dir, &harness, config)?;
+    let configs = load_configs(&runtime_dir);
     Ok(harness_entry(d, configs.get(&harness)))
 }
 
@@ -453,6 +499,51 @@ mod tests {
                 .any(|n| n.starts_with("config.json.corrupt-")),
             "{restored:?}"
         );
+    }
+
+    #[test]
+    fn validate_config_rejects_empty_manual_path() {
+        let empty = HarnessUserConfig {
+            binary: BinarySource::Manual {
+                path: "   ".to_string(),
+            },
+            ..Default::default()
+        };
+        let err = validate_config(&empty).unwrap_err();
+        assert!(err.contains("不能为空"), "{err}");
+        // 存在性不在这里要求（允许「待验证」态）——合法路径即通过
+        let plausible = HarnessUserConfig {
+            binary: BinarySource::Manual {
+                path: "/opt/harness/maybe-later".to_string(),
+            },
+            ..Default::default()
+        };
+        assert!(validate_config(&plausible).is_ok());
+    }
+
+    #[test]
+    fn concurrent_upsert_does_not_lose_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        std::thread::scope(|scope| {
+            for i in 0..8u32 {
+                let dir = dir.path().to_path_buf();
+                scope.spawn(move || {
+                    for _ in 0..5 {
+                        upsert_config(
+                            &dir,
+                            &format!("provider-{i}"),
+                            HarnessUserConfig {
+                                enabled: true,
+                                ..Default::default()
+                            },
+                        )
+                        .unwrap();
+                    }
+                });
+            }
+        });
+        let configs = load_configs(dir.path());
+        assert_eq!(configs.len(), 8, "并发 upsert 不得丢 key：{configs:?}");
     }
 
     #[cfg(unix)]
@@ -545,7 +636,9 @@ mod tests {
             },
             ..Default::default()
         };
-        assert!(resolve_program(&cfg, "tool").unwrap_err().contains("不可执行"));
+        assert!(resolve_program(&cfg, "tool")
+            .unwrap_err()
+            .contains("不可执行"));
         std::fs::set_permissions(&non_exec, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(resolve_program(&cfg, "tool").unwrap(), non_exec);
 
@@ -592,6 +685,7 @@ mod tests {
             }),
         );
         assert_eq!(pending["state"], "pendingVerification");
+        assert_eq!(pending["installed"], false, "F-U1-5：路径缺失不得报已安装");
 
         // 默认配置（Detected）→ installed 跟随探测（测试环境无 omp 也可能真有——
         // 只断言 state 与 installed 自洽）
