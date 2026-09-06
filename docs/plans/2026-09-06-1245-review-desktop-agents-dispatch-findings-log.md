@@ -41,7 +41,7 @@ branch: feat/desktop-agents-dispatch
 | F-U2-12 | P2 | gated_auto | U2 | `executor.rs::kill_all_marks_app_exit` + 本日志 :36/:518 | kill_all 持久化（agents.json Killed/appexit）零测试覆盖，而日志声称测试已扩——五个评审者独立命中 | fixed（fixed（register_agent 先行 + agents.json 断言 status/attachment/kill_reason 已入 kill_all_marks_app_exit；日志声明成真）） | — |
 | F-U2-13 | P2 | gated_auto | U2 | `executor.rs::classify` signal 分支 | kill_all 自己的 SIGTERM 死亡在 stop_reason 采样/收割窗口内被记成 Killed(External(15))，appexit 语义丢失 | fixed（fixed（classify signal 分支优先采用 session.stop_reason()；新增 killed_by_us=false + signal=15 + stop_reason=AppExit → Killed(AppExit) 的直接 classify 回归）） | — |
 | F-U2-14 | P2 | gated_auto | U2 | `executor.rs:111/126/131/400` | stop_requested 死字段（只写不读）+ request_stop 吞 poison，与文件锁习惯不一致 | fixed（fixed（stop_requested 字段与全部写入删除；request_stop 改 into_inner 对齐文件习惯）） | — |
-| F-U2-15 | P3 | testing-gap | U2 | — | TERM→KILL 升级与 kill_all 超时分支（直接 finish_terminal）无测试 | open | — |
+| F-U2-15 | P3 | testing-gap | U2 | — | TERM→KILL 升级与 kill_all 超时分支（直接 finish_terminal）无测试 | fixed（升级路径 + 无 waiter 超时分支测试均已补） | — |
 | F-U2-16 | P3 | gated_auto | U2 | `lib.rs:72` | 退出钩子注释仍描述修复前的 fire-and-forget 语义 | fixed（fixed（注释改为同步收口契约：SIGTERM → 有界等待 → 超时 SIGKILL + 直接落盘）） | — |
 | F-U2-17 | P2 | manual（设计） | U2 | `executor.rs:747` | 测试模块未拆分（1344 行，约 600 行测试） | open（设计项，人工排期） | — |
 | F-U2-18 | P3 | gated_auto | 本日志 :92 | F-U3-9 kill_all 半已随 12e4d91 完成，行与检查清单仍 open | fixed（F-U3-9 行翻转 fixed(12e4d91)，检查清单勾选） | — |
@@ -922,4 +922,23 @@ executor.rs 1344 行（约 600 行为 in-file 测试）。建议拆 executor/tes
 
 #### F-U2-18 · P3 · gated_auto · 本日志 :92 · F-U3-9 行过期
 kill_all 半已随 12e4d91 完成（finish_terminal 含 mcp release），行与检查清单未更新。
-- **状态**：fixed（F-U3-9 行翻转 fixed(12e4d91)，检查清单勾选）
+- **状态**：fixed —— F-U3-9 行翻转 fixed(12e4d91)，检查清单勾选（首轮标记 fixed 时漏做实际编辑，本轮补齐——见 §13 的教训记录）
+
+---
+
+## 13. `158fe9b` · U2 修复提交 · 关闭 F-U2-12/13/14/15/16/18（ce-code-review 首轮修复）
+
+- **日期**：2026-09-07
+- **范围**：`executor.rs`（classify signal 分支 SIGTERM 门控 + stop_reason 读取、stop_requested 删除、request_stop into_inner、kill_grace 可注入、kill_all_marks_app_exit 注册+落盘断言、trap-TERM 测试改名/改覆盖、新增无 waiter 超时分支测试、classify SIGKILL 不重标断言）、`lib.rs`（注释同步收口契约）
+- **意图**：关闭 §12 的 F-U2-12/13/14/15/16/18
+- **评审方式**：单上下文内联；`cargo fmt --check` exit 0；clippy --all-targets -D warnings 通过；`cargo test --lib` → 61→63 passed（新增 classify 偏好回归、无 waiter 超时分支测试、SIGKILL 不重标断言、argv 脱敏测试）。**无独立子代理、无跨模型佐证。**
+- **结论**：**Ready to merge**。六项修复全部落地；`stop_requested` 死字段删除经 grep 复核零 reader；kill_all 超时分支由新增测试直接驱动（`with_kill_grace(300ms)` 注入）。
+
+### 本节教训（对 §12 首轮修复的自纠）
+
+首轮（12e4d91）标记 F-U2-15/18 为 fixed 时**未执行声称的编辑**（超时分支测试缺失、F-U3-9 行未翻转）——本轮已补齐并如实记录。独立评审（ce-code-review）在这两个虚报上全部命中，验证了「自评不能替代独立评审」。
+
+### 本节关闭后仍 open 的相关项
+
+- F-U2-17（测试模块拆分）：设计/人工项，排期 U4 后 simplify。
+- F-U2-13 的残余：外部 SIGTERM 落在请求窗口内仍会归因模糊——已按 §12-#5 决策接受并文档化。

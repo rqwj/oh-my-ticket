@@ -257,12 +257,14 @@ pub struct ExecutionManager {
     sessions: Mutex<HashMap<String, Arc<ExecSession>>>,
     startup_window: Option<Duration>,
     max_duration: Option<Duration>,
+    /// kill_all 的有界等待时长（SIGTERM 后给优雅退出的宽限；测试可缩短）
+    kill_grace: Option<Duration>,
 }
 
 impl ExecutionManager {
     /// tauri 管理的构造入口：执行启动 demote（F-U4a-2）。
     pub fn new() -> Self {
-        let mgr = Self::with_limits(STARTUP_WINDOW, DEFAULT_MAX_DURATION);
+        let mgr = Self::with_kill_grace(STARTUP_WINDOW, DEFAULT_MAX_DURATION, KILL_GRACE);
         match agents::demote_live_agents(&daemon::runtime_dir()) {
             Ok(n) if n > 0 => eprintln!("启动 demote：{n} 个 Live agent 已降级（app 重启）"),
             Err(err) => eprintln!("启动 demote 失败：{err}"),
@@ -277,10 +279,19 @@ impl ExecutionManager {
     }
 
     fn with_limits(startup_window: Duration, max_duration: Duration) -> Self {
+        Self::with_kill_grace(startup_window, max_duration, KILL_GRACE)
+    }
+
+    fn with_kill_grace(
+        startup_window: Duration,
+        max_duration: Duration,
+        kill_grace: Duration,
+    ) -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
             startup_window: Some(startup_window),
             max_duration: Some(max_duration),
+            kill_grace: Some(kill_grace),
         }
     }
 
@@ -290,6 +301,10 @@ impl ExecutionManager {
 
     fn max_duration(&self) -> Duration {
         self.max_duration.unwrap_or(DEFAULT_MAX_DURATION)
+    }
+
+    fn kill_grace(&self) -> Duration {
+        self.kill_grace.unwrap_or(KILL_GRACE)
     }
 
     /// spawn 一个 harness 会话并接入事件泵。`runtime_dir` 用于 OMT_RUNTIME_DIR
@@ -557,7 +572,7 @@ impl ExecutionManager {
             session.request_stop(reason);
             session.kill_tree(libc::SIGTERM);
         }
-        let deadline = Instant::now() + KILL_GRACE + Duration::from_secs(2);
+        let deadline = Instant::now() + self.kill_grace() + Duration::from_secs(2);
         loop {
             pending.retain(|s| s.terminal().is_none());
             if pending.is_empty() || Instant::now() >= deadline {
@@ -635,7 +650,15 @@ fn classify(
         return Terminal::Killed(kill_reason.unwrap_or(KillReason::User));
     }
     if let Some(sig) = signal {
-        return Terminal::Killed(session.stop_reason().unwrap_or(KillReason::External(sig)));
+        // F-U2-13：desktop 自己发的 SIGTERM（waiter 升级或 kill_all）按已请求
+        // 的原因收口；#5 决策：其余信号（外部 SIGKILL/SEGV 等）保持 External
+        // 归因——窗口内外部 SIGTERM 的归因模糊已接受并在此文档化。
+        let reason = if sig == libc::SIGTERM {
+            session.stop_reason().unwrap_or(KillReason::External(sig))
+        } else {
+            KillReason::External(sig)
+        };
+        return Terminal::Killed(reason);
     }
     let code = code.unwrap_or(-1);
     let produced_output = session.first_event_seen.load(Ordering::Relaxed);
@@ -1075,9 +1098,144 @@ mod tests {
     }
 
     #[test]
-    fn term_immune_child_exercises_kill_all_timeout_branch() {
-        // F-U2-15：SIGTERM 免疫的子进程走 kill_all 的超时分支（直接
-        // finish_terminal），仍以 Killed(AppExit) 落盘
+    fn classify_keeps_external_attribution_for_non_sigterm_deaths() {
+        // #5 决策：signal 分支的 stop_reason 偏好仅适用于 desktop 发的
+        // SIGTERM；外部 SIGKILL 即使有 pending stop_reason 也保持 External。
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        let home_path = dir.path().join("ws").join(".omt");
+        std::fs::create_dir_all(&home_path).unwrap();
+        let agent = agents::register_agent(
+            &runtime,
+            "h_test",
+            "fake",
+            NewExec {
+                exec_id: "exec-sigkill".into(),
+                node_id: None,
+                run_id: None,
+                binary_path: None,
+                binary_args: vec![],
+            },
+        )
+        .unwrap();
+        let session = ExecSession {
+            exec_id: "exec-sigkill".into(),
+            agent_id: agent.id.clone(),
+            home_id: "h_test".into(),
+            harness: "fake".into(),
+            node_id: None,
+            run_id: None,
+            pid: u32::MAX,
+            pgid: i32::MAX - 1,
+            program: PathBuf::from("/bin/echo"),
+            args: vec![],
+            cwd: PathBuf::from("/"),
+            started_at_epoch_ms: agents::now_epoch_ms(),
+            raw_log: runtime.join("transcripts").join("h_test").join("x.raw.log"),
+            runtime_dir: runtime.clone(),
+            mcp: McpInjection::None,
+            started: Instant::now(),
+            sink: Arc::new(|_| {}),
+            first_event_seen: AtomicBool::new(true),
+            stop_reason: Mutex::new(Some(KillReason::AppExit)),
+            terminal: Mutex::new(None),
+        };
+        let terminal = classify(
+            &session,
+            None,
+            Some(9),
+            false,
+            None,
+            session.started,
+            STARTUP_WINDOW,
+        );
+        assert_eq!(terminal, Terminal::Killed(KillReason::External(9)));
+    }
+
+    #[test]
+    fn kill_all_timeout_branch_settles_unwaited_session() {
+        // F-U2-15（实质）：TERM 免疫 + 无等待线程的会话走 kill_all 的超时
+        // 分支（SIGKILL + 直接 finish_terminal），agents.json 仍落
+        // Killed(AppExit)/kill_reason=appexit。kill_grace 缩短以控制时长。
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        let home_path = dir.path().join("ws").join(".omt");
+        std::fs::create_dir_all(&home_path).unwrap();
+        let manager = ExecutionManager::with_kill_grace(
+            STARTUP_WINDOW,
+            DEFAULT_MAX_DURATION,
+            Duration::from_millis(300),
+        );
+        let script = write_script(dir.path(), "stubborn2", "trap '' TERM\nsleep 30\n");
+        let (tx, _rx) = mpsc::channel();
+        let sink: EventSink = Arc::new(move |v| {
+            let _ = tx.send(v);
+        });
+        let agent = agents::register_agent(
+            &runtime,
+            "h_test",
+            "fake",
+            NewExec {
+                exec_id: "exec-stubborn2".into(),
+                node_id: None,
+                run_id: None,
+                binary_path: None,
+                binary_args: vec![],
+            },
+        )
+        .unwrap();
+        let session = manager
+            .spawn(
+                &runtime,
+                SpawnRequest {
+                    exec_id: "exec-stubborn2".into(),
+                    agent_id: agent.id.clone(),
+                    home_id: "h_test".into(),
+                    home_path: home_path.clone(),
+                    harness: "fake".into(),
+                    node_id: None,
+                    run_id: None,
+                    program: script,
+                    args: vec![],
+                    env_additions: BTreeMap::new(),
+                    mcp: McpInjection::None,
+                },
+                sink,
+            )
+            .unwrap();
+        let started = Instant::now();
+        manager.kill_all(KillReason::AppExit);
+        let elapsed = started.elapsed();
+        assert_eq!(
+            session.terminal(),
+            Some(Terminal::Killed(KillReason::AppExit)),
+            "无等待线程的会话应由 kill_all 直接 finish_terminal"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(250) && elapsed < Duration::from_secs(8),
+            "kill_all 应在 kill_grace 超时后返回：{elapsed:?}"
+        );
+        // agents.json 已落 Killed(AppExit)/kill_reason=appexit
+        let (file, parse_failed) = crate::atomic_json::read_json::<crate::agents::AgentsFile>(
+            &runtime.join("agents").join("h_test").join("agents.json"),
+        )
+        .unwrap();
+        assert!(!parse_failed);
+        assert_eq!(
+            file.agents[0].status,
+            crate::agents::AgentRecordStatus::Killed
+        );
+        assert_eq!(
+            file.agents[0].execs[0].kill_reason.as_deref(),
+            Some("appexit")
+        );
+    }
+
+    #[test]
+    fn term_immune_child_escalates_to_sigkill_via_exec_stop() {
+        // F-U2-15（部分）：SIGTERM 免疫的子进程经 exec_stop → waiter 的
+        // TERM→KILL 升级清除，终态 Killed(User)。（kill_all 的超时分支由
+        // kill_all_timeout_branch_settles_unwaited_session 单独覆盖）
         let dir = tempfile::tempdir().unwrap();
         let runtime = dir.path().join("runtime");
         let home_path = dir.path().join("ws").join(".omt");
@@ -1391,12 +1549,26 @@ mod tests {
             terminal,
             Some(Terminal::Killed(KillReason::AppExit))
         ));
-        // F-U2-12：kill_all 路径必须真正落盘（F-U2-1 修复的验收断言）
-        let (file, parse_failed) = crate::atomic_json::read_json::<crate::agents::AgentsFile>(
-            &runtime.join("agents").join("h_test").join("agents.json"),
-        )
-        .unwrap();
-        assert!(!parse_failed);
+        // F-U2-12：kill_all 路径必须真正落盘（F-U2-1 修复的验收断言）。
+        // finish_terminal 先置 terminal 再写文件——用轮询读消除断言与持久化
+        // 写入之间的竞态（correctness 评审指出的 read-race）。
+        let agents_file = runtime.join("agents").join("h_test").join("agents.json");
+        let persisted = wait_for(
+            || {
+                let (file, parse_failed) =
+                    crate::atomic_json::read_json::<crate::agents::AgentsFile>(&agents_file)
+                        .unwrap_or_default();
+                (!parse_failed
+                    && file.agents.iter().any(|a| {
+                        a.execs
+                            .iter()
+                            .any(|e| e.kill_reason.as_deref() == Some("appexit"))
+                    }))
+                .then_some(file)
+            },
+            Duration::from_secs(3),
+        );
+        let file = persisted.expect("agents.json 应在 3s 内落 Killed/appexit");
         assert_eq!(
             file.agents[0].status,
             crate::agents::AgentRecordStatus::Killed
@@ -1404,10 +1576,6 @@ mod tests {
         assert_eq!(
             file.agents[0].attachment,
             crate::agents::AgentAttachment::None
-        );
-        assert_eq!(
-            file.agents[0].execs[0].kill_reason.as_deref(),
-            Some("appexit")
         );
     }
 
