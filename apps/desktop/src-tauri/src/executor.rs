@@ -1090,7 +1090,9 @@ mod tests {
             None,
             Some(15),
             false,
-            Some(KillReason::AppExit),
+            // F-U2-13 验证器 #2：必须传 None——只有 session.stop_reason() 读取
+            // 能让断言通过；传 Some 会掩蔽 kill_reason 参数化重构的回归。
+            None,
             session.started,
             STARTUP_WINDOW,
         );

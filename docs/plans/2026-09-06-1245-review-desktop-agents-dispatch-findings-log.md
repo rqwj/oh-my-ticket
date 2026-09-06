@@ -82,7 +82,7 @@ branch: feat/desktop-agents-dispatch
 | F-U3-6 | P3 | gated_auto | U3 | `mcp_injection.rs::workspace_hash` | 路径未 canonicalize，symlink 拆分 refcount | fixed(b3500cb) | — |
 | F-U3-7 | P3 | gated_auto | U3 | `mcp_injection.rs::remove_launcher` | 定义了但从未调用，launcher 累积 | fixed(b3500cb)（`McpInjection::Omp` 加 `launcher_id`，每次 release 都删自己的） | — |
 | F-U3-8 | P3 | gated_auto | U3 | `mcp_injection.rs::merge_omp_mcp` | 用户工作区文件非原子写 | fixed(b3500cb)（统一 tmp+rename） | — |
-| F-U3-9 | P3 | advisory | U3→U4 | 补偿表 ⑦/⑧ | spawn 失败路径不释放已 prepare 的注入 | 半 fixed(b3500cb)：spawn 失败已修；kill_all 路径 open，待 F-U2-1 | — |
+| F-U3-9 | P3 | advisory | U3→U4 | 补偿表 ⑦/⑧ | spawn 失败路径不释放已 prepare 的注入 | fixed(12e4d91)：spawn 失败已修；kill_all 路径随 finish_terminal 的 mcp release 完成 | — |
 | F-U3-10 | P3 | advisory | U3 | `mcp_injection.rs` persistent 混用 | 非 persistent release 可能恢复 backup、抹掉 persistent 注入 | fixed(b3500cb)（release/scrub 改为按 launcher_id 精确匹配，各管各的） | — |
 
 ## 待办的跨阶段事项（由 findings 派生）
@@ -90,13 +90,13 @@ branch: feat/desktop-agents-dispatch
 - [x] ~~U4a 落地时回看 F-U15-1~~ 已于 43bf89f 关闭（harness config + agents.json 两条已覆盖）。
 - [ ] U9 落地 bindings.json 时确认走 `atomic_json`（F-U15-1 的第三条写路径）；同时按 F-U4a-1 把 GC 冻结改为粘性判定。
 - [x] ~~U2 开工时落地 F-U4a-2 与 F-U4a-6~~ 已于 b8b00f8 关闭。
-- [ ] U4 接线前修 F-U2-1（AppExit 落盘）与 F-U2-2（起动窗判据）——两者都影响 P0 验收「起动失败呈现 Failed + stderr 尾」与「终止后终态正确」。
+- [x] ~~U4 接线前修 F-U2-1（AppExit 落盘）与 F-U2-2（起动窗判据）~~ 已于 12e4d91 关闭。
 - [ ] 计划定 transcript `.jsonl` header/事件写入的归属（F-U2-7），U10 之前必须存在。
 - [ ] P0 桌面冒烟时执行 F-U15-3 的手工双开验证并回填记录（可顺手用 `OMT_ALLOW_MULTI_INSTANCE` 写 dev 自动化脚本）。
 - [x] ~~下次触碰 lib.rs 时顺手关 F-U15-4；下次改 dev-notes 时顺手关 F-U15-5~~ 已于 7be3f76 关闭。
 - [x] ~~U4 接线前修 F-U3-2（daemon 静默降级 actor）~~ 已于 b3500cb 关闭（含 daemon 侧 `Registry::issue` 测试）——U4 现在可以放心假设 `executor_session_id` 以 `/exec:<execId>` 结尾即可定位派发方。
 - [ ] U4 前关 F-U3-15/16（P1，§8 漏检）并决策 F-U3-14；F-U3-11/12/13 建议随同一 fix commit（§10）。
-- [ ] U4 补上剩下半边的 F-U3-9：`kill_all` 路径（依赖 F-U2-1 先修）走 release，才能让 app 强退后的 omp 注入也被正常释放而不是等下次启动 sweep。
+- [x] ~~U4 补上剩下半边的 F-U3-9：`kill_all` 路径（依赖 F-U2-1 先修）走 release~~ 已于 12e4d91 关闭（kill_all 经 finish_terminal 的 mcp release 释放）。
 
 ---
 
