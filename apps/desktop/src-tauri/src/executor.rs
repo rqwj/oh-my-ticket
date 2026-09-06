@@ -976,22 +976,37 @@ mod tests {
     fn spawn_failure_releases_mcp_injection() {
         // F-U3-9: any spawn() error path must release an already-prepared
         // MCP bridge — nobody else will ever call finish_terminal for a
-        // session that never got created.
+        // session that never got created. Go through the real prepare
+        // path (pub(crate) `prepare_with`, injectable omt_path) rather
+        // than hand-building a McpInjection — release now drives launcher
+        // deletion off the tracked `launchers` set in state.json
+        // (F-U3-12), which a hand-built value bypasses entirely.
+        use crate::mcp_injection;
         let dir = tempfile::tempdir().unwrap();
         let runtime = dir.path().join("runtime");
-        let home_path = dir.path().join("ws").join(".omt");
+        let workspace = dir.path().join("ws");
+        let home_path = workspace.join(".omt");
         std::fs::create_dir_all(&home_path).unwrap();
-        // 手工布置一个"已注入"的 omp launcher（模拟 U4 在 spawn 前已调用
-        // mcp_injection::prepare）——只关心 spawn 失败时是否被释放。
-        let launcher_dir = runtime.join("harness").join("omp-launchers");
-        std::fs::create_dir_all(&launcher_dir).unwrap();
-        let launcher_path = launcher_dir.join("test-launcher.sh");
-        std::fs::write(&launcher_path, "#!/bin/sh\n").unwrap();
-        let mcp = McpInjection::Omp {
-            workspace_root: dir.path().join("ws"),
-            persistent: false,
-            launcher_id: "test-launcher".into(),
-        };
+        let fake_omt = dir.path().join("omt");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(&fake_omt, "#!/bin/sh\necho fake omt\n").unwrap();
+            std::fs::set_permissions(&fake_omt, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mcp = mcp_injection::prepare_with(
+            &fake_omt,
+            &runtime,
+            &workspace,
+            "omp",
+            "exec-mcp-fail",
+            false,
+        )
+        .unwrap();
+        let launcher_path = runtime
+            .join("harness")
+            .join("omp-launchers")
+            .join("exec-mcp-fail.sh");
+        assert!(launcher_path.is_file(), "prepare 应已写出 launcher");
         let manager = ExecutionManager::with_limits(STARTUP_WINDOW, DEFAULT_MAX_DURATION);
         let (tx, _rx) = mpsc::channel();
         let sink: EventSink = Arc::new(move |v| {

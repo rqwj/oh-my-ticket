@@ -92,6 +92,7 @@ pub fn serve(globals: &GlobalArgs) -> Result<i32, Problem> {
     // Restricted enrollment: node/run/events only — home administration
     // and adapter UI bags stay outside the agent surface (R7).
     let (actor, name) = enroll_identity(globals);
+    let requested_actor = actor.clone();
     let options = omt_client::EnrollOptions {
         kind: "mcp".into(),
         name: Some(name),
@@ -104,6 +105,17 @@ pub fn serve(globals: &GlobalArgs) -> Result<i32, Problem> {
         &options,
         &["node", "run", "events"],
     )?;
+
+    // F-U3-14: `Registry::issue` (auth.rs) downgrades an out-of-policy
+    // actorNamespace request SILENTLY (never errors) — a length overflow
+    // past its 64-char cap looks identical to a successful enroll from
+    // here. Detect the mismatch so it is at least visible in the log
+    // instead of only manifesting later as an unmatchable
+    // executor_session_id.
+    let granted = enrollment.handshake["credential"]["actorNamespace"].as_str();
+    if identity_downgraded(&requested_actor, granted) {
+        log_line("warning: daemon granted a narrower actor namespace than requested (see auth.rs Registry::issue)");
+    }
 
     log_line("mcp server ready (scoped grant: node/run/events)");
 
@@ -292,6 +304,21 @@ fn write_frame(writer: &mut impl Write, body: &str) -> std::io::Result<()> {
 /// 也不以其为前缀，会被**静默**降级回 `mcp:<pid>`，且不报错。因此这里把请求
 /// 的 actor 规整成 `mcp:<pid>/exec:<execId>` 这一嵌套形式再送去 enroll，才能
 /// 被 daemon 实际采纳；未指定时保持 `mcp:<pid>` 兼容（F18/F19：原为硬编码）。
+///
+/// **F-U3-14（决策，二次评审 §10）**：嵌套形式把 pid 重新绑进了身份——如果
+/// harness 中途重启 `omt mcp`（新 pid），新连接的 actor 变成
+/// `mcp:<新pid>/exec:<execId>`，与旧连接持有的租约 actor 不再字符串相等，
+/// `authorize_report` 会拒绝用旧租约 report。**这是刻意接受的 v1 权衡**，
+/// 而非需要在 daemon 侧放行裸 `exec:` 前缀的理由——后者需要修改
+/// `Registry::issue` 的授权策略，属于独立安全评审范畴，不在本单元做。MCP
+/// 中途重启视为罕见事件，交给既有的 15 分钟租约 TTL（interrupted → retry）
+/// 兜底恢复，与 desktop/执行器崩溃走的是同一条路径。desktop 侧按
+/// `executor_session_id.ends_with("/exec:<execId>")` 匹配，不做精确相等。
+///
+/// 64 字符上限（`Registry::issue`）留给 execId 的预算：`mcp:` + pid（最多
+/// 7 位）+ `/exec:` 已占约 17 字符，execId 建议控制在 40 字符以内；超限会
+/// 被静默降级（见 `serve()` 里 enroll 后的 `identity_downgraded` 检测）。
+///
 /// 返回 (actor, name)。
 fn enroll_identity(globals: &GlobalArgs) -> (String, String) {
     let base = format!("mcp:{}", std::process::id());
@@ -301,6 +328,13 @@ fn enroll_identity(globals: &GlobalArgs) -> (String, String) {
     };
     let name = format!("omt-mcp-{actor}");
     (actor, name)
+}
+
+/// F-U3-14: 真代表 daemon 实际授予的 actorNamespace 与我们请求的不同——
+/// `Registry::issue` 对策略外的请求是**静默**降级（从不报错），这是唯一能
+/// 探知它发生过的方式。纯函数，不依赖真实 daemon 连接，便于单测覆盖。
+fn identity_downgraded(requested: &str, granted: Option<&str>) -> bool {
+    granted != Some(requested)
 }
 
 #[cfg(test)]
@@ -331,5 +365,12 @@ mod tests {
         let (actor, _name) = enroll_identity(&globals(None));
         assert!(actor.starts_with("mcp:"), "{actor}");
         assert!(!actor.contains('/'), "{actor}");
+    }
+
+    #[test]
+    fn identity_downgraded_detects_daemon_mismatch() {
+        assert!(!identity_downgraded("mcp:1/exec:e1", Some("mcp:1/exec:e1")));
+        assert!(identity_downgraded("mcp:1/exec:e1", Some("mcp:1")));
+        assert!(identity_downgraded("mcp:1/exec:e1", None));
     }
 }

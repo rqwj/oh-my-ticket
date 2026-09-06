@@ -13,6 +13,36 @@
 //!   模式（设置项，U7 透传）用固定名 launcher 幂等合并、不备份不恢复，与
 //!   per-exec 注入互不覆盖对方的引用（F-U3-10）。
 //!
+//! omp 注入的生命周期簿记（二次评审 §10 修复，F-U3-11/12/15/16/17/18）：
+//! - **state.json 在 merge 之前先记 `workspace`**（F-U3-15）：merge 与"记录
+//!   这是哪个 workspace"之间的崩溃窗口，是 sweep 能否找到并清理该目录的
+//!   分界——先记再改，窗口内至多留下"文件已改但没人认领"，而不是"文件
+//!   已改且从此没人知道要清理"。首个 exec 备份原文件前还会先扫一遍现存
+//!   `omt` 条目，若其 command 落在 `omp-launchers/` 下（persistent 的固定
+//!   路径除外）就先剔除——防止上一轮崩溃的残留被当成"用户原始内容"永久
+//!   烙进未来所有恢复。
+//! - **`launchers` 数组 + 推迟删除**（F-U3-12）：mcp.json 的 `omt.command`
+//!   永远只指向"最近一次 merge"的那个 launcher，不一定是当前正在 release
+//!   的那个——提前删自己的 launcher 曾经让仍被引用的脚本消失。本模块改为
+//!   把整批 exec 用过的 launcher id 记进 state，全部留到批次最终 release
+//!   （`finalize_release`）才一次性清空。
+//! - **`userModified` 粘性标记**（F-U3-16）：hash 比对只能发现"最近一次
+//!   merge 之后"的改动——两个重叠 exec 之间发生的用户编辑会被第二次
+//!   merge 悄悄吸收进新基线。每次非首个 exec 的 prepare，在 merge 之前先
+//!   比对当前文件与上一次写入的 hash，不符就置粘性标记，最终 release 时
+//!   与即时 hash 比对结果 OR 在一起。
+//! - **外科手术分支保留备份**（F-U3-11）：备份在删除 state 目录**之前**
+//!   原子拷到 `<hash>.last-backup.json`（state 目录之外，sweep 的
+//!   `is_dir()` 过滤天然跳过它）——旧实现日志说"备份保留"，随后却把整个
+//!   目录连 backup.json 一起删了。
+//! - **sweep 逐目录 log-and-continue**（F-U3-17）：一个 workspace 恢复失败
+//!   不再中止其余 workspace 的清理；sweep 在每次启动都跑，卡死一次就是
+//!   永久卡死。
+//! - **sweep 不再整体清空 launcher 目录**（F-U3-18）：per-workspace
+//!   `finalize_release` 已经清了自己追踪到的 launcher；末尾兜底只逐文件删
+//!   真正的孤儿，**跳过 persistent.sh**——persistent 没有 state 目录，每次
+//!   正常重启都要用到它。
+//!
 //! 身份纪律（§3.3）：每个 exec 的 MCP 启动参数带 `--actor exec:<execId>`，
 //! 经 per-exec launcher 脚本实现（omp 的 mcp.json 是共享文件，不能内嵌
 //! per-exec 参数）；opencode 的 env 天然 per-process。
@@ -41,8 +71,8 @@ pub enum McpInjection {
         workspace_root: PathBuf,
         persistent: bool,
         /// launcher 脚本 id（不含 `.sh` 后缀）：非 persistent 为 exec_id，
-        /// persistent 为固定 `"persistent"`（跨多次派发复用，release 不删，
-        /// F-U3-7）。
+        /// persistent 为固定 `"persistent"`。仅供展示/调试——实际删除时机
+        /// 由 state.json 的 `launchers` 集合统一管理（F-U3-12）。
         launcher_id: String,
     },
 }
@@ -106,6 +136,14 @@ fn launcher_path(runtime_dir: &Path, launcher_id: &str) -> PathBuf {
     omp_launchers_dir(runtime_dir).join(format!("{launcher_id}.sh"))
 }
 
+/// 目录前缀比较用；带尾部分隔符，避免 "omp-launchers" 误匹配
+/// "omp-launchers-other" 这类兄弟目录（纯字符串 `starts_with` 的陷阱）。
+fn omp_launchers_prefix(runtime_dir: &Path) -> String {
+    let mut s = omp_launchers_dir(runtime_dir).display().to_string();
+    s.push(std::path::MAIN_SEPARATOR);
+    s
+}
+
 fn single_quote(path: &str) -> String {
     format!("'{}'", path.replace('\'', "'\\''"))
 }
@@ -121,7 +159,12 @@ fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
         std::process::id()
     ));
     std::fs::write(&tmp, text).map_err(|e| format!("write tmp: {e}"))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("rename: {e}"))
+    std::fs::rename(&tmp, path).map_err(|e| {
+        // F-U3-13：rename 失败不留 tmp——否则每次失败都在用户工作区（或
+        // state 目录）多一个孤儿文件。
+        let _ = std::fs::remove_file(&tmp);
+        format!("rename: {e}")
+    })
 }
 
 /// 写 launcher：`omt [--actor <actor>] mcp` 的包装脚本（omp 的 mcp.json 是
@@ -160,9 +203,6 @@ fn write_launcher(
     Ok(path)
 }
 
-/// F-U3-7：每个 exec 用完自己的 launcher 就删——refcount 只决定 workspace
-/// 文件何时恢复，与某个 launcher 文件是否还有用是两回事（mcp.json 的
-/// `omt` 条目每次 merge 都被覆盖，只有最后写入的那个 launcher 是"活的"）。
 fn remove_launcher(runtime_dir: &Path, launcher_id: &str) {
     let _ = std::fs::remove_file(launcher_path(runtime_dir, launcher_id));
 }
@@ -189,14 +229,12 @@ fn merge_omp_mcp(workspace_root: &Path, launcher: &Path) -> Result<String, Strin
     Ok(stable_hash_hex(text.as_bytes()))
 }
 
-/// F-U3-3/F-U3-10 外科手术式移除：只删 `mcpServers.omt`，且**只当它的
-/// command 精确等于我们这次写入的 launcher 路径**才动手——不是任何
-/// `omp-launchers` 路径都算数（否则会误删 persistent 注入，F-U3-10）。
-/// 保留用户在执行期间对文件做的其它改动；解析失败/结构不符则什么都不做
+/// 外科手术式移除 `mcpServers.omt`：只有 `is_ours(command)` 为真才动手，
+/// 保留用户在执行期间对文件做的其它改动。解析失败/结构不符则什么都不做
 /// （文件已经不是我们能安全修的东西）。
-fn remove_omt_entry_if_matches(
+fn remove_omt_entry_if(
     workspace_file: &Path,
-    expected_command: &str,
+    is_ours: impl Fn(&str) -> bool,
 ) -> Result<(), String> {
     let Ok(text) = std::fs::read_to_string(workspace_file) else {
         return Ok(()); // 文件已不存在
@@ -211,13 +249,39 @@ fn remove_omt_entry_if_matches(
         .get("omt")
         .and_then(|v| v.get("command"))
         .and_then(|v| v.as_str())
-        == Some(expected_command);
+        .map(&is_ours)
+        .unwrap_or(false);
     if !matches {
-        return Ok(()); // 已被别的注入（如 persistent）接管，不是我们的了
+        return Ok(()); // 不是我们这次写的那个（已被别的注入接管，或压根不存在）
     }
     servers.remove("omt");
     let text = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
     write_atomic(workspace_file, &text)
+}
+
+/// F-U3-3/F-U3-10：精确匹配——只当 command **等于**我们这次写入的那个才删。
+fn remove_omt_entry_if_matches(
+    workspace_file: &Path,
+    expected_command: &str,
+) -> Result<(), String> {
+    remove_omt_entry_if(workspace_file, |cmd| cmd == expected_command)
+}
+
+/// F-U3-15：宽匹配兜底——用于我们已丢失确切 command 记录的场合（state 不
+/// 完整）。只要求 command 落在我们的 launcher 目录下，但**显式排除**
+/// persistent 的固定路径，避免误删一个此刻可能合法存在的 persistent 注入
+/// （F-U3-10 同款风险，这里换了个触发路径）。
+fn remove_omt_entry_if_under_launchers_dir(
+    runtime_dir: &Path,
+    workspace_file: &Path,
+) -> Result<(), String> {
+    let prefix = omp_launchers_prefix(runtime_dir);
+    let persistent = launcher_path(runtime_dir, "persistent")
+        .display()
+        .to_string();
+    remove_omt_entry_if(workspace_file, |cmd| {
+        cmd.starts_with(&prefix) && cmd != persistent
+    })
 }
 
 fn omp_state(state_dir: &Path) -> serde_json::Value {
@@ -263,9 +327,18 @@ fn prepare_omp_with(
     let state_dir = omp_state_dir(runtime_dir, workspace_root);
     let mut state = omp_state(&state_dir);
     let refcount = state["refcount"].as_u64().unwrap_or(0);
+    let workspace_file = omp_workspace_file(workspace_root);
     if refcount == 0 {
-        // 首个 exec：备份原文件（内容原样存 runtime dir，不在工作区留副本）
-        let workspace_file = omp_workspace_file(workspace_root);
+        // F-U3-15：先记 `workspace` 再动用户文件——merge 与这次写之间的
+        // 崩溃窗口，决定 sweep 到底能不能找到这个目录。
+        state["workspace"] = serde_json::json!(workspace_root.to_string_lossy());
+        write_omp_state(&state_dir, &state)?;
+
+        // F-U3-15：上一轮崩溃可能在文件里留下了我们自己的旧注入（state 已
+        // 丢失，文件没丢）。备份前先剔除，否则未来所有恢复都会把这个残留
+        // 当成"用户原始内容"永久保留。persistent 的条目豁免（见函数文档）。
+        remove_omt_entry_if_under_launchers_dir(runtime_dir, &workspace_file)?;
+
         let backup_existed = workspace_file.is_file();
         if backup_existed {
             let original = std::fs::read_to_string(&workspace_file)
@@ -274,12 +347,39 @@ fn prepare_omp_with(
             write_atomic(&state_dir.join("backup.json"), &original)?;
         }
         state["backupExisted"] = serde_json::json!(backup_existed);
-        state["workspace"] = serde_json::json!(workspace_root.to_string_lossy());
+    } else {
+        // F-U3-16：hash 比对只能发现"上一次写入之后"的改动——两次重叠
+        // prepare 之间的用户编辑会被这次 merge 悄悄吸收进新基线。在 merge
+        // 覆写证据之前先比对，不符就置粘性标记，直到批次最终 release 才
+        // 清空（随 state 目录一起删除）。
+        let prior_sha = state["writtenSha"].as_str().unwrap_or_default().to_string();
+        if !prior_sha.is_empty() {
+            let current = std::fs::read_to_string(&workspace_file).unwrap_or_default();
+            if stable_hash_hex(current.as_bytes()) != prior_sha {
+                state["userModified"] = serde_json::json!(true);
+            }
+        }
     }
     let written_sha = merge_omp_mcp(workspace_root, &launcher)?;
     state["refcount"] = serde_json::json!(refcount + 1);
     state["writtenSha"] = serde_json::json!(written_sha);
     state["writtenCommand"] = serde_json::json!(launcher.display().to_string());
+    {
+        // F-U3-12：记录本批次用过的全部 launcher——删除时机统一推迟到
+        // `finalize_release`，见模块文档。
+        let mut launchers: Vec<String> = state["launchers"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !launchers.contains(&launcher_id) {
+            launchers.push(launcher_id.clone());
+        }
+        state["launchers"] = serde_json::json!(launchers);
+    }
     write_omp_state(&state_dir, &state)?;
     Ok(McpInjection::Omp {
         workspace_root: workspace_root.to_path_buf(),
@@ -288,10 +388,14 @@ fn prepare_omp_with(
     })
 }
 
-/// 最终释放（refcount 归零）：恢复原文件；若 workspace 文件在执行期间被
-/// 改过（hash 不符我们最后写入的内容），改为外科手术移除我们自己的 `omt`
-/// 条目而不整体覆盖（F-U3-3/F-U3-10）。随后清理 state 目录。
+/// 最终释放（refcount 归零，或 crash-sweep 直接触发）：恢复原文件；若
+/// workspace 文件在执行期间被改过（即时 hash 不符，或粘性 `userModified`
+/// 标记——F-U3-16），改为外科手术移除我们自己的 `omt` 条目而不整体覆盖
+/// （F-U3-3/F-U3-10）。无论走哪条分支，都清理本批次追踪到的全部 launcher
+/// （F-U3-12）与 state 目录；外科手术分支额外把备份原地保存到 state 目录
+/// **之外**（F-U3-11）。
 fn finalize_release(
+    runtime_dir: &Path,
     state_dir: &Path,
     workspace_root: &Path,
     state: &serde_json::Value,
@@ -299,19 +403,43 @@ fn finalize_release(
     let workspace_file = omp_workspace_file(workspace_root);
     let written_sha = state["writtenSha"].as_str().unwrap_or_default();
     let written_command = state["writtenCommand"].as_str().unwrap_or_default();
+    let sticky_modified = state["userModified"].as_bool().unwrap_or(false);
     let current = std::fs::read_to_string(&workspace_file).ok();
-    let user_modified = match (&current, written_sha.is_empty()) {
-        (Some(text), false) => stable_hash_hex(text.as_bytes()) != written_sha,
-        (Some(_), true) => true, // 无记录可比对，视为已改
-        (None, _) => false,
-    };
+    let user_modified = sticky_modified
+        || match (&current, written_sha.is_empty()) {
+            (Some(text), false) => stable_hash_hex(text.as_bytes()) != written_sha,
+            (Some(_), true) => true, // 无记录可比对，视为已改
+            (None, _) => false,
+        };
     if user_modified {
-        eprintln!(
-            "omp mcp.json 在执行期间被修改，跳过整体恢复，改为移除 omt 条目（备份保留于 {}）",
-            state_dir.display()
-        );
+        // F-U3-11：备份先原子拷到 state 目录之外再报告"已保留"，随后的
+        // remove_dir_all 才不会把刚才承诺保留的东西一并删掉。
+        let preserved_at = if state["backupExisted"].as_bool().unwrap_or(false) {
+            std::fs::read_to_string(state_dir.join("backup.json"))
+                .ok()
+                .and_then(|original| {
+                    let dst = state_dir.with_extension("last-backup.json");
+                    write_atomic(&dst, &original).ok().map(|_| dst)
+                })
+        } else {
+            None
+        };
+        match &preserved_at {
+            Some(path) => eprintln!(
+                "omp mcp.json 在执行期间被修改，跳过整体恢复，改为移除 omt 条目（原始内容已保存于 {}）",
+                path.display()
+            ),
+            None => {
+                eprintln!("omp mcp.json 在执行期间被修改，跳过整体恢复，改为移除 omt 条目")
+            }
+        }
         if !written_command.is_empty() {
             remove_omt_entry_if_matches(&workspace_file, written_command)?;
+        } else {
+            // F-U3-15：state 不完整（崩溃发生在 writtenCommand 落盘之前），
+            // 没有精确 command 可比对——退化为宽匹配，总比永远留着一个
+            // 悬空条目强。
+            remove_omt_entry_if_under_launchers_dir(runtime_dir, &workspace_file)?;
         }
     } else if state["backupExisted"].as_bool().unwrap_or(false) {
         let backup = std::fs::read_to_string(state_dir.join("backup.json"))
@@ -320,18 +448,26 @@ fn finalize_release(
     } else {
         let _ = std::fs::remove_file(&workspace_file);
     }
+    // F-U3-12：本批次追踪到的全部 launcher，此刻文件要么已整体恢复/删除、
+    // 要么刚被外科手术清掉引用——无论哪种，都不会再有 launcher 被引用了。
+    if let Some(launchers) = state["launchers"].as_array() {
+        for id in launchers.iter().filter_map(|v| v.as_str()) {
+            remove_launcher(runtime_dir, id);
+        }
+    }
     let _ = std::fs::remove_dir_all(state_dir);
     Ok(())
 }
 
-/// 恢复 omp workspace 的 mcp.json：先删本 exec 的 launcher（F-U3-7，refcount
-/// 是否归零与"这个 launcher 是否还有用"是两回事）；仅最后一个引用才触发
-/// `finalize_release`。
-fn release_omp(runtime_dir: &Path, workspace_root: &Path, launcher_id: &str) -> Result<(), String> {
+/// 处理一次 release：refcount > 1 只减计数，最后一次触发
+/// `finalize_release`。launcher 删除**推迟到** `finalize_release`
+/// （F-U3-12）——mcp.json 的 `omt` 条目只会指向"最近一次 merge"的那个
+/// launcher，不一定是当前正在 release 的这个；提前删会让仍被引用的脚本
+/// 消失。
+fn release_omp(runtime_dir: &Path, workspace_root: &Path) -> Result<(), String> {
     let _guard = OMP_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    remove_launcher(runtime_dir, launcher_id);
     let state_dir = omp_state_dir(runtime_dir, workspace_root);
     let mut state = omp_state(&state_dir);
     let refcount = state["refcount"].as_u64().unwrap_or(0);
@@ -340,7 +476,7 @@ fn release_omp(runtime_dir: &Path, workspace_root: &Path, launcher_id: &str) -> 
         write_omp_state(&state_dir, &state)?;
         return Ok(());
     }
-    finalize_release(&state_dir, workspace_root, &state)
+    finalize_release(runtime_dir, &state_dir, workspace_root, &state)
 }
 
 /// 注入准备：sidecar 预检 + 按 provider 分派。任何失败=派发失败（绝不
@@ -363,7 +499,11 @@ pub fn prepare(
     )
 }
 
-fn prepare_with(
+/// `pub(crate)`（not just `#[cfg(test)]`) so other modules' tests can drive
+/// the real prepare path with an injectable `omt_path`, instead of hand-
+/// building a `McpInjection` that bypasses the `launchers` bookkeeping
+/// (F-U3-12) — see `executor::tests::spawn_failure_releases_mcp_injection`.
+pub(crate) fn prepare_with(
     omt_path: &Path,
     runtime_dir: &Path,
     workspace_root: &Path,
@@ -412,21 +552,21 @@ pub fn release(runtime_dir: &Path, injection: &McpInjection) -> Result<(), Strin
         McpInjection::Omp {
             workspace_root,
             persistent,
-            launcher_id,
+            ..
         } => {
             if *persistent {
                 return Ok(()); // 长期复用，release 是 no-op（F-U3-10）
             }
-            release_omp(runtime_dir, workspace_root, launcher_id)
+            release_omp(runtime_dir, workspace_root)
         }
         _ => Ok(()),
     }
 }
 
 /// desktop 启动清扫：desktop 退出时未正常 release 的 omp 注入（crash 残留）
-/// 逐 workspace 恢复/外科手术清理，随后清空整个 launcher 目录——到这一步
-/// 所有仍活跃的引用（包括 persistent 的）都已在各自的 state 处理中被跳过
-/// 或保留，遗留文件均为真正的孤儿。返回处理过的 workspace 数。
+/// 逐 workspace 恢复/外科手术清理（F-U3-17：单个失败不中止其余），随后
+/// 清扫真正的孤儿 launcher（F-U3-18：跳过 persistent.sh，它没有 state
+/// 目录、每次正常重启都要继续用）。返回成功处理的 workspace 数。
 pub fn sweep_omp_crash_residue(runtime_dir: &Path) -> Result<usize, String> {
     let root = omp_injection_root(runtime_dir);
     let Ok(entries) = std::fs::read_dir(&root) else {
@@ -445,19 +585,26 @@ pub fn sweep_omp_crash_residue(runtime_dir: &Path) -> Result<usize, String> {
         let _guard = OMP_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        finalize_release(&entry.path(), Path::new(workspace), &state)?;
+        match finalize_release(runtime_dir, &entry.path(), Path::new(workspace), &state) {
+            Ok(()) => swept += 1,
+            Err(err) => eprintln!(
+                "omp 注入残留清扫失败（{}）：{err}（本次跳过，下次启动重试）",
+                entry.path().display()
+            ),
+        }
         drop(_guard);
-        swept += 1;
     }
-    // 残留 launcher 一并清空（crash 的 exec 不会再释放；persistent 的
-    // launcher 若仍被引用，上面的 finalize_release 不会碰它所在 workspace
-    // 的 state——但 persistent 本身不建 state 目录，也就不会被这里遍历
-    // 到，其 launcher 文件此刻会被一并删掉。这是已知的 v1 限制：persistent
-    // 模式下 app 崩溃重启会丢失 persistent launcher，用户需在设置页重新
-    // 开启——记入 backlog，不在本次 fix 范围内自动续期。）
-    let launchers = omp_launchers_dir(runtime_dir);
-    if launchers.is_dir() {
-        let _ = std::fs::remove_dir_all(&launchers);
+    // 上面每个 workspace 的 finalize_release 已经清了自己追踪到的
+    // launcher；这里只兜底真正的孤儿（例如 state 目录在记录 `workspace`
+    // 之前就整个丢失）。绝不动 persistent.sh。
+    if let Ok(entries) = std::fs::read_dir(omp_launchers_dir(runtime_dir)) {
+        let persistent = launcher_path(runtime_dir, "persistent");
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path != persistent {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
     }
     Ok(swept)
 }
@@ -494,6 +641,13 @@ mod tests {
         std::fs::read_dir(omp_launchers_dir(runtime))
             .map(|entries| entries.flatten().count())
             .unwrap_or(0)
+    }
+
+    fn omt_command(mcp_json: &str) -> Option<String> {
+        let root: serde_json::Value = serde_json::from_str(mcp_json).ok()?;
+        root["mcpServers"]["omt"]["command"]
+            .as_str()
+            .map(str::to_string)
     }
 
     #[test]
@@ -566,7 +720,6 @@ mod tests {
             "恢复后不含 omt 条目: {restored}"
         );
         assert!(restored.contains("user-server"));
-        // F-U3-7：本 exec 的 launcher 用完即删
         assert_eq!(launcher_count(&rig.runtime), 0);
     }
 
@@ -611,11 +764,59 @@ mod tests {
         )
         .unwrap();
         release(&rig.runtime, &first).unwrap();
-        // 还有 exec-2：不应恢复；exec-1 自己的 launcher 已删，exec-2 的还在
+        // 还有 exec-2：不应恢复。F-U3-12：launcher 删除推迟到批次最终
+        // release，所以此刻两个 launcher 都还在——mcp.json 此刻仍指向
+        // exec-2 的那个，提前删任何一个都有悬空风险。
         let merged = std::fs::read_to_string(omp_workspace_file(&rig.workspace)).unwrap();
         assert!(merged.contains("omp-launchers"));
-        assert_eq!(launcher_count(&rig.runtime), 1);
+        assert_eq!(
+            launcher_count(&rig.runtime),
+            2,
+            "两个 launcher 都要等批次结束才清"
+        );
         release(&rig.runtime, &second).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(omp_workspace_file(&rig.workspace)).unwrap(),
+            "{}"
+        );
+        assert_eq!(launcher_count(&rig.runtime), 0);
+    }
+
+    #[test]
+    fn releasing_later_exec_first_does_not_dangle_current_launcher() {
+        // F-U3-12 回归测试：exec-2 后于 exec-1 prepare（mcp.json 此刻指向
+        // exec-2 的 launcher），但 exec-2 先结束、先 release。修复前
+        // release_omp 会无条件删掉"自己的" launcher——恰好是 mcp.json 仍
+        // 引用的那个，导致 exec-1 剩余运行期间悬空。
+        let rig = rig();
+        std::fs::create_dir_all(rig.workspace.join(".omp")).unwrap();
+        std::fs::write(omp_workspace_file(&rig.workspace), "{}").unwrap();
+        let first = prepare_with(
+            &rig.fake_omt,
+            &rig.runtime,
+            &rig.workspace,
+            "omp",
+            "exec-1",
+            false,
+        )
+        .unwrap();
+        let _second = prepare_with(
+            &rig.fake_omt,
+            &rig.runtime,
+            &rig.workspace,
+            "omp",
+            "exec-2",
+            false,
+        )
+        .unwrap();
+        release(&rig.runtime, &_second).unwrap();
+        let merged = std::fs::read_to_string(omp_workspace_file(&rig.workspace)).unwrap();
+        let referenced = omt_command(&merged).expect("omt 条目应仍存在（exec-1 还没释放）");
+        assert!(
+            Path::new(&referenced).is_file(),
+            "mcp.json 引用的 launcher 必须仍然存在: {merged}"
+        );
+        release(&rig.runtime, &first).unwrap();
         assert_eq!(
             std::fs::read_to_string(omp_workspace_file(&rig.workspace)).unwrap(),
             "{}"
@@ -652,6 +853,86 @@ mod tests {
         let after_json: serde_json::Value = serde_json::from_str(&after).unwrap();
         assert!(after_json["mcpServers"].get("omt").is_none(), "{after}");
         assert!(after_json["mcpServers"].get("mine").is_some(), "{after}");
+    }
+
+    #[test]
+    fn user_modified_release_preserves_backup_outside_state_dir() {
+        // F-U3-11 回归测试：外科手术分支的日志曾说"备份保留"，紧接着却
+        // 把整个 state 目录（含 backup.json）删掉。
+        let rig = rig();
+        std::fs::create_dir_all(rig.workspace.join(".omp")).unwrap();
+        std::fs::write(
+            omp_workspace_file(&rig.workspace),
+            r#"{"mcpServers":{"user-server":{"type":"stdio","command":"u"}}}"#,
+        )
+        .unwrap();
+        let injection = prepare_with(
+            &rig.fake_omt,
+            &rig.runtime,
+            &rig.workspace,
+            "omp",
+            "exec-1",
+            false,
+        )
+        .unwrap();
+        // mid-exec：整份覆盖（不再含我们的 omt 条目）
+        std::fs::write(
+            omp_workspace_file(&rig.workspace),
+            r#"{"mcpServers":{"mine":{"type":"stdio","command":"x"}}}"#,
+        )
+        .unwrap();
+        release(&rig.runtime, &injection).unwrap();
+        let preserved = std::fs::read_dir(omp_injection_root(&rig.runtime))
+            .unwrap()
+            .flatten()
+            .find(|e| e.path().to_string_lossy().ends_with("last-backup.json"));
+        let preserved = preserved.expect("备份应保留在 state 目录之外");
+        let content = std::fs::read_to_string(preserved.path()).unwrap();
+        assert!(content.contains("user-server"), "{content}");
+    }
+
+    #[test]
+    fn overlapping_exec_user_edit_survives_final_restore() {
+        // F-U3-16 回归测试：writtenSha 每次 prepare 都重置基线，两次重叠
+        // prepare 之间的用户改动会被第二次悄悄吸收、最终整体恢复时丢失。
+        let rig = rig();
+        std::fs::create_dir_all(rig.workspace.join(".omp")).unwrap();
+        std::fs::write(omp_workspace_file(&rig.workspace), "{}").unwrap();
+        let first = prepare_with(
+            &rig.fake_omt,
+            &rig.runtime,
+            &rig.workspace,
+            "omp",
+            "exec-1",
+            false,
+        )
+        .unwrap();
+        // 用户在 exec-1 与 exec-2 之间手改
+        let merged = std::fs::read_to_string(omp_workspace_file(&rig.workspace)).unwrap();
+        let mut root: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        root["mcpServers"]["mine"] = serde_json::json!({ "type": "stdio", "command": "x" });
+        std::fs::write(
+            omp_workspace_file(&rig.workspace),
+            serde_json::to_string_pretty(&root).unwrap(),
+        )
+        .unwrap();
+        let second = prepare_with(
+            &rig.fake_omt,
+            &rig.runtime,
+            &rig.workspace,
+            "omp",
+            "exec-2",
+            false,
+        )
+        .unwrap();
+        release(&rig.runtime, &first).unwrap();
+        release(&rig.runtime, &second).unwrap();
+        let after = std::fs::read_to_string(omp_workspace_file(&rig.workspace)).unwrap();
+        assert!(
+            after.contains("mine"),
+            "用户在重叠 exec 期间的改动应存活: {after}"
+        );
+        assert!(!after.contains("\"omt\""), "{after}");
     }
 
     #[test]
@@ -698,6 +979,7 @@ mod tests {
         release(&rig.runtime, &persistent).unwrap();
         let still = std::fs::read_to_string(omp_workspace_file(&rig.workspace)).unwrap();
         assert!(still.contains("persistent"), "{still}");
+        assert_eq!(launcher_count(&rig.runtime), 1, "persistent.sh 不受影响");
     }
 
     #[test]
@@ -758,6 +1040,83 @@ mod tests {
     }
 
     #[test]
+    fn sweep_discovers_and_scrubs_orphan_from_incomplete_state() {
+        // F-U3-15 回归测试：模拟 merge 与最终 write_omp_state 之间的崩溃
+        // ——文件已被注入，但 state.json 只有早期写入的 `workspace` 字段，
+        // 没有 writtenCommand/writtenSha。
+        let rig = rig();
+        std::fs::create_dir_all(rig.workspace.join(".omp")).unwrap();
+        let launcher = launcher_path(&rig.runtime, "exec-orphan");
+        std::fs::create_dir_all(launcher.parent().unwrap()).unwrap();
+        std::fs::write(&launcher, "#!/bin/sh\n").unwrap();
+        std::fs::write(
+            omp_workspace_file(&rig.workspace),
+            serde_json::json!({
+                "mcpServers": {
+                    "omt": { "type": "stdio", "command": launcher.display().to_string(), "args": [] }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let state_dir = omp_state_dir(&rig.runtime, &rig.workspace);
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(
+            state_dir.join("state.json"),
+            serde_json::json!({ "refcount": 0, "workspace": rig.workspace.to_string_lossy() })
+                .to_string(),
+        )
+        .unwrap();
+
+        sweep_omp_crash_residue(&rig.runtime).unwrap();
+        let after = std::fs::read_to_string(omp_workspace_file(&rig.workspace)).unwrap();
+        let after_json: serde_json::Value = serde_json::from_str(&after).unwrap();
+        assert!(after_json["mcpServers"].get("omt").is_none(), "{after}");
+    }
+
+    #[test]
+    fn prepare_scrubs_dangling_entry_before_backing_up_as_original() {
+        // F-U3-15 回归测试：state 目录完全丢失（未被 sweep 追上的更早一次
+        // 崩溃），但文件里还留着我们自己的旧注入。下一次 prepare 不能把
+        // 这个残留当成"用户原始内容"备份下来。
+        let rig = rig();
+        std::fs::create_dir_all(rig.workspace.join(".omp")).unwrap();
+        let stale_launcher = launcher_path(&rig.runtime, "exec-stale");
+        std::fs::write(
+            omp_workspace_file(&rig.workspace),
+            serde_json::json!({
+                "mcpServers": {
+                    "user-server": { "type": "stdio", "command": "u" },
+                    "omt": { "type": "stdio", "command": stale_launcher.display().to_string(), "args": [] }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let injection = prepare_with(
+            &rig.fake_omt,
+            &rig.runtime,
+            &rig.workspace,
+            "omp",
+            "exec-1",
+            false,
+        )
+        .unwrap();
+        release(&rig.runtime, &injection).unwrap();
+        let restored = std::fs::read_to_string(omp_workspace_file(&rig.workspace)).unwrap();
+        let restored_json: serde_json::Value = serde_json::from_str(&restored).unwrap();
+        assert!(
+            restored_json["mcpServers"].get("user-server").is_some(),
+            "{restored}"
+        );
+        assert!(
+            restored_json["mcpServers"].get("omt").is_none(),
+            "陈旧残留不该复活: {restored}"
+        );
+    }
+
+    #[test]
     fn omp_persistent_mode_merges_without_state() {
         let rig = rig();
         let injection = prepare_with(
@@ -786,6 +1145,31 @@ mod tests {
         release(&rig.runtime, &injection).unwrap();
         assert!(omp_workspace_file(&rig.workspace).is_file());
         assert_eq!(launcher_count(&rig.runtime), 1);
+    }
+
+    #[test]
+    fn sweep_never_deletes_persistent_launcher() {
+        // F-U3-18 回归测试：sweep 曾经在**每次**启动（不只 crash 后）无条件
+        // 清空整个 launcher 目录，persistent.sh 一并被删。
+        let rig = rig();
+        let persistent = prepare_with(
+            &rig.fake_omt,
+            &rig.runtime,
+            &rig.workspace,
+            "omp",
+            "exec-1",
+            true,
+        )
+        .unwrap();
+        let _ = persistent;
+        assert_eq!(launcher_count(&rig.runtime), 1);
+        sweep_omp_crash_residue(&rig.runtime).unwrap();
+        assert_eq!(
+            launcher_count(&rig.runtime),
+            1,
+            "persistent launcher 必须挺过每次启动的 sweep"
+        );
+        assert!(launcher_path(&rig.runtime, "persistent").is_file());
     }
 
     #[test]
