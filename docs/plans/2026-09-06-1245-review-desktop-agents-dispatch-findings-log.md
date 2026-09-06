@@ -38,10 +38,17 @@ branch: feat/desktop-agents-dispatch
 | F-U2-3 | P3 | gated_auto | U2 | `executor.rs::finish_terminal` | `ExecRecord.exit_code` / `kill_reason` 从未回写（只写 failure_detail） | fixed(12e4d91)（finish_terminal 一次 update_exec 写齐 exit_code/kill_reason/failure_detail） | — |
 | F-U2-4 | P3 | gated_auto | U2 | `executor.rs::spawn` / waiter | setpgid 只在子进程侧做，spawn 后立即 stop 有 ESRCH 窗口；正常退出后不清残留 pgid 成员 → 孙进程持管道时 reader 永不 EOF、waiter 线程泄漏 | fixed(12e4d91)（父侧 setpgid 双保险 + 退出后对 pgid 补 SIGKILL 清孤儿） | — |
 | F-U2-5 | P3 | gated_auto | U2 | `executor.rs::classify` | 信号死亡（`code()==None`）被映射成 -1：窗内 Failed / 窗外 Exited(-1)，应读 `status.signal()` | fixed(12e4d91)（ExitStatusExt::signal → Killed(External(sig))，KillReason 加 External） | — |
+| F-U2-12 | P2 | gated_auto | U2 | `executor.rs::kill_all_marks_app_exit` + 本日志 :36/:518 | kill_all 持久化（agents.json Killed/appexit）零测试覆盖，而日志声称测试已扩——五个评审者独立命中 | open（随修复提交关闭） | — |
+| F-U2-13 | P2 | gated_auto | U2 | `executor.rs::classify` signal 分支 | kill_all 自己的 SIGTERM 死亡在 stop_reason 采样/收割窗口内被记成 Killed(External(15))，appexit 语义丢失 | open（随修复提交关闭） | — |
+| F-U2-14 | P2 | gated_auto | U2 | `executor.rs:111/126/131/400` | stop_requested 死字段（只写不读）+ request_stop 吞 poison，与文件锁习惯不一致 | open（随修复提交关闭） | — |
+| F-U2-15 | P3 | testing-gap | U2 | — | TERM→KILL 升级与 kill_all 超时分支（直接 finish_terminal）无测试 | open | — |
+| F-U2-16 | P3 | gated_auto | U2 | `lib.rs:72` | 退出钩子注释仍描述修复前的 fire-and-forget 语义 | open（随修复提交关闭） | — |
+| F-U2-17 | P2 | manual（设计） | U2 | `executor.rs:747` | 测试模块未拆分（1344 行，约 600 行测试） | open（设计项，人工排期） | — |
+| F-U2-18 | P3 | gated_auto | 本日志 :92 | F-U3-9 kill_all 半已随 12e4d91 完成，行与检查清单仍 open | open（随修复提交关闭） | — |
 | F-U2-6 | P3 | advisory | U2 | `executor.rs` 事件 | envelope 不统一：`session_start`/`exit` 无 `seq`/`ts`，与 design §5.3 `{seq, ts, execId, kind, payload}` 不符；U5 消费前统一 | open（U5 前） | — |
-| F-U2-7 | P3 | advisory | U2/U12 | 计划 §3.2 / design §5.6 | transcript `.jsonl`（header + 事件）写入未落地，仅 raw.log；U10 reconcile 依赖 header——归属未定 | open（计划定归属） | — |
+| F-U2-7 | P3 | advisory | U2/U12 | 计划 §3.2 / design §5.6 | transcript `.jsonl`（header + 事件）写入未落地，仅 raw.log；U10 reconcile 依赖 header | open（归属已定：U4，见计划 U4 Approach；U10 前必须存在） | — |
 | F-U2-8 | P3 | gated_auto | U2 | `executor.rs::sanitize_line` / `session_start.args` | `to_lowercase()` 索引原串，非 ASCII 行偏移错位可能欠脱敏（改 `to_ascii_lowercase`）；`args` 事件/日志未脱敏（extra_args 可含 `--api-key`） | fixed(12e4d91)（sanitize_line 改 ascii lowercase；新增 sanitize_args 并用于 session_start 事件与会话记录） | — |
-| F-U2-9 | P3 | advisory | U2 | `agents::demote_live_agents` × dev 多实例 | `OMT_ALLOW_MULTI_INSTANCE` 下第二实例启动 demote 会把首实例的 Live agent 标 Failed；dev-notes 需补「同时隔离 `OMT_RUNTIME_DIR`」 | open | — |
+| F-U2-9 | P3 | advisory | U2 | `agents::demote_live_agents` × dev 多实例 | `OMT_ALLOW_MULTI_INSTANCE` 下第二实例启动 demote 会把首实例的 Live agent 标 Failed；dev-notes 需补「同时隔离 `OMT_RUNTIME_DIR`」 | fixed(af28ca2)（dev-notes §1.4 已补 OMT_RUNTIME_DIR 隔离说明） | — |
 | F-U2-10 | P3 | gated_auto | U2 | `executor.rs::spawn` raw_log 路径 | `home_id` 未经 `validate_home_id` 即拼路径 | fixed(12e4d91)（spawn 入口复用 agents::validate_home_id（提为 pub(crate)）） | — |
 | F-U2-11 | P3 | advisory | U2 | `harness.rs::probe_descriptor` | 探针失败重试一次把 `harness_list` 最坏延迟翻倍（8s）；注释归因「fork→exec 卡死」需复现记录 | open | — |
 | F-U4a-1 | P2 | manual | U4a | `atomic_json::read_json_locked` / `agents::agents_list` | `parseFailed` 是**瞬态**信号（损坏文件被 rename 后第二次读即 false + 空列表），U9「解析失败期间冻结 GC」硬规则会失效并清空全部绑定 | open（U9 前置） | — |
@@ -873,3 +880,46 @@ exec-1 prepare 存 S1 → 用户加了 `mcpServers.mine` → exec-2 prepare 读�
 | F-U3-11 / 12 / 13 / 14 / 15 / 16 / 17 / 18 | fixed(d53b191) |
 
 U3 单元的 mcp_injection 模块目前已过两轮评审 + 两轮修复。**建议 U4 开工前跑一次独立的第三轮评审**（本轮仍是自评，§10 的教训还没被"用独立评审验证自评"这一步兑现）；如果时间有限，至少应验证「关键设计变化」小节列出的三点，以及本节列出的覆盖缺口是否可接受。
+
+---
+
+## 12. `12e4d91` + `73c4588` · U2 前置修复（F-U2 系列）· ce-code-review 独立评审
+
+- **日期**：2026-09-07
+- **范围**：`12e4d91` executor.rs +297/−87（kill_all 同步收口、classify first_event 判据、External 信号、sanitize_args、home_id 校验、父侧 setpgid、pgid 清场）、agents.rs（validate_home_id pub(crate)）、lib.rs（退出钩子 + ExecutionState）、计划 §3.3 文案（嵌套命名空间）；`73c4588` 本日志 F-U2 系列状态更新
+- **意图**：U4 接线前关闭 F-U2-1/2 并顺手清 F-U2-3/4/5/8/10
+- **评审方式**：ce-code-review 多 persona——correctness / project-standards / testing / maintainability / reliability / security / adversarial 七路独立子代理并发派发，另有一个独立验证批（5/5 validated）。**独立佐证成立**（各 persona 独立上下文；adversarial 与 reliability 独立命中同一竞态属有效交叉佐证）。跨模型 pass 因宿主 serving family 无法证实而跳过（in-process adversarial 覆盖）。
+- **结论**：**Ready with fixes**——12e4d91 的修复语义全部按 F-U2-1/2 的建议落地且经 5/5 独立验证；但评审发现 (a) F-U2-1 的回归测试并不存在（日志虚报覆盖）、(b) 一个真实的终止原因误标竞态、(c) stop_requested 成为死字段、外加测试/文档缺口。
+
+### Findings
+
+#### F-U2-12 · P2 · gated_auto · `executor.rs::kill_all_marks_app_exit` + 本日志 ：36/:518 · kill_all 持久化零覆盖且日志虚报
+kill_all_marks_app_exit 未 register_agent（`update_agent_status`/`update_exec` 对不存在记录是 no-op，agents.rs:253-256/277-284）、不读 agents.json——F-U2-1 修复的落盘行为零回归覆盖；而本日志 36/518 行声称「测试扩至 agents.json 断言 Killed/appexit」。testing / maintainability / adversarial / correctness / reliability 五路独立命中。
+- **建议**：register_agent 先行 + kill_all 后 `read_json` 断言 status=Killed、attachment=None、exec kill_reason=appexit，使日志为真。
+- **状态**：open（随本节后的修复提交关闭）
+
+#### F-U2-13 · P2 · gated_auto · `executor.rs::classify` signal 分支 · kill_all 自己的 SIGTERM 死亡可被记成 external-15
+waiter 在循环顶采样 stop_reason() 与 try_wait 之间有窗口：kill_all request_stop(AppExit) + SIGTERM 杀死子进程 → 同迭代收割 → killed_by_us=false（term_sig 未置）→ signal 分支返回 Killed(External(15)) 持久化，appexit 语义丢失。adversarial 与 reliability 独立命中。
+- **建议**：signal 分支优先采用已请求的 stop_reason：`Terminal::Killed(session.stop_reason().unwrap_or(KillReason::External(sig)))`；直接 classify 测试断言 killed_by_us=false + signal=15 + stop_reason=AppExit → Killed(AppExit)。
+- **状态**：open（随修复提交关闭）
+
+#### F-U2-14 · P2 · gated_auto · `executor.rs` :111/:126/:131/:400 · stop_requested 死字段 + poison 策略不一致
+12e4d91 删除了唯一 reader，stop_requested 只写不读；request_stop 用 `if let Ok(guard)` 吞 poison（文件内其余锁为 into_inner）。
+- **建议**：删除 stop_requested；request_stop 改 into_inner。
+- **状态**：open（随修复提交关闭）
+
+#### F-U2-15 · P3 · testing-gap · TERM→KILL 升级与 kill_all 超时分支无测试
+SIGTERM 免疫脚本（`trap '' TERM`）无测试覆盖 kill_all 超时直接 finish_terminal 的分支。
+- **状态**：open
+
+#### F-U2-16 · P3 · gated_auto · `lib.rs:72` · 退出钩子注释过时
+注释仍是「等待线程随后完成回写」——12e4d91 后 kill_all 同步收口并直接落盘。
+- **状态**：open（随修复提交关闭）
+
+#### F-U2-17 · P2 · manual（设计）· `executor.rs:747` · 测试模块未拆分
+executor.rs 1344 行（约 600 行为 in-file 测试）。建议拆 executor/tests.rs（`use super::*` 保留私有访问）。
+- **状态**：open（设计/人工，可与 U4 后的 simplify 一起做）
+
+#### F-U2-18 · P3 · gated_auto · 本日志 :92 · F-U3-9 行过期
+kill_all 半已随 12e4d91 完成（finish_terminal 含 mcp release），行与检查清单未更新。
+- **状态**：open（随修复提交一并翻转）
