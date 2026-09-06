@@ -25,12 +25,12 @@ branch: feat/desktop-agents-dispatch
 
 | ID | 级别 | 类型 | 单元 | 位置 | 摘要 | 状态 | 负责人 |
 |---|---|---|---|---|---|---|---|
-| F-U1b-1 | P3 | advisory | U1b | 计划 U1b Files / 排期 | `store.ts` 的 `harness_list` 封装放在 U1b，但 U6 弹窗选择器先于 U1b 需要它——依赖倒置 | open（计划动作） | — |
-| F-U1-8 | P3 | gated_auto | U1 | `harness.rs::upsert_config` | `CONFIG_LOCK` 一旦 poison，所有后续保存永久失败直至重启 | open | — |
-| F-U1-9 | P3 | advisory | U1 | `harness.rs::save_configs` | 写入与 rename 之间崩溃留下的 `config.json.tmp-*` 无人清扫 | open（U4a 共用 helper 时顺手） | — |
+| F-U1b-1 | P3 | advisory | U1b | 计划 U1b Files / 排期 | `store.ts` 的 `harness_list` 封装放在 U1b，但 U6 弹窗选择器先于 U1b 需要它——依赖倒置 | fixed(43bf89f)（封装移入 U6 Files，U1b 只留退役/迁移/接线） | — |
+| F-U1-8 | P3 | gated_auto | U1 | `harness.rs::upsert_config` | `CONFIG_LOCK` 一旦 poison，所有后续保存永久失败直至重启 | fixed(43bf89f)（写纪律收敛进 atomic_json，`STORE_LOCK` poison 容忍） | — |
+| F-U1-9 | P3 | advisory | U1 | `harness.rs::save_configs` | 写入与 rename 之间崩溃留下的 `config.json.tmp-*` 无人清扫 | fixed(43bf89f)（update 内清扫 mtime>1h 的残留 tmp，测试覆盖） | — |
 | F-U1-4 | P3 | testing-gap | U1 | `harness.rs::REGISTRY` omp | omp `--approval-mode write` 无 TTY 实测（计划 U1 必做项）未做，`unattended_flag` 暂记 `--yolo` | open（U6 前置门） | — |
 | F-U1-7 | P3 | advisory | U1 | `harness.rs::probe_version` | stderr 被丢弃，向 stderr 打版本号的 CLI 会被判「待验证」 | open（U1b/U2 用真实 binary 实测后定） | — |
-| F-U15-1 | P3 | advisory | U15 | `apps/desktop/src-tauri/src/lib.rs:19` | single-instance 为 best-effort 守卫，非正确性保证；需注释点明 U4a 文件锁才是 | open（注释已补 c8d8946；`fixed` 待 U4a 文件锁覆盖三条写路径后复核） | — |
+| F-U15-1 | P3 | advisory | U15 | `apps/desktop/src-tauri/src/lib.rs:19` | single-instance 为 best-effort 守卫，非正确性保证；需注释点明 U4a 文件锁才是 | fixed(43bf89f)（atomic_json flock 覆盖 harness config + agents.json 两条写路径；bindings.json 由 U9 按计划用同一 helper） | — |
 | F-U15-3 | P3 | testing-gap | U15 | — | 「双开 → 第二实例退出并聚焦」无自动化或记录的手工验证 | open（手工验证排期 P0 链路打通后的桌面冒烟；`OMT_ALLOW_MULTI_INSTANCE` 已就绪，可支撑 dev 自动化双开脚本） | — |
 | F-U1-1 | P1 | gated_auto | U1 | `harness.rs`（7 处） | `cargo fmt --check` 失败，CI `rust` job 会红 | fixed(716ce0e) | — |
 | F-U1-2 | P2 | gated_auto | U1 | `harness.rs::harness_config_set` / `save_configs` | 无进程内锁：并发 `harness_config_set` 会丢更新，且 tmp 文件名仅含 pid，同进程并发写会互相截断 | fixed(716ce0e) | — |
@@ -76,7 +76,7 @@ branch: feat/desktop-agents-dispatch
 插件 macOS 实现：连接 `/tmp/com_ohmyticket_desktop_si.sock` 失败且错误**不是** `NotFound`/`ConnectionRefused` 时（如同机另一 OS 用户先启动占用同名 socket → `PermissionDenied`），**静默按普通启动继续且不监听**，两实例并存。commit message「the guard must land before any dispatch chain ships」把它当成了正确性门。
 
 - **建议**：不改逻辑。计划 §3.6.9 已写「存储写路径同时保留文件锁」——U4a 的文件锁才是正确性守卫。在 `lib.rs` 注释补一句「best-effort；跨进程写安全由 U4a 文件锁保证」，防止后人省掉文件锁。
-- **状态**：open → U4a 落地后复核。2026-09-06 注释已补（best-effort 定位 + 「不要省掉文件锁」警示）。
+- **状态**：fixed(43bf89f) —— U4a 落地 `atomic_json`（companion lockfile flock + 进程内锁），覆盖 harness config 与 agents.json 两条写路径；bindings.json（U9）按计划用同一 helper。single-instance 保持 best-effort 定位不变。
 
 #### F-U15-2 · P3 · manual · `lib.rs:19` · dev 与打包版共用 socket
 
@@ -311,21 +311,20 @@ commit message 明示前端消费者（HarnessSelect 移除、bag v2 迁移、st
 U1b Files 把「`store.ts` 的 `harness_list`/`harness_config_set` 封装」放在 U1b，而 U1b 排在 U6 之后；但 U6 弹窗的「选择器 = 已启用 harness ∪ 空闲 Agent」「默认 = workspace 默认 harness（读取时校验 enabled）」必须消费 `harness_list`。U6 开工时要么临时自造封装（重复），要么被迫先做 U1b 的一半。
 
 - **建议**：把 `store.ts` 的 `harness_list`/`harness_config_set` 封装（含类型 `HarnessEntry`）移入 U6 Files；U1b 只保留 HarnessSelect 退役、bag v2 迁移、SettingsPanel/WorkspaceSwitcher 接线与测试调整。或者反过来把 U1b 提到 U6 之前——但 U1b 的 SettingsPanel 接线又想等 U7，故前者更顺。
-- **状态**：open（计划动作）
-
+- **状态**：fixed —— 2026-09-06 计划已改（U1b Files 只留退役/迁移/接线；`store.ts` 的 `harness_list`/`harness_config_set` 封装与 `HarnessEntry` 类型移入 U6 Files）。
 #### F-U1-8 · P3 · gated_auto · `upsert_config` · 锁 poison 即永久失败
 
 `CONFIG_LOCK.lock().map_err(|_| "config lock poisoned")`：任何一次持锁期间 panic（如 `serde_json::to_string_pretty` 极端情况、未来 helper 演进）都会让后续所有保存返回错误直到 app 重启。锁保护的是 `()`，没有需要保护的不变量，poison 无意义。
 
 - **建议**：`let _guard = CONFIG_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);`
-- **状态**：open（U4a 抽共用 helper 时一并处理即可）
+- **状态**：fixed(43bf89f) —— 写纪律收敛进 `atomic_json`：`STORE_LOCK` 以 `PoisonError::into_inner` 容忍 poison；`upsert_config` 改为该 helper 的薄封装。
 
 #### F-U1-9 · P3 · advisory · `save_configs` · tmp 残留无清扫
 
 写入 tmp 与 rename 之间崩溃会留下 `harness/config.json.tmp-<pid>-<seq>`；文件 0600 且很小，无功能影响，但会累积。
 
 - **建议**：U4a 的共用原子写 helper 在 `load` 时顺手清扫同目录 `*.tmp-*`（pid 已死或 mtime 超过 1h）。
-- **状态**：open（U4a 顺手）
+- **状态**：fixed(43bf89f) —— `update_json` 每次顺手清扫同目录 mtime>1h 的 `*.json.tmp-*`；测试 `tmp_files_are_unique_and_swept` 覆盖「阈值 0 清除 / 阈值 1h 不误删新鲜 tmp」。
 
 ### 当前 U1 收口状态
 

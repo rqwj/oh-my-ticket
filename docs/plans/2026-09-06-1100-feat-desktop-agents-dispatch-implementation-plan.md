@@ -276,7 +276,7 @@ stateDiagram-v2
 - **Goal**: U1 的前端半（F-U1-3 拆分）：设置页/弹窗消费 `harness_list`，旧 `HarnessSelect`/`tauri:harness` 退役，bag v2 迁移落地——避免 P0 验收漏掉迁移用例。
 - **Requirements**: R-A（前端半）。
 - **Dependencies**: U1（后端 contract）、U6（弹窗消费方）。
-- **Files**: 修改 `apps/desktop/src/store.ts`（bag v2 `{defaultHarness, approvalAck}` 迁移 + `harness_list`/`harness_config_set` 封装）、`apps/desktop/src/WorkspaceSwitcher.tsx`、`apps/desktop/src/SettingsPanel.tsx`、`apps/desktop/src/types.ts`；移除 `apps/desktop/src/HarnessSelect.tsx`；调整 `apps/desktop/tests/store.spec.tsx`（HarnessSelect 用例）与 `apps/desktop/tests/settings-install.spec.tsx`（harness_detect mock）。
+- **Files**: 修改 `apps/desktop/src/store.ts`（bag v2 `{defaultHarness, approvalAck}` 迁移）、`apps/desktop/src/WorkspaceSwitcher.tsx`、`apps/desktop/src/SettingsPanel.tsx`、`apps/desktop/src/types.ts`；移除 `apps/desktop/src/HarnessSelect.tsx`；调整 `apps/desktop/tests/store.spec.tsx`（HarnessSelect 用例）与 `apps/desktop/tests/settings-install.spec.tsx`（harness_detect mock）。（F-U1b-1：`harness_list`/`harness_config_set` 的 store 封装与 `HarnessEntry` 类型**移入 U6**——弹窗选择器先于本单元消费它。）
 - **Approach**: 旧 bag `{type:'dsh'|'opencode', mode, installPath, devPath}` → v2 `{defaultHarness, approvalAck}`：旧 opencode 条目 → `defaultHarness:'opencode'`（binary 由 U1 探测重填）；旧 dsh 条目 → UI 提示「dsh 后续版本支持」，不静默丢弃。`harness_detect` 保留为薄封装（dsh 插件安装流程仍用）。
 - **Test scenarios**:
   - 旧 bag opencode 条目 → v2 defaultHarness；dsh 条目 → 提示不丢弃
@@ -381,7 +381,7 @@ stateDiagram-v2
 - **Goal**: R-B 完整交互。
 - **Requirements**: R-B。
 - **Dependencies**: U1、U4（不再依赖 U9——解环：本单元独占创建 ExecutionDialog，U9 之后追加绑定预选）。
-- **Files**: 新建 `apps/desktop/src/ExecutionDialog.tsx`（Modal 照 WorkspaceSwitcher overlay 模式）；修改 `apps/desktop/src/App.tsx`（全局门控）、`apps/desktop/src/DetailPanel.tsx`（execute() 改开弹窗，接线自 U4 移入）。
+- **Files**: 新建 `apps/desktop/src/ExecutionDialog.tsx`（Modal 照 WorkspaceSwitcher overlay 模式）；修改 `apps/desktop/src/App.tsx`（全局门控）、`apps/desktop/src/DetailPanel.tsx`（execute() 改开弹窗，接线自 U4 移入）、`apps/desktop/src/store.ts`（F-U1b-1：`harness_list`/`harness_config_set` 封装 + `HarnessEntry` 类型——弹窗选择器的数据源，U1b 复用）。
 - **Approach**: 选择器 = 已启用 harness ∪ 空闲 Agent；默认 = workspace 默认 harness（读取时校验 enabled，失效回退首个 enabled 并提示）；「详情」展开只读预览（binary/args/env 解析结果）；同节点已有运行中派发 → 三选项（查看运行中 Agent / 追加到该 Agent 当前 run（`run/add-members`，daemon 已有，其 claim 循环自然认领）/ 取消）；零可用 harness → 引导前往设置；续跑选项按 provider 能力灰置。**权限知情确认**（原 §九-10，「显式放行 + per-workspace 记住」）：headless 无人应答，v1 显式传放行 flag（omp `--yolo` / opencode `--auto`，以 U1 实测结论为准），弹窗醒目显示「<harness> 将无人值守执行文件/命令操作」需勾选确认；附「本 workspace 记住」勾选 → 写 bag v2 `approvalAck[providerId]=true`，之后该 workspace × provider 不再弹此项（设置页可清除）。**提交态机**（原 §九-7）：确认后按钮禁用显示「派发中…」；成功关弹窗、右侧切 Agents tab 并选中 `exec_start` 返回的 agentId；失败保留弹窗就地内联报错；超过 5s 未返回展开 ①–⑧ 步骤进度作为降级；绑定写失败作为 Agent 行持久警告条。
 - **Test scenarios**:
   - 默认选中与失效回退（bag defaultHarness 指向未启用 provider）
