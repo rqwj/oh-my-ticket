@@ -18,10 +18,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+use crate::agents::NewExec;
 use crate::agents::{self, AgentAttachment, AgentRecordStatus};
 use crate::daemon;
 use crate::harness;
 use crate::mcp_injection::McpInjection;
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
 
 const STARTUP_WINDOW: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_DURATION: Duration = Duration::from_secs(120 * 60);
@@ -34,14 +38,18 @@ pub enum KillReason {
     User,
     MaxDuration,
     AppExit,
+    /// 非 desktop 发起的信号死亡（外部 kill -9 等，F-U2-5）。
+    External(i32),
 }
 
 impl KillReason {
-    fn as_str(&self) -> &'static str {
+    /// 持久化到 `execs[].kill_reason` 的键（external 带信号号）。
+    pub fn key(&self) -> String {
         match self {
-            KillReason::User => "user",
-            KillReason::MaxDuration => "maxduration",
-            KillReason::AppExit => "appexit",
+            KillReason::User => "user".to_string(),
+            KillReason::MaxDuration => "maxduration".to_string(),
+            KillReason::AppExit => "appexit".to_string(),
+            KillReason::External(sig) => format!("external-{sig}"),
         }
     }
 }
@@ -95,8 +103,14 @@ pub struct ExecSession {
     pub raw_log: PathBuf,
     pub runtime_dir: PathBuf,
     pub mcp: McpInjection,
+    /// spawn 时刻（durationMs 与 kill 兜底计算用）
+    pub started: Instant,
+    /// 事件出口（waiter 与 kill_all 路径共用；U4 接 Tauri Channel）
+    sink: EventSink,
     first_event_seen: AtomicBool,
     stop_requested: AtomicBool,
+    /// 终止方设置的原因：exec_stop=User、kill_all=AppExit、watchdog=MaxDuration
+    stop_reason: Mutex<Option<KillReason>>,
     terminal: Mutex<Option<Terminal>>,
 }
 
@@ -106,6 +120,22 @@ impl ExecSession {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    fn request_stop(&self, reason: KillReason) {
+        if let Ok(mut guard) = self.stop_reason.lock() {
+            if guard.is_none() {
+                *guard = Some(reason);
+            }
+        }
+        self.stop_requested.store(true, Ordering::Relaxed);
+    }
+
+    fn stop_reason(&self) -> Option<KillReason> {
+        *self
+            .stop_reason
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn kill_tree(&self, sig: i32) {
@@ -120,7 +150,9 @@ impl ExecSession {
 /// Failed 的 stderr 尾诊断。
 fn sanitize_line(line: &str) -> String {
     const KEYWORDS: &[&str] = &["key", "token", "secret", "password", "bearer"];
-    let lower = line.to_lowercase();
+    // F-U2-8(a)：ascii 小写不改字节长度——lower 的偏移对原串安全（多字节
+    // 非 ASCII 字符不会被 to_ascii_lowercase 改写）。
+    let lower = line.to_ascii_lowercase();
     let mut cut: Option<usize> = None;
     for kw in KEYWORDS {
         if let Some(pos) = lower.find(kw) {
@@ -170,6 +202,40 @@ fn sanitize_stderr_tail(tail: &str) -> String {
         joined.pop();
     }
     joined
+}
+
+/// F-U2-8(b)：argv 进事件/日志前的脱敏。`--api-key=xxx` 同词内替换值；
+/// `--api-key xxx` 值在下一个 arg，置 redact_next。宁枉勿纵：以 `-` 开头的
+/// 词以关键字结尾即视为敏感标志位。
+fn sanitize_args(args: &[String]) -> Vec<String> {
+    const KEYWORDS: &[&str] = &["key", "token", "secret", "password"];
+    let mut out = Vec::with_capacity(args.len());
+    let mut redact_next = false;
+    for arg in args {
+        if redact_next {
+            out.push("***".to_string());
+            redact_next = false;
+            continue;
+        }
+        let lower = arg.to_ascii_lowercase();
+        let bare = lower.trim_start_matches('-');
+        if let Some(eq) = bare.find('=') {
+            if KEYWORDS.iter().any(|kw| bare[..eq].ends_with(kw)) {
+                out.push(format!(
+                    "{}=***",
+                    &arg[..arg.find('=').unwrap_or(arg.len())]
+                ));
+                continue;
+            }
+        }
+        if KEYWORDS.iter().any(|kw| bare.ends_with(kw)) {
+            out.push(arg.clone());
+            redact_next = true;
+            continue;
+        }
+        out.push(arg.clone());
+    }
+    out
 }
 
 /// home（`.omt`）目录 → workspace 根（§3.6.4：spawn cwd 不允许落在 `.omt` 里）。
@@ -252,6 +318,8 @@ impl ExecutionManager {
         req: SpawnRequest,
         on_event: EventSink,
     ) -> Result<Arc<ExecSession>, String> {
+        // F-U2-10：home_id 拼路径前与 agents_path 同规则校验
+        agents::validate_home_id(&req.home_id)?;
         if req
             .env_additions
             .keys()
@@ -265,6 +333,8 @@ impl ExecutionManager {
         if !cwd.is_dir() {
             return Err(format!("workspace 根不存在：{}", cwd.display()));
         }
+        // F-U2-8(b)：argv 进事件/日志前脱敏（raw.log 保留原始流供诊断）
+        let sanitized_args = sanitize_args(&req.args);
         let raw_log = runtime_dir
             .join("transcripts")
             .join(&req.home_id)
@@ -299,6 +369,12 @@ impl ExecutionManager {
             .spawn()
             .map_err(|e| format!("spawn {} 失败: {e}", req.program.display()))?;
         let pid = child.id();
+        // F-U2-4(a)：父侧同步 setpgid——子进程可能尚未执行到 pre_exec 的
+        // setpgid，此刻 exec_stop 会 kill(-pid) 得 ESRCH 而漏杀。EACCES
+        // （子已 exec）忽略。
+        unsafe {
+            libc::setpgid(pid as i32, pid as i32);
+        }
         let started_at_epoch_ms = agents::now_epoch_ms();
         let started = Instant::now();
 
@@ -312,14 +388,17 @@ impl ExecutionManager {
             pid,
             pgid: pid as i32,
             program: req.program.clone(),
-            args: req.args.clone(),
+            args: sanitized_args,
             cwd: cwd.clone(),
             started_at_epoch_ms,
             raw_log,
             runtime_dir: runtime_dir.to_path_buf(),
             mcp: req.mcp.clone(),
+            started,
+            sink: on_event.clone(),
             first_event_seen: AtomicBool::new(false),
             stop_requested: AtomicBool::new(false),
+            stop_reason: Mutex::new(None),
             terminal: Mutex::new(None),
         });
         self.sessions
@@ -361,21 +440,16 @@ impl ExecutionManager {
 
         // 等待线程：终态分类 + kill 升级 + agents.json 回写 + 终态事件。
         let waiter_session = session.clone();
-        let waiter_events = on_event.clone();
         let startup_window = self.startup_window();
         let max_duration = self.max_duration();
         std::thread::spawn(move || {
             let mut term_sig: Option<i32> = None;
-            let mut kill_reason: Option<KillReason> = None;
             let mut kill_at: Option<Instant> = None;
             loop {
-                if kill_reason.is_none() {
-                    if waiter_session.stop_requested.load(Ordering::Relaxed) {
-                        kill_reason = Some(KillReason::User);
-                    } else if started.elapsed() >= max_duration {
-                        kill_reason = Some(KillReason::MaxDuration);
-                    }
-                }
+                // 终止原因：exec_stop=User、kill_all=AppExit、watchdog=MaxDuration
+                let kill_reason = waiter_session.stop_reason().or_else(|| {
+                    (started.elapsed() >= max_duration).then_some(KillReason::MaxDuration)
+                });
                 if kill_reason.is_some() {
                     if term_sig.is_none() {
                         term_sig = Some(libc::SIGTERM);
@@ -387,15 +461,36 @@ impl ExecutionManager {
                 }
                 match child.try_wait() {
                     Ok(Some(status)) => {
+                        // F-U2-2：reader 线程可能还有缓冲行未落账——先给首事件
+                        // ≤300ms 浮现，再分类（否则首行输出会被误判为起动失败）
+                        let _ = wait_for(
+                            || {
+                                waiter_session
+                                    .first_event_seen
+                                    .load(Ordering::Relaxed)
+                                    .then_some(())
+                            },
+                            Duration::from_millis(300),
+                        );
+                        // F-U2-4(b)：harness 本体已退出，进程组内的残留成员是
+                        // 孤儿（继承 stdout 会卡住 reader）——KD-D7 语义清场
+                        // （本分支只会进入一次）
+                        waiter_session.kill_tree(libc::SIGKILL);
+                        let code = status.code();
+                        #[cfg(unix)]
+                        let signal = status.signal();
+                        #[cfg(not(unix))]
+                        let signal: Option<i32> = None;
                         let terminal = classify(
                             &waiter_session,
-                            status.code(),
+                            code,
+                            signal,
                             term_sig.is_some(),
                             kill_reason,
                             started,
                             startup_window,
                         );
-                        finish_terminal(&waiter_session, &terminal, &waiter_events, started);
+                        finish_terminal(&waiter_session, &terminal);
                         break;
                     }
                     Ok(None)
@@ -406,7 +501,7 @@ impl ExecutionManager {
                         waiter_session.kill_tree(libc::SIGKILL);
                         let terminal =
                             Terminal::Killed(kill_reason.unwrap_or(KillReason::MaxDuration));
-                        finish_terminal(&waiter_session, &terminal, &waiter_events, started);
+                        finish_terminal(&waiter_session, &terminal);
                         break;
                     }
                     Ok(None) => std::thread::sleep(Duration::from_millis(100)),
@@ -432,35 +527,49 @@ impl ExecutionManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(session) = sessions.get(exec_id) {
             if session.terminal().is_none() {
-                session.stop_requested.store(true, Ordering::Relaxed);
+                session.request_stop(KillReason::User);
             }
         }
         Ok(())
     }
 
     /// 退出钩子：终止全部会话（KD-D7）。app 退出路径调用。
+    ///
+    /// F-U2-1：同步收口——预置 terminal 会让等待线程的 finish_terminal 早退，
+    /// agents.json 永远收不到 Killed(AppExit)（下次启动被 demote 记成
+    /// 「app restarted」的 Failed，语义错且 execs[].kill_reason 缺失）。这里
+    /// 设置原因 → SIGTERM → 有界等待等待线程收口 → 超时则本路径直接
+    /// finish_terminal（幂等 guard 保证与等待线程只写一次）。
     pub fn kill_all(&self, reason: KillReason) {
-        let sessions = self
-            .sessions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for session in sessions.values() {
-            if session.terminal().is_none() {
-                session.stop_requested.store(true, Ordering::Relaxed);
-                // AppExit 终止不走 stop_requested 的 User 分类——直接标记并 kill
-                session.kill_tree(libc::SIGTERM);
-                let mut terminal = session
-                    .terminal
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if terminal.is_none() {
-                    *terminal = Some(Terminal::Killed(reason));
-                }
-            }
+        let mut pending: Vec<Arc<ExecSession>> = {
+            let sessions = self
+                .sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            sessions
+                .values()
+                .filter(|s| s.terminal().is_none())
+                .cloned()
+                .collect()
+        };
+        for session in &pending {
+            session.request_stop(reason);
+            session.kill_tree(libc::SIGTERM);
         }
-        drop(sessions);
-        // 给读线程/等待线程一点收割时间；SIGKILL 兜底由各等待线程完成。
-        std::thread::sleep(Duration::from_millis(200));
+        let deadline = Instant::now() + KILL_GRACE + Duration::from_secs(2);
+        loop {
+            pending.retain(|s| s.terminal().is_none());
+            if pending.is_empty() || Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // 未收口的：升级 SIGKILL 并同步落盘（finish_terminal 幂等 guard 防
+        // 与等待线程双写；MCP 注入的 workspace 释放同路径完成）
+        for session in &pending {
+            session.kill_tree(libc::SIGKILL);
+            finish_terminal(session, &Terminal::Killed(reason));
+        }
     }
 
     pub fn get(&self, exec_id: &str) -> Option<Arc<ExecSession>> {
@@ -506,22 +615,28 @@ fn spawn_reader(
     })
 }
 
-/// 终态分类（§3.2）：kill → Killed(reason)；起动窗内非零退出 → Failed(stderr
-/// 尾，已脱敏)；其余 → Exited(code)。
+/// 终态分类（§3.2 / F-U2-2）：desktop 发起的 kill → Killed(reason)；**外部**
+/// 信号死亡 → Killed(External)（F-U2-5）；起动窗内**未产出任何 transcript
+/// 事件**且非零退出 → Failed(stderr 尾，已脱敏)；其余 → Exited(code)。
 #[allow(clippy::too_many_arguments)]
 fn classify(
     session: &ExecSession,
     code: Option<i32>,
-    killed: bool,
+    signal: Option<i32>,
+    killed_by_us: bool,
     kill_reason: Option<KillReason>,
     started: Instant,
     startup_window: Duration,
 ) -> Terminal {
-    if killed {
+    if killed_by_us {
         return Terminal::Killed(kill_reason.unwrap_or(KillReason::User));
     }
+    if let Some(sig) = signal {
+        return Terminal::Killed(KillReason::External(sig));
+    }
     let code = code.unwrap_or(-1);
-    if started.elapsed() < startup_window && code != 0 {
+    let produced_output = session.first_event_seen.load(Ordering::Relaxed);
+    if !produced_output && code != 0 && started.elapsed() < startup_window {
         let tail = std::fs::read_to_string(&session.raw_log)
             .map(|text| {
                 let lines: Vec<&str> = text.lines().collect();
@@ -540,12 +655,7 @@ fn classify(
 }
 
 /// 终态收口：写 agents.json（仅状态变化时落盘）+ 终态事件。
-fn finish_terminal(
-    session: &ExecSession,
-    terminal: &Terminal,
-    on_event: &EventSink,
-    started: Instant,
-) {
+fn finish_terminal(session: &ExecSession, terminal: &Terminal) {
     {
         let mut guard = session
             .terminal
@@ -557,7 +667,7 @@ fn finish_terminal(
         *guard = Some(terminal.clone());
     }
     let runtime_dir = &session.runtime_dir;
-    let (status, detail) = match terminal {
+    let (status, _detail) = match terminal {
         Terminal::Exited(_) => (AgentRecordStatus::Exited, None),
         Terminal::Failed(detail) => (AgentRecordStatus::Failed, Some(detail.clone())),
         Terminal::Killed(_) => (AgentRecordStatus::Killed, None),
@@ -576,20 +686,20 @@ fn finish_terminal(
         status,
         AgentAttachment::None,
     );
-    if let Some(detail) = detail {
-        let exec_id = session.exec_id.clone();
-        let _ = agents::update_exec(
-            runtime_dir,
-            &session.home_id,
-            &session.agent_id,
-            &exec_id,
-            |exec| {
-                exec.failure_detail = Some(detail);
-            },
-        );
-    }
-    let duration_ms = started.elapsed().as_millis() as u64;
-    on_event(serde_json::json!({
+    // F-U2-3：exec 终态三字段一次回写（U5 显示退出码、U10 reconcile 依赖）
+    let _ = agents::update_exec(
+        runtime_dir,
+        &session.home_id,
+        &session.agent_id,
+        &session.exec_id,
+        |exec| match terminal {
+            Terminal::Exited(code) => exec.exit_code = Some(*code),
+            Terminal::Failed(detail) => exec.failure_detail = Some(detail.clone()),
+            Terminal::Killed(reason) => exec.kill_reason = Some(reason.key()),
+        },
+    );
+    let duration_ms = session.started.elapsed().as_millis() as u64;
+    (session.sink)(serde_json::json!({
         "execId": session.exec_id,
         "kind": "exit",
         "status": match status {
@@ -603,7 +713,7 @@ fn finish_terminal(
             _ => None,
         },
         "killReason": match terminal {
-            Terminal::Killed(reason) => Some(reason.as_str()),
+            Terminal::Killed(reason) => Some(reason.key()),
             _ => None,
         },
         "durationMs": duration_ms,
@@ -619,24 +729,25 @@ pub fn exec_stop(
     state.0.exec_stop(&exec_id)
 }
 
+/// 轮询等待条件成立（非阻塞检查 + 50ms 步进）；测试与等待线程共用。
+fn wait_for<T>(mut check: impl FnMut() -> Option<T>, timeout: Duration) -> Option<T> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(v) = check() {
+            return Some(v);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::sync::mpsc;
-
-    fn wait_for<T>(mut check: impl FnMut() -> Option<T>, timeout: Duration) -> Option<T> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if let Some(v) = check() {
-                return Some(v);
-            }
-            if Instant::now() >= deadline {
-                return None;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
 
     fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
@@ -754,12 +865,14 @@ mod tests {
     }
 
     #[test]
-    fn failed_stderr_tail_is_sanitized() {
+    fn stderr_output_then_nonzero_exit_is_exited_not_failed() {
+        // F-U2-2：起动窗判据 = 「未产出任何 transcript 事件」。先输出再非零
+        // 退出是真实运行（如 claim 被拒按纪律退出）——归 Exited 而非 Failed
         let dir = tempfile::tempdir().unwrap();
         let runtime = dir.path().join("runtime");
         let home_path = dir.path().join("ws").join(".omt");
         std::fs::create_dir_all(&home_path).unwrap();
-        let manager = ExecutionManager::with_limits(Duration::from_secs(10), DEFAULT_MAX_DURATION);
+        let manager = ExecutionManager::with_limits(Duration::from_secs(30), DEFAULT_MAX_DURATION);
         let script = write_script(
             dir.path(),
             "leaky",
@@ -789,13 +902,197 @@ mod tests {
             )
             .unwrap();
         let terminal = wait_for(|| session.terminal(), Duration::from_secs(5));
+        assert!(
+            matches!(terminal, Some(Terminal::Exited(3))),
+            "{terminal:?}"
+        );
+    }
+
+    #[test]
+    fn silent_exit_within_startup_window_yields_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        let home_path = dir.path().join("ws").join(".omt");
+        std::fs::create_dir_all(&home_path).unwrap();
+        let manager = ExecutionManager::with_limits(Duration::from_secs(30), DEFAULT_MAX_DURATION);
+        let script = write_script(dir.path(), "silent", "exit 1\n");
+        // U4a 语义：spawn 前 Agent 记录已注册（U4 链步骤 ⑤），id = agent-<execId>
+        let agent = agents::register_agent(
+            &runtime,
+            "h_test",
+            "fake",
+            NewExec {
+                exec_id: "exec-silent".into(),
+                node_id: None,
+                run_id: None,
+                binary_path: None,
+                binary_args: vec![],
+            },
+        )
+        .unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let sink: EventSink = Arc::new(move |v| {
+            let _ = tx.send(v);
+        });
+        let session = manager
+            .spawn(
+                &runtime,
+                SpawnRequest {
+                    exec_id: "exec-silent".into(),
+                    agent_id: agent.id.clone(),
+                    home_id: "h_test".into(),
+                    home_path: home_path.clone(),
+                    harness: "fake".into(),
+                    node_id: None,
+                    run_id: None,
+                    program: script,
+                    args: vec![],
+                    env_additions: BTreeMap::new(),
+                    mcp: McpInjection::None,
+                },
+                sink,
+            )
+            .unwrap();
+        let terminal = wait_for(|| session.terminal(), Duration::from_secs(5));
         let Some(Terminal::Failed(detail)) = terminal else {
             panic!("应为 Failed：{terminal:?}");
         };
-        assert!(!detail.contains("sk-abcdef123"), "{detail}");
-        assert!(!detail.contains("abc.def"), "{detail}");
-        assert!(detail.contains("API_KEY="), "{detail}");
-        assert!(detail.contains("Bearer"), "{detail}");
+        assert!(detail.contains("起动窗"), "{detail}");
+        // agents.json 同步落了 Failed（F-U2-3：attach None）
+        let (file, _) = crate::atomic_json::read_json::<crate::agents::AgentsFile>(
+            &runtime.join("agents").join("h_test").join("agents.json"),
+        )
+        .unwrap();
+        assert_eq!(
+            file.agents[0].status,
+            crate::agents::AgentRecordStatus::Failed
+        );
+        assert_eq!(
+            file.agents[0].attachment,
+            crate::agents::AgentAttachment::None
+        );
+    }
+
+    #[test]
+    fn external_signal_death_is_killed_external() {
+        // F-U2-5：非 desktop 发起的信号死亡 → Killed(External(sig))
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        let home_path = dir.path().join("ws").join(".omt");
+        std::fs::create_dir_all(&home_path).unwrap();
+        let manager = ExecutionManager::with_limits(Duration::from_secs(30), DEFAULT_MAX_DURATION);
+        let script = write_script(dir.path(), "selfkill", "kill -9 $$\nsleep 30\n");
+        let (tx, _rx) = mpsc::channel();
+        let sink: EventSink = Arc::new(move |v| {
+            let _ = tx.send(v);
+        });
+        let session = manager
+            .spawn(
+                &runtime,
+                SpawnRequest {
+                    exec_id: "exec-sig".into(),
+                    agent_id: "agent-sig".into(),
+                    home_id: "h_test".into(),
+                    home_path: home_path.clone(),
+                    harness: "fake".into(),
+                    node_id: None,
+                    run_id: None,
+                    program: script,
+                    args: vec![],
+                    env_additions: BTreeMap::new(),
+                    mcp: McpInjection::None,
+                },
+                sink,
+            )
+            .unwrap();
+        let terminal = wait_for(|| session.terminal(), Duration::from_secs(5));
+        assert!(
+            matches!(&terminal, Some(Terminal::Killed(KillReason::External(9)))),
+            "{terminal:?}"
+        );
+    }
+
+    #[test]
+    fn sanitize_stderr_tail_redacts_secret_lines() {
+        let tail = "starting up\nAPI_KEY=sk-abcdef123\nAuthorization: Bearer abc.def\ndone\n";
+        let sanitized = sanitize_stderr_tail(tail);
+        assert!(!sanitized.contains("sk-abcdef123"), "{sanitized}");
+        assert!(!sanitized.contains("abc.def"), "{sanitized}");
+        assert!(sanitized.contains("API_KEY= ***"), "{sanitized}");
+        assert!(
+            sanitized.contains("Authorization: Bearer ***"),
+            "{sanitized}"
+        );
+    }
+
+    #[test]
+    fn sanitize_args_redacts_key_value_flags() {
+        let args = vec![
+            "--model".to_string(),
+            "k3".to_string(),
+            "--api-key".to_string(),
+            "sk-live123".to_string(),
+            "--token=abcdef".to_string(),
+            "--verbose".to_string(),
+        ];
+        let sanitized = sanitize_args(&args);
+        assert_eq!(sanitized[0], "--model");
+        assert_eq!(sanitized[1], "k3");
+        assert_eq!(sanitized[2], "--api-key");
+        assert_eq!(sanitized[3], "***");
+        assert_eq!(sanitized[4], "--token=***");
+        assert_eq!(sanitized[5], "--verbose");
+    }
+
+    #[test]
+    fn argv_into_session_start_is_sanitized() {
+        // F-U2-8(b)：session_start 事件的 args 必须是脱敏后的
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        let home_path = dir.path().join("ws").join(".omt");
+        std::fs::create_dir_all(&home_path).unwrap();
+        let manager = ExecutionManager::with_limits(STARTUP_WINDOW, DEFAULT_MAX_DURATION);
+        let script = write_script(dir.path(), "argpeek", "sleep 30\n");
+        let (tx, rx) = mpsc::channel();
+        let sink: EventSink = Arc::new(move |v| {
+            let _ = tx.send(v);
+        });
+        let _session = manager
+            .spawn(
+                &runtime,
+                SpawnRequest {
+                    exec_id: "exec-args".into(),
+                    agent_id: "agent-args".into(),
+                    home_id: "h_test".into(),
+                    home_path: home_path.clone(),
+                    harness: "fake".into(),
+                    node_id: None,
+                    run_id: None,
+                    program: script,
+                    args: vec!["--api-key".to_string(), "sk-live123".to_string()],
+                    env_additions: BTreeMap::new(),
+                    mcp: McpInjection::None,
+                },
+                sink,
+            )
+            .unwrap();
+        let args = wait_for(
+            || {
+                while let Ok(event) = rx.try_recv() {
+                    if event["kind"] == "session_start" {
+                        return Some(event["args"].clone());
+                    }
+                }
+                None
+            },
+            Duration::from_secs(5),
+        );
+        assert_eq!(
+            args,
+            Some(serde_json::json!(["--api-key", "***"])),
+            "session_start 的 args 必须脱敏"
+        );
+        let _ = manager.exec_stop("exec-args");
     }
 
     #[test]

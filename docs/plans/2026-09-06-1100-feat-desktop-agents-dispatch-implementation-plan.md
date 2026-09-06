@@ -132,7 +132,7 @@ pub enum Attachment { Live, Orphan, None }
 ```
 
 - **commandId 幂等纪律（per-step 派生）**：journal 以 commandId 为**全局唯一键**（`dispatch.rs:331-345`），同 id 不同输入 → `CONFLICT command-id-reuse`，因此**不能**用一个 id 贯穿 ②③④。一次逻辑派发生成 `dispatchId`，各步派生独立 id：② `<dispatchId>:execute`、③ `<dispatchId>:create`、④ `<dispatchId>:start`；超时重试复用**各步自己的** id（journal 命中即回放存储结果，不重复建 run）。④ 对「run 已是 Running」的 `run-status-gate` CONFLICT 视为成功（与复用 Running run 跳过 ④ 的分支一致）。
-- **执行者身份纪律（`--actor` 注入）**：`omt mcp` 现硬编码 actor 为 `mcp:<pid>`（`mcp.rs:97`）且忽略 CLI 已有的全局 `--actor`（`cli/mod.rs:155-158`）；MCP 是 harness 的孙进程，desktop 不可知其 pid。U3 让 `omt mcp` 尊重 `--actor`，desktop 生成 MCP config 时传 `args: ["--actor", "exec:<execId>", "mcp"]`。由此：desktop 凭 `run_items.executor_session_id == exec:<execId>` 精确知道本 exec 持有的 item；MCP 进程重启不丢租约身份；Runs 面谱系 `exec:<execId>` 可直接定位 Agents 面对应 Agent。CLI 参数变更，daemon 协议零变更。
+- **执行者身份纪律（`--actor` 注入）**：`omt mcp` 现硬编码 actor 为 `mcp:<pid>`（`mcp.rs:97`）且忽略 CLI 已有的全局 `--actor`（`cli/mod.rs:155-158`）；MCP 是 harness 的孙进程，desktop 不可知其 pid。U3 让 `omt mcp` 尊重 `--actor`，desktop 生成 MCP config 时传 `args: ["--actor", "exec:<execId>", "mcp"]`。由此：desktop 凭 `run_items.executor_session_id` 以 `ends_with("/exec:<execId>")` 定位本 exec 持有的 item（F-U3-14 决策 (a)：daemon 对 kind=mcp 的显式 actor 做基命名空间嵌套，实际授予形如 `mcp:<pid>/exec:<id>`，MCP 进程重启会换 pid——身份精度损失接受为 v1 权衡，租约 TTL 兜底；execId 上界 47 字符防 64 字符截断静默降级）；Runs 面谱系 `exec:<execId>` 可直接定位 Agents 面对应 Agent。CLI 参数变更，daemon 协议零变更。
 - **复用分支**：目标 run Pending → 正常 start；Running → 跳过 ④；Paused/Interrupted → 弹窗询问 resume/retry 或取消（附成员交集预览）。
 - **补偿表**（只作用于**本次新建**的 run——复用 run 里可能有其他 agent 在 claim，绝不 cancel）：
   | 失败点 | 补偿 |
@@ -143,7 +143,7 @@ pub enum Attachment { Live, Orphan, None }
   | ⑧ spawn 失败或起动窗内退出且本 run 无 item 被 claim | 同上补偿 + Agent Failed（附 stderr 尾） |
   ⑤ 之后的失败一律在 Agents 列表留 Failed 记录（①–④ 失败时尚无 Agent 记录，弹窗报错即可），不静默吞掉。
 - **终止/崩溃后的租约释放（替代原「run/interrupt 该 exec 持有项」方案）**。两项 daemon 事实决定了做法：(a) `run/interrupt` 是 **run 级**原语——interrupt 全部 in-flight（含 awaiting_confirmation）、清全部租约、置 run Paused（`dispatch.rs:2634-2690`）；(b) `claim` 只取 `state='pending'`（`store.rs:890`），interrupted 项必须经 `run/control retry(nodeId)` 才回 pending，`resume` 不动 item。因此原方案既会误伤同 run 其他 agent，又无法让「终止后立即重派发」推进。**定稿做法**：
-  1. exec 进入 Killed / Exited / Failed 任一终态时，desktop 以 `executor_session_id == exec:<execId>` 查出本 exec 仍持有的 in-flight 项；
+  1. exec 进入 Killed / Exited / Failed 任一终态时，desktop 以 `executor_session_id` 以 `ends_with("/exec:<execId>")` 查出本 exec 仍持有的 in-flight 项；
   2. 对其中 `running` 项，desktop 以 **admin 身份**（desktop 自注册 admin principal，无 leaseToken 的 report 走 `Administrator` 授权，`dispatch.rs:2281-2290`）调 `run/report failed`（note 如实记「被用户终止」/「harness 退出未报告」）→ 再 `run/control retry(nodeId)` 使其回 pending；item 精确、不置 run Paused、不影响同 run 其他 agent、零协议变更、历史如实（attempts+1）；
   3. 对 `awaiting_confirmation` 项**不动**，交 U14 人工确认/打回；
   4. 兜底：desktop 非 admin（admin-grants 被禁用）时退回 run 级链——仅当本 exec 独占 run 全部 in-flight 时 `run/interrupt` → `run/control resume` → 逐项 `retry`；否则等 15min TTL 并在 Agents 面提示。

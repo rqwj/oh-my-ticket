@@ -115,7 +115,7 @@ impl Default for AgentRecord {
 
 /// home-id 来自 daemon handshake（`h_`+base36），防御性拒绝路径分隔符与
 /// 上级目录形态。
-fn validate_home_id(home_id: &str) -> Result<(), String> {
+pub(crate) fn validate_home_id(home_id: &str) -> Result<(), String> {
     if home_id.is_empty()
         || home_id.contains('/')
         || home_id.contains('\\')
