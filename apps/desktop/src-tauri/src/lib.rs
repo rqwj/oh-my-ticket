@@ -68,8 +68,9 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building oh-my-ticket desktop")
         .run(|app, event| {
-            // KD-D7：app 退出 = 执行终止。最后一个窗口关闭/退出请求时
-            // killpg 全部会话（等待线程随后完成 agents.json 终态回写）。
+            // KD-D7：app 退出 = 执行终止。F-U2-1 后 kill_all 同步收口：
+            // SIGTERM → 有界等待（≤ KILL_GRACE+2s）等待线程落盘 → 超时则
+            // SIGKILL 并由本路径直接 finish_terminal 落盘。
             if let tauri::RunEvent::ExitRequested { .. } = event {
                 use crate::executor::KillReason;
                 app.state::<ExecutionState>()

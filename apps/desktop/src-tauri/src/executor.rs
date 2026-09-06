@@ -108,7 +108,6 @@ pub struct ExecSession {
     /// 事件出口（waiter 与 kill_all 路径共用；U4 接 Tauri Channel）
     sink: EventSink,
     first_event_seen: AtomicBool,
-    stop_requested: AtomicBool,
     /// 终止方设置的原因：exec_stop=User、kill_all=AppExit、watchdog=MaxDuration
     stop_reason: Mutex<Option<KillReason>>,
     terminal: Mutex<Option<Terminal>>,
@@ -123,12 +122,15 @@ impl ExecSession {
     }
 
     fn request_stop(&self, reason: KillReason) {
-        if let Ok(mut guard) = self.stop_reason.lock() {
-            if guard.is_none() {
-                *guard = Some(reason);
-            }
+        // F-U2-14：与文件内其余锁一致，poison 穿透而非吞掉（锁保护的是写
+        // 互斥而非不变量，poison 无意义）。
+        let mut guard = self
+            .stop_reason
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.is_none() {
+            *guard = Some(reason);
         }
-        self.stop_requested.store(true, Ordering::Relaxed);
     }
 
     fn stop_reason(&self) -> Option<KillReason> {
@@ -397,7 +399,6 @@ impl ExecutionManager {
             started,
             sink: on_event.clone(),
             first_event_seen: AtomicBool::new(false),
-            stop_requested: AtomicBool::new(false),
             stop_reason: Mutex::new(None),
             terminal: Mutex::new(None),
         });
@@ -618,6 +619,8 @@ fn spawn_reader(
 /// 终态分类（§3.2 / F-U2-2）：desktop 发起的 kill → Killed(reason)；**外部**
 /// 信号死亡 → Killed(External)（F-U2-5）；起动窗内**未产出任何 transcript
 /// 事件**且非零退出 → Failed(stderr 尾，已脱敏)；其余 → Exited(code)。
+/// F-U2-13：signal 分支优先采用已请求的 stop_reason——kill_all 的
+/// request_stop 与 SIGTERM 之间的采样/收割窗口不得把 app 退出记成 external。
 #[allow(clippy::too_many_arguments)]
 fn classify(
     session: &ExecSession,
@@ -632,7 +635,7 @@ fn classify(
         return Terminal::Killed(kill_reason.unwrap_or(KillReason::User));
     }
     if let Some(sig) = signal {
-        return Terminal::Killed(KillReason::External(sig));
+        return Terminal::Killed(session.stop_reason().unwrap_or(KillReason::External(sig)));
     }
     let code = code.unwrap_or(-1);
     let produced_output = session.first_event_seen.load(Ordering::Relaxed);
@@ -1013,6 +1016,122 @@ mod tests {
     }
 
     #[test]
+    fn classify_prefers_requested_stop_over_external_signal() {
+        // F-U2-13：kill_all 的 request_stop 与 SIGTERM 死亡落在同一收割迭代
+        // 时（killed_by_us=false + signal=15），必须按已请求的原因收口，而不是
+        // 误标 external-15。
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        let home_path = dir.path().join("ws").join(".omt");
+        std::fs::create_dir_all(&home_path).unwrap();
+        let agent = agents::register_agent(
+            &runtime,
+            "h_test",
+            "fake",
+            NewExec {
+                exec_id: "exec-race".into(),
+                node_id: None,
+                run_id: None,
+                binary_path: None,
+                binary_args: vec![],
+            },
+        )
+        .unwrap();
+        let session = ExecSession {
+            exec_id: "exec-race".into(),
+            agent_id: agent.id.clone(),
+            home_id: "h_test".into(),
+            harness: "fake".into(),
+            node_id: None,
+            run_id: None,
+            pid: u32::MAX,
+            pgid: i32::MAX - 1,
+            program: PathBuf::from("/bin/echo"),
+            args: vec![],
+            cwd: PathBuf::from("/"),
+            started_at_epoch_ms: agents::now_epoch_ms(),
+            raw_log: runtime
+                .join("transcripts")
+                .join("h_test")
+                .join("exec-race.raw.log"),
+            runtime_dir: runtime.clone(),
+            mcp: McpInjection::None,
+            started: Instant::now(),
+            sink: Arc::new(|_| {}),
+            first_event_seen: AtomicBool::new(true),
+            stop_reason: Mutex::new(Some(KillReason::AppExit)),
+            terminal: Mutex::new(None),
+        };
+        let terminal = classify(
+            &session,
+            None,
+            Some(15),
+            false,
+            Some(KillReason::AppExit),
+            session.started,
+            STARTUP_WINDOW,
+        );
+        assert_eq!(terminal, Terminal::Killed(KillReason::AppExit));
+    }
+
+    #[test]
+    fn term_immune_child_exercises_kill_all_timeout_branch() {
+        // F-U2-15：SIGTERM 免疫的子进程走 kill_all 的超时分支（直接
+        // finish_terminal），仍以 Killed(AppExit) 落盘
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        let home_path = dir.path().join("ws").join(".omt");
+        std::fs::create_dir_all(&home_path).unwrap();
+        let manager = ExecutionManager::with_limits(STARTUP_WINDOW, DEFAULT_MAX_DURATION);
+        let script = write_script(dir.path(), "stubborn", "trap '' TERM\nsleep 30\n");
+        let (tx, _rx) = mpsc::channel();
+        let sink: EventSink = Arc::new(move |v| {
+            let _ = tx.send(v);
+        });
+        let agent = agents::register_agent(
+            &runtime,
+            "h_test",
+            "fake",
+            NewExec {
+                exec_id: "exec-stubborn".into(),
+                node_id: None,
+                run_id: None,
+                binary_path: None,
+                binary_args: vec![],
+            },
+        )
+        .unwrap();
+        let session = manager
+            .spawn(
+                &runtime,
+                SpawnRequest {
+                    exec_id: "exec-stubborn".into(),
+                    agent_id: agent.id.clone(),
+                    home_id: "h_test".into(),
+                    home_path: home_path.clone(),
+                    harness: "fake".into(),
+                    node_id: None,
+                    run_id: None,
+                    program: script,
+                    args: vec![],
+                    env_additions: BTreeMap::new(),
+                    mcp: McpInjection::None,
+                },
+                sink,
+            )
+            .unwrap();
+        manager.exec_stop("exec-stubborn").unwrap();
+        let terminal = wait_for(|| session.terminal(), KILL_GRACE + Duration::from_secs(8));
+        assert!(
+            matches!(&terminal, Some(Terminal::Killed(KillReason::User))),
+            "{terminal:?}"
+        );
+        // 进程组确已清空（SIGKILL 升级生效）
+        let alive = unsafe { libc::kill(-session.pgid, 0) };
+        assert_ne!(alive, 0, "TERM 免疫进程应被 SIGKILL 升级清除");
+    }
+
+    #[test]
     fn sanitize_stderr_tail_redacts_secret_lines() {
         let tail = "starting up\nAPI_KEY=sk-abcdef123\nAuthorization: Bearer abc.def\ndone\n";
         let sanitized = sanitize_stderr_tail(tail);
@@ -1233,12 +1352,26 @@ mod tests {
         let sink: EventSink = Arc::new(move |v| {
             let _ = tx.send(v);
         });
+        // U4a 语义：spawn 前 Agent 记录已注册（U4 链步骤 ⑤）
+        let agent = agents::register_agent(
+            &runtime,
+            "h_test",
+            "fake",
+            NewExec {
+                exec_id: "exec-exit".into(),
+                node_id: None,
+                run_id: None,
+                binary_path: None,
+                binary_args: vec![],
+            },
+        )
+        .unwrap();
         let session = manager
             .spawn(
                 &runtime,
                 SpawnRequest {
                     exec_id: "exec-exit".into(),
-                    agent_id: "agent-exit".into(),
+                    agent_id: agent.id.clone(),
                     home_id: "h_test".into(),
                     home_path: home_path.clone(),
                     harness: "fake".into(),
@@ -1258,6 +1391,24 @@ mod tests {
             terminal,
             Some(Terminal::Killed(KillReason::AppExit))
         ));
+        // F-U2-12：kill_all 路径必须真正落盘（F-U2-1 修复的验收断言）
+        let (file, parse_failed) = crate::atomic_json::read_json::<crate::agents::AgentsFile>(
+            &runtime.join("agents").join("h_test").join("agents.json"),
+        )
+        .unwrap();
+        assert!(!parse_failed);
+        assert_eq!(
+            file.agents[0].status,
+            crate::agents::AgentRecordStatus::Killed
+        );
+        assert_eq!(
+            file.agents[0].attachment,
+            crate::agents::AgentAttachment::None
+        );
+        assert_eq!(
+            file.agents[0].execs[0].kill_reason.as_deref(),
+            Some("appexit")
+        );
     }
 
     #[test]
