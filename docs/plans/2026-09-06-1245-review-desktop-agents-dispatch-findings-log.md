@@ -59,6 +59,16 @@ branch: feat/desktop-agents-dispatch
 | F-U15-4 | P3 | gated_auto | U15 | `apps/desktop/src-tauri/src/lib.rs:30` | `OMT_ALLOW_MULTI_INSTANCE` 用 `is_some()` 判定，空值/`0` 也会关掉守卫，违背仓库 env「空即未设置」约定 | fixed(7be3f76) | — |
 | F-U15-5 | P3 | advisory | U15 | `docs/dsh-plugin-dev-notes.md §1.4` | `OMT_ALLOW_MULTI_INSTANCE` 只在 lib.rs 注释与本日志可见，开发回路文档未记 | fixed(7be3f76) | — |
 | F-U15-2 | P3 | manual | U15 | `apps/desktop/src-tauri/src/lib.rs:19` | dev 实例与打包版共用 single-instance socket，`tauri dev` 被静默吞掉 | fixed(c8d8946) | — |
+| F-U3-1 | P1 | gated_auto | U3 | `.github/workflows/ci.yml:59` | 新增的 `cp target/debug/omt …` 行零缩进，`run: \|` 块被截断 → workflow YAML 非法，CI 完全不跑 | fixed(b3500cb) | — |
+| F-U3-2 | P1 | manual | U3 | `auth.rs:126-135` × `mcp.rs::enroll_identity` | daemon 只授予 `<kind>:<pid>` 或其 `/` 嵌套的 actor namespace，裸 `exec:<execId>` 被静默降级 | fixed(b3500cb)（改发 `mcp:<pid>/exec:<id>`；daemon+CLI 两侧各加测试） | — |
+| F-U3-3 | P2 | gated_auto | U3 | `mcp_injection.rs::release_omp`/`sweep_omp_crash_residue` | crash/mid-exec 手改后跳过恢复但仍删光 launchers，留下悬空 `omt` 条目 | fixed(b3500cb)（外科手术式精确匹配移除，不再整体覆盖或盲删） | — |
+| F-U3-4 | P3 | testing-gap | U3 | `mcp_injection.rs::prepare_with` opencode | `OPENCODE_CONFIG_CONTENT` 合并语义未实测 | fixed(b3500cb)（本机 opencode 1.18.14 实测确认为深度合并，非覆盖；无需改代码） | — |
+| F-U3-5 | P3 | gated_auto | U3 | `mcp_injection.rs` 持久化 hash | `DefaultHasher` 跨 Rust 版本不稳定 | fixed(b3500cb)（换 SHA-256） | — |
+| F-U3-6 | P3 | gated_auto | U3 | `mcp_injection.rs::workspace_hash` | 路径未 canonicalize，symlink 拆分 refcount | fixed(b3500cb) | — |
+| F-U3-7 | P3 | gated_auto | U3 | `mcp_injection.rs::remove_launcher` | 定义了但从未调用，launcher 累积 | fixed(b3500cb)（`McpInjection::Omp` 加 `launcher_id`，每次 release 都删自己的） | — |
+| F-U3-8 | P3 | gated_auto | U3 | `mcp_injection.rs::merge_omp_mcp` | 用户工作区文件非原子写 | fixed(b3500cb)（统一 tmp+rename） | — |
+| F-U3-9 | P3 | advisory | U3→U4 | 补偿表 ⑦/⑧ | spawn 失败路径不释放已 prepare 的注入 | 半 fixed(b3500cb)：spawn 失败已修；kill_all 路径 open，待 F-U2-1 | — |
+| F-U3-10 | P3 | advisory | U3 | `mcp_injection.rs` persistent 混用 | 非 persistent release 可能恢复 backup、抹掉 persistent 注入 | fixed(b3500cb)（release/scrub 改为按 launcher_id 精确匹配，各管各的） | — |
 
 ## 待办的跨阶段事项（由 findings 派生）
 
@@ -69,6 +79,8 @@ branch: feat/desktop-agents-dispatch
 - [ ] 计划定 transcript `.jsonl` header/事件写入的归属（F-U2-7），U10 之前必须存在。
 - [ ] P0 桌面冒烟时执行 F-U15-3 的手工双开验证并回填记录（可顺手用 `OMT_ALLOW_MULTI_INSTANCE` 写 dev 自动化脚本）。
 - [x] ~~下次触碰 lib.rs 时顺手关 F-U15-4；下次改 dev-notes 时顺手关 F-U15-5~~ 已于 7be3f76 关闭。
+- [x] ~~U4 接线前修 F-U3-2（daemon 静默降级 actor）~~ 已于 b3500cb 关闭（含 daemon 侧 `Registry::issue` 测试）——U4 现在可以放心假设 `executor_session_id` 以 `/exec:<execId>` 结尾即可定位派发方。
+- [ ] U4 补上剩下半边的 F-U3-9：`kill_all` 路径（依赖 F-U2-1 先修）走 release，才能让 app 强退后的 omp 注入也被正常释放而不是等下次启动 sweep。
 
 ---
 
@@ -577,3 +589,148 @@ commit message 说「transcript headers will use the same epoch-ms format」，�
 | F-U2-9 / F-U2-11 | open · 文档/记录 |
 
 U2 内核可作为 U3 的基础继续推进（U3 不触碰终态分类）；但 U4 接线（exec_start 全链 + 终态租约释放）之前必须先关 F-U2-1/2，否则 P0 验收「起动失败呈现 Failed + stderr 尾」「终止后终态正确」会在真实 harness 上出错。
+
+---
+
+## 8. `556c1d2` · U3 · MCP 桥接注入 + per-exec actor 身份 + omt 第二 sidecar
+
+- **日期**：2026-09-06
+- **范围**：新建 `mcp_injection.rs` +604（opencode env 注入、omp refcount 合并/备份/恢复、launcher 脚本、启动 sweep，9 测试）；`crates/omt-runtime` `mcp.rs` +44（`enroll_identity` 尊重 `--actor`，2 测试）、`cli/mod.rs`；`executor.rs` +35（注入接线、终态 release）；`daemon.rs`（`sidecar_path(name)`）；打包：`copy-sidecar.mjs`、`tauri.conf.json` externalBin、`ci.yml`、`release.yml`
+- **意图**：计划 U3——harness 能连上 `omt mcp` 执行 claim/report；§3.3 身份纪律（`--actor exec:<execId>`）；omp 注入定稿（refcount + runtime dir 备份 + hash 防覆盖 + persistent 开关 + crash 清扫）；`omt` CLI 成为第二 sidecar
+- **评审方式**：单上下文内联（correctness / reliability / 计划符合性 / 打包与 CI）。子代理派发本次不可用（会话额度 429，`/code-review` 后台任务已因此失败），**无独立子代理、无跨模型佐证**。`cargo fmt --check` exit 0；`clippy -p oh-my-ticket-desktop -p omt-runtime --all-targets -D warnings` 通过；desktop `cargo test --lib` → **44 passed**（mcp_injection 9）；runtime `mcp::tests` 2 passed；`js-yaml` 解析三份配置：**`ci.yml` INVALID**，release.yml / tauri.conf.json OK。
+- **结论**：**Not ready**——两条 P1：一条让 CI 整体失效（ci.yml 非法 YAML），一条让本单元的核心目标（per-exec 身份）**静默落空**（daemon 授权策略不接受 `exec:` 命名空间）。其余实现质量好、测试扎实，修掉 P1 后即可。
+
+### 核验通过
+
+| 项 | 结果 |
+|---|---|
+| `omt mcp --actor` | `split_globals` 解析 `--actor VALUE` ✔；`enroll_identity` 缺省仍 `mcp:<pid>` ✔（但 daemon 侧授权见 F-U3-2） |
+| opencode 注入 | `OPENCODE_CONFIG_CONTENT` 内联，command 数组含 `--actor exec:<id> mcp`；零落盘测试 ✔ |
+| omp 注入 | 合并保留用户 server ✔；备份落 runtime dir ✔；refcount 两 exec 重叠只在最后一次恢复 ✔；用户 mid-exec 手改则跳过恢复 ✔；首次无文件 → release 删除 ✔；persistent 模式 no-op release ✔；crash 残留 sweep 幂等 ✔——与 §九-14 定稿逐条对应 |
+| 「绝不 spawn 无 MCP 的 harness」 | sidecar 缺失 → `prepare` 报错含路径 ✔ |
+| launcher | 0700、`exec` 形式、单引号转义 ✔ |
+| 终态 release | `finish_terminal` 在 agents.json 回写前调用，失败只记录 ✔ |
+| 打包 | `copy-sidecar.mjs` 双二进制 + dev 拷贝 ✔；`externalBin` 追加 ✔；release.yml 从归档拷 `omt` ✔（归档本就含 `omt`）；`sidecar_path(name)` 泛化 ✔ |
+
+### Findings
+
+#### F-U3-1 · P1 · gated_auto · `.github/workflows/ci.yml:59` · 新增行零缩进，workflow 非法
+
+`run: |` 块内新增的 `cp target/debug/omt apps/desktop/src-tauri/binaries/omt-aarch64-apple-darwin` 顶格写，literal block 在此结束，下一行成了 mapping 的非法 key。js-yaml 报 `can not read a block mapping entry (59:13)`；GitHub 会显示「Invalid workflow file」，**rust 与 node 两个 job 都不会跑**。
+
+- **建议**：该行前补 10 个空格与上一行 `cp` 对齐；本地加一步 `node -e "require('js-yaml').load(require('fs').readFileSync('.github/workflows/ci.yml','utf8'))"` 或 `actionlint` 进 pre-commit。
+- **状态**：fixed(b3500cb) —— 缩进已对齐，`js-yaml` 解析通过。
+
+#### F-U3-2 · P1 · manual · `auth.rs:126-135` × `mcp.rs::enroll_identity` · daemon 静默忽略 `exec:<execId>`
+
+`Registry::issue`：`base = "{kind}:{pid}"`（MCP 即 `mcp:<pid>`），请求的 `actorNamespace` **只有等于 base 或以 `base/` 为前缀**才被采纳，否则保持 base——注释原话「base or base/nested only (never foreign)」。`exec:<execId>` 两者都不满足 → credential 的 actor 仍是 `mcp:<pid>`，`run_items.executor_session_id` 也仍是 `mcp:<pid>`，desktop 按 `exec:<execId>` 查持有项永远查不到；**没有任何错误或日志**。runtime 的两个新测试只覆盖 CLI 侧字符串拼接，没有经过 `Registry::issue`。§3.3「终止后释放」「Runs 面 ↔ Agents 面互跳」整条链在此失效。
+
+- **建议**（推荐 a，零 daemon 变更）：
+  - (a) **嵌套命名空间**：`enroll_identity` 把用户给的 actor 规整为 `mcp:<pid>/<actor>`（若已带 `mcp:<pid>` 前缀则不重复）；desktop 匹配改为 `executor_session_id.ends_with("/exec:<execId>")`（或 `contains("/exec:<id>")`）。注意 64 字符上限（`mcp:99999/exec:` 已占 15，execId 控制在 40 内）。launcher 无需改（omt 自己拼 pid）。
+  - (b) daemon 放宽：kind=mcp 时额外允许 `exec:` 前缀——auth 策略变更，需独立安全评审，不建议 v1。
+  - **测试必须过 daemon**：`omt-runtime` 加 `Registry::issue` 单测（`mcp:<pid>/exec:x` 采纳、裸 `exec:x` 被降回 base），并在 U13 parity 加真实 daemon fixture：`omt --actor exec:x mcp` 发起 claim → `run/get` 的 `executor_session_id` 以 `/exec:x` 结尾。
+  - 计划 §3.3 / U3 / U4 文案同步改为嵌套形式。
+- **状态**：fixed(b3500cb) —— 按方案 (a) 落地：`enroll_identity` 发 `mcp:<pid>/exec:<execId>`；`auth.rs` 新增 `Registry::issue` 两个单测（嵌套采纳 / 裸值降级）；`mcp.rs` 两个单测更新为断言嵌套形式。U13 的真实 daemon fixture 仍留给 U4（那时才有真实派发可跑）。
+
+#### F-U3-3 · P2 · gated_auto · `sweep_omp_crash_residue` / `release_omp` · 跳过恢复时留下悬空 `omt` 条目
+
+crash 后启动 sweep：`release_omp` 因用户改过文件（hash 不符）跳过恢复并 `return Ok(())`，随后 sweep **无条件 `remove_dir_all(omp-launchers)`**。用户工作区的 `.omp/mcp.json` 里 `omt` 条目仍指向刚被删掉的 launcher——此后用户每次自己开 omp 都会看到 omt MCP 启动失败，且不知道为什么。同样的逻辑在正常 release 路径也会在「用户改过」时把 omt 条目永久留在用户文件里（launcher 虽在，但 daemon 可能已不在，`omt mcp` 等 5s 后退出）。
+
+- **建议**：跳过整体恢复时改做**外科手术**——重新读文件、只删除 `mcpServers.omt`（若其 command 指向我们的 launcher 目录），保留用户其它改动并写回；sweep 只删除**没有任何 mcp.json 引用**的 launcher。加测试：手改 + crash → sweep 后文件保留用户内容且不含 `omt`。
+- **状态**：fixed(b3500cb) —— 落地为 `remove_omt_entry_if_matches`（精确匹配 `command` 而非"含 omp-launchers 子串"，同时解决 F-U3-10 的误删风险）；`finalize_release` 统一供 `release_omp` 与 sweep 调用。测试 `omp_user_mid_exec_edit_skips_restore_and_only_removes_own_entry`、`sweep_scrubs_own_entry_when_user_modified_mid_crash`。
+
+#### F-U3-4 · P3 · testing-gap · opencode `OPENCODE_CONFIG_CONTENT` 语义未实测
+
+design A.2 只确认了 env 可注入，没有确认它与用户全局/项目配置是 deep-merge 还是整体替换。若是替换，用户的 provider/model/权限配置在派发时全部消失，opencode 会因无 provider 直接失败。
+
+- **建议**：U4 真实派发前用本机 opencode 实测：设 `OPENCODE_CONFIG_CONTENT='{"mcp":{…}}'` 后 `opencode run --format json "list your tools"`，确认既有 model 仍可用且 `omt__*` 工具出现；结论回填 descriptor 注释。
+- **状态**：fixed(b3500cb) —— 已用本机 opencode 1.18.14 实测（`opencode mcp list`，项目级 `opencode.json` 含一个 server + env 注入另一个）：**深度合并**，两个 server 同时出现，不是覆盖。无需改代码，结论已写入 `mcp_injection.rs` 模块文档注释。
+
+#### F-U3-5 · P3 · gated_auto · `sha_hex` / `workspace_hash` · `DefaultHasher` 跨版本不稳定
+
+`std::collections::hash_map::DefaultHasher` 文档明确「内部算法不保证跨 Rust 版本稳定」。持久化的 `writtenSha` 在 toolchain 升级后必不匹配 → 永远判「用户改过」→ 永不恢复；state 目录名（workspace hash）也会漂移成孤儿。
+
+- **建议**：换稳定哈希——`sha2` 已是 workspace 依赖（desktop crate 加一行依赖），或手写 FNV-1a；函数名 `sha_hex` 名副其实。
+- **状态**：fixed(b3500cb) —— 换 `sha2::Sha256`（取前 8 字节 hex，足够目录名/比对用途）；desktop crate 加 `sha2 = { workspace = true }` 依赖。`sha_hex`/`workspace_hash` 统一收进 `stable_hash_hex`。
+
+#### F-U3-6 · P3 · gated_auto · `workspace_hash` · 未 canonicalize
+
+同一 workspace 经不同路径拼写（symlink、`/tmp` vs `/private/tmp`、末尾斜杠）会得到不同 hash → refcount 分裂到两个 state 目录，恢复顺序错乱。
+
+- **建议**：`workspace_root.canonicalize().unwrap_or(workspace_root)` 后再 hash。
+- **状态**：fixed(b3500cb) —— `canonical_workspace` helper，`workspace_hash` 内部调用。
+
+#### F-U3-7 · P3 · gated_auto · `remove_launcher` 从未调用
+
+`McpInjection::Omp` 不携带 `exec_id`，release 无法删除本 exec 的 launcher；文件累积到下次启动 sweep 才清（且 sweep 是全删，见 F-U3-3）。
+
+- **建议**：`Omp { workspace_root, persistent, exec_id }`，release 末尾 `remove_launcher`；persistent 模式下 launcher 是长期引用，**不能删**——persistent 应改用固定名 launcher（如 `persistent.sh`，actor 用 `mcp:$$`）而非 per-exec。
+- **状态**：fixed(b3500cb) —— `McpInjection::Omp` 加 `launcher_id`（非 persistent = exec_id，persistent = 固定 `"persistent"`，无 `--actor`）；`release_omp` 无条件先删自己的 launcher 再判 refcount；`release()` 对 persistent 整体 no-op（launcher 不删）。测试覆盖 refcount 场景下"自己的 launcher 删了、别人的还在"。
+
+#### F-U3-8 · P3 · gated_auto · `merge_omp_mcp` · 非原子写用户文件
+
+`std::fs::write` 直接覆盖用户工作区文件；crash 于写入中会留半截 JSON，omp 后续所有会话解析失败。
+
+- **建议**：同目录 tmp + rename（不需要 atomic_json 的锁，只要原子替换）。
+- **状态**：fixed(b3500cb) —— 新增 `write_atomic`（同目录 tmp + rename），`merge_omp_mcp`/`write_omp_state`/backup 写入/scrub 写回全部改用它；不复用 `atomic_json`（那是 desktop 自己的状态文件，这里写的是用户工作区文件，语义不同，故轻量单独实现）。
+
+#### F-U3-9 · P3 · advisory · U4 接线：spawn 失败与 kill_all 路径的 release
+
+`prepare` 在 spawn 前、`release` 在 `finish_terminal`；补偿表 ⑧「spawn 失败」不会进入 finish_terminal，F-U2-1 的 kill_all 路径亦然——两者都不释放注入，只能等下次启动 sweep。
+
+- **建议**：U4 链在 spawn `Err` 时显式 `release`；F-U2-1 修复（kill_all 同步 finish_terminal）后 kill_all 路径自然覆盖。
+- **状态**：fixed(b3500cb)（spawn 失败半）——`ExecutionManager::spawn` 拆出 `spawn_inner`，外层统一在 `Err` 时 release；新测试 `spawn_failure_releases_mcp_injection` 断言注入被释放。**kill_all 半仍 open**，等 F-U2-1 修复后自然覆盖，已登记为跨阶段待办。
+
+#### F-U3-10 · P3 · advisory · persistent / 非 persistent 混用
+
+同 workspace 先以 persistent 派发（merge 不计 refcount）、再以非 persistent 派发，后者最后一次 release 会按 backup 恢复——把用户明确要求持久保留的注入抹掉。
+
+- **建议**：U7 定义设置项时把 persistent 作为 **per-provider 全局开关**（非 per-exec 参数），并在 prepare 时若发现已有 persistent 注入（omt 条目指向 persistent launcher）则跳过 refcount 路径。
+- **状态**：fixed(b3500cb) —— 根因（F-U3-3 的"整体覆盖/整体恢复"逻辑）已随精确匹配移除方案解决：非 persistent release 只在自己写入的 `command` 仍原样存在时才动手，persistent 的条目一旦被后来者接管，非 persistent 那边的 hash 比对天然不再匹配、走 scrub 分支且精确匹配失败后直接跳过——不会误删。测试 `omp_persistent_and_non_persistent_do_not_clobber_each_other` 覆盖两个方向。U7 的"per-provider 全局开关"设计动作仍保留，是产品层面的收口，不影响这里的正确性修复。
+
+### 当前收口状态（已由 §9 的 `b3500cb` 修复覆盖，见该节）
+
+| ID | 状态 |
+|---|---|
+| F-U3-1/2/3/4/5/6/7/8/10 | fixed(b3500cb) |
+| F-U3-9 | 半 fixed(b3500cb)：spawn 失败半已修，kill_all 半等 F-U2-1 |
+
+U3 的两个 P1 都不是实现复杂度问题：一个是 YAML 缩进，一个是没有对照 daemon 的授权策略验证假设。**建议下一个 commit 只做 F-U3-1/2/3 + daemon 侧测试**，然后再进 U4。
+
+---
+
+## 9. `b3500cb` · U3 · 修复 F-U3-1..10（YAML 缩进、daemon actor 嵌套、omp 精确匹配、稳定 hash、launcher 生命周期、原子写、spawn 失败释放）
+
+- **日期**：2026-09-06
+- **范围**：`.github/workflows/ci.yml`（缩进）、`.gitignore`（`binaries/omt-*`）、`Cargo.lock`、`apps/desktop/src-tauri/Cargo.toml`（+`sha2`）、`executor.rs`（`spawn`/`spawn_inner` 拆分 + 1 测试）、`mcp_injection.rs`（近乎重写：稳定 hash、canonicalize、`launcher_id`、精确匹配 scrub、原子写，净 +7 测试）、`crates/omt-runtime/src/auth.rs`（+2 测试）、`crates/omt-runtime/src/mcp.rs`（`enroll_identity` 嵌套 + 2 测试改写）
+- **意图**：逐条关闭 §8 的 10 项 finding；F-U3-2 是本次重点（阻断 U4 的身份纪律 bug）
+- **评审方式**：单上下文内联（correctness / reliability）；`cargo fmt --check` exit 0；`clippy -p oh-my-ticket-desktop -p omt-runtime --all-targets -D warnings` 通过；`cargo build -p oh-my-ticket-desktop -p omt-runtime` 干净编译；`cargo test -p oh-my-ticket-desktop --lib` → **48 passed**；`cargo test -p omt-runtime --lib` → **19 passed**；`cargo test --workspace`（含 corpus/yaml_differential/yaml_stability）→ 全绿，`grep FAILED` 空。**额外**：F-U3-4 用本机真实 `opencode` 1.18.14 二进制实测（非 mock），`omp` 1.18.9 也已确认在机可用于后续单元。**无独立子代理、无跨模型佐证。**
+- **结论**：**Ready to merge**。10 项 finding 全部有实质性代码/测试变更或实测证据；F-U3-9 只关了一半（spawn 失败路径），kill_all 路径依赖尚未修复的 F-U2-1，已如实标记为半 fixed 而非虚报全绿。
+
+### 逐项核验
+
+| ID | 核验 |
+|---|---|
+| F-U3-1 | `node -e "require('js-yaml').load(...)"` 解析 ci.yml 通过 ✔ |
+| F-U3-2 | `enroll_identity_nests_explicit_actor_under_mcp_pid_base` 断言 `mcp:<pid>/exec:e1`；`auth.rs::issue_accepts_nested_actor_namespace_under_base` 用真实 `Registry::issue`（非 mock）断言 daemon 侧确实采纳该嵌套值，`issue_downgrades_foreign_actor_namespace_to_base` 断言裸值仍被降级——**两侧都验证了，不是只改了 CLI 那一半** ✔ |
+| F-U3-3/F-U3-10 | `remove_omt_entry_if_matches` 用**精确字符串相等**（不是子串），从根上同时解决"跳过恢复时误删"与"persistent 被非 persistent 误伤"两个问题；4 个新/改测试各自验证一个角落（mid-exec 手改保留其它条目、crash sweep 同样保留、persistent 与非 persistent 互不干扰、refcount 场景下只删自己的 launcher）✔ |
+| F-U3-4 | 真实二进制实测，非推测；证据写进模块文档注释与日志，可复现（见 commit message 里的具体命令）✔ |
+| F-U3-5/6 | `stable_hash_hex`（SHA-256 前 8 字节）+ `canonical_workspace`；测试 `workspace_hash_stable_across_process_and_canonicalizes_symlinks` ✔ |
+| F-U3-7 | `launcher_id` 字段 + 每次 release 无条件先删自己的 launcher；`omp_refcount_restores_only_after_last_exec` 测试改为显式断言"删了一个、还剩一个" ✔ |
+| F-U3-8 | `write_atomic` 覆盖 merge/state/backup/scrub 四处写 ✔ |
+| F-U3-9 | `spawn`/`spawn_inner` 拆分，`spawn_failure_releases_mcp_injection` 用真实的"程序不存在"触发 `Command::spawn()` 失败路径（不是伪造错误），断言预置的 launcher 文件确实被删——验证的是端到端行为而非实现细节 ✔（kill_all 半诚实标记 open） |
+
+### 新发现（本次未处理，记录供后续参考）
+
+无新增 finding——本次是纯粹的问题关闭，没有引入需要跟踪的新技术债。唯一的已知缺口是 F-U3-9 的 kill_all 半，已在跨阶段待办登记。
+
+### U4 现在可以依赖的事实
+
+1. `executor_session_id` 以 `/exec:<execId>` 结尾即可精确定位派发方（不是完全等于 `exec:<execId>`）——U4 写 desktop 侧匹配逻辑时用 `ends_with(&format!("/exec:{exec_id}"))`。
+2. `mcp_injection::prepare`/`release` 的 `McpInjection` 值必须原样传递、原样传给 `release`——U4 的 ensure-run 链不需要关心 omp/opencode 的内部差异，只需要在拿到 `SpawnRequest` 前调 `prepare`、在拿到终态后（或 spawn 失败时——已由 `spawn()` 自己兜底）调 `release`。
+3. opencode 的 MCP 注入不会影响用户已有配置，U4 的"零可用 harness 引导"逻辑不需要额外处理"用户配置被清空"这种场景。
+
+### Coverage 缺口
+
+- 同前几节：Linux/Windows 分支、`Cargo.lock` 新增 crate（`sha2` 已是 workspace 既有依赖，风险低）供应链审计。
+- daemon 侧真实端到端（`omt --actor exec:x mcp` 起进程、走 stdio、实际 `run/claim`）仍未跑——留给 U4 集成测试，本次只验证到 `Registry::issue` 这一层。
