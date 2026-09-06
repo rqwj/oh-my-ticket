@@ -86,7 +86,7 @@ pub enum BinarySource { Detected, Manual(PathBuf) }
 
 ### 3.2 Agent 实体与生命周期
 
-**关系模型：Agent(1) ↔ exec(N) ↔ transcript(N)。** session 归属 exec（每次 exec 捕获自己的 `harness_session_id`）；Agent 持派生指针 `lastExecId`/`lastSessionId`（续跑语义读它）；agents.json 的 Agent 记录内嵌 `execs[]`（execId、nodeId、runId、startedAt、exit 状态、harnessSessionId、transcript 相对路径），**与 transcript header 字段互为镜像**（header 另含 agentId——它是回放事实源，agents.json 是可重建索引）。
+**关系模型：Agent(1) ↔ exec(N) ↔ transcript(N)。** session 归属 exec（每次 exec 捕获自己的 `harness_session_id`）；Agent 持派生指针 `lastExecId`/`lastSessionId`（续跑语义读它）；agents.json 的 Agent 记录内嵌 `execs[]`（execId、nodeId、runId、startedAt、exit 状态、harnessSessionId、transcript 相对路径），**与 transcript header 字段互为镜像**（header 另含 agentId——它是回放事实源，agents.json 是可重建索引）。`startedAt` 格式统一为 **epoch 毫秒十进制字符串**（字典序=时间序），header 与 `execs[]` 一致（F-U4a-6）。
 
 ```rust
 pub struct Agent {
@@ -350,7 +350,7 @@ stateDiagram-v2
 - **Goal**: U4 步骤 ⑤「先落盘」与 U9「GC 仅在解析成功后执行」的存储前置（原 U10 的存储半拆出）。
 - **Requirements**: R-E（存储不变式）。
 - **Dependencies**: 无（可与 U2 并行）。
-- **Files**: 新建 `apps/desktop/src-tauri/src/agents.rs`（schema：`meta.agentSeq` + `agents[].{status, attachment, execs[]}`（§3.2）；`execs[]` 只记 binary 路径与非敏感 args、**不记 env 值**（§3.1 secrets 纪律）；进程内锁 + tmp/rename 原子写；`.corrupt-<ts>` 降级；写合并——仅 Agent/exec **状态变化**落盘，事件计数等派生量不落盘）；`apps/desktop/src-tauri/src/lib.rs`（注册 `agents_list`）；`apps/desktop/src/bridge.ts`。
+- **Files**: 新建 `apps/desktop/src-tauri/src/agents.rs`（schema：`meta.agentSeq` + `agents[].{status, attachment, execs[]}`（§3.2）；`execs[]` 只记 binary 路径与非敏感 args、**不记 env 值**（§3.1 secrets 纪律）；进程内锁 + tmp/rename 原子写；`.corrupt-<ts>` 降级；写合并——仅 Agent/exec **状态变化**落盘，事件计数等派生量不落盘）；`apps/desktop/src-tauri/src/lib.rs`（注册 `agents_list`）。（F-U4a-8：`bridge.ts` 的 `agents_list` 封装移至 U5 Files。）
 - **Approach**: 单文件 read-merge-write under 锁（§3.6.6）；`agentSeq` 持久单调自本单元起（避免 P0「Agent 3」重启变「Agent 1」）；解析失败暴露 `parseFailed` 标志供 U9 冻结 GC；reconcile / 回放 / pid 校验**不在**本单元（U10）。
 - **Test scenarios**:
   - 并发两次写 → 无丢更新（锁）
@@ -364,7 +364,7 @@ stateDiagram-v2
 - **Goal**: message 流实时可见 + Agent 列表（R-E）。
 - **Requirements**: R-E。
 - **Dependencies**: U2。
-- **Files**: 新建 `apps/desktop/src/TranscriptView.tsx`、`apps/desktop/src/AgentsPanel.tsx`；修改 `apps/desktop/src/App.tsx`（center-pane 内层 tab：详情|Agents）、`apps/desktop/src/store.ts`（executions/agents 切片 + Channel 归并）、`apps/desktop/src/styles.css`；复用 `apps/desktop/src/MarkdownText.tsx`。
+- **Files**: 新建 `apps/desktop/src/TranscriptView.tsx`、`apps/desktop/src/AgentsPanel.tsx`；修改 `apps/desktop/src/App.tsx`（center-pane 内层 tab：详情|Agents）、`apps/desktop/src/store.ts`（executions/agents 切片 + Channel 归并）、`apps/desktop/src/bridge.ts`（F-U4a-8：`agents_list` 封装自 U4a 移此）、`apps/desktop/src/styles.css`；复用 `apps/desktop/src/MarkdownText.tsx`。
 - **Approach**: **所有活跃 exec 各保尾窗**（与选中无关，内存上界 = agent 数 × 2000 条）；虚拟滚动 + raw 50ms 合并刷新；**自动跟随**：视口近底才跟随，上滚解除并显示「回到最新 (N)」pill，点击回贴（原 §九-13）；display_name 序号自 U4a 起持久单调；列表按当前 home 过滤、按 `status` 分组、`Orphan` 加「不受控·只读」角标；条目含状态/当前节点/run item 统计（走 `run/get`，§四）；零 claim 退出标注「未认领任何项」；「长时间无输出」提示。**终止控件**（原 §九-8）：Running/Starting 行与 TranscriptView 头部各一「终止」按钮，首次点击变行内「确认终止：将释放 N 个已认领项」（N 由 `executor_session_id == exec:<execId>` 查得），再次点击执行 exec_stop，3s 无操作还原；`Orphan` 行改为「强制 kill pid」。**失败可见性**（原 §九-9）：Agents tab 标签显示本 home 未查看的 Failed 计数 badge，选中该 agent 清除。空态：居中提示「尚无 Agent——在 ticket 详情点『运行』派发」，无已启用 provider 时附「配置 Harness」入口跳设置 Harnesses tab。
 - **Test scenarios**:
   - 多 agent 并跑时事件按 execId 归并、切换选中各自尾窗保留

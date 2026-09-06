@@ -279,7 +279,11 @@ pub fn resolve_program(cfg: &HarnessUserConfig, binary_name: &str) -> Result<Pat
 // ---------------------------------------------------------------------------
 
 fn probe_descriptor(detected: Option<&Path>, d: &HarnessDescriptor) -> Option<String> {
-    detected.and_then(|path| probe_version(path, d.probe_args, 2))
+    detected.and_then(|path| {
+        // 多线程进程里 fork→exec 偶发子进程卡死（exec 前的库锁），全量测试
+        // 并行时会放大 2s 窗口误判——超时重试一次兜底。
+        probe_version(path, d.probe_args, 2).or_else(|| probe_version(path, d.probe_args, 2))
+    })
 }
 
 fn harness_entry(d: &HarnessDescriptor, cfg: Option<&HarnessUserConfig>) -> serde_json::Value {

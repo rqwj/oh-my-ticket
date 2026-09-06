@@ -25,7 +25,15 @@ branch: feat/desktop-agents-dispatch
 
 | ID | 级别 | 类型 | 单元 | 位置 | 摘要 | 状态 | 负责人 |
 |---|---|---|---|---|---|---|---|
-| F-U1b-1 | P3 | advisory | U1b | 计划 U1b Files / 排期 | `store.ts` 的 `harness_list` 封装放在 U1b，但 U6 弹窗选择器先于 U1b 需要它——依赖倒置 | fixed(43bf89f)（封装移入 U6 Files，U1b 只留退役/迁移/接线） | — |
+| F-U4a-1 | P2 | manual | U4a | `atomic_json::read_json_locked` / `agents::agents_list` | `parseFailed` 是**瞬态**信号（损坏文件被 rename 后第二次读即 false + 空列表），U9「解析失败期间冻结 GC」硬规则会失效并清空全部绑定 | open（U9 前置） | — |
+| F-U4a-2 | P2 | gated_auto | U4a→U2 | `agents::register_agent` 写 `attachment: Live` | Live 持久化后跨重启失真：U10（P1）才 reconcile，P0 期间重启/崩溃后 `agents_list` 仍报 Live+Starting/Running | fixed(`demote_live_agents` + ExecutionManager::new 启动 demote + 测试，随 U2 commit) | — |
+| F-U4a-3 | P3 | gated_auto | U4a | `atomic_json::read_json` | 读路径的损坏 rename 不在 flock 内，与另一进程的写 rename 竞态可能把刚写好的文件挪成 `.corrupt` | open | — |
+| F-U4a-4 | P3 | gated_auto | U4a | `atomic_json::write_tmp_and_rename` | rename 前无 `sync_all`，断电可能留下 0 字节文件 → 下次降级丢 agents 列表 | open | — |
+| F-U4a-5 | P3 | advisory | U4a | `atomic_json::STORE_LOCK` | 全局锁横跨所有 store 文件且持锁等 flock 最长 10s，未来 CLI 长持 agents 锁会连 harness config 保存一起阻塞 | open（v1 接受） | — |
+| F-U4a-6 | P3 | advisory | U4a | `agents::now_iso` / §3.2 | 函数名 iso 实为 epoch ms；transcript header `startedAt` 格式未定，U2 必须与 `execs[].startedAt` 同格式 | fixed(U2)（`now_epoch_ms` 改名；计划 §3.2 补「header 与 execs[] 同为 epoch ms 字符串」；U2 transcript header 用同格式） | — |
+| F-U4a-7 | P3 | advisory | U4a | `agents.rs` API | 无「向既有 Agent 追加 exec」入口；U11 续跑与 U6 add-members 需要 `append_exec` | open（U11 补） | — |
+| F-U4a-8 | P3 | advisory | U4a | 计划 U4a Files | 列了 `bridge.ts` 但未动，`agents_list` 尚无 TS 封装 | fixed(cf8a2c7 顺序)（计划记注：bridge.ts 移至 U5 Files） | — |
+| F-U1b-1 | P3 | advisory | U1b | 计划 U1b Files / 排期 | `store.ts` 的 `harness_list` 封装放在 U1b，但 U6 弹窗选择器先于 U1b 需要它——依赖倒置 | fixed(cf8a2c7)（封装移入 U6 Files，U1b 只留退役/迁移/接线） | — |
 | F-U1-8 | P3 | gated_auto | U1 | `harness.rs::upsert_config` | `CONFIG_LOCK` 一旦 poison，所有后续保存永久失败直至重启 | fixed(43bf89f)（写纪律收敛进 atomic_json，`STORE_LOCK` poison 容忍） | — |
 | F-U1-9 | P3 | advisory | U1 | `harness.rs::save_configs` | 写入与 rename 之间崩溃留下的 `config.json.tmp-*` 无人清扫 | fixed(43bf89f)（update 内清扫 mtime>1h 的残留 tmp，测试覆盖） | — |
 | F-U1-4 | P3 | testing-gap | U1 | `harness.rs::REGISTRY` omp | omp `--approval-mode write` 无 TTY 实测（计划 U1 必做项）未做，`unattended_flag` 暂记 `--yolo` | open（U6 前置门） | — |
@@ -43,7 +51,9 @@ branch: feat/desktop-agents-dispatch
 
 ## 待办的跨阶段事项（由 findings 派生）
 
-- [ ] U4a 落地时回看 F-U15-1：确认文件锁覆盖 agents.json / bindings.json / harness config 三条写路径后，将 F-U15-1 置 `fixed`。
+- [x] ~~U4a 落地时回看 F-U15-1~~ 已于 43bf89f 关闭（harness config + agents.json 两条已覆盖）。
+- [ ] U9 落地 bindings.json 时确认走 `atomic_json`（F-U15-1 的第三条写路径）；同时按 F-U4a-1 把 GC 冻结改为粘性判定。
+- [ ] U2 开工时落地 F-U4a-2（启动 demote Live）与 F-U4a-6（startedAt 格式对齐）。
 - [ ] P0 桌面冒烟时执行 F-U15-3 的手工双开验证并回填记录（可顺手用 `OMT_ALLOW_MULTI_INSTANCE` 写 dev 自动化脚本）。
 - [x] ~~下次触碰 lib.rs 时顺手关 F-U15-4；下次改 dev-notes 时顺手关 F-U15-5~~ 已于 7be3f76 关闭。
 
@@ -338,3 +348,102 @@ U1b Files 把「`store.ts` 的 `harness_list`/`harness_config_set` 封装」放�
 | F-U1b-1 | open，计划动作 |
 
 U1 后端半可视为完成，**不阻塞 U4a 开工**；U4a 是三条「顺手」项（F-U15-1、F-U1-8、F-U1-9）的汇合点，建议 U4a 的共用原子写 helper 一次把「进程内锁 + flock + poison 容忍 + tmp 清扫」做齐，然后把 harness config 切过去。
+
+---
+
+## 6. `43bf89f`（+ `cf8a2c7` 文档）· U4a · 共用原子写 helper + Agent 最小存储
+
+- **日期**：2026-09-06
+- **范围**：新建 `atomic_json.rs` +363（`STORE_LOCK` + companion flock + tmp/rename + 清扫 + 损坏降级，6 测试）、`agents.rs` +403（schema / `register_agent` / `update_agent_status` / `update_exec` / `agents_list`，6 测试）；`harness.rs` −90（切到 helper）；`lib.rs` +3。`cf8a2c7`：关闭 F-U15-1 / F-U1-8 / F-U1-9 / F-U1b-1，U1b→U6 store 封装迁移
+- **意图**：计划 U4a——§3.6.6 写纪律一次做齐并让 harness config 切过去；agents.json 最小存储（schema、持久 agentSeq、仅状态变化写、parseFailed 暴露）；reconcile/回放留 U10
+- **评审方式**：单上下文内联（correctness / reliability / 计划符合性）；`cargo fmt --check` exit 0；`clippy --all-targets -D warnings` 通过；`cargo test --lib` → **26 passed**。**无独立子代理、无跨模型佐证。**
+- **结论**：**Ready with fixes**——helper 本身实现扎实、测试覆盖全面；但 `parseFailed` 的瞬态语义会让 U9 的 GC 冻结硬规则失效（F-U4a-1，P2，需在 U9 前定案），持久化的 `Live` 在 U10 之前跨重启失真（F-U4a-2，P2，U2 顺手）。两条都不需要回改本 commit，但要进入下一单元的入参。
+
+### 核验通过
+
+| 项 | 结果 |
+|---|---|
+| 进程内锁 + poison 容忍 | `STORE_LOCK.lock().unwrap_or_else(PoisonError::into_inner)` ✔（F-U1-8） |
+| 跨进程 flock | companion `<file>.lock`（稳定 inode，rename 不影响）；`LOCK_EX\|LOCK_NB` 轮询 + 10s 上界；guard 随 `File` drop 释放，`?` 早退也释放 ✔；双 fd 互斥测试 ✔（macOS flock 按 open-file-description 计，模拟另一进程有效） |
+| tmp/rename | `tmp-<pid>-<seq>` + 0600；rename 后无残留 ✔；清扫只删 mtime>1h 且同前缀 ✔（F-U1-9） |
+| 损坏降级 | `<name>.corrupt-<ms>` 留证 + 默认值 + `parse_failed` ✔ |
+| 仅状态变化写 | `mutate → bool`，`update_agent_status` 同态不写、`update_exec` 按 `!=` 判定 ✔ |
+| agentSeq 持久单调 | 6 线程并发注册 → 6 agent、seq=6、`Agent 1..6` 全在 ✔ |
+| secrets | `ExecRecord` schema 无 env 字段（测试断言序列化不含 `"env"`）✔ |
+| home-id 防穿越 | 拒绝 `/`、`\`、`..`、`.` 前缀、空 ✔ |
+| harness config 切换 | `load_configs`/`upsert_config` 改为 helper 薄封装，原有 5 个 harness 测试仍过 ✔ |
+| F-U15-1 关闭 | harness config + agents.json 两条写路径已在 flock 下；bindings.json 由 U9 走同一 helper——已在待办登记复核点 ✔ |
+| cf8a2c7 | U1b Files 去掉 store 封装、U6 Files 加入 ✔；F-U1b-1 的 sha 应为 `cf8a2c7`（计划改动在该 commit），本次已改正 |
+
+### Findings
+
+#### F-U4a-1 · P2 · manual · `read_json_locked` / `agents_list` · `parseFailed` 是瞬态信号，U9 GC 冻结会失效
+
+流程：agents.json 损坏 → 第一次读：rename 成 `.corrupt-<ms>`、返回默认值、`parse_failed=true` → **第二次读：文件不存在 → 默认值、`parse_failed=false`**。U9 的硬规则「agents.json 解析失败期间 bindings GC 冻结」只会收到一次信号；随后 GC 看到的是「解析成功、零 agent」——正好会把**全部绑定判为悬空并清掉**，这是 §3.6.6 要防的事故本身。
+
+- **建议**（推荐 b）：
+  - (a) 读路径不 rename、只报告（rename 留给 `update_json`）——但 `agents_list` 读多写少，仍会在下一次写后变瞬态；
+  - **(b) 粘性判定**：helper 增 `has_unrecovered_corrupt(path) -> bool`（同目录存在 `<name>.corrupt-*`），`agents_list` 返回 `parseFailed = parse_failed || has_unrecovered_corrupt`；U9 GC 以该字段为准；U10 reconcile 从 transcript 重建成功后把 `.corrupt-*` 移到 `recovered/` 子目录解除粘性。加测试：损坏 → 连读两次 → 第二次 `parseFailed` 仍 true。
+- **状态**：open（U9 前置门；helper 改动可随 U9 一起）
+
+#### F-U4a-2 · P2 · gated_auto · `register_agent` → U2 · 持久化 `attachment: Live` 跨重启失真
+
+`register_agent` 写 `attachment: Live`，只有 U10（P1）的 reconcile 会把它降级。P0 期间 app 重启或崩溃后，`agents_list` 仍返回 `Live + Starting/Running`，U5 会把死 agent 当可控项显示、终止按钮可点。
+
+- **建议**：U2 的 ExecutionManager 构造时做一次启动 demote：对当前 home 所有 `attachment == Live` 且不在内存注册表的记录 → `attachment = None`；`Starting/Running` → `Failed`（`failure_detail = "app restarted before exec finished"`），或保持 status 但前端按 `attachment=None` 视为历史。pid liveness / Orphan 判定仍留 U10。加入 U2 Test scenarios：「写入 Live 后模拟重启 → 列表不再 Live」。
+- **状态**：open（U2）
+
+#### F-U4a-3 · P3 · gated_auto · `read_json` · 损坏 rename 不在 flock 内
+
+`read_json` 只持 `STORE_LOCK`（进程内），损坏时的 rename 没有跨进程互斥。窗口：进程 B 读到损坏内容 → 进程 A `update_json` 写好并 rename 就位 → B 把 A 刚写好的**好文件** rename 成 `.corrupt`。只在文件本就损坏 + 恰有另一进程同时写时触发，概率低但后果是丢一次有效写入。
+
+- **建议**：读路径检测到损坏后，先取 companion flock 再重读一次确认仍损坏才 rename；或读路径不 rename（与 F-U4a-1 (a) 合并考虑）。
+- **状态**：open
+
+#### F-U4a-4 · P3 · gated_auto · `write_tmp_and_rename` · 无 fsync
+
+rename 前未 `sync_all()`。APFS 的 rename 原子，但数据页可能未刷盘；断电/内核崩溃后可能得到 0 字节或截断的 agents.json → 下次读走 `.corrupt` 降级（进而触发 F-U4a-1）。写频极低，`sync_all` 代价可忽略。
+
+- **建议**：`file.write_all(..)?; file.sync_all().map_err(..)?;` 再 rename；目录 fsync 可省。
+- **状态**：open
+
+#### F-U4a-5 · P3 · advisory · `STORE_LOCK` · 全局锁 + 持锁等 flock
+
+进程内锁横跨 harness config / agents / bindings 三类文件，且**持锁期间**最长等 flock 10s。未来 omt CLI 若长时间持有 agents.json 的 flock，desktop 连保存 harness 设置都会卡 10s。v1 只有 desktop 一个写者，接受。
+
+- **建议**：U9/U10 若写频上升，改为 per-path 锁表（`Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>`），flock 等待不再阻塞其它文件。
+- **状态**：open（v1 接受，记录）
+
+#### F-U4a-6 · P3 · advisory · `now_iso` / §3.2 · 命名与格式对齐
+
+`now_iso()` 返回 epoch 毫秒字符串（注释也这么说），名字误导；更重要的是 design §5.6 的 transcript header `startedAt` 未定格式，而 `execs[]` 与 header 是镜像关系（§3.2），U2 写 header 时必须同格式，否则 U10 reconcile 比对/排序出错。
+
+- **建议**：改名 `now_epoch_ms`；计划 §3.2 补一句「`startedAt` = epoch ms 十进制字符串，header 与 execs[] 同」。
+- **状态**：open（U2 对齐）
+
+#### F-U4a-7 · P3 · advisory · `agents.rs` API · 缺「向既有 Agent 追加 exec」
+
+`register_agent` 总是新建 Agent（id = `agent-<首个 execId>`）。U11 续跑（同 Agent 新 exec、读 `lastSessionId`）和 U6「追加到该 Agent 当前 run」都需要在既有 Agent 上 push 一条 `ExecRecord` 并更新 `last_exec_id`。
+
+- **建议**：U11 落地时补 `append_exec(runtime_dir, home_id, agent_id, NewExec)`，复用 `update_json`；本单元不要求。
+- **状态**：open（U11）
+
+#### F-U4a-8 · P3 · advisory · 计划 U4a Files · `bridge.ts` 未动
+
+计划 U4a Files 列了 `apps/desktop/src/bridge.ts`，commit 未提供 `agents_list` 的 TS 封装。U5 消费时补即可。
+
+- **建议**：计划 U4a Files 去掉 bridge.ts、U5 Files 加上，避免 P0 验收对照时误判缺漏。
+- **状态**：open（计划记注）
+
+### 当前收口状态
+
+| ID | 状态 |
+|---|---|
+| F-U15-1 / F-U1-8 / F-U1-9 | fixed(43bf89f) |
+| F-U1b-1 | fixed(cf8a2c7) |
+| F-U4a-1 | open · **U9 前置**（粘性 parseFailed） |
+| F-U4a-2 | open · **U2 顺手**（启动 demote Live） |
+| F-U4a-3/4 | open · 小改，下次触碰 atomic_json 顺手 |
+| F-U4a-5/6/7/8 | open · 记录/后续单元 |
+
+U4a 达成计划目标，**不阻塞 U2 开工**。U2 入参：F-U4a-2（启动 demote）、F-U4a-6（startedAt 格式）、以及 §4 记的两条前瞻（`extra_args` 顺序、Detected 重探结果写 header）。

@@ -77,3 +77,19 @@ impl SharedSession {
         Self(Mutex::new(None))
     }
 }
+
+/// U2: 所有执行会话的持有者（照 SharedSession 模式 manage）。构造即执行
+/// 启动 demote（F-U4a-2：重启后 Live 记录不再可控）。
+pub struct ExecutionState(pub crate::executor::ExecutionManager);
+
+impl ExecutionState {
+    pub fn new() -> Self {
+        Self(crate::executor::ExecutionManager::new())
+    }
+}
+
+impl Default for ExecutionState {
+    fn default() -> Self {
+        Self::new()
+    }
+}

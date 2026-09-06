@@ -132,14 +132,60 @@ pub fn agents_path(runtime_dir: &Path, home_id: &str) -> Result<PathBuf, String>
     Ok(runtime_dir.join("agents").join(home_id).join("agents.json"))
 }
 
-fn now_iso() -> String {
-    // 排序用时间戳：epoch 毫秒（字符串化，字典序=时间序）。无 chrono 依赖；
-    // 展示层的格式化（相对时间等）由前端负责。
+pub(crate) fn now_epoch_ms() -> String {
+    // 排序用时间戳：epoch 毫秒（字符串化，字典序=时间序）；transcript header
+    // 的 startedAt 与 execs[].startedAt 必须同格式（§3.2 / F-U4a-6）。展示层
+    // 的格式化（相对时间等）由前端负责。
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or_default();
     format!("{ms}")
+}
+
+/// F-U4a-2（P0 半）：启动 demote——扫描所有 home 的 agents.json，把
+/// `attachment == Live` 的记录降级：`attachment=None`、`Starting/Running →
+/// Failed`（failure_detail 注明 app 重启）。pid liveness 与 Orphan 只读
+/// 尾随是 U10 的活；这里只保证 P0 期间「重启后不再把死 agent 当可控项」。
+/// 返回降级条数。
+pub fn demote_live_agents(runtime_dir: &Path) -> Result<usize, String> {
+    let root = runtime_dir.join("agents");
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return Ok(0);
+    };
+    let mut demoted = 0usize;
+    for entry in entries.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let file = entry.path().join("agents.json");
+        let (_, changed) = update_json(&file, |f: &mut AgentsFile| {
+            let mut touched = false;
+            for agent in &mut f.agents {
+                if agent.attachment == AgentAttachment::Live {
+                    agent.attachment = AgentAttachment::None;
+                    demoted += 1;
+                    touched = true;
+                }
+                if matches!(
+                    agent.status,
+                    AgentRecordStatus::Starting | AgentRecordStatus::Running
+                ) {
+                    agent.status = AgentRecordStatus::Failed;
+                    for exec in &mut agent.execs {
+                        if exec.failure_detail.is_none() {
+                            exec.failure_detail =
+                                Some("app restarted before exec finished".to_string());
+                        }
+                    }
+                    touched = true;
+                }
+            }
+            touched
+        })?;
+        let _ = changed;
+    }
+    Ok(demoted)
 }
 
 /// 一次派发的 exec 标识（U4 链步骤 ⑤ 的入参；binary 信息进 execs[] 用于
@@ -179,7 +225,7 @@ pub fn register_agent(
                 exec_id: new_exec.exec_id.clone(),
                 node_id: new_exec.node_id.clone(),
                 run_id: new_exec.run_id.clone(),
-                started_at: now_iso(),
+                started_at: now_epoch_ms(),
                 binary_path: new_exec.binary_path.clone(),
                 binary_args: new_exec.binary_args.clone(),
                 ..Default::default()
@@ -399,5 +445,26 @@ mod tests {
         };
         let text = serde_json::to_string(&exec).unwrap();
         assert!(!text.contains("\"env\""), "{text}");
+    }
+
+    #[test]
+    fn demote_live_agents_after_restart() {
+        // F-U4a-2：写入 Live 后模拟重启 → 列表不再 Live
+        let (_dir, runtime, home) = temp_runtime();
+        register_agent(&runtime, &home, "omp", new_exec("exec-1")).unwrap();
+        assert_eq!(demote_live_agents(&runtime).unwrap(), 1);
+        let (file, _) = read_json::<AgentsFile>(&agents_path(&runtime, &home).unwrap()).unwrap();
+        assert_eq!(file.agents[0].attachment, AgentAttachment::None);
+        assert_eq!(file.agents[0].status, AgentRecordStatus::Failed);
+        assert!(
+            file.agents[0].execs[0]
+                .failure_detail
+                .as_deref()
+                .unwrap()
+                .contains("app restarted"),
+            "failure_detail 应注明重启"
+        );
+        // 幂等：再次 demote 无新增
+        assert_eq!(demote_live_agents(&runtime).unwrap(), 0);
     }
 }

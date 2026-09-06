@@ -7,11 +7,14 @@
 mod agents;
 mod atomic_json;
 mod daemon;
+// U2 内核先于 U4 exec_start 接线落地——spawn 侧 API 在 U4 前是死代码
+#[allow(dead_code)]
+mod executor;
 mod harness;
 mod rpc_bridge;
 mod state;
 
-use state::SharedSession;
+use state::{ExecutionState, SharedSession};
 use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -43,6 +46,7 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(SharedSession::new())
+        .manage(ExecutionState::new())
         .invoke_handler(tauri::generate_handler![
             rpc_bridge::omt_call,
             rpc_bridge::daemon_status,
@@ -56,9 +60,20 @@ pub fn run() {
             harness::harness_list,
             harness::harness_config_set,
             agents::agents_list,
+            executor::exec_stop,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running oh-my-ticket desktop")
+        .build(tauri::generate_context!())
+        .expect("error while building oh-my-ticket desktop")
+        .run(|app, event| {
+            // KD-D7：app 退出 = 执行终止。最后一个窗口关闭/退出请求时
+            // killpg 全部会话（等待线程随后完成 agents.json 终态回写）。
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                use crate::executor::KillReason;
+                app.state::<ExecutionState>()
+                    .0
+                    .kill_all(KillReason::AppExit);
+            }
+        });
 }
 
 /// F-U15-4：按仓库 env 约定（docs/runtime/config.md「空即未设置」）解析布尔开关——
