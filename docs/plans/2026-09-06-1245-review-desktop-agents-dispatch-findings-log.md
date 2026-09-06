@@ -25,6 +25,14 @@ branch: feat/desktop-agents-dispatch
 
 | ID | 级别 | 类型 | 单元 | 位置 | 摘要 | 状态 | 负责人 |
 |---|---|---|---|---|---|---|---|
+| F-U3-15 | P1 | manual | U3 | `mcp_injection.rs::prepare_omp_with` :279→:283 | **merge 先于 state.json 写入**：二者之间崩溃 → 首个 exec 无 `workspace` 记录，sweep 跳过该目录且删光 launcher → 用户文件留悬空 `omt`；下次 prepare 把污染后的文件当"原件"备份，永远恢复不干净（556c1d2 引入，§8 漏检） | fixed(d53b191) | — |
+| F-U3-16 | P1 | manual | U3 | `mcp_injection.rs` :281/:304 | **writtenSha 每次 prepare 都重置基线**：两 exec 重叠期间用户改了文件 → 第二次 prepare 把改动吸进 S2 → 最后 release 比对 S2 相等 → 整体恢复到第一次 prepare 时的 backup，用户改动静默丢失（556c1d2 引入，§8 漏检） | fixed(d53b191) | — |
+| F-U3-11 | P2 | gated_auto | U3 | `mcp_injection.rs::finalize_release` :310/:323 | **b3500cb 回归**：user_modified 分支打印「备份保留于 …」后无条件 `remove_dir_all(state_dir)` 删掉 backup；外科手术 no-op（command 不匹配/文件不可解析）时用户文件仍被污染且唯一原件已毁 | fixed(d53b191) | — |
+| F-U3-12 | P2 | manual | U3 | `mcp_injection.rs::release_omp` :334 | **b3500cb 回归**：`remove_launcher` 在 refcount 判断之前——后 prepare 的 exec 先结束时，mcp.json 仍指向它刚被删的 launcher，直到最后一次 release 都是悬空 | fixed(d53b191) | — |
+| F-U3-13 | P2 | gated_auto | U3 | `mcp_injection.rs::write_atomic` :124 | rename 失败时 tmp 文件残留在用户工作区（`.omp/mcp.json.tmp-<pid>`） | fixed(d53b191) | — |
+| F-U3-14 | P2 | manual | U3 | `mcp.rs::enroll_identity` :300 × 计划 §3.3 | 嵌套 `mcp:<pid>/exec:<id>` 把 pid 重新绑进身份：MCP 进程重启 → 新 pid → 租约 actor 不匹配、report 被拒——F-U3-2 原本承诺的「MCP 重启不丢身份」不再成立；计划文案仍写精确匹配 `exec:<id>`；enroll 后未核对 daemon 实际授予值（64 字符上限超限同样静默降级） | fixed(d53b191)（方案 a：接受 pid 绑定，加静默降级检测；见 §11） | — |
+| F-U3-17 | P2 | gated_auto | U3 | `mcp_injection.rs::sweep_omp_crash_residue` :448 | sweep 循环内 `?`：一个 workspace 恢复失败即中止全部后续恢复与 launcher 清理，且每次启动都如此（556c1d2 引入） | fixed(d53b191) | — |
+| F-U3-18 | P3 | gated_auto | U3 | `mcp_injection.rs::sweep_omp_crash_residue` :460 | sweep 在**每次**启动（非仅 crash 后）删光 launcher 目录，persistent.sh 一并被删 → persistent 模式每次重启后 mcp.json 悬空；代码注释已记为 v1 限制，但修法只是「逐文件删、跳过 persistent.sh」 | fixed(d53b191) | — |
 | F-U2-1 | P2 | gated_auto | U2 | `executor.rs::kill_all` / `finish_terminal` | app 退出路径**不落盘**：`kill_all` 预置 terminal → 等待线程的 `finish_terminal` 早退，agents.json 永远收不到 Killed(AppExit)，下次启动被 demote 记成 Failed | open | — |
 | F-U2-2 | P2 | gated_auto | U2 | `executor.rs::classify` | 起动窗判据用「elapsed < 30s && code != 0」而非计划 §3.2 的「未产出任何 transcript 事件」；`first_event_seen` 有写无读——正常输出 20s 后 exit 1 会被记成 Failed「起动窗内退出」 | open | — |
 | F-U2-3 | P3 | gated_auto | U2 | `executor.rs::finish_terminal` | `ExecRecord.exit_code` / `kill_reason` 从未回写（只写 failure_detail） | open | — |
@@ -80,6 +88,7 @@ branch: feat/desktop-agents-dispatch
 - [ ] P0 桌面冒烟时执行 F-U15-3 的手工双开验证并回填记录（可顺手用 `OMT_ALLOW_MULTI_INSTANCE` 写 dev 自动化脚本）。
 - [x] ~~下次触碰 lib.rs 时顺手关 F-U15-4；下次改 dev-notes 时顺手关 F-U15-5~~ 已于 7be3f76 关闭。
 - [x] ~~U4 接线前修 F-U3-2（daemon 静默降级 actor）~~ 已于 b3500cb 关闭（含 daemon 侧 `Registry::issue` 测试）——U4 现在可以放心假设 `executor_session_id` 以 `/exec:<execId>` 结尾即可定位派发方。
+- [ ] U4 前关 F-U3-15/16（P1，§8 漏检）并决策 F-U3-14；F-U3-11/12/13 建议随同一 fix commit（§10）。
 - [ ] U4 补上剩下半边的 F-U3-9：`kill_all` 路径（依赖 F-U2-1 先修）走 release，才能让 app 强退后的 omp 注入也被正常释放而不是等下次启动 sweep。
 
 ---
@@ -734,3 +743,133 @@ U3 的两个 P1 都不是实现复杂度问题：一个是 YAML 缩进，一个�
 
 - 同前几节：Linux/Windows 分支、`Cargo.lock` 新增 crate（`sha2` 已是 workspace 既有依赖，风险低）供应链审计。
 - daemon 侧真实端到端（`omt --actor exec:x mcp` 起进程、走 stdio、实际 `run/claim`）仍未跑——留给 U4 集成测试，本次只验证到 `Registry::issue` 这一层。
+
+---
+
+## 10. `b3500cb` 二次评审 · U3 修复 commit 的独立多角色评审
+
+- **日期**：2026-09-06
+- **范围**：与 §9 同一 commit（b3500cb vs 556c1d2，8 文件 +458/−113）
+- **评审方式**：**独立子代理**三路（correctness / adversarial / reliability，各自独立上下文，未互相喂结果）+ **一批独立验证器**（7 条 P1/可执行项逐条裁定）。合并用 findings-mechanics 做去重/置信度门/编号，语义归并 4 组交叉命中。跨模型对抗评审本会话不可用。project-standards 跳过（CLAUDE.md 无适用规则）。
+- **为什么再评一次**：§9 是作者（我）的自评，无独立视角；本轮是对修复本身的独立审计。
+- **结论**：**Ready with fixes**——修复目标（F-U3-1..10）确实达成，但引入 **2 个回归**（F-U3-11、F-U3-12）、1 个新缺口（F-U3-13）、1 个需决策的设计后果（F-U3-14）；同时验证器判定的 4 条「pre-existing」（F-U3-15..18）是 556c1d2 就有、§8 漏检的真实缺陷，其中两条 P1。
+
+### 验证器裁定
+
+| # | 结论 | 理由 |
+|---|---|---|
+| #4 → F-U3-11 | **确认（回归）** | 基线在 user_modified 分支 `return Ok(())` 保留 backup；新 `finalize_release` 打印「备份保留」后落到无条件 `remove_dir_all` |
+| #6 → F-U3-13 | 确认 | `write_atomic` 新增，rename 失败不清 tmp |
+| #8 → F-U3-12 | **确认（回归）** | 基线从不调用 `remove_launcher`；本 commit 在 refcount 判断前删，`merge_omp_mcp` 又总是把 `omt.command` 指向最新 launcher |
+| #1 → F-U3-15 | pre-existing | merge→state 顺序与基线逐字节相同 |
+| #2 → F-U3-16 | pre-existing | writtenSha 每次 prepare 覆盖、finalize 只比最后一次——基线相同 |
+| #3 → F-U3-17 | pre-existing | 循环内 `?` 基线已有 |
+| #5 → F-U3-18 | pre-existing | 每次启动调用 sweep + 无条件删目录基线已有；本 commit 注释已标 v1 限制 |
+
+### Findings（本 commit 引入或新暴露）
+
+#### F-U3-11 · P2 · gated_auto · `finalize_release` :310/:323 · 「备份保留」是假的
+user_modified 分支的日志说 backup 保留在 state_dir，函数末尾却无条件删 state_dir。当 `remove_omt_entry_if_matches` 因 command 不匹配或文件不可解析而 no-op 时，用户文件仍被污染，且唯一原件已销毁——比修复前更糟（基线至少留着 backup）。
+- **建议**：user_modified 分支把 backup.json 移到 `omp-injection/<hash>.last-backup.json`（文件而非目录，sweep 的 `is_dir` 过滤会跳过），日志打印该路径；只有 restored/removed 分支才 `remove_dir_all`。测试：手改 + 不可解析 → release 后 backup 仍在。
+- **状态**：fixed(d53b191) —— `finalize_release` 在 `remove_dir_all` 前把 backup.json 原子拷到 `<state_dir>.last-backup.json`（`state_dir.with_extension`，天然落在 state 目录之外）；日志按是否实际保留成功分两种文案。测试 `user_modified_release_preserves_backup_outside_state_dir`。
+
+#### F-U3-12 · P2 · manual · `release_omp` :334 · 后完成的 exec 删掉仍被引用的 launcher
+exec-1 prepare（文件→exec-1.sh）→ exec-2 prepare（文件→exec-2.sh）→ exec-2 先结束：删 exec-2.sh、refcount 2→1、文件不动 → exec-1 剩余运行期间 mcp.json 指向不存在的脚本，MCP 重启或用户手动开 omp 都失败。§8 F-U3-7 的建议本身没考虑这个顺序。
+- **建议**：launcher 删除推迟到 `finalize_release`（state.json 记录本 workspace 所有 launcher，最终一次性删），或非最终 release 时若被删的是当前引用的 launcher 就重指到存活的那个。测试：exec-2 先 release，断言 `omt.command` 指向仍存在的文件。
+- **状态**：fixed(d53b191) —— 按第一个建议落地：`state["launchers"]` 数组记录本批次全部 launcher id，`release_omp` 不再单独删自己的，全部推迟到 `finalize_release` 一次性清空。回归测试 `releasing_later_exec_first_does_not_dangle_current_launcher`（exec-2 先 release，断言 `omt.command` 指向的文件仍存在）；`omp_refcount_restores_only_after_last_exec` 同步改为断言"两个 launcher 都要等批次结束才清"。
+
+#### F-U3-13 · P2 · gated_auto · `write_atomic` :124 · rename 失败留 tmp
+- **建议**：`rename` 出错时 best-effort `remove_file(&tmp)` 再返回错误。
+- **状态**：fixed(d53b191) —— 按建议落地，`map_err` 内先 `remove_file(&tmp)` 再返回错误串。
+
+#### F-U3-14 · P2 · manual（决策）· `mcp.rs` :300 × 计划 §3.3 · 嵌套命名空间把 pid 重新绑进身份
+F-U3-2 的三个目标之一是「MCP 进程重启不丢租约身份」，嵌套形式 `mcp:<pid>/exec:<id>` 让身份再次随 pid 变化：harness 中途重启 MCP server → 新 pid → `authorize_report` 的 actor 不匹配 → report 被拒，退回 15min TTL。另外：计划 §3.3/U4 文案仍写精确匹配 `exec:<id>`；enroll 后没有核对 daemon 实际授予的 namespace（超 64 字符同样静默降级，`mcp:<pid>/exec:` 已占 ~17 字符，execId 超 ~47 字符即失效）。
+- **候选**：(a) 接受 pid 绑定，daemon 协议零变更；U4 用 `ends_with("/exec:<id>")` 匹配，计划文案改；MCP 中途重启视为罕见事件交给租约 TTL。(b) daemon `Registry::issue` 对 kind=mcp 额外放行 `exec:` 顶层前缀——auth 策略变更，需安全评审。无论选哪个：`serve()` 在 enroll 后比对 handshake 返回的 `actorNamespace` 与请求值，不一致时至少 log warn（否则 F-U3-2 这类静默降级下次还会发生）；desktop 侧给 execId 长度上界并加测试。
+- **状态**：fixed(d53b191) —— **选定 (a)**：daemon 协议零变更，MCP 中途重启的身份不连续接受为 v1 权衡，交给既有 15min 租约 TTL 恢复（与 desktop/执行器崩溃走同一条路径）。`enroll_identity` doc comment 记录该决策与理由；`serve()` 新增 `identity_downgraded` 检测（对比 enroll 后 handshake 返回的 `actorNamespace` 与请求值），不一致时 `log_line` 警告（覆盖 64 字符上限静默降级的场景）；`identity_downgraded` 抽成纯函数单测覆盖。desktop 侧 `ends_with("/exec:<id>")` 匹配逻辑与 execId 长度上界留给 U4（尚未有生产调用方）。
+
+### Pre-existing（556c1d2 引入，§8 漏检，不计入本 commit verdict）
+
+#### F-U3-15 · P1 · manual · `prepare_omp_with` :279→:283 · merge 先于 state 写入
+首个 exec：`merge_omp_mcp` 已改写用户文件，`write_omp_state` 还没落盘 → 此刻崩溃 → state 目录没有 `workspace` 字段 → sweep `continue` 跳过它、随后删光 launcher → 用户文件永久留一个指向不存在脚本的 `omt`；更糟的是下一次 prepare 在 refcount==0 分支把这个已污染的文件当"原件"备份，此后所有恢复都恢复到污染态。
+- **建议**：首个 exec 先写 state.json（workspace、backupExisted、refcount 0）再 merge；refcount==0 分支备份前先剔除任何 command 位于 `omp_launchers_dir` 下的旧 `omt` 条目；sweep 对只有 backup.json 的目录也做处理。
+- **状态**：fixed(d53b191) —— 按建议落地：`state["workspace"]` 在 merge 前先写盘；refcount==0 分支备份前先调用 `remove_omt_entry_if_under_launchers_dir`（宽匹配，显式排除 persistent.sh 精确路径，防止误伤合法的 persistent 注入）。`finalize_release` 在 `writtenCommand` 为空（state 不完整）时同样退化到这个宽匹配兜底，而不是永远留着悬空条目。测试 `sweep_discovers_and_scrubs_orphan_from_incomplete_state`（state 有 `workspace` 但没有 writtenCommand）与 `prepare_scrubs_dangling_entry_before_backing_up_as_original`（state 目录整个丢失，靠下一次 prepare 自愈）。
+
+#### F-U3-16 · P1 · manual · :281/:304 · writtenSha 每次 prepare 重置基线，重叠期间用户改动丢失
+exec-1 prepare 存 S1 → 用户加了 `mcpServers.mine` → exec-2 prepare 读到含 mine 的文件、merge、存 S2 → exec-1 release（2→1）→ exec-2 release：hash==S2 → 判"未改动" → 整体恢复 exec-1 时刻的 backup → `mine` 丢失。hash 比对只能发现**最后一次 prepare 之后**的改动。correctness 与 adversarial 两路独立命中。
+- **建议**：refcount>0 时 merge 前先比对当前文件 hash 与 writtenSha，不等则置粘性 `state.userModified=true`；`finalize_release` 把它 OR 进 user_modified 走外科手术分支。测试：prepare-1 → 手改 → prepare-2 → 双 release → `mine` 仍在。
+- **状态**：fixed(d53b191) —— 按建议落地，`state["userModified"]` 粘性标记，`finalize_release` 与即时 hash 比对结果 `||` 在一起。回归测试 `overlapping_exec_user_edit_survives_final_restore` 精确复现建议里的场景，双 release 后断言 `mine` 存活且 `omt` 已被外科手术移除。
+
+#### F-U3-17 · P2 · gated_auto · `sweep_omp_crash_residue` :448 · 循环内 `?`
+一个 workspace 恢复失败（如 EACCES）→ 整个 sweep 返回 Err → 其余 workspace 不恢复、launcher 不清理，且每次启动重复。
+- **建议**：逐 workspace log-and-continue；launcher 清理无论如何执行。
+- **状态**：fixed(d53b191) —— `sweep_omp_crash_residue` 循环内 `match` 代替 `?`，失败只 `eprintln` 并跳过该目录；末尾的 launcher 兜底清理不再依赖循环是否全部成功（本来就在循环外）。
+
+#### F-U3-18 · P3 · gated_auto · :460 · sweep 每次启动删 persistent.sh
+`ExecutionManager::new` 每次启动都 sweep，末尾无条件 `remove_dir_all(omp-launchers)`；persistent 无 state 目录、release 为 no-op → 任何正常退出+重启后 persistent 注入的 `omt.command` 悬空。b3500cb 注释已把它记为 v1 限制，但修法很轻。
+- **建议**：逐文件删、跳过 `persistent.sh`；测试：prepare persistent → sweep → 文件仍在。
+- **状态**：fixed(d53b191) —— 末尾清理改为逐文件 `read_dir` + 跳过 `launcher_path(runtime_dir, "persistent")` 精确匹配。测试 `sweep_never_deletes_persistent_launcher`（prepare persistent → sweep → 文件仍在，且 `launcher_count == 1`）。副作用：per-workspace `finalize_release` 现在也会清自己追踪到的 launcher，所以这一步实际只兜底真正孤儿（state 目录在记录 `workspace` 之前就整个丢失的极端情况）。
+
+### 软桶（低置信度/单人 advisory，不进主 findings）
+- `remove_omt_entry_if_matches` 把任何读错误（非 NotFound）当"文件不存在"静默返回 → EACCES 时悬空条目留下（reliability，c75 但 human 路由）。
+- `write_launcher` 用 truncate 原地写，persistent.sh 重写非原子（c50）。
+- `canonical_workspace` 在 prepare/release 两次独立计算，workspace 存在性变化时可能落到不同 state 目录（c50）。
+- `release` 非幂等：U4 补偿链若与 `spawn()` 的自动 release 各调一次，refcount 会被双减、其它存活 exec 的文件被提前恢复——**U4 接线契约**：spawn 失败后调用方**不要**再 release（c50）。
+- `merge_omp_mcp` 对任何读错误（非 NotFound）回退空 JSON 后原子覆盖——EACCES 变成"清空用户文件"（pre-existing，c50）。
+- 多实例（`OMT_ALLOW_MULTI_INSTANCE`）下 `OMP_LOCK` 进程内锁不保护 state.json 的跨进程读改写。
+- `serde_json` 未开 preserve_order：每次 merge/scrub 会重排用户 mcp.json 的键序。
+
+### 测试缺口（三路合并）
+重叠 exec 期间用户改动；backup 在外科手术分支/no-op 分支存活；非最终 release 后 `omt.command` 仍指向存在的文件；merge 与 state 写之间崩溃 + sweep；多 workspace 残留且其一失败；`write_atomic` rename 失败清理；sweep 后 persistent.sh 仍在；`kill_all(AppExit)` 触发 release；`omt --actor exec:<id> mcp` 端到端 claim 后 desktop 按后缀能查到；`workspace_hash_stable_…` 测试实际没测 symlink 也没测跨进程（两次进程内调用 DefaultHasher 也能过）——需真建 symlink + 固定 golden 值。
+
+### 当前收口状态
+
+| ID | 状态 |
+|---|---|
+| F-U3-11 / 12 / 13 / 14 / 15 / 16 / 17 / 18 | fixed(d53b191)，见 §11 |
+
+**对 §9 自评的修正**：§9 写「无新增 finding、没有引入需要跟踪的新技术债」——错。独立评审找出 2 个回归 + 1 个新缺口 + 1 个设计后果，并暴露 §8 漏掉的 2 个 P1。自评不能替代独立评审，这一条本身值得记住。
+
+---
+
+## 11. `d53b191` · U3 · 修复二次评审全部 8 项（F-U3-11..18）
+
+- **日期**：2026-09-06
+- **范围**：`mcp_injection.rs` 近乎重写（新增 `launchers`/`userModified`/`workspace` 提前写入的 state 字段、`remove_omt_entry_if` 通用化为精确/宽匹配两个变体、`omp_launchers_prefix` 防兄弟目录误匹配、9 个新/改测试，共 18 个 mcp_injection 测试）；`executor.rs`（`spawn_failure_releases_mcp_injection` 改走真实 `prepare_with` 而非手造 `McpInjection`，`prepare_with` 因此升级为 `pub(crate)`）；`mcp.rs`（`identity_downgraded` 纯函数 + `serve()` 内 enroll 后校验 + `enroll_identity` doc comment 记录 F-U3-14 决策）
+- **意图**：逐条关闭 §10 发现的 8 项（2 回归 + 2 pre-existing P1 + 3 小修 + 1 决策）
+- **评审方式**：单上下文内联（correctness / reliability）；`cargo fmt --check` exit 0；`clippy -p oh-my-ticket-desktop -p omt-runtime --all-targets -D warnings` 通过；`cargo test -p oh-my-ticket-desktop --lib` → **54 passed**；`cargo test -p omt-runtime --lib` → **20 passed**；`cargo test --workspace` → 全绿零失败。**无独立子代理、无跨模型佐证**——这一轮是作者自评，§10 的教训（自评不能替代独立评审）在此如实标注，不假装这是第三方核验。
+- **结论**：**Ready to merge，待下一轮独立复核**。8 项全部有对应代码改动与专项回归测试；核心设计决策是"launcher 删除统一推迟到批次最终 release"（`launchers` 数组），一次性解构了 F-U3-7/F-U3-12 反复出现的"什么时候删 launcher 安全"问题，比逐个打补丁更根本。
+
+### 关键设计变化（供下一轮评审重点核查）
+
+1. **launcher 删除时机从"per-exec 释放时"改为"批次最终 release 时"**：`state["launchers"]` 记录本 workspace 批次用过的全部 launcher id，`release_omp` 不再单独删除，全部推迟到 `finalize_release`。代价是同批次内的 launcher 文件会比原设计（F-U3-7）多存活一段时间（直到整批结束），换来的是不可能再出现"仍被引用的 launcher 被删"这类竞态。
+2. **`remove_omt_entry_if` 拆成精确匹配（`remove_omt_entry_if_matches`，用于正常路径，command 完全相等才动）与宽匹配（`remove_omt_entry_if_under_launchers_dir`，用于 state 不完整的兜底路径，只要求 command 落在 launcher 目录下且不等于 persistent 的固定路径）**——宽匹配理论上仍有极小残留风险：如果 persistent 的 launcher 曾经被重命名过（当前实现是固定名 `persistent.sh`，不会发生），或者未来引入除 persistent 外的第二种"长期存活、不受 refcount 管理"的 launcher 类型，这个"排除单个固定路径"的写法需要跟着扩展，否则会重新变成 F-U3-10 那种误删。
+3. **F-U3-14 是产品/安全决策而非纯 bug 修复**：选择了"接受 MCP 重启丢身份精度、靠租约 TTL 兜底"而不是"daemon 放宽 auth 策略"。这个决策目前只有代码注释记录，没有走独立的安全评审——下一轮评审如果有余力，建议至少让 security 视角过一遍这个权衡是否可接受。
+
+### 逐项核验
+
+| ID | 核验 |
+|---|---|
+| F-U3-11 | 新测试 `user_modified_release_preserves_backup_outside_state_dir`：mid-exec 整份覆盖 → release 后在 `omp_injection_root` 下能找到 `*.last-backup.json` 且内容含原始 `user-server` ✔ |
+| F-U3-12 | 新测试 `releasing_later_exec_first_does_not_dangle_current_launcher`：exec-2 先 release，断言 mcp.json 引用的文件仍存在；`omp_refcount_restores_only_after_last_exec` 更新为断言两个 launcher 都存活到批次结束 ✔ |
+| F-U3-13 | 代码审阅：`rename` 的 `map_err` 闭包内先 `remove_file(&tmp)` 再返回 ✔（未额外加测试——tmp 泄漏难以在不 mock 文件系统的前提下可靠触发 rename 失败，判定为可接受的覆盖缺口） |
+| F-U3-14 | 新测试 `identity_downgraded_detects_daemon_mismatch`（纯函数三态）；`serve()` 内的实际 enroll-后校验没有对应集成测试（需要真实 daemon，留给 U13/U4）|
+| F-U3-15 | 新测试 `sweep_discovers_and_scrubs_orphan_from_incomplete_state`、`prepare_scrubs_dangling_entry_before_backing_up_as_original`，分别覆盖"state 不完整但目录能被 sweep 找到"与"state 目录整个丢失、靠下次 prepare 自愈"两种崩溃时点 ✔ |
+| F-U3-16 | 新测试 `overlapping_exec_user_edit_survives_final_restore` 完整复现 §10 描述的场景 ✔ |
+| F-U3-17 | 代码审阅：`sweep_omp_crash_residue` 循环体从 `finalize_release(...)?;` 改为 `match` + `eprintln`；未加"一个目录失败、其余仍恢复"的专项测试（需要构造一个真实失败的 workspace，如只读目录，判定为可接受的覆盖缺口） |
+| F-U3-18 | 新测试 `sweep_never_deletes_persistent_launcher` ✔ |
+
+### 已知覆盖缺口（本轮未补，供下一轮参考）
+
+- F-U3-13（tmp 清理）与 F-U3-17（sweep 部分失败容错）只有代码审阅，没有专项测试——两者都需要模拟文件系统层面的失败（只读目录、rename 跨设备等），在当前 `tempfile::TempDir` 方案下不易可靠构造，需要引入 mock 文件系统或 unix 权限技巧才能测。
+- `write_launcher`（persistent.sh 重写）仍非原子——§10 软桶已记录，本轮未处理（低优先级，persistent 尚无生产调用方）。
+- `canonical_workspace` 在 prepare/release 两次独立计算——§10 软桶已记录，本轮未处理。
+- `release` 非幂等的 U4 契约（"spawn 失败后调用方不要再 release"）仍只是注释里的口头约定，没有代码层面的幂等保护或断言——U4 接线时若这条契约被违反，会静默双减 refcount。建议 U4 落地时补一个"已释放过的 exec_id 再次 release 时警告"的轻量守卫。
+- `merge_omp_mcp` 对非 NotFound 读错误回退空 JSON 后原子覆盖（EACCES → 清空用户文件）——§10 软桶已记录为 pre-existing，本轮未处理。
+
+### 当前收口状态
+
+| ID | 状态 |
+|---|---|
+| F-U3-11 / 12 / 13 / 14 / 15 / 16 / 17 / 18 | fixed(d53b191) |
+
+U3 单元的 mcp_injection 模块目前已过两轮评审 + 两轮修复。**建议 U4 开工前跑一次独立的第三轮评审**（本轮仍是自评，§10 的教训还没被"用独立评审验证自评"这一步兑现）；如果时间有限，至少应验证「关键设计变化」小节列出的三点，以及本节列出的覆盖缺口是否可接受。
