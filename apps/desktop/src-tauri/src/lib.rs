@@ -5,6 +5,7 @@
 //! connection bridged to the frontend through tauri commands.
 
 mod daemon;
+mod harness;
 mod rpc_bridge;
 mod state;
 
@@ -50,6 +51,8 @@ pub fn run() {
             rpc_bridge::harness_detect,
             rpc_bridge::harness_validate_checkout,
             rpc_bridge::dsh_plugin_install,
+            harness::harness_list,
+            harness::harness_config_set,
         ])
         .run(tauri::generate_context!())
         .expect("error while running oh-my-ticket desktop")

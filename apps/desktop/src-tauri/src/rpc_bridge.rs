@@ -14,75 +14,12 @@
 
 use tauri::{AppHandle, Emitter, State};
 
-/// GUI 启动（Finder/Dock）的 PATH 往往只有系统目录（/usr/bin:/bin:…），
-/// homebrew/nvm 装的 dsh/pnpm 会找不到。把常见包管理器前缀补进查找与
-/// 子进程环境，避免「终端里能跑、GUI 里找不到」。
-fn augmented_path() -> String {
-    let existing = std::env::var("PATH").unwrap_or_default();
-    let home = std::env::var("HOME").unwrap_or_default();
-    let prefixes = [
-        "/opt/homebrew/bin".to_string(),
-        "/usr/local/bin".to_string(),
-        format!("{home}/.local/bin"),
-        format!("{home}/bin"),
-    ];
-    let missing: Vec<String> = prefixes
-        .into_iter()
-        .filter(|p| !existing.split(':').any(|d| d == p.as_str()))
-        .collect();
-    if missing.is_empty() {
-        existing
-    } else {
-        format!("{}:{existing}", missing.join(":"))
-    }
-}
-
-/// 在 PATH 上查找可执行文件（harness 安装探测）。
-fn which_binary(name: &str) -> Option<std::path::PathBuf> {
-    let path_var = augmented_path();
-    for dir in path_var.split(':') {
-        if dir.is_empty() {
-            continue;
-        }
-        let candidate = std::path::PathBuf::from(dir).join(name);
-        if candidate.is_file()
-            && std::fs::metadata(&candidate)
-                .map(|m| {
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        m.permissions().mode() & 0o111 != 0
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        true
-                    }
-                })
-                .unwrap_or(false)
-        {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
-/// `<binary> --version` 首行输出（2s 上限；失败不阻断探测）。
-fn probe_version(binary: &std::path::Path) -> Option<String> {
-    let output = std::process::Command::new(binary)
-        .arg("--version")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    text.lines()
-        .next()
-        .map(|line| line.trim().to_string())
-        .filter(|line| !line.is_empty())
-}
+use crate::harness::{augmented_path, probe_version, which_binary};
 
 /// 检测本机已安装的 agent harness（dsh / opencode）：PATH 查找 +
 /// 版本探针。渲染进程无 fs/shell 能力，探测只能在 Rust 侧做。
+/// （U1 起探测原语在 harness.rs；dsh 走通用探测，opencode/omp 走
+/// `harness_list` 的 registry 投影。）
 #[tauri::command]
 pub fn harness_detect(harness: String) -> Result<serde_json::Value, String> {
     let binary = match harness.as_str() {
@@ -92,7 +29,7 @@ pub fn harness_detect(harness: String) -> Result<serde_json::Value, String> {
     };
     match which_binary(binary) {
         Some(path) => {
-            let version = probe_version(&path);
+            let version = probe_version(&path, &["--version"], 2);
             Ok(serde_json::json!({
                 "installed": true,
                 "path": path.display().to_string(),
