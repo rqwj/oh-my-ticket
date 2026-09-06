@@ -29,7 +29,7 @@
 - client 改动：`tsdown --watch` 重建 `lib/client.js` + **刷新页面**（index tap 每次渲染注入最新图，rev 防缓存）。
 - host 改动：必须重启实例。
 - 多实例开发**必须隔离 DSH_HOME**（`DSH_HOME=~/.dsh-omt pnpm dsh ...`）——两个实例共享 sessions home 会同写 session 日志，seq 撞号导致 "corrupt session log"（本仓库 `scripts/repair-session-log.mjs` 是修复工具）。
-- desktop 多实例/多 worktree 开发：debug 构建设 `OMT_ALLOW_MULTI_INSTANCE=1` 跳过 single-instance 守卫（release 不受影响），与上面的 `DSH_HOME` 隔离配合使用。
+- desktop 多实例/多 worktree 开发：debug 构建设 `OMT_ALLOW_MULTI_INSTANCE=1` 跳过 single-instance 守卫（release 不受影响），与上面的 `DSH_HOME` 隔离配合使用。**并须为每个实例单独设 `OMT_RUNTIME_DIR`**（如 `OMT_RUNTIME_DIR=~/.omt-run-ws1`）——共享 runtime dir 时，第二个实例的启动 demote 会把首实例仍在运行的 Live agent 降级（F-U2-9；U10 pid liveness 落地后缓解）。
 
 ---
 

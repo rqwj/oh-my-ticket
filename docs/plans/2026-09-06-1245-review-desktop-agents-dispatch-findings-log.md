@@ -25,14 +25,25 @@ branch: feat/desktop-agents-dispatch
 
 | ID | 级别 | 类型 | 单元 | 位置 | 摘要 | 状态 | 负责人 |
 |---|---|---|---|---|---|---|---|
+| F-U2-1 | P2 | gated_auto | U2 | `executor.rs::kill_all` / `finish_terminal` | app 退出路径**不落盘**：`kill_all` 预置 terminal → 等待线程的 `finish_terminal` 早退，agents.json 永远收不到 Killed(AppExit)，下次启动被 demote 记成 Failed | open | — |
+| F-U2-2 | P2 | gated_auto | U2 | `executor.rs::classify` | 起动窗判据用「elapsed < 30s && code != 0」而非计划 §3.2 的「未产出任何 transcript 事件」；`first_event_seen` 有写无读——正常输出 20s 后 exit 1 会被记成 Failed「起动窗内退出」 | open | — |
+| F-U2-3 | P3 | gated_auto | U2 | `executor.rs::finish_terminal` | `ExecRecord.exit_code` / `kill_reason` 从未回写（只写 failure_detail） | open | — |
+| F-U2-4 | P3 | gated_auto | U2 | `executor.rs::spawn` / waiter | setpgid 只在子进程侧做，spawn 后立即 stop 有 ESRCH 窗口；正常退出后不清残留 pgid 成员 → 孙进程持管道时 reader 永不 EOF、waiter 线程泄漏 | open | — |
+| F-U2-5 | P3 | gated_auto | U2 | `executor.rs::classify` | 信号死亡（`code()==None`）被映射成 -1：窗内 Failed / 窗外 Exited(-1)，应读 `status.signal()` | open | — |
+| F-U2-6 | P3 | advisory | U2 | `executor.rs` 事件 | envelope 不统一：`session_start`/`exit` 无 `seq`/`ts`，与 design §5.3 `{seq, ts, execId, kind, payload}` 不符；U5 消费前统一 | open（U5 前） | — |
+| F-U2-7 | P3 | advisory | U2/U12 | 计划 §3.2 / design §5.6 | transcript `.jsonl`（header + 事件）写入未落地，仅 raw.log；U10 reconcile 依赖 header——归属未定 | open（计划定归属） | — |
+| F-U2-8 | P3 | gated_auto | U2 | `executor.rs::sanitize_line` / `session_start.args` | `to_lowercase()` 索引原串，非 ASCII 行偏移错位可能欠脱敏（改 `to_ascii_lowercase`）；`args` 事件/日志未脱敏（extra_args 可含 `--api-key`） | open | — |
+| F-U2-9 | P3 | advisory | U2 | `agents::demote_live_agents` × dev 多实例 | `OMT_ALLOW_MULTI_INSTANCE` 下第二实例启动 demote 会把首实例的 Live agent 标 Failed；dev-notes 需补「同时隔离 `OMT_RUNTIME_DIR`」 | open | — |
+| F-U2-10 | P3 | gated_auto | U2 | `executor.rs::spawn` raw_log 路径 | `home_id` 未经 `validate_home_id` 即拼路径 | open | — |
+| F-U2-11 | P3 | advisory | U2 | `harness.rs::probe_descriptor` | 探针失败重试一次把 `harness_list` 最坏延迟翻倍（8s）；注释归因「fork→exec 卡死」需复现记录 | open | — |
 | F-U4a-1 | P2 | manual | U4a | `atomic_json::read_json_locked` / `agents::agents_list` | `parseFailed` 是**瞬态**信号（损坏文件被 rename 后第二次读即 false + 空列表），U9「解析失败期间冻结 GC」硬规则会失效并清空全部绑定 | open（U9 前置） | — |
-| F-U4a-2 | P2 | gated_auto | U4a→U2 | `agents::register_agent` 写 `attachment: Live` | Live 持久化后跨重启失真：U10（P1）才 reconcile，P0 期间重启/崩溃后 `agents_list` 仍报 Live+Starting/Running | fixed(`demote_live_agents` + ExecutionManager::new 启动 demote + 测试，随 U2 commit) | — |
+| F-U4a-2 | P2 | gated_auto | U4a→U2 | `agents::register_agent` 写 `attachment: Live` | Live 持久化后跨重启失真：U10（P1）才 reconcile，P0 期间重启/崩溃后 `agents_list` 仍报 Live+Starting/Running | fixed(b8b00f8)（`demote_live_agents` + ExecutionManager::new 启动 demote + 测试） | — |
 | F-U4a-3 | P3 | gated_auto | U4a | `atomic_json::read_json` | 读路径的损坏 rename 不在 flock 内，与另一进程的写 rename 竞态可能把刚写好的文件挪成 `.corrupt` | open | — |
 | F-U4a-4 | P3 | gated_auto | U4a | `atomic_json::write_tmp_and_rename` | rename 前无 `sync_all`，断电可能留下 0 字节文件 → 下次降级丢 agents 列表 | open | — |
 | F-U4a-5 | P3 | advisory | U4a | `atomic_json::STORE_LOCK` | 全局锁横跨所有 store 文件且持锁等 flock 最长 10s，未来 CLI 长持 agents 锁会连 harness config 保存一起阻塞 | open（v1 接受） | — |
-| F-U4a-6 | P3 | advisory | U4a | `agents::now_iso` / §3.2 | 函数名 iso 实为 epoch ms；transcript header `startedAt` 格式未定，U2 必须与 `execs[].startedAt` 同格式 | fixed(U2)（`now_epoch_ms` 改名；计划 §3.2 补「header 与 execs[] 同为 epoch ms 字符串」；U2 transcript header 用同格式） | — |
+| F-U4a-6 | P3 | advisory | U4a | `agents::now_iso` / §3.2 | 函数名 iso 实为 epoch ms；transcript header `startedAt` 格式未定，U2 必须与 `execs[].startedAt` 同格式 | fixed(b8b00f8)（`now_epoch_ms` 改名；计划 §3.2 补「header 与 execs[] 同为 epoch ms 字符串」；header 本身尚未写入，见 F-U2-7） | — |
 | F-U4a-7 | P3 | advisory | U4a | `agents.rs` API | 无「向既有 Agent 追加 exec」入口；U11 续跑与 U6 add-members 需要 `append_exec` | open（U11 补） | — |
-| F-U4a-8 | P3 | advisory | U4a | 计划 U4a Files | 列了 `bridge.ts` 但未动，`agents_list` 尚无 TS 封装 | fixed(cf8a2c7 顺序)（计划记注：bridge.ts 移至 U5 Files） | — |
+| F-U4a-8 | P3 | advisory | U4a | 计划 U4a Files | 列了 `bridge.ts` 但未动，`agents_list` 尚无 TS 封装 | fixed(b8b00f8)（计划记注：bridge.ts 移至 U5 Files） | — |
 | F-U1b-1 | P3 | advisory | U1b | 计划 U1b Files / 排期 | `store.ts` 的 `harness_list` 封装放在 U1b，但 U6 弹窗选择器先于 U1b 需要它——依赖倒置 | fixed(cf8a2c7)（封装移入 U6 Files，U1b 只留退役/迁移/接线） | — |
 | F-U1-8 | P3 | gated_auto | U1 | `harness.rs::upsert_config` | `CONFIG_LOCK` 一旦 poison，所有后续保存永久失败直至重启 | fixed(43bf89f)（写纪律收敛进 atomic_json，`STORE_LOCK` poison 容忍） | — |
 | F-U1-9 | P3 | advisory | U1 | `harness.rs::save_configs` | 写入与 rename 之间崩溃留下的 `config.json.tmp-*` 无人清扫 | fixed(43bf89f)（update 内清扫 mtime>1h 的残留 tmp，测试覆盖） | — |
@@ -53,7 +64,9 @@ branch: feat/desktop-agents-dispatch
 
 - [x] ~~U4a 落地时回看 F-U15-1~~ 已于 43bf89f 关闭（harness config + agents.json 两条已覆盖）。
 - [ ] U9 落地 bindings.json 时确认走 `atomic_json`（F-U15-1 的第三条写路径）；同时按 F-U4a-1 把 GC 冻结改为粘性判定。
-- [ ] U2 开工时落地 F-U4a-2（启动 demote Live）与 F-U4a-6（startedAt 格式对齐）。
+- [x] ~~U2 开工时落地 F-U4a-2 与 F-U4a-6~~ 已于 b8b00f8 关闭。
+- [ ] U4 接线前修 F-U2-1（AppExit 落盘）与 F-U2-2（起动窗判据）——两者都影响 P0 验收「起动失败呈现 Failed + stderr 尾」与「终止后终态正确」。
+- [ ] 计划定 transcript `.jsonl` header/事件写入的归属（F-U2-7），U10 之前必须存在。
 - [ ] P0 桌面冒烟时执行 F-U15-3 的手工双开验证并回填记录（可顺手用 `OMT_ALLOW_MULTI_INSTANCE` 写 dev 自动化脚本）。
 - [x] ~~下次触碰 lib.rs 时顺手关 F-U15-4；下次改 dev-notes 时顺手关 F-U15-5~~ 已于 7be3f76 关闭。
 
@@ -447,3 +460,120 @@ rename 前未 `sync_all()`。APFS 的 rename 原子，但数据页可能未刷�
 | F-U4a-5/6/7/8 | open · 记录/后续单元 |
 
 U4a 达成计划目标，**不阻塞 U2 开工**。U2 入参：F-U4a-2（启动 demote）、F-U4a-6（startedAt 格式）、以及 §4 记的两条前瞻（`extra_args` 顺序、Detected 重探结果写 header）。
+
+---
+
+## 7. `b8b00f8` · U2 · ExecutionManager 执行内核 + 假 harness 测试
+
+- **日期**：2026-09-06
+- **范围**：新建 `executor.rs` +934（spawn / 事件泵 / 终态分类 / exec_stop / kill_all / 脱敏，8 测试）；`agents.rs` +75（`demote_live_agents`、`now_epoch_ms`）；`lib.rs`（`ExecutionState` manage + `RunEvent::ExitRequested` 退出钩子）；`state.rs` +16；`harness.rs`（探针重试）；计划 §3.2/U4a/U5 记注；日志 §6 入库
+- **意图**：计划 U2——setpgid/killpg、cwd 剥尾、env 合并 + 强制 `OMT_RUNTIME_DIR`、起动窗/最大时长兜底、终态分类与 agents.json 回写、退出钩子；顺手关 F-U4a-2/6/8
+- **评审方式**：单上下文内联（correctness / reliability / 计划符合性 / secrets）；`cargo fmt --check` exit 0；`clippy --all-targets -D warnings` 通过；`cargo test --lib` → **35 passed**（executor 8）。**无独立子代理、无跨模型佐证。**
+- **结论**：**Ready with fixes**——内核结构正确、假 harness 测试真实有效（进程组含孙进程、脱敏、env 强制注入、watchdog 均实测），但两条 P2 直接影响 P0 验收语义，建议在 U4 接线前修掉。
+
+### 核验通过
+
+| 项 | 结果 |
+|---|---|
+| 进程组 | `pre_exec(setpgid(0,0))`，`kill(-pgid)` TERM→3s→KILL；测试含孙进程且断言组清空 ✔ |
+| cwd 剥尾 | `workspace_root_of` 仅当末段 == `.omt` 时取 parent ✔ |
+| env | PATH 增广 → `OMT_RUNTIME_DIR` 强制 → 用户 env；保留键在 spawn 入口再拒一次；测试断言子进程看到 desktop 的 runtime dir ✔ |
+| 起动窗 Failed + stderr 尾 | `exit 1` → Failed；`API_KEY=sk-…`/`Bearer …` 脱敏后不含值 ✔（判据问题见 F-U2-2） |
+| watchdog | 400ms 上限实测 Killed(MaxDuration) ✔ |
+| exec_stop 幂等 | 已终态/未知 id 均 Ok ✔ |
+| 退出钩子 | `build().run(\|app, ev\|)` 捕 `ExitRequested` → `kill_all(AppExit)` ✔（落盘问题见 F-U2-1） |
+| F-U4a-2 demote | 启动扫全部 home，Live→None、Starting/Running→Failed + failure_detail；幂等测试 ✔ |
+| F-U4a-6 | `now_epoch_ms` 改名，`ExecSession.started_at_epoch_ms` 同格式 ✔ |
+| 事件回调抽象 | `EventSink = Arc<dyn Fn(Value)>`，单测 mpsc、U4 换 tauri Channel——干净 ✔ |
+| 锁 | 全部 `unwrap_or_else(PoisonError::into_inner)` ✔ |
+
+### Findings
+
+#### F-U2-1 · P2 · gated_auto · `kill_all` / `finish_terminal` · app 退出路径不落盘
+
+`kill_all` 先把 `session.terminal` 预置为 `Killed(AppExit)`，再依赖等待线程收割。但 `finish_terminal` 开头 `if guard.is_some() { return; }`——等待线程看到已预置，**直接返回，不写 agents.json、不发 exit 事件**；而且 app 退出后等待线程根本活不到那一步。结果：agents.json 里该 agent 永远停在 `Running/Live`，下次启动被 demote 记成 `Failed("app restarted before exec finished")`——语义错（用户是正常退出 app），且 `ExecRecord.kill_reason` 永远拿不到 `appexit`。测试 `kill_all_marks_app_exit` 只断言内存态，没覆盖落盘。
+
+- **建议**：`kill_all` 不预置 terminal，改为**同步**对每个存活 session：`stop_reason = AppExit` → `kill_tree(SIGTERM)` → `finish_terminal(session, Killed(AppExit), …)`（幂等 guard 天然处理与等待线程的竞争）；等待线程用 `stop_reason` 而非固定 `User` 分类。测试补：`kill_all` 后读 agents.json 断言 `status == Killed` 且 exec `kill_reason == "appexit"`。
+- **状态**：open（U4 前）
+
+#### F-U2-2 · P2 · gated_auto · `classify` · 起动窗判据与计划不符，`first_event_seen` 有写无读
+
+计划 §3.2：「起动窗内退出（默认 30s，**判据=未产出任何 transcript 事件**）→ Failed」。实现是 `started.elapsed() < startup_window && code != 0`，`first_event_seen` 只在 reader 里 `store(true)`，从未 `load`。后果：harness 正常跑了 20s、输出了一堆、因 claim 被拒按 prompt 纪律 `exit 1`——被记成 Failed「harness 在起动窗内退出」而不是 `Exited(1)`（后者才会联动 run item 统计）。另一个隐患：子进程退出时 reader 线程可能还没处理完缓冲的行，即便改用 `first_event_seen` 也可能读到 false。
+
+- **建议**：`classify` 改为 `!first_event_seen.load() && code != 0`（elapsed 上界可保留为「且」条件）；等待线程在 `try_wait` 返回 Some 后先轮询 `first_event_seen` ≤300ms 再分类；测试补「先 echo 再 exit 1 → Exited(1) 非 Failed」。
+- **状态**：open（U4 前）
+
+#### F-U2-3 · P3 · gated_auto · `finish_terminal` · `exit_code` / `kill_reason` 未回写
+
+`ExecRecord` 有 `exit_code`/`kill_reason`/`failure_detail` 三个字段，`finish_terminal` 只写 `failure_detail`。U5 列表要显示退出码、U10 reconcile 要靠 execs[] 回填终态，两者都缺数据。
+
+- **建议**：`finish_terminal` 一次 `update_exec` 写齐：`Exited(c)` → `exit_code=Some(c)`；`Killed(r)` → `kill_reason=Some(r.as_str())`；`Failed(d)` → `failure_detail`。
+- **状态**：open
+
+#### F-U2-4 · P3 · gated_auto · `spawn` / waiter · setpgid 竞态与残留 pgid 成员
+
+(a) `setpgid(0,0)` 只在子进程 `pre_exec` 里做；父进程 spawn 返回后立刻 `exec_stop` 时，子进程可能尚未执行到 pre_exec，`kill(-pid)` 得 ESRCH，harness 存活。经典解法是父子两侧都调 `setpgid(pid, pid)`（父侧忽略 EACCES）。(b) 子进程正常退出后，等待线程无条件 `join` reader——若 harness 留下了继承 stdout 的后台孙进程，管道永不 EOF，reader 与 waiter 线程永久泄漏。
+
+- **建议**：(a) spawn 后父侧补 `libc::setpgid(pid as i32, pid as i32)`；(b) `try_wait` 返回 Some 后对 pgid 补一次 `SIGKILL`（harness 已退出，残留成员就是孤儿，KD-D7 语义），再 join。
+- **状态**：open
+
+#### F-U2-5 · P3 · gated_auto · `classify` · 信号死亡映射成 -1
+
+外部 `kill -9 <harness>`（非 desktop 发起）→ `status.code() == None` → `-1`：窗内记 Failed「code -1」、窗外记 `Exited(-1)`。
+
+- **建议**：读 `std::os::unix::process::ExitStatusExt::signal()`，非 desktop 发起的信号死亡归 `Killed(External(sig))` 或 `Exited` 附 `signal` 字段；`KillReason` 加 `External`。
+- **状态**：open
+
+#### F-U2-6 · P3 · advisory · 事件 envelope 不统一
+
+`raw` 事件有 `seq`/`ts`，`session_start`/`exit` 没有；design §5.3 定义的是统一 `{seq, ts, execId, kind, payload}`。U5 的尾窗归并、U10 回放按 seq 重推都依赖统一 envelope。
+
+- **建议**：在 U5 消费前把三类事件统一为 `{execId, seq, ts, kind, payload{…}}`，seq 由同一 AtomicU64 发（session_start = 0）。
+- **状态**：open（U5 前）
+
+#### F-U2-7 · P3 · advisory · transcript `.jsonl` 写入未落地，归属未定
+
+commit message 说「transcript headers will use the same epoch-ms format」，但本 commit 只写 `<execId>.raw.log`，没有 `<execId>.jsonl`（design §5.6：首行 header `{execId, agentId, nodeId, runId, harness, harnessSessionId, argv, startedAt}` + 事件行）。U10「扫 transcript header 采纳索引缺失 exec」和 §3.2「header 是回放事实源」都依赖它；计划里 U2/U12 均未明确认领。
+
+- **建议**：计划记注——U2（或 U4 接线时）补 header + raw 事件的 jsonl 写入（与 raw.log 并存），U12 只负责把 raw 行升级为结构化事件；U10 之前必须存在。
+- **状态**：open（计划定归属）
+
+#### F-U2-8 · P3 · gated_auto · `sanitize_line` / `args` · 非 ASCII 偏移与 args 未脱敏
+
+(a) `line.to_lowercase()` 后用其字节偏移切原串，非 ASCII（如土耳其 İ）会改变字节长度；`is_char_boundary` 只防 panic，不防错位——可能欠脱敏。(b) `session_start.args`、`ExecSession.args`、未来 header 的 argv 都原样记录；用户 `extra_args` 完全可能含 `--api-key xxx`，§3.1「只记非敏感 args」没有执行点。
+
+- **建议**：(a) 改 `to_ascii_lowercase()`（长度不变）；(b) `args` 进事件/日志前逐项过 `sanitize_line`（对 `--key=val` 与 `--key val` 两种形态：值项前一项若含 key/token/secret 关键字则替换值）。
+- **状态**：open
+
+#### F-U2-9 · P3 · advisory · dev 多实例 × 启动 demote
+
+`OMT_ALLOW_MULTI_INSTANCE=1` 下起第二个 dev 实例，其 `ExecutionManager::new` 会把**首实例仍在跑的** Live agent 全部 demote 成 Failed（同一 runtime dir）。
+
+- **建议**：`dsh-plugin-dev-notes.md §1.4` 那行补「并为每个实例单独设 `OMT_RUNTIME_DIR`」；U10 引入 pid liveness 后 demote 只动 pid 已死的记录。
+- **状态**：open
+
+#### F-U2-10 · P3 · gated_auto · `spawn` · raw_log 路径未校验 home_id
+
+`runtime_dir/transcripts/<home_id>/…` 直接拼接，`agents_path` 有 `validate_home_id` 而这里没有。来源虽是 daemon handshake，防御应一致。
+
+- **建议**：复用 `agents::validate_home_id`（提为 `pub(crate)`）。
+- **状态**：open
+
+#### F-U2-11 · P3 · advisory · `probe_descriptor` 重试
+
+失败即重试一次让 `harness_list` 最坏延迟从 4s 变 8s；注释归因「多线程进程 fork→exec 偶发卡死」——`probe_version` 没有 `pre_exec`，Rust std 在 macOS 上走 `posix_spawn`，不应有 fork 后库锁问题；更可能是测试并行下 CPU 争用。若确有复现，应记录条件而不是靠重试掩盖。
+
+- **建议**：保留重试但只对「超时」重试（spawn 错误不重试）；在日志/注释附复现条件。
+- **状态**：open
+
+### 当前收口状态
+
+| ID | 状态 |
+|---|---|
+| F-U4a-2 / F-U4a-6 / F-U4a-8 | fixed(b8b00f8) |
+| F-U2-1 / F-U2-2 | open · **U4 接线前修**（影响 P0 验收语义） |
+| F-U2-3/4/5/8/10 | open · 小改，可与 F-U2-1/2 同一 commit |
+| F-U2-6 / F-U2-7 | open · U5 前 / 计划定归属 |
+| F-U2-9 / F-U2-11 | open · 文档/记录 |
+
+U2 内核可作为 U3 的基础继续推进（U3 不触碰终态分类）；但 U4 接线（exec_start 全链 + 终态租约释放）之前必须先关 F-U2-1/2，否则 P0 验收「起动失败呈现 Failed + stderr 尾」「终止后终态正确」会在真实 harness 上出错。

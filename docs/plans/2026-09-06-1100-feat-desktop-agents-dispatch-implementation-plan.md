@@ -331,7 +331,7 @@ stateDiagram-v2
 - **Requirements**: R-C；base_design KD-D2。
 - **Dependencies**: U2、U3、U4a。
 - **Files**: 修改 `apps/desktop/src-tauri/src/executor.rs`（链编排 + 互斥锁 + 补偿表 + dispatchId/per-step commandId 纪律 + 终态租约释放 + prompt 模板常量）；测试新 spec。（DetailPanel 接线移至 U6。）
-- **Approach**: 锁内预检（成员 DFS 对齐 collectRunMembers 语义；活跃 run 检测；空成员集在 ② 前 fail-fast）；链序与补偿表照 §3.3 逐条；复用分支三态处理（Paused 复用 = resume + 对 interrupted 项逐个 retry，否则 claim 取不到项）；exec 终态（Killed/Exited/Failed）触发 §3.3 租约释放（admin report failed + retry；awaiting_confirmation 不动；非 admin 退回 run 级链）；run pause/cancel 联动提示并 exec_stop 存活 Agent；`exec_start` 返回 `{execId, agentId, runId}` 供 UI 选中；prompt 模板常量含 `<runId>`/`<nodeId>`/`<homeId>` 占位与 §3.6.11 不可信内容规则。
+- **Approach**: 锁内预检（成员 DFS 对齐 collectRunMembers 语义；活跃 run 检测；空成员集在 ② 前 fail-fast）；链序与补偿表照 §3.3 逐条；复用分支三态处理（Paused 复用 = resume + 对 interrupted 项逐个 retry，否则 claim 取不到项）；exec 终态（Killed/Exited/Failed）触发 §3.3 租约释放（admin report failed + retry；awaiting_confirmation 不动；非 admin 退回 run 级链）；run pause/cancel 联动提示并 exec_stop 存活 Agent；`exec_start` 返回 `{execId, agentId, runId}` 供 UI 选中；prompt 模板常量含 `<runId>`/`<nodeId>`/`<homeId>` 占位与 §3.6.11 不可信内容规则。**transcript `.jsonl` 写入归属本单元**（F-U2-7）：spawn 时写首行 header `{execId, agentId, nodeId, runId, harness, harnessSessionId, argv, startedAt(epoch ms)}`，raw/结构化事件行随后追加（与 raw.log 并存）；U12 只把 raw 行升级为结构化事件；U10 reconcile 依赖本文件，故 U10 前必须存在。
 - **Test scenarios**:
   - 新建 run 全链成功，Runs 面可见 item 被 `exec:<execId>` 逐步 claim/report
   - 复用 Running run → 跳过 start 不报错
