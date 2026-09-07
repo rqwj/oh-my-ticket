@@ -13,12 +13,14 @@
 import { useEffect, useRef, useState } from 'react'
 import type { TranscriptEvent } from './bridge'
 import type { AgentRecord } from './types'
-import { agentDisplayName, ConfirmStopButton } from './AgentsPanel'
+import { agentDisplayName, ConfirmStopButton } from './agentUi'
 
 export const ROW_HEIGHT_PX = 22
 export const OVERSCAN_ROWS = 10
 export const FOLLOW_THRESHOLD_PX = 40
 export const IDLE_THRESHOLD_MS = 60_000
+/** live 期间 idle 提示的重估周期（无新事件不触发渲染，必须定时强制重估） */
+export const IDLE_RECHECK_MS = 15_000
 
 /** 视口近底判定（纯函数——jsdom 无布局也能测跟随语义）。 */
 export function shouldFollow(
@@ -69,6 +71,16 @@ export function TranscriptView({ agent, events, claimed = null, onStopAgent }: P
   const [range, setRange] = useState({ start: 0, end: 0 })
   const followRef = useRef(true)
   const lastSeenRef = useRef(0)
+  // idle 求值用的时钟 tick：事件静默时不发生重渲染，Date.now() 只在渲染期
+  // 求值会让「长时间无输出」在 60s 静默场景永不出现——live 期间用 interval
+  // 定期 bump（cleanup 与 live 翻转时清理）。
+  const [nowTick, setNowTick] = useState(() => Date.now())
+  const live = agent !== null && agent.attachment === 'live' && (agent.status === 'running' || agent.status === 'starting')
+  useEffect(() => {
+    if (!live) return
+    const timer = setInterval(() => setNowTick(Date.now()), IDLE_RECHECK_MS)
+    return () => clearInterval(timer)
+  }, [live])
 
   // events 是 store 尾窗的稳定数组引用（原地追加）——用 length 感知新事件；
   // 身份变化（切换 exec）由父组件按 execId 换 key（整体重挂载）解决。
@@ -115,9 +127,8 @@ export function TranscriptView({ agent, events, claimed = null, onStopAgent }: P
     return <p className="empty-hint transcript-hint">从左侧选择一个 Agent 查看消息流</p>
   }
 
-  const live = agent.attachment === 'live' && (agent.status === 'running' || agent.status === 'starting')
   const lastTsMs = events.length > 0 ? Number(events[events.length - 1].ts) : undefined
-  const idle = live && isIdle(lastTsMs, Date.now())
+  const idle = live && isIdle(lastTsMs, nowTick)
   const slice = events.slice(range.start, range.end)
 
   return (

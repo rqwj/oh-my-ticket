@@ -11,15 +11,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { TranscriptEvent } from './bridge'
 import type { AgentRecord, ExecRecord, OmtNode, RunDetail, RunItemView } from './types'
-import { claimedCountForExec, danglingBindingsOf, nodesById } from './store'
+import { claimedCountForExec, danglingBindingsOf, nodeTitlesById } from './store'
+import { agentDisplayName, ConfirmStopButton } from './agentUi'
 import { TranscriptView } from './TranscriptView'
-
-const CONFIRM_RESET_MS = 3000
-
-/** 展示名：harness 给出的 title 优先，回退记录 displayName（P0 即 Agent N）。 */
-export function agentDisplayName(agent: AgentRecord): string {
-  return agent.title ?? agent.displayName
-}
 
 /** 最新 exec：lastExecId 指针优先，缺失时回退 execs[] 末位。 */
 function latestExecOf(agent: AgentRecord): ExecRecord | null {
@@ -57,61 +51,6 @@ function statsOf(detail: RunDetail): RunStat {
     failed: items.filter(i => i.state === 'failed').length,
     items,
   }
-}
-
-/**
- * 两段式终止控件（原 §九-8）：首击变行内「确认终止：将释放 N 个已认领项」
- * （N 未知时省略计数），3s 无操作还原，二击执行。
- */
-export function ConfirmStopButton({
-  claimed,
-  onConfirm,
-}: {
-  claimed: number | null
-  onConfirm: () => void
-}) {
-  const [arming, setArming] = useState(false)
-  useEffect(() => {
-    if (!arming) return
-    const timer = setTimeout(() => setArming(false), CONFIRM_RESET_MS)
-    return () => clearTimeout(timer)
-  }, [arming])
-  if (!arming) {
-    return (
-      <button
-        className="chip agent-stop-btn"
-        onClick={event => {
-          event.stopPropagation()
-          setArming(true)
-        }}
-      >
-        终止
-      </button>
-    )
-  }
-  return (
-    <span className="confirm-stop" onClick={event => event.stopPropagation()}>
-      确认终止{claimed !== null ? `：将释放 ${claimed} 个已认领项` : ''}
-      <button
-        className="chip active"
-        onClick={event => {
-          event.stopPropagation()
-          onConfirm()
-        }}
-      >
-        确认终止
-      </button>
-      <button
-        className="chip"
-        onClick={event => {
-          event.stopPropagation()
-          setArming(false)
-        }}
-      >
-        取消
-      </button>
-    </span>
-  )
 }
 
 interface Props {
@@ -152,11 +91,7 @@ export function AgentsPanel({
   const [stats, setStats] = useState<Record<string, RunStat>>({})
   const statsRef = useRef<Record<string, RunStat>>({})
   // 当前节点标题一次建表（行渲染 O(1) 查询；免每行全树 DFS）
-  const titleById = useMemo(() => {
-    const titles = new Map<string, string>()
-    for (const node of nodesById(nodes).values()) titles.set(node.id, node.title)
-    return titles
-  }, [nodes])
+  const titleById = useMemo(() => nodeTitlesById(nodes), [nodes])
 
   // run item 统计：对列表内出现的 runId 做 run/get 单拉；runId 缓存跨
   // 重渲染复用（agents 重拉不重取）。

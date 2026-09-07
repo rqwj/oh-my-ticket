@@ -13,7 +13,7 @@ import { useEffect, useMemo, useState } from 'react'
 import type { AgentRecord, OmtNode, SavedFilters } from './types'
 import { STATUS_COLORS } from './types'
 import { bindingViewsForNodes, type NodeBindingView } from './store'
-import { agentDisplayName } from './AgentsPanel'
+import { agentDisplayName } from './agentUi'
 
 interface Props {
   nodes: OmtNode[]

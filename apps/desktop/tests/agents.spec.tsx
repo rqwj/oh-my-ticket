@@ -187,6 +187,19 @@ describe('U5 store: transcript 归并', () => {
     }
   })
 
+  it('sessionPidOf：session_start 事件给出 pid；仅 raw 事件的 exec → null', async () => {
+    invokeMock.mockReset()
+    invokeMock.mockResolvedValue({})
+    const { result } = await setupStore()
+    // session_start 低频事件立即入窗（不经 50ms raw 合并）
+    act(() => { result.current.ingestTranscriptEvent(sessionStart('exec-s', 4242)) })
+    act(() => { result.current.ingestTranscriptEvent(raw('exec-r', 0, 'out')) })
+    expect(result.current.sessionPidOf('exec-s')).toBe(4242)
+    // orphan 强杀依赖 session_start——只有 raw 事件（或无事件）时 pid 缺失
+    expect(result.current.sessionPidOf('exec-r')).toBeNull()
+    expect(result.current.sessionPidOf('exec-missing')).toBeNull()
+  })
+
   it('exit failed 事件：本地 status/attachment 联动 + badge +1；选中清零', async () => {
     invokeMock.mockImplementation((cmd: string) => {
       if (cmd === 'agents_list') {
@@ -222,6 +235,79 @@ describe('U5 store: claimed 判定', () => {
       {},
     ]
     expect(claimedCountForExec(items, 'exec-a')).toBe(1)
+  })
+})
+
+// ── store：绑定清理 / 终止动作（错误呈现与防抖重拉契约）───────────────────
+
+describe('U9/U5 store 动作：gcBindings / stopAgent / killOrphan', () => {
+  const home = { homeId: 'h1', kind: 'workspace', path: '/tmp/ws/.omt' }
+
+  beforeEach(() => {
+    invokeMock.mockReset()
+  })
+
+  it('gcBindings：bindings_gc 成功后重拉绑定表更新 state', async () => {
+    let bindings: Record<string, string> = { 'T-1': 'ghost', 'T-2': 'phantom' }
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'bindings_get') return { bindings, parseFailed: false }
+      if (cmd === 'bindings_gc') {
+        bindings = {}
+        return {}
+      }
+      return {}
+    })
+    const { result } = await setupStore()
+    await act(async () => { await result.current.selectHome(home) })
+    expect(result.current.state.bindingsByHome['h1']).toEqual({ 'T-1': 'ghost', 'T-2': 'phantom' })
+    await act(async () => { await result.current.gcBindings() })
+    expect(result.current.state.bindingsByHome['h1']).toEqual({})
+    expect(result.current.state.error).toBeNull()
+  })
+
+  it('gcBindings：bindings_gc reject（降级冻结）→ error 呈现且不重拉绑定表', async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'bindings_get') return { bindings: { 'T-1': 'ghost' }, parseFailed: true }
+      if (cmd === 'bindings_gc') return Promise.reject(new Error('agents.json 解析失败，GC 冻结'))
+      return {}
+    })
+    const { result } = await setupStore()
+    await act(async () => { await result.current.selectHome(home) })
+    const callsBefore = invokeMock.mock.calls.filter(c => c[0] === 'bindings_get').length
+    await act(async () => { await result.current.gcBindings() })
+    // presentError 原样透传（非已知契约错误）
+    expect(result.current.state.error).toContain('冻结')
+    // 失败路径不重拉（重拉只会原样返回降级表）
+    const callsAfter = invokeMock.mock.calls.filter(c => c[0] === 'bindings_get').length
+    expect(callsAfter).toBe(callsBefore)
+  })
+
+  it('stopAgent：exec_stop reject → 错误经 presentError 进全局 error', async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'exec_stop') return Promise.reject(new Error('CONFLICT: revision mismatch expected 3 got 5'))
+      return {}
+    })
+    const { result } = await setupStore()
+    await act(async () => { await result.current.stopAgent('exec-a') })
+    expect(result.current.state.error).toContain('revision 冲突')
+  })
+
+  it('killOrphan：exec_kill_orphan 成功 → 防抖后 agents_list 重拉', async () => {
+    vi.useFakeTimers()
+    try {
+      invokeMock.mockResolvedValue({})
+      const { result } = await setupStore()
+      await act(async () => { await result.current.selectHome(home) })
+      const before = invokeMock.mock.calls.filter(c => c[0] === 'agents_list').length
+      await act(async () => { await result.current.killOrphan(4711) })
+      expect(result.current.state.error).toBeNull()
+      // 400ms 防抖（等 Rust 侧落盘收敛）到期才重拉
+      act(() => { vi.advanceTimersByTime(500) })
+      const after = invokeMock.mock.calls.filter(c => c[0] === 'agents_list').length
+      expect(after).toBeGreaterThan(before)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })
 
@@ -309,6 +395,30 @@ describe('U5 TranscriptView 自动跟随', () => {
     render(<TranscriptView agent={makeAgent('agent-a', 'exec-a')} events={[stale]} />)
     expect(screen.getByText(/长时间无输出/)).toBeTruthy()
   })
+
+  it('live 期间静默：重估定时器在超过阈值后出现空闲提示；非 live 后不再出现', async () => {
+    vi.useFakeTimers()
+    try {
+      const { TranscriptView } = await import('../src/TranscriptView')
+      // 挂载时刻的新鲜事件（fake timers 下 Date.now() 即 mock 时钟）
+      const fresh = { ...raw('exec-a', 0, 'line'), ts: String(Date.now()) }
+      const agent = makeAgent('agent-a', 'exec-a')
+      const { rerender } = render(<TranscriptView agent={agent} events={[fresh]} />)
+      // 无新事件（无重渲染）：15s 重估 interval 推进时钟，60s 阈值前不提示
+      act(() => { vi.advanceTimersByTime(15_000) })
+      expect(screen.queryByText(/长时间无输出/)).toBeNull()
+      // nowTick 按 15s 周期量化——推进到 76s（最后一次重估 t=75s）后提示出现
+      act(() => { vi.advanceTimersByTime(61_000) })
+      expect(screen.getByText(/长时间无输出/)).toBeTruthy()
+      // live 翻转（exit）→ 提示消失且不再随时间复现
+      rerender(<TranscriptView agent={makeAgent('agent-a', 'exec-a', { status: 'exited', attachment: 'none' })} events={[fresh]} />)
+      expect(screen.queryByText(/长时间无输出/)).toBeNull()
+      act(() => { vi.advanceTimersByTime(120_000) })
+      expect(screen.queryByText(/长时间无输出/)).toBeNull()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
 })
 
 // ── AgentsPanel：列表呈现 / 两段式终止 / Orphan / 空态 ────────────────────
@@ -389,6 +499,21 @@ describe('U5 AgentsPanel 列表', () => {
     expect(screen.queryByRole('button', { name: '终止' })).toBeNull()
     fireEvent.click(screen.getByRole('button', { name: '强制 kill pid' }))
     expect(onKillOrphan).toHaveBeenCalledWith(4711)
+  })
+
+  it('Orphan 且 pid 缺失（transcript 未回放）→ kill 控件退化为非按钮占位，onKillOrphan 不触发', async () => {
+    const onKillOrphan = vi.fn()
+    await renderPanel({
+      agents: [makeAgent('o1', 'exec-o', { attachment: 'orphan' })],
+      pidOf: () => null,
+      onKillOrphan,
+    })
+    // pid 为 null：占位是 span（非按钮），点击不触发强杀
+    const placeholder = screen.getByText('强制 kill pid')
+    expect(placeholder.tagName).toBe('SPAN')
+    expect(screen.queryByRole('button', { name: '强制 kill pid' })).toBeNull()
+    fireEvent.click(placeholder)
+    expect(onKillOrphan).not.toHaveBeenCalled()
   })
 
   it('零 claim 退出标注「未认领任何项」', async () => {

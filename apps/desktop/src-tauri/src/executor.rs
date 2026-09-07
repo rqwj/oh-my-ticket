@@ -873,10 +873,15 @@ fn daemon_rpc(
     session.call(method, params)
 }
 
+/// dispatch_chain 的 daemon RPC seam（#5）：生产侧由 `exec_start_impl` 包装
+/// 真实 `daemon_rpc`（行为不变），测试侧注入脚本化替身——补偿表（cancel）
+/// 才能被断言。
+type DaemonRpc<'a> = &'a dyn Fn(&str, serde_json::Value) -> Result<serde_json::Value, String>;
+
 /// F-U3-9 后续：收集子树内可执行的 ticket/subticket 成员（跳过 done/archived），
 /// 语义对齐 DSH 面 collectRunMembers。
 fn collect_members(
-    shared: &SharedSession,
+    rpc: DaemonRpc<'_>,
     home_id: &str,
     node_id: &str,
 ) -> Result<Vec<String>, String> {
@@ -887,8 +892,7 @@ fn collect_members(
         if !visited.insert(current.clone()) {
             continue;
         }
-        let resp = daemon_rpc(
-            shared,
+        let resp = rpc(
             "node/get",
             serde_json::json!({"homeId": home_id, "nodeId": current}),
         )?;
@@ -917,11 +921,12 @@ fn collect_members(
 }
 
 /// 派发链（§3.3 全量）。由 `exec_start` 在 `DISPATCH_LOCK` 内调用。
-/// 返回 `(exec_id, agent_id, run_id, warnings)`。
+/// 返回 `ExecStartOutcome`（#9：调用方不再解构重打包）。所有 daemon 交互
+/// （含补偿表的 cancel）经 `rpc` seam。
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)]
 fn dispatch_chain(
-    shared: &SharedSession,
+    rpc: DaemonRpc<'_>,
     manager: &ExecutionManager,
     runtime_dir: &Path,
     home_id: &str,
@@ -930,7 +935,7 @@ fn dispatch_chain(
     provider_id: &str,
     unattended: bool,
     sink: EventSink,
-) -> Result<(String, String, String, Vec<String>), String> {
+) -> Result<ExecStartOutcome, String> {
     let dispatch_id = format!(
         "d-{}-{}",
         agents::now_epoch_ms(),
@@ -938,12 +943,11 @@ fn dispatch_chain(
     );
 
     // ① 预检（锁内）
-    let node_resp = daemon_rpc(
-        shared,
+    let node_resp = rpc(
         "node/get",
         serde_json::json!({"homeId": home_id, "nodeId": node_id}),
     )?;
-    let members = collect_members(shared, home_id, node_id)?;
+    let members = collect_members(rpc, home_id, node_id)?;
     if members.is_empty() {
         return Err("无未完成可执行成员".into());
     }
@@ -960,14 +964,13 @@ fn dispatch_chain(
         "homeId": home_id, "nodeId": node_id,
         "commandId": format!("{dispatch_id}:execute"),
     });
-    daemon_rpc(shared, "node/execute", exec_params)?;
+    rpc("node/execute", exec_params)?;
 
     // ③ ensure-run
     let (run_id, run_was_newly_created) = if let Some(existing) = active_runs.first() {
         (existing.clone(), false)
     } else {
-        let resp = daemon_rpc(
-            shared,
+        let resp = rpc(
             "run/create",
             serde_json::json!({
                 "homeId": home_id,
@@ -981,8 +984,7 @@ fn dispatch_chain(
 
     // ④ run/control start（仅新建/Pending；复用 Running 跳过）
     let run_status = {
-        let resp = daemon_rpc(
-            shared,
+        let resp = rpc(
             "run/get",
             serde_json::json!({"homeId": home_id, "runId": run_id}),
         )?;
@@ -993,8 +995,7 @@ fn dispatch_chain(
     };
     match run_status.as_str() {
         "pending" => {
-            daemon_rpc(
-                shared,
+            rpc(
                 "run/control",
                 serde_json::json!({
                     "homeId": home_id, "runId": run_id, "action": "start",
@@ -1042,7 +1043,7 @@ fn dispatch_chain(
     ) {
         Ok(agent) => agent,
         Err(err) => {
-            compensate_new_run(shared, home_id, &run_id, run_was_newly_created);
+            compensate_new_run(rpc, home_id, &run_id, run_was_newly_created);
             return Err(err);
         }
     };
@@ -1061,7 +1062,7 @@ fn dispatch_chain(
             AgentRecordStatus::Failed,
             AgentAttachment::None,
         );
-        compensate_new_run(shared, home_id, &run_id, run_was_newly_created);
+        compensate_new_run(rpc, home_id, &run_id, run_was_newly_created);
         err
     };
 
@@ -1092,27 +1093,22 @@ fn dispatch_chain(
         return Err(fail_agent_and_compensate(err));
     }
 
-    Ok((
+    Ok(ExecStartOutcome {
         exec_id,
-        agent.id,
+        agent_id: agent.id,
         run_id,
-        vec![bind_warning.unwrap_or_default()]
+        warnings: vec![bind_warning.unwrap_or_default()]
             .into_iter()
             .filter(|s| !s.is_empty())
             .collect(),
-    ))
+    })
 }
 
-/// 补偿表（§3.3）：⑤⑦ 失败 → cancel 新建 run + Agent Failed。
-fn compensate_new_run(
-    shared: &SharedSession,
-    home_id: &str,
-    run_id: &str,
-    was_newly_created: bool,
-) {
+/// 补偿表（§3.3）：⑤⑦ 失败 → cancel 新建 run + Agent Failed。cancel 与链上
+/// 其余步骤同走 `rpc` seam（测试据此断言补偿行为）。
+fn compensate_new_run(rpc: DaemonRpc<'_>, home_id: &str, run_id: &str, was_newly_created: bool) {
     if was_newly_created {
-        let _ = daemon_rpc(
-            shared,
+        let _ = rpc(
             "run/control",
             serde_json::json!({"homeId": home_id, "runId": run_id, "action": "cancel"}),
         );
@@ -1136,8 +1132,10 @@ pub fn exec_start_impl(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    let (exec_id, agent_id, run_id, warnings) = dispatch_chain(
-        shared,
+    // 生产 RPC seam：包装真实 daemon_rpc（语义与直接调用一致，#5）。
+    let rpc = |method: &str, params: serde_json::Value| daemon_rpc(shared, method, params);
+    dispatch_chain(
+        &rpc,
         manager,
         runtime_dir,
         home_id,
@@ -1146,14 +1144,7 @@ pub fn exec_start_impl(
         provider_id,
         unattended,
         sink,
-    )?;
-
-    Ok(ExecStartOutcome {
-        exec_id,
-        agent_id,
-        run_id,
-        warnings,
-    })
+    )
 }
 
 /// U6 (R-B)：exec_start tauri command（§3.4 统一入口，内含 §3.3 链）。
@@ -2237,5 +2228,366 @@ mod tests {
         assert!(sanitize_line("Authorization: Bearer abc.def").ends_with("***"));
         assert!(sanitize_line("password: hunter2").ends_with("***"));
         assert!(!sanitize_line("plain log line").contains("***"));
+    }
+
+    // ── U4 dispatch_chain（#5：补偿表经 rpc seam 断言）─────────────────────
+
+    /// dispatch_chain 的 daemon RPC 替身：按 method 返回预置 JSON，并全量记账
+    /// (method, params) 供补偿断言（cancel 是否发生 / 指向哪个 run）。
+    struct FakeDaemon {
+        calls: Mutex<Vec<(String, serde_json::Value)>>,
+        node_get: serde_json::Value,
+        run_get: serde_json::Value,
+        run_create_id: String,
+    }
+
+    impl FakeDaemon {
+        fn new(
+            node_get: serde_json::Value,
+            run_get: serde_json::Value,
+            run_create_id: &str,
+        ) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                node_get,
+                run_get,
+                run_create_id: run_create_id.to_string(),
+            }
+        }
+
+        fn rpc(
+            &self,
+            method: &str,
+            params: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((method.to_string(), params));
+            Ok(match method {
+                "node/get" => self.node_get.clone(),
+                "run/get" => self.run_get.clone(),
+                "run/create" => serde_json::json!({ "id": self.run_create_id }),
+                _ => serde_json::json!({}),
+            })
+        }
+
+        fn method_names(&self) -> Vec<String> {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .map(|(m, _)| m.clone())
+                .collect()
+        }
+
+        /// run/control 中 action=cancel 的调用参数（补偿表断言面）
+        fn cancel_params(&self) -> Vec<serde_json::Value> {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .filter(|(m, p)| m == "run/control" && p["action"] == "cancel")
+                .map(|(_, p)| p.clone())
+                .collect()
+        }
+    }
+
+    /// node/get 预置响应：同时满足 ① 预检（`runs`）与 collect_members
+    /// （`node` 可执行 ticket + 空 `children` 收敛遍历）。
+    fn dispatch_node_get(runs: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "node": { "id": "t1", "kind": "ticket", "status": "pending" },
+            "children": [],
+            "runs": runs,
+        })
+    }
+
+    fn dispatch_run_get(status: &str) -> serde_json::Value {
+        serde_json::json!({ "run": { "status": status } })
+    }
+
+    /// dispatch_chain 夹具：workspace（`.omt` home）+ 已启用的 Manual binary
+    /// fake harness 配置。返回 (runtime_dir, home_path)。
+    fn setup_dispatch_env(dir: &Path, provider: &str, program: &Path) -> (PathBuf, PathBuf) {
+        let runtime = dir.join("runtime");
+        let home_path = dir.join("ws").join(".omt");
+        std::fs::create_dir_all(&home_path).unwrap();
+        harness::upsert_config(
+            &runtime,
+            provider,
+            harness::HarnessUserConfig {
+                enabled: true,
+                binary: harness::BinarySource::Manual {
+                    path: program.display().to_string(),
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        (runtime, home_path)
+    }
+
+    /// `prepare()` 走 `daemon::omt_sidecar_path()`（current_exe 旁的 `omt`）。
+    /// 测试进程旁通常没有 sidecar——占位一个普通文件即可让 prepare 走通
+    /// （opencode 注入只做 `is_file` 预检，值从不执行）；幂等，测试进程内共享。
+    fn ensure_fake_sidecar() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let exe = std::env::current_exe().unwrap();
+            let sidecar = exe.parent().unwrap().join("omt");
+            if !sidecar.is_file() {
+                std::fs::write(&sidecar, "#!/bin/sh\nexit 0\n").unwrap();
+            }
+        });
+    }
+
+    fn read_agents_file(runtime: &Path) -> crate::agents::AgentsFile {
+        let (file, parse_failed) = crate::atomic_json::read_json::<crate::agents::AgentsFile>(
+            &runtime.join("agents").join("h_test").join("agents.json"),
+        )
+        .unwrap();
+        assert!(!parse_failed);
+        file
+    }
+
+    #[test]
+    fn dispatch_register_agent_failure_cancels_new_run_without_agent_record() {
+        // 补偿表 ⑤：register_agent 失败 → 新建 run 被 cancel，且不留 Agent
+        // 记录。写失败手法：agents/<home_id> 被普通文件占据
+        // （create_dir_all 必败），不影响 harness 配置子树的读取。
+        let dir = tempfile::tempdir().unwrap();
+        let program = write_script(dir.path(), "never-runs-a", "exit 0");
+        let (runtime, home_path) = setup_dispatch_env(dir.path(), "omp", &program);
+        std::fs::create_dir_all(runtime.join("agents")).unwrap();
+        std::fs::write(runtime.join("agents").join("h_test"), "occupied").unwrap();
+
+        let fake = FakeDaemon::new(
+            dispatch_node_get(serde_json::json!([])),
+            dispatch_run_get("pending"),
+            "run-new-a",
+        );
+        let rpc = |method: &str, params: serde_json::Value| fake.rpc(method, params);
+        let manager = ExecutionManager::with_limits(STARTUP_WINDOW, DEFAULT_MAX_DURATION);
+        let sink: EventSink = Arc::new(|_| {});
+
+        let result = dispatch_chain(
+            &rpc, &manager, &runtime, "h_test", &home_path, "t1", "omp", false, sink,
+        );
+        let err = result.expect_err("register_agent 写失败应使 dispatch_chain 失败");
+
+        // 确为「新建 run」分支：run/create 已发生，随后恰好一次 cancel 指向它
+        assert!(
+            fake.method_names().iter().any(|m| m == "run/create"),
+            "run/create 应已发生: {:?}",
+            fake.method_names()
+        );
+        let cancels = fake.cancel_params();
+        assert_eq!(cancels.len(), 1, "应恰好一次补偿 cancel: {err}");
+        assert_eq!(cancels[0]["runId"], "run-new-a");
+        assert_eq!(cancels[0]["homeId"], "h_test");
+        // 不留 Agent 记录（agents/<home_id> 仍是被占据的文件）
+        assert!(!runtime.join("agents").join("h_test").is_dir());
+        assert!(!runtime
+            .join("agents")
+            .join("h_test")
+            .join("agents.json")
+            .exists());
+    }
+
+    #[test]
+    fn dispatch_mcp_prepare_failure_marks_agent_failed_and_cancels_new_run() {
+        // 补偿表 ⑦：MCP prepare 失败 → Agent 记录转 Failed（attachment None）
+        // + 仅新建 run 被 cancel。失败手法：home_path 非 `.omt` 尾 → cwd 即
+        // home_path 本身且是普通文件——omp 注入写 workspace mcp.json 必败
+        // （sidecar 缺失时则在 sidecar 预检即败，补偿路径相同）。
+        let dir = tempfile::tempdir().unwrap();
+        let program = write_script(dir.path(), "never-runs-b", "exit 0");
+        let runtime = dir.path().join("runtime");
+        let home_path = dir.path().join("ws-as-file");
+        std::fs::write(&home_path, "not a workspace").unwrap();
+        harness::upsert_config(
+            &runtime,
+            "omp",
+            harness::HarnessUserConfig {
+                enabled: true,
+                binary: harness::BinarySource::Manual {
+                    path: program.display().to_string(),
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let fake = FakeDaemon::new(
+            dispatch_node_get(serde_json::json!([])),
+            dispatch_run_get("pending"),
+            "run-new-b",
+        );
+        let rpc = |method: &str, params: serde_json::Value| fake.rpc(method, params);
+        let manager = ExecutionManager::with_limits(STARTUP_WINDOW, DEFAULT_MAX_DURATION);
+        let sink: EventSink = Arc::new(|_| {});
+
+        let result = dispatch_chain(
+            &rpc, &manager, &runtime, "h_test", &home_path, "t1", "omp", false, sink,
+        );
+        let err = result.expect_err("MCP prepare 失败应使 dispatch_chain 失败");
+
+        // Agent 已注册（⑤ 越过）且转 Failed
+        let file = read_agents_file(&runtime);
+        assert_eq!(file.agents.len(), 1, "{err}");
+        assert_eq!(file.agents[0].status, AgentRecordStatus::Failed);
+        assert_eq!(file.agents[0].attachment, AgentAttachment::None);
+        // 仅新建 run 被补偿 cancel
+        let cancels = fake.cancel_params();
+        assert_eq!(cancels.len(), 1, "应恰好一次补偿 cancel: {err}");
+        assert_eq!(cancels[0]["runId"], "run-new-b");
+    }
+
+    #[test]
+    fn dispatch_spawn_failure_marks_agent_failed_and_cancels_new_run() {
+        // 补偿表 ⑧：spawn 同步失败 → Agent 转 Failed + 仅新建 run 被 cancel。
+        // 失败手法：runtime/transcripts 被普通文件占据（raw.log 父目录
+        // create_dir_all 必败）。prepare 须走通：opencode 注入只查 sidecar
+        // is_file → 占位 sidecar，workspace 语义保持完整。
+        ensure_fake_sidecar();
+        let dir = tempfile::tempdir().unwrap();
+        let program = write_script(dir.path(), "never-runs-c", "exit 0");
+        let (runtime, home_path) = setup_dispatch_env(dir.path(), "opencode", &program);
+        std::fs::write(runtime.join("transcripts"), "occupied").unwrap();
+
+        let fake = FakeDaemon::new(
+            dispatch_node_get(serde_json::json!([])),
+            dispatch_run_get("pending"),
+            "run-new-c",
+        );
+        let rpc = |method: &str, params: serde_json::Value| fake.rpc(method, params);
+        let manager = ExecutionManager::with_limits(STARTUP_WINDOW, DEFAULT_MAX_DURATION);
+        let sink: EventSink = Arc::new(|_| {});
+
+        let result = dispatch_chain(
+            &rpc, &manager, &runtime, "h_test", &home_path, "t1", "opencode", false, sink,
+        );
+        let err = result.expect_err("spawn 失败应使 dispatch_chain 失败");
+        assert!(
+            err.contains("transcripts"),
+            "失败点应落在 spawn 步骤（raw.log 目录）: {err}"
+        );
+
+        // Agent 已注册且转 Failed
+        let file = read_agents_file(&runtime);
+        assert_eq!(file.agents.len(), 1);
+        assert_eq!(file.agents[0].status, AgentRecordStatus::Failed);
+        assert_eq!(file.agents[0].attachment, AgentAttachment::None);
+        // 仅新建 run 被补偿 cancel
+        let cancels = fake.cancel_params();
+        assert_eq!(cancels.len(), 1);
+        assert_eq!(cancels[0]["runId"], "run-new-c");
+    }
+
+    #[test]
+    fn dispatch_reused_run_is_never_cancelled_on_later_failure() {
+        // run_was_newly_created=false 门：复用已有 run（node/get 返回 runs
+        // 非空）时，后续失败（此处 ⑦ prepare 失败）绝不允许 cancel 复用的
+        // run，也不得再 create 新 run。
+        let dir = tempfile::tempdir().unwrap();
+        let program = write_script(dir.path(), "never-runs-d", "exit 0");
+        let runtime = dir.path().join("runtime");
+        let home_path = dir.path().join("ws-as-file");
+        std::fs::write(&home_path, "not a workspace").unwrap();
+        harness::upsert_config(
+            &runtime,
+            "omp",
+            harness::HarnessUserConfig {
+                enabled: true,
+                binary: harness::BinarySource::Manual {
+                    path: program.display().to_string(),
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let fake = FakeDaemon::new(
+            dispatch_node_get(serde_json::json!([{ "runId": "run-existing" }])),
+            dispatch_run_get("running"), // 复用 Running：跳过 run/control start
+            "run-should-not-be-created",
+        );
+        let rpc = |method: &str, params: serde_json::Value| fake.rpc(method, params);
+        let manager = ExecutionManager::with_limits(STARTUP_WINDOW, DEFAULT_MAX_DURATION);
+        let sink: EventSink = Arc::new(|_| {});
+
+        let result = dispatch_chain(
+            &rpc, &manager, &runtime, "h_test", &home_path, "t1", "omp", false, sink,
+        );
+        assert!(result.is_err(), "prepare 失败应使 dispatch_chain 失败");
+
+        // 复用分支：未 create、未 cancel 任何 run（cancel 门关死）
+        assert!(
+            !fake.method_names().iter().any(|m| m == "run/create"),
+            "复用 run 不得 create 新 run: {:?}",
+            fake.method_names()
+        );
+        assert!(
+            fake.cancel_params().is_empty(),
+            "复用的 run 绝不允许被补偿 cancel: {:?}",
+            fake.cancel_params()
+        );
+        // 链确实流经复用 run：Agent exec 记录携带 run-existing
+        let file = read_agents_file(&runtime);
+        assert_eq!(file.agents.len(), 1);
+        assert_eq!(
+            file.agents[0].execs[0].run_id.as_deref(),
+            Some("run-existing")
+        );
+    }
+
+    #[test]
+    fn dispatch_success_builds_exec_start_outcome() {
+        // #9：dispatch_chain 直接返回 ExecStartOutcome——成功路径字段对账，
+        // 新建 run 的 execute/create/start 指令齐备，warnings 为空。
+        ensure_fake_sidecar();
+        let dir = tempfile::tempdir().unwrap();
+        let program = write_script(dir.path(), "happy-e", "exit 0\n");
+        let (runtime, home_path) = setup_dispatch_env(dir.path(), "opencode", &program);
+
+        let fake = FakeDaemon::new(
+            dispatch_node_get(serde_json::json!([])),
+            dispatch_run_get("pending"),
+            "run-new-e",
+        );
+        let rpc = |method: &str, params: serde_json::Value| fake.rpc(method, params);
+        let manager = ExecutionManager::with_limits(STARTUP_WINDOW, DEFAULT_MAX_DURATION);
+        let sink: EventSink = Arc::new(|_| {});
+
+        let outcome = dispatch_chain(
+            &rpc, &manager, &runtime, "h_test", &home_path, "t1", "opencode", false, sink,
+        )
+        .expect("全链应成功");
+
+        assert!(outcome.exec_id.starts_with("exec-"), "{outcome:?}");
+        assert_eq!(outcome.agent_id, format!("agent-{}", outcome.exec_id));
+        assert_eq!(outcome.run_id, "run-new-e");
+        assert!(outcome.warnings.is_empty(), "{outcome:?}");
+        for method in [
+            "node/get",
+            "node/execute",
+            "run/create",
+            "run/get",
+            "run/control",
+        ] {
+            assert!(
+                fake.method_names().iter().any(|m| m == method),
+                "缺少 {method}: {:?}",
+                fake.method_names()
+            );
+        }
+        // 收割子进程（脚本 exit 0 → Exited），不留给分离的等待线程
+        let session = manager.get(&outcome.exec_id).expect("session 应已注册");
+        let terminal = wait_for(|| session.terminal(), Duration::from_secs(5));
+        assert!(
+            matches!(terminal, Some(Terminal::Exited(0))),
+            "{terminal:?}"
+        );
     }
 }

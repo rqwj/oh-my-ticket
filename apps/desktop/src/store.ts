@@ -21,7 +21,7 @@
  * （harnessByHome/loadHarness/saveHarness）退役。
  *
  * U9 增量：bindings 切片——bindingsByHome（bindings_get pull，契约对齐
- * agents）+ 子树继承解析纯函数（resolveBindingForNode / bindingViewForNode
+ * agents）+ 子树继承解析纯函数（resolveBindingForNode / bindingViewsForNodes
  * / danglingBindingsOf，R-C）+ gcBindings（一键清理，Rust 侧降级冻结）。
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
@@ -109,6 +109,13 @@ export function nodesById(nodes: OmtNode[]): Map<string, OmtNode> {
   return byId
 }
 
+/** 全树 nodeId → title 一次建表（AgentsPanel 行渲染 / ExecutionDialog 成员预览共用）。 */
+export function nodeTitlesById(nodes: OmtNode[]): Map<string, string> {
+  const titles = new Map<string, string>()
+  for (const node of nodesById(nodes).values()) titles.set(node.id, node.title)
+  return titles
+}
+
 /**
  * 子树继承解析（§U9 Approach）：沿祖先链（parentId 上溯）取最近绑定——
  * 自身命中为 direct，祖先命中为 inherited（viaNodeId = 提供绑定的最近
@@ -149,33 +156,12 @@ export type NodeBindingView =
   | { state: 'dangling'; agentId: string; agent: null }
 
 /**
- * 悬空判定：agentId 不在当前 agents 列表 → 失效。`degraded`（parseFailed）
- * 时冻结悬空判定并返回 null（数据降级——降级空表会把全部绑定误判失效，
- * §3.6.6 的读侧对称纪律）。
- */
-export function bindingViewForNode(
-  bindings: Record<string, string>,
-  nodes: OmtNode[],
-  nodeId: string,
-  agents: AgentRecord[],
-  degraded: boolean,
-): NodeBindingView | null {
-  const resolved = resolveBindingForNode(bindings, nodes, nodeId)
-  if (!resolved) return null
-  const agent = agents.find(a => a.id === resolved.agentId) ?? null
-  if (!agent) {
-    return degraded ? null : { state: 'dangling', agentId: resolved.agentId, agent: null }
-  }
-  return resolved.source === 'direct'
-    ? { state: 'direct', agentId: resolved.agentId, agent }
-    : { state: 'inherited', agentId: resolved.agentId, agent, viaNodeId: resolved.viaNodeId }
-}
-
-/**
  * 整树 badge 视图批量解析（TreePanel views memo 消费）：byId 与 agents 表
- * 各建一次，逐节点沿祖先链解析——等价于对每节点调 `bindingViewForNode`
+ * 各建一次，逐节点沿祖先链解析——单节点语义与 resolveBindingForNode 一致
  * （agents 表 first-wins，与 `Array.find` 一致），但免去每节点全树重建的
- * O(N²)。
+ * O(N²)。悬空判定：agentId 不在当前 agents 列表 → 失效；`degraded`
+ * （parseFailed）时冻结悬空判定并返回 null（数据降级——降级空表会把全部
+ * 绑定误判失效，§3.6.6 的读侧对称纪律）。
  */
 export function bindingViewsForNodes(
   bindings: Record<string, string>,

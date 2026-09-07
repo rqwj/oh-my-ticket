@@ -9,7 +9,7 @@
  * 接线；派发成功后 refreshBindings（R-C）。
  * U8/R-D：树与 splitter 仅 Tickets 视图渲染（Runs/设置全宽）。
  */
-import { useCallback, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { WorkspaceSwitcher } from './WorkspaceSwitcher'
 import { workspaceRootOf } from './homePath'
 import { useTreeStore } from './store'
@@ -67,6 +67,12 @@ export function App() {
     void store.refreshBindings()
     switchToAgent(outcome.agentId)
   }, [switchToAgent, store])
+
+  // 警告条不跨 workspace 存活（与上方 openDispatch 注释的承诺一致）：
+  // 换 home 即清除；「下次派发前清除」由 openDispatch 负责。
+  useEffect(() => {
+    setDispatchWarnings([])
+  }, [state.activeHome?.homeId])
 
   // Drag-to-resize the tree/center splitter: pointer captured on the
   // divider, width clamped 240–720px, persisted across launches.

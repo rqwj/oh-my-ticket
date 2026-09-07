@@ -19,8 +19,8 @@
  */
 import { useEffect, useMemo, useState } from 'react'
 import { omtCall, harnessLaunchPreview, bindingsGet, type ExecStartOutcome, type HarnessLaunchPreview } from './bridge'
-import { readHarnessBag, writeHarnessBag, harnessList, resolveBindingForNode, nodesById, type HarnessEntry, type ResolvedBinding } from './store'
-import { agentDisplayName } from './AgentsPanel'
+import { readHarnessBag, writeHarnessBag, harnessList, resolveBindingForNode, nodesById, nodeTitlesById, type HarnessEntry, type ResolvedBinding } from './store'
+import { agentDisplayName } from './agentUi'
 import type { AgentRecord, HomeInfo, OmtNode } from './types'
 
 const SLOW_DISPATCH_MS = 5000 // 超时未返回 → 展开 ①–⑧ 步骤降级清单（§九-7）
@@ -230,11 +230,7 @@ export function ExecutionDialog({
   }, [detailOpen, selected])
 
   // 标题查找一次建表（成员预览/绑定提示行 O(1) 查询）
-  const titleById = useMemo(() => {
-    const titles = new Map<string, string>()
-    for (const node of nodesById(nodes).values()) titles.set(node.id, node.title)
-    return titles
-  }, [nodes])
+  const titleById = useMemo(() => nodeTitlesById(nodes), [nodes])
   const memberTitle = (id: string) => titleById.get(id) ?? id
 
   const dispatch = async () => {
@@ -354,7 +350,14 @@ export function ExecutionDialog({
                 value={selected}
                 onChange={e => {
                   const value = e.target.value
-                  if (!value.startsWith('agent:')) setSelected(value)
+                  if (!value.startsWith('agent:')) {
+                    setSelected(value)
+                    // 知情确认的对象是「这个 provider 将无人值守执行」——跨
+                    // harness 切换必须重置（含「记住」勾选态），A 的放行不
+                    // 隐含对 B 的放行（§九-10）。
+                    setConfirmChecked(false)
+                    setRememberChecked(false)
+                  }
                 }}
               >
                 {enabledHarnesses.length > 0 && (

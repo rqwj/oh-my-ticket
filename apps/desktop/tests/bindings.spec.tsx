@@ -1,6 +1,6 @@
 /**
  * U9 (R-C) 绑定可见与继承测试：resolveBindingForNode 三态纯函数（直接/
- * 祖先继承/无，archived 祖先绑定仍有效）、bindingViewForNode 悬空与降级
+ * 祖先继承/无，archived 祖先绑定仍有效）、bindingViewsForNodes 悬空与降级
  * 冻结、danglingBindingsOf、TreePanel badge（直接高亮 / 继承灰显 / 悬空 /
  * archived 跳过渲染）、AgentsPanel 一键清理、ExecutionDialog 绑定提示与
  * harness 默认优先级（绑定 agent.harness > bag defaultHarness > 首个
@@ -133,25 +133,25 @@ describe('U9 纯函数 resolveBindingForNode（子树继承解析）', () => {
   })
 })
 
-describe('U9 纯函数 bindingViewForNode / danglingBindingsOf', () => {
+describe('U9 纯函数 bindingViewsForNodes / danglingBindingsOf', () => {
   it('agent 存在 → direct/inherited 视图；不存在 → dangling；degraded → 悬空判定冻结', async () => {
-    const { bindingViewForNode } = await import('../src/store')
+    const { bindingViewsForNodes } = await import('../src/store')
     const nodes = tree()
     const agents = [makeAgent('agent-a')]
-    expect(bindingViewForNode({ 'T-1': 'agent-a' }, nodes, 'T-1', agents, false)).toMatchObject({
+    const viewOf = (bindings: Record<string, string>, degraded: boolean) =>
+      bindingViewsForNodes(bindings, nodes, agents, degraded).get('T-1')
+    expect(viewOf({ 'T-1': 'agent-a' }, false)).toMatchObject({
       state: 'direct',
       agentId: 'agent-a',
     })
-    expect(
-      bindingViewForNode({ 'S-1': 'agent-a' }, nodes, 'T-1', agents, false),
-    ).toMatchObject({ state: 'inherited', viaNodeId: 'S-1' })
-    expect(bindingViewForNode({ 'T-1': 'agent-gone' }, nodes, 'T-1', agents, false)).toEqual({
+    expect(viewOf({ 'S-1': 'agent-a' }, false)).toMatchObject({ state: 'inherited', viaNodeId: 'S-1' })
+    expect(viewOf({ 'T-1': 'agent-gone' }, false)).toEqual({
       state: 'dangling',
       agentId: 'agent-gone',
       agent: null,
     })
     // 数据降级（parseFailed）：不做悬空判定 → null（badge 不渲染）
-    expect(bindingViewForNode({ 'T-1': 'agent-gone' }, nodes, 'T-1', agents, true)).toBeNull()
+    expect(viewOf({ 'T-1': 'agent-gone' }, true)).toBeNull()
   })
 
   it('danglingBindingsOf 列出悬空项（Agents 面清理计数）', async () => {

@@ -267,6 +267,26 @@ describe('U6 权限知情确认', () => {
     await renderDialog({ home: homeOf('h2') }, invokeRoutesOf(baseDialogRoutes()))
     await waitFor(() => expect(screen.getByText(/我已知悉/)).toBeTruthy())
   })
+
+  it('切换 harness 重置知情确认：派发禁用直到勾选新 provider 的确认', async () => {
+    await renderDialog(
+      {},
+      invokeRoutesOf(baseDialogRoutes(), [
+        harnessWire({}),
+        harnessWire({ id: 'opencode', label: 'OpenCode' }),
+      ]),
+    )
+    await waitFor(() => expect(screen.getByRole('button', { name: '派发' })).toBeTruthy())
+    // 勾选 harness A（omp）的知情确认 → 派发可用
+    clickCheckboxIn(screen.getByText(/我已知悉/))
+    await waitFor(() => expect((screen.getByRole('button', { name: '派发' }) as HTMLButtonElement).disabled).toBe(false))
+    // 切到 harness B（opencode）→ 确认重置，派发回到禁用
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'opencode' } })
+    expect((screen.getByRole('button', { name: '派发' }) as HTMLButtonElement).disabled).toBe(true)
+    // 勾选 B 的确认 → 派发恢复可用
+    clickCheckboxIn(screen.getByText(/我已知悉/))
+    await waitFor(() => expect((screen.getByRole('button', { name: '派发' }) as HTMLButtonElement).disabled).toBe(false))
+  })
 })
 
 // ── 同节点运行中派发：三选项 ──────────────────────────────────────────────
@@ -621,5 +641,50 @@ describe('U6 App 全局门控', () => {
     await waitFor(() => expect(screen.queryByText(/我已知悉/)).toBeNull())
     await waitFor(() => expect(screen.getAllByText('Agent 1').length).toBeGreaterThan(0))
     expect(screen.getByText(/绑定写入失败：boom/)).toBeTruthy()
+  })
+})
+
+describe('U6 App 派发警告条随 workspace 切换清除', () => {
+  it('派发产生 warnings 后切换 workspace → 警告条消失', async () => {
+    window.localStorage.setItem('omt-desktop-last-home', 'h1')
+    const { App } = await import('../src/App')
+    invokeMock.mockImplementation(async (cmd: string, args?: { method: string; params: Record<string, unknown> }) => {
+      if (cmd === 'daemon_homes') return { homes: [homeOf('h1'), homeOf('h2')], homeDir: '/tmp' }
+      if (cmd === 'exec_start') return outcomeOf({ warnings: ['绑定写入失败：boom'] })
+      if (cmd === 'agents_list') return { agents: [makeAgent('agent-new', { displayName: 'Agent 1' })], agentSeq: 1, parseFailed: false }
+      if (cmd === 'harness_list') return { harnesses: [harnessWire({})] }
+      if (cmd === 'harness_launch_preview') return { program: '/usr/local/bin/omp', args: [], envKeys: [], unattendedFlag: ['--yolo'] }
+      if (cmd === 'omt_call') {
+        const method = args!.method
+        if (method === 'home/list-known' || method === 'ui/recent-get') return {}
+        if (method === 'ui/filters-get') return { filters: {} }
+        if (method === 'ui/filters-set') return {}
+        if (method === 'node/tree') {
+          return { trees: [{ nodeId: 'T-1', type: 'ticket', title: '登录修复', status: 'open', priority: 0 }] }
+        }
+        if (method === 'run/list') return { runs: [] }
+        if (method === 'node/get') return { node: { nodeId: 'T-1', type: 'ticket', title: '登录修复', status: 'open', priority: 0, revision: 1 }, children: [], runs: [] }
+        throw new Error(`unexpected method: ${method}`)
+      }
+      throw new Error(`unexpected command: ${cmd}`)
+    })
+    render(<App />)
+    // 树选中 ticket → Execute → 知情确认 → 派发成功 → 警告条出现
+    await waitFor(() => expect(screen.getByText('登录修复')).toBeTruthy())
+    fireEvent.click(screen.getByText('登录修复'))
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Execute' })).toBeTruthy())
+    fireEvent.click(screen.getByRole('button', { name: 'Execute' }))
+    await waitFor(() => expect(screen.getByRole('button', { name: '派发' })).toBeTruthy())
+    clickCheckboxIn(screen.getByText(/我已知悉/))
+    fireEvent.click(screen.getByRole('button', { name: '派发' }))
+    await waitFor(() => expect(screen.getByText(/绑定写入失败：boom/)).toBeTruthy())
+    // 设置页选第二个 workspace（h2）→ activeHome 变化 → 警告条清除
+    fireEvent.click(screen.getByText('设置'))
+    await waitFor(() => expect(document.querySelectorAll('.home-row').length).toBe(2))
+    await act(async () => {
+      fireEvent.click(document.querySelectorAll('.home-row')[1])
+      await Promise.resolve()
+    })
+    await waitFor(() => expect(screen.queryByText(/绑定写入失败：boom/)).toBeNull())
   })
 })
