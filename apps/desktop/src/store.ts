@@ -67,6 +67,12 @@ export interface HarnessEntry {
   state: 'ready' | 'notDetected' | 'pendingVerification'
   /** 无人值守放行 flag（弹窗确认文案与预览说明用） */
   unattendedFlag: string[]
+  /**
+   * U7 起投影携带的已存用户配置（回显编辑用，v1 env 值为字面量）；
+   * 旧 fixture/降级缺省按空处理。
+   */
+  extraArgs?: string[]
+  env?: Record<string, string>
 }
 
 /** harness_list：类型表 × 探测 × 用户配置投影。 */

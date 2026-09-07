@@ -276,6 +276,70 @@ body {
 .row-spacer { flex: 1; }
 .harness-notice { color: var(--muted); font-size: 11px; }
 
+/* ── U7：设置页 Harnesses 管理面（R-A：左类型列表右详情）──────────────── */
+.harness-manager { margin-bottom: 24px; }
+.hm-layout { display: flex; gap: 16px; align-items: flex-start; }
+.hm-nav {
+  width: 220px; flex-shrink: 0;
+  display: flex; flex-direction: column; gap: 6px;
+}
+.hm-nav-item {
+  display: flex; gap: 8px; align-items: center; justify-content: space-between;
+  padding: 8px 12px;
+  border: 1px solid var(--border); border-radius: 6px;
+  background: var(--panel); color: var(--text); cursor: pointer; text-align: left;
+}
+.hm-nav-item:hover { background: var(--panel-raised); border-color: var(--muted); }
+.hm-nav-item.selected { border-color: var(--accent); background: rgba(88, 166, 255, 0.08); }
+.hm-nav-label { font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hm-state-badge {
+  font-size: 11px; padding: 1px 8px; border-radius: 999px; flex-shrink: 0;
+  border: 1px solid var(--border); color: var(--muted);
+}
+.hm-state-badge.ready { color: #3fb950; border-color: #3fb950; }
+.hm-state-badge.pendingVerification { color: #d29922; border-color: #d29922; }
+.hm-detail { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 14px; }
+.hm-detail-header { display: flex; gap: 8px; align-items: center; }
+.hm-detail-header h4 { margin: 0; font-size: 15px; }
+.hm-muted-chip {
+  font-size: 11px; padding: 1px 8px; border-radius: 999px; flex-shrink: 0;
+  border: 1px solid var(--border); color: var(--muted);
+}
+.hm-field { display: flex; flex-direction: column; gap: 6px; }
+.hm-label { color: var(--muted); font-size: 12px; font-weight: 600; }
+.hm-hint { color: var(--muted); font-size: 12px; margin: 0; }
+.hm-hint .mono { margin: 0 4px; word-break: break-all; }
+.hm-warn { color: #d29922; }
+.hm-input {
+  padding: 6px 10px; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--panel); color: var(--text);
+  font-size: 13px;
+}
+.hm-textarea {
+  width: 100%; padding: 8px 10px; border-radius: 6px; resize: vertical;
+  border: 1px solid var(--border); background: var(--panel); color: var(--text);
+  font-size: 13px; line-height: 1.6;
+}
+.hm-manual-row { display: flex; gap: 8px; align-items: center; }
+.hm-manual-row .hm-input { flex: 1; min-width: 0; }
+.env-row { display: flex; gap: 6px; align-items: center; }
+.env-row .hm-input:first-child { width: 180px; flex-shrink: 0; }
+.env-row .hm-input:nth-child(2) { flex: 1; min-width: 0; }
+.hm-switch-row { display: flex; gap: 10px; align-items: center; }
+.hm-switch {
+  width: 38px; height: 22px; border-radius: 999px; padding: 0; position: relative;
+  border: 1px solid var(--border); background: var(--panel-raised); cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+.hm-switch.on { background: rgba(63, 185, 80, 0.35); border-color: #3fb950; }
+.hm-switch:disabled { opacity: 0.5; cursor: default; }
+.hm-switch-knob {
+  position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%;
+  background: var(--muted); transition: left 0.15s, background 0.15s;
+}
+.hm-switch.on .hm-switch-knob { left: 18px; background: #3fb950; }
+.hm-actions { display: flex; gap: 8px; }
+
 .run-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .run-progress { color: var(--muted); font-size: 12px; font-family: ui-monospace, monospace; }
 .stalled-row { color: var(--danger); }

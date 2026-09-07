@@ -426,6 +426,12 @@ fn harness_entry(d: &HarnessDescriptor, cfg: Option<&HarnessUserConfig>) -> serd
         "manualPath": manual_path,
         "state": state,
         "unattendedFlag": d.unattended_flag,
+        // U7 (R-A)：设置页编辑需要回显已存配置（v1 值为字面量）——否则任何
+        // 保存（含 Enabled 切换）都会以未知空值全量替换既有 env/args。只读
+        // 投影，零语义变化；§3.1 secrets 纪律约束的是 transcript/execs/预览，
+        // 设置页回显的是用户刚写入的自身配置（config.json 0600 机器本地）。
+        "extraArgs": cfg.extra_args,
+        "env": cfg.env,
     })
 }
 
@@ -815,13 +821,18 @@ mod tests {
                 binary: BinarySource::Manual {
                     path: tool.display().to_string(),
                 },
-                ..Default::default()
+                extra_args: vec!["--model".to_string(), "k3".to_string()],
+                env: BTreeMap::from([("MY_FLAG".to_string(), "1".to_string())]),
             }),
         );
         assert_eq!(ready["state"], "ready");
         assert_eq!(ready["installed"], true);
         assert_eq!(ready["detectedVersion"], "v9");
         assert_eq!(ready["binarySource"], "manual");
+        // U7：设置页回显已存 extra_args/env（v1 值为字面量）——缺失会让任何
+        // 保存以空值全量替换既有配置
+        assert_eq!(ready["extraArgs"], serde_json::json!(["--model", "k3"]));
+        assert_eq!(ready["env"], serde_json::json!({ "MY_FLAG": "1" }));
 
         // Manual + 探针失败 → pendingVerification（「待验证」）
         let pending = harness_entry(

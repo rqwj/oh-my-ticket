@@ -2,6 +2,9 @@
  * U10 settings panel: daemon status projection + home selector/declare
  * flow. Admin-only actions render ONLY when the credential's operations
  * include the admin family (AE12: no grant → no render).
+ *
+ * U7：内层分段「通用 | Harnesses」——R-A 的 Harnesses 完整管理面
+ * （左类型列表右详情）在 HarnessManagerTab，挂载即拉 harness_list。
  */
 import { useEffect, useState } from 'react'
 import { ask, open as openDialog } from '@tauri-apps/plugin-dialog'
@@ -18,6 +21,10 @@ import type { HomeInfo } from './types'
 import type { KnownHome } from './store'
 import { NOT_A_WORKSPACE_HINT, resolveHomeFromPickedDir } from './workspacePath'
 import { workspaceRootOf } from './homePath'
+import { HarnessManagerTab } from './HarnessManagerTab'
+
+/** 设置页内层分段（U7）：通用（daemon/DSH/workspaces/admin）+ Harnesses（R-A 一等区）。 */
+type SettingsSection = 'general' | 'harnesses'
 
 interface Props {
   homes: HomeInfo[]
@@ -37,6 +44,7 @@ export function SettingsPanel({ homes, knownHomes, homeDir, legacyDshByHome, act
   const [picking, setPicking] = useState(false)
   const [installing, setInstalling] = useState(false)
   const [installMessage, setInstallMessage] = useState<string | null>(null)
+  const [section, setSection] = useState<SettingsSection>('general')
 
   useEffect(() => {
     void daemonStatus().then(setStatus).catch(() => {})
@@ -114,85 +122,100 @@ export function SettingsPanel({ homes, knownHomes, homeDir, legacyDshByHome, act
 
   return (
     <div className="settings-panel">
-      <section>
-        <h3>Daemon</h3>
-        {status ? (
-          <dl className="status-grid">
-            <dt>状态</dt><dd>{status.running ? '运行中' : '未运行'}</dd>
-            <dt>pid</dt><dd>{status.pid ?? '—'}</dd>
-            <dt>代际</dt><dd>{status.generation ?? '—'}</dd>
-            <dt>endpoint</dt><dd className="mono">{status.endpoint ?? '—'}</dd>
-          </dl>
-        ) : (
-          <p className="empty-hint">读取中…</p>
-        )}
-      </section>
-      <section>
-        <div className="section-header">
-          <h3>DSH 集成</h3>
-          <button className="chip active" disabled={installing} onClick={() => void installPlugin()}>
-            {installing ? '安装中…' : '安装 DSH 插件…'}
-          </button>
-        </div>
-        <p className="empty-hint">
-          把 oh-my-ticket 插件装进本机 dsh（web profile）。版本与本桌面 app 保持一致；
-          未装全局 dsh 时可改用 dsh 源码开发环境安装。
-        </p>
-        {installMessage && <p className="info-banner">{installMessage}</p>}
-      </section>
-      <section>
-        <div className="section-header">
-          <h3>Workspaces</h3>
-          <button className="chip active" disabled={picking} onClick={() => void pickWorkspace()}>
-            {picking ? '选择中…' : '＋ 添加 workspace…'}
-          </button>
-        </div>
-        <div className="home-list">
-          {homes.map(home => (
-            <button
-              key={home.homeId}
-              className={`home-row${activeHome?.homeId === home.homeId ? ' selected' : ''}`}
-              onClick={() => onSelectHome(home)}
-            >
-              <span className="home-row-main">
-                <span className="chip">{home.kind ?? 'workspace'}</span>
-                <span className="mono home-path">{workspaceRootOf(home.path, homeDir, home.name ?? home.homeId)}</span>
-                {activeHome?.homeId === home.homeId && <span className="row-check">✓</span>}
-              </span>
-              {legacyDshByHome[home.homeId] && (
-                <span className="home-row-sub">
-                  {/* U1b：旧 dsh harness 条目保留在 bag，不静默丢弃（dsh 接入属后续版本） */}
-                  <span className="harness-notice">dsh harness 后续版本支持，当前配置已保留</span>
-                </span>
-              )}
-            </button>
-          ))}
-        </div>
-        {knownHomes.filter(k => !k.open).length > 0 && (
-          <div className="known-section">
-            <h4>已知未开（点击即添加）</h4>
-            {knownHomes.filter(k => !k.open).map(known => (
-              <button
-                key={known.path}
-                className="home-row"
-                disabled={known.missing}
-                title={known.missing ? '目录已不存在（被移动/删除）' : known.path}
-                onClick={() => void onDeclare(known.path).then(err => setDeclareMessage(err ?? `已收录 ${known.name}`))}
-              >
-                <span className="chip">{known.kind}</span>
-                <span className="mono">{workspaceRootOf(known.path, homeDir, known.name)}</span>
-                {known.missing && <span className="chip">已缺失</span>}
+      {/* U7：内层分段——R-A Harnesses 是设置页一等区（非弹窗） */}
+      <div className="inner-tabs">
+        <button className={`inner-tab${section === 'general' ? ' active' : ''}`} onClick={() => setSection('general')}>
+          通用
+        </button>
+        <button className={`inner-tab${section === 'harnesses' ? ' active' : ''}`} onClick={() => setSection('harnesses')}>
+          Harnesses
+        </button>
+      </div>
+      {section === 'harnesses' ? (
+        <HarnessManagerTab homes={homes} />
+      ) : (
+        <>
+          <section>
+            <h3>Daemon</h3>
+            {status ? (
+              <dl className="status-grid">
+                <dt>状态</dt><dd>{status.running ? '运行中' : '未运行'}</dd>
+                <dt>pid</dt><dd>{status.pid ?? '—'}</dd>
+                <dt>代际</dt><dd>{status.generation ?? '—'}</dd>
+                <dt>endpoint</dt><dd className="mono">{status.endpoint ?? '—'}</dd>
+              </dl>
+            ) : (
+              <p className="empty-hint">读取中…</p>
+            )}
+          </section>
+          <section>
+            <div className="section-header">
+              <h3>DSH 集成</h3>
+              <button className="chip active" disabled={installing} onClick={() => void installPlugin()}>
+                {installing ? '安装中…' : '安装 DSH 插件…'}
               </button>
-            ))}
-          </div>
-        )}
-        {declareMessage && <p className="info-banner">{declareMessage}</p>}
-      </section>
-      {isAdmin && (
-        <section>
-          <h3>Admin</h3>
-          <p className="empty-hint">管理操作区（凭据已授权 admin 族）</p>
-        </section>
+            </div>
+            <p className="empty-hint">
+              把 oh-my-ticket 插件装进本机 dsh（web profile）。版本与本桌面 app 保持一致；
+              未装全局 dsh 时可改用 dsh 源码开发环境安装。
+            </p>
+            {installMessage && <p className="info-banner">{installMessage}</p>}
+          </section>
+          <section>
+            <div className="section-header">
+              <h3>Workspaces</h3>
+              <button className="chip active" disabled={picking} onClick={() => void pickWorkspace()}>
+                {picking ? '选择中…' : '＋ 添加 workspace…'}
+              </button>
+            </div>
+            <div className="home-list">
+              {homes.map(home => (
+                <button
+                  key={home.homeId}
+                  className={`home-row${activeHome?.homeId === home.homeId ? ' selected' : ''}`}
+                  onClick={() => onSelectHome(home)}
+                >
+                  <span className="home-row-main">
+                    <span className="chip">{home.kind ?? 'workspace'}</span>
+                    <span className="mono home-path">{workspaceRootOf(home.path, homeDir, home.name ?? home.homeId)}</span>
+                    {activeHome?.homeId === home.homeId && <span className="row-check">✓</span>}
+                  </span>
+                  {legacyDshByHome[home.homeId] && (
+                    <span className="home-row-sub">
+                      {/* U1b：旧 dsh harness 条目保留在 bag，不静默丢弃（dsh 接入属后续版本） */}
+                      <span className="harness-notice">dsh harness 后续版本支持，当前配置已保留</span>
+                    </span>
+                  )}
+                </button>
+              ))}
+            </div>
+            {knownHomes.filter(k => !k.open).length > 0 && (
+              <div className="known-section">
+                <h4>已知未开（点击即添加）</h4>
+                {knownHomes.filter(k => !k.open).map(known => (
+                  <button
+                    key={known.path}
+                    className="home-row"
+                    disabled={known.missing}
+                    title={known.missing ? '目录已不存在（被移动/删除）' : known.path}
+                    onClick={() => void onDeclare(known.path).then(err => setDeclareMessage(err ?? `已收录 ${known.name}`))}
+                  >
+                    <span className="chip">{known.kind}</span>
+                    <span className="mono">{workspaceRootOf(known.path, homeDir, known.name)}</span>
+                    {known.missing && <span className="chip">已缺失</span>}
+                  </button>
+                ))}
+              </div>
+            )}
+            {declareMessage && <p className="info-banner">{declareMessage}</p>}
+          </section>
+          {isAdmin && (
+            <section>
+              <h3>Admin</h3>
+              <p className="empty-hint">管理操作区（凭据已授权 admin 族）</p>
+            </section>
+          )}
+        </>
       )}
     </div>
   )
