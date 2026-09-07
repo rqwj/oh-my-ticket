@@ -12,7 +12,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { AgentRecord, OmtNode, SavedFilters } from './types'
 import { STATUS_COLORS } from './types'
-import { bindingViewForNode, type NodeBindingView } from './store'
+import { bindingViewsForNodes, type NodeBindingView } from './store'
 import { agentDisplayName } from './AgentsPanel'
 
 interface Props {
@@ -167,17 +167,14 @@ export function TreePanel({ nodes, filters, recentIds, selectedId, bindings = {}
   // Persisted bag loads asynchronously after mount — adopt its query.
   useEffect(() => setQuery(filters.query ?? ''), [filters.query])
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set())
-  // U9：全树绑定 badge 视图一次预解析（直接/继承/悬空三态，降级冻结悬空判定）
+  // U9：全树绑定 badge 视图一次预解析（直接/继承/悬空三态，降级冻结悬空判定）；
+  // 批量入口共享一次 byId/agents 建表，避免每节点全树重建的 O(N²)
   const views = useMemo(() => {
+    const resolved = bindingViewsForNodes(bindings, nodes, agents, bindingsDegraded)
     const map = new Map<string, NodeBindingView>()
-    const walk = (list: OmtNode[]) => {
-      for (const node of list) {
-        const view = bindingViewForNode(bindings, nodes, node.id, agents, bindingsDegraded)
-        if (view) map.set(node.id, view)
-        if (node.children) walk(node.children)
-      }
+    for (const [id, view] of resolved) {
+      if (view) map.set(id, view)
     }
-    walk(nodes)
     return map
   }, [nodes, bindings, agents, bindingsDegraded])
   const roots = useMemo(

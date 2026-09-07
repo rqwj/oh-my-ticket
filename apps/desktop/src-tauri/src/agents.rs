@@ -357,12 +357,12 @@ pub fn bindings_get(home_id: String) -> Result<serde_json::Value, String> {
 
 fn bindings_get_in(runtime_dir: &Path, home_id: &str) -> Result<serde_json::Value, String> {
     let bindings = read_bindings(runtime_dir, home_id)?;
-    let bindings_path = bindings_path(runtime_dir, home_id)?;
+    let b_path = bindings_path(runtime_dir, home_id)?;
     let agents_path = agents_path(runtime_dir, home_id)?;
     // 读一次 agents.json：让「此刻损坏」也进粘性留证（rename 发生在本读），
     // 与 agents_list 的判定完全同源。
     let (_, agents_parse_failed) = read_json::<AgentsFile>(&agents_path)?;
-    let parse_failed = has_unrecovered_corrupt(&bindings_path)
+    let parse_failed = has_unrecovered_corrupt(&b_path)
         || has_unrecovered_corrupt(&agents_path)
         || agents_parse_failed;
     Ok(serde_json::json!({

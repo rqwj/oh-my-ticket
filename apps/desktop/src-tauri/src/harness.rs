@@ -294,7 +294,7 @@ impl LaunchPlan {
     pub fn sanitized_env(&self) -> BTreeMap<String, String> {
         self.env
             .iter()
-            .filter(|(k, _)| !matches!(k.as_str(), "OMT_RUNTIME_DIR" | "OMT_HOME" | "PATH"))
+            .filter(|(k, _)| !RESERVED_ENV_KEYS.contains(&k.as_str()))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
     }

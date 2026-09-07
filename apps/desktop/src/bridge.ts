@@ -101,7 +101,7 @@ export async function subscribeEvents(
 // TranscriptEvent 经 Tauri Channel 推送（随子进程生命周期，KD-D3：绝不进
 // daemon 事件流）。三类事件统一 §5.3 envelope：{execId, seq, ts, kind, ...}。
 
-export interface SessionStartEvent {
+interface SessionStartEvent {
   execId: string
   seq: number
   /** epoch 毫秒字符串（Rust 侧 agents::now_epoch_ms，字典序 = 时间序） */
@@ -114,7 +114,7 @@ export interface SessionStartEvent {
   pid: number
 }
 
-export interface RawTranscriptEvent {
+interface RawTranscriptEvent {
   execId: string
   seq: number
   ts: string
@@ -123,7 +123,7 @@ export interface RawTranscriptEvent {
   text: string
 }
 
-export interface ExitTranscriptEvent {
+interface ExitTranscriptEvent {
   execId: string
   seq: number
   ts: string
@@ -189,13 +189,13 @@ export interface ExecStartOutcome {
  * `homePath` 是 `.omt` 目录（activeHome.path）；`unattended` 显式放行
  * （headless 无人应答，flag 由 provider descriptor 提供）。
  */
-export async function execStart<T = unknown>(options: {
+export async function execStart(options: {
   homeId: string
   homePath: string
   nodeId: string
   harness: string
   unattended: boolean
-  channel: Channel<T>
+  channel: Channel<TranscriptEvent>
 }): Promise<ExecStartOutcome> {
   return invoke<ExecStartOutcome>('exec_start', {
     homeId: options.homeId,

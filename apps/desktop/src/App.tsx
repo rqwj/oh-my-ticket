@@ -26,6 +26,8 @@ type CenterView = 'detail' | 'runs' | 'settings'
 type TicketTab = 'detail' | 'agents'
 
 const TREE_WIDTH_KEY = 'omt-desktop-tree-width'
+// 无绑定的稳定空表：每渲染新建 `{}` 会击穿下游 views memo（U7 评审修复）
+const EMPTY_BINDINGS: Record<string, string> = {}
 const clampWidth = (px: number) => Math.min(720, Math.max(240, Math.round(px)))
 
 function initialTreeWidth(): number {
@@ -109,7 +111,7 @@ export function App() {
             filters={state.filters}
             recentIds={state.recentIds}
             selectedId={state.selectedId}
-            bindings={state.bindingsByHome[state.activeHome.homeId] ?? {}}
+            bindings={state.bindingsByHome[state.activeHome.homeId] ?? EMPTY_BINDINGS}
             agents={state.agents}
             bindingsDegraded={state.bindingsParseFailed}
             onSelect={id => { store.selectNode(id); setView('detail'); setTicketTab('detail') }}
@@ -167,7 +169,7 @@ export function App() {
                     parseFailed={state.parseFailed}
                     selectedAgentId={state.selectedAgentId}
                     nodes={state.nodes}
-                    bindings={state.bindingsByHome[state.activeHome.homeId] ?? {}}
+                    bindings={state.bindingsByHome[state.activeHome.homeId] ?? EMPTY_BINDINGS}
                     bindingsDegraded={state.bindingsParseFailed}
                     fetchRun={store.fetchRun}
                     eventsOf={store.transcriptWindow}

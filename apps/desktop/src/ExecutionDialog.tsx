@@ -19,7 +19,7 @@
  */
 import { useEffect, useMemo, useState } from 'react'
 import { omtCall, harnessLaunchPreview, bindingsGet, type ExecStartOutcome, type HarnessLaunchPreview } from './bridge'
-import { readHarnessBag, writeHarnessBag, harnessList, resolveBindingForNode, type HarnessEntry, type ResolvedBinding } from './store'
+import { readHarnessBag, writeHarnessBag, harnessList, resolveBindingForNode, nodesById, type HarnessEntry, type ResolvedBinding } from './store'
 import { agentDisplayName } from './AgentsPanel'
 import type { AgentRecord, HomeInfo, OmtNode } from './types'
 
@@ -28,14 +28,7 @@ const SLOW_DISPATCH_MS = 5000 // 超时未返回 → 展开 ①–⑧ 步骤降�
 /** 成员预览：目标节点子树 DFS，跳过 archived（不下钻）与 done/skipped，
  * 只收 ticket/subticket——语义对齐 daemon 侧 collectRunMembers（executor.rs）。 */
 export function collectRunMembers(nodes: OmtNode[], rootId: string): string[] {
-  const byId = new Map<string, OmtNode>()
-  const walk = (list: OmtNode[]) => {
-    for (const node of list) {
-      byId.set(node.id, node)
-      if (node.children) walk(node.children)
-    }
-  }
-  walk(nodes)
+  const byId = nodesById(nodes)
   const members: string[] = []
   const visited = new Set<string>()
   const stack = [rootId]
@@ -236,17 +229,13 @@ export function ExecutionDialog({
     }
   }, [detailOpen, selected])
 
-  const memberTitle = (id: string) => {
-    const find = (list: OmtNode[]): string | null => {
-      for (const node of list) {
-        if (node.id === id) return node.title
-        const found = node.children ? find(node.children) : null
-        if (found !== null) return found
-      }
-      return null
-    }
-    return find(nodes) ?? id
-  }
+  // 标题查找一次建表（成员预览/绑定提示行 O(1) 查询）
+  const titleById = useMemo(() => {
+    const titles = new Map<string, string>()
+    for (const node of nodesById(nodes).values()) titles.set(node.id, node.title)
+    return titles
+  }, [nodes])
+  const memberTitle = (id: string) => titleById.get(id) ?? id
 
   const dispatch = async () => {
     if (!selected || submitting) return

@@ -96,6 +96,19 @@ export type ResolvedBinding =
   | { agentId: string; source: 'direct' }
   | { agentId: string; source: 'inherited'; viaNodeId: string }
 
+/** 全树扁平化为 byId 表（绑定解析 / 标题查找共用；O(N) 一次构建）。 */
+export function nodesById(nodes: OmtNode[]): Map<string, OmtNode> {
+  const byId = new Map<string, OmtNode>()
+  const walk = (list: OmtNode[]) => {
+    for (const node of list) {
+      byId.set(node.id, node)
+      if (node.children) walk(node.children)
+    }
+  }
+  walk(nodes)
+  return byId
+}
+
 /**
  * 子树继承解析（§U9 Approach）：沿祖先链（parentId 上溯）取最近绑定——
  * 自身命中为 direct，祖先命中为 inherited（viaNodeId = 提供绑定的最近
@@ -107,14 +120,15 @@ export function resolveBindingForNode(
   nodes: OmtNode[],
   nodeId: string,
 ): ResolvedBinding | null {
-  const byId = new Map<string, OmtNode>()
-  const walk = (list: OmtNode[]) => {
-    for (const node of list) {
-      byId.set(node.id, node)
-      if (node.children) walk(node.children)
-    }
-  }
-  walk(nodes)
+  return resolveBindingWith(nodesById(nodes), bindings, nodeId)
+}
+
+/** resolveBindingForNode 的共享内核（byId 表由调用方构建——树面批量解析免 O(N²)）。 */
+function resolveBindingWith(
+  byId: Map<string, OmtNode>,
+  bindings: Record<string, string>,
+  nodeId: string,
+): ResolvedBinding | null {
   let current = byId.get(nodeId)
   while (current) {
     const agentId = bindings[current.id]
@@ -157,6 +171,45 @@ export function bindingViewForNode(
     : { state: 'inherited', agentId: resolved.agentId, agent, viaNodeId: resolved.viaNodeId }
 }
 
+/**
+ * 整树 badge 视图批量解析（TreePanel views memo 消费）：byId 与 agents 表
+ * 各建一次，逐节点沿祖先链解析——等价于对每节点调 `bindingViewForNode`
+ * （agents 表 first-wins，与 `Array.find` 一致），但免去每节点全树重建的
+ * O(N²)。
+ */
+export function bindingViewsForNodes(
+  bindings: Record<string, string>,
+  nodes: OmtNode[],
+  agents: AgentRecord[],
+  degraded: boolean,
+): Map<string, NodeBindingView | null> {
+  const byId = nodesById(nodes)
+  const agentById = new Map<string, AgentRecord>()
+  for (const a of agents) {
+    if (!agentById.has(a.id)) agentById.set(a.id, a)
+  }
+  const views = new Map<string, NodeBindingView | null>()
+  for (const node of byId.values()) {
+    const resolved = resolveBindingWith(byId, bindings, node.id)
+    if (!resolved) {
+      views.set(node.id, null)
+      continue
+    }
+    const agent = agentById.get(resolved.agentId) ?? null
+    if (!agent) {
+      views.set(node.id, degraded ? null : { state: 'dangling', agentId: resolved.agentId, agent: null })
+      continue
+    }
+    views.set(
+      node.id,
+      resolved.source === 'direct'
+        ? { state: 'direct', agentId: resolved.agentId, agent }
+        : { state: 'inherited', agentId: resolved.agentId, agent, viaNodeId: resolved.viaNodeId },
+    )
+  }
+  return views
+}
+
 /** 悬空绑定清单（Agents 面一键清理的计数与存在性依据；降级期间不消费）。 */
 export function danglingBindingsOf(
   bindings: Record<string, string>,
@@ -175,7 +228,7 @@ export async function harnessConfigSet(harness: string, config: HarnessUserConfi
 
 // ── U6 bag v2（§四定稿：key 仍 `tauri:harness`，跟项目走的偏好）────────────
 
-export const HARNESS_BAG_KEY = 'tauri:harness'
+const HARNESS_BAG_KEY = 'tauri:harness'
 
 /**
  * bag schema v2：`{defaultHarness: <providerId>, approvalAck: {<providerId>:
@@ -273,7 +326,6 @@ export interface TreeState {
   runs: RunSummary[]
   /** U5：当前 home 的 agent 列表（运行中 + 历史，跨重启保留） */
   agents: AgentRecord[]
-  agentSeq: number
   /** agents.json 解析失败（前端提示降级；U9 据此冻结 GC） */
   parseFailed: boolean
   selectedAgentId: string | null
@@ -300,7 +352,6 @@ const INITIAL: TreeState = {
   recentIds: [],
   runs: [],
   agents: [],
-  agentSeq: 0,
   parseFailed: false,
   selectedAgentId: null,
   unviewedFailedIds: [],
@@ -340,6 +391,18 @@ export function claimedCountForExec(
   return items.filter(i => typeof i.executorActor === 'string' && i.executorActor.endsWith(suffix)).length
 }
 
+/** 尾窗入窗（有界：丢最旧；与选中无关，全部活跃 exec 都保）。 */
+function appendTail(
+  windows: Map<string, TranscriptEvent[]>,
+  execId: string,
+  events: TranscriptEvent[],
+): void {
+  const tail = windows.get(execId) ?? []
+  for (const ev of events) tail.push(ev)
+  if (tail.length > TRANSCRIPT_TAIL_CAP) tail.splice(0, tail.length - TRANSCRIPT_TAIL_CAP)
+  windows.set(execId, tail)
+}
+
 export function useTreeStore() {
   const [state, setState] = useState<TreeState>(INITIAL)
   const disposers = useRef<Array<() => void>>([])
@@ -373,11 +436,7 @@ export function useTreeStore() {
     flushTimerRef.current = undefined
     if (pendingRawRef.current.size === 0) return
     for (const [execId, events] of pendingRawRef.current) {
-      const tail = transcriptsRef.current.get(execId) ?? []
-      for (const ev of events) tail.push(ev)
-      // 尾窗有界：丢最旧（与选中无关，全部活跃 exec 都保）
-      if (tail.length > TRANSCRIPT_TAIL_CAP) tail.splice(0, tail.length - TRANSCRIPT_TAIL_CAP)
-      transcriptsRef.current.set(execId, tail)
+      appendTail(transcriptsRef.current, execId, events)
     }
     pendingRawRef.current.clear()
     bumpTranscriptVersion()
@@ -402,7 +461,6 @@ export function useTreeStore() {
       setState(s => ({
         ...s,
         agents,
-        agentSeq: result.agentSeq ?? 0,
         parseFailed: result.parseFailed ?? false,
         unviewedFailedIds: agents
           .filter(a => a.status === 'failed' && !viewedFailedRef.current.has(a.id))
@@ -486,10 +544,7 @@ export function useTreeStore() {
         return
       }
       // session_start / exit 低频且影响状态：立即入窗
-      const tail = transcriptsRef.current.get(ev.execId) ?? []
-      tail.push(ev)
-      if (tail.length > TRANSCRIPT_TAIL_CAP) tail.splice(0, tail.length - TRANSCRIPT_TAIL_CAP)
-      transcriptsRef.current.set(ev.execId, tail)
+      appendTail(transcriptsRef.current, ev.execId, [ev])
       if (ev.kind === 'exit') {
         applyExitLocal(ev)
         scheduleAgentsRepull()
@@ -523,12 +578,11 @@ export function useTreeStore() {
         channel,
       })
       // pull 契约：派发后拉 agents_list（防抖等 Rust 侧 ⑤ 落盘收敛）；
-      // 绑定写在链步骤 ⑥、先于 exec_start 返回，直接拉即可
+      // 绑定表重拉由 App 的派发成功回调统一触发（单一落点，避免双拉）
       scheduleAgentsRepull()
-      void refreshBindings()
       return outcome
     },
-    [ingestTranscriptEvent, scheduleAgentsRepull, refreshBindings],
+    [ingestTranscriptEvent, scheduleAgentsRepull],
   )
 
   const selectAgent = useCallback((agentId: string) => {
@@ -726,7 +780,6 @@ export function useTreeStore() {
         filters: {},
         // U5：切换 home 重置 agents 视图态（尾窗按 execId 键控，跨 home 保留）
         agents: [],
-        agentSeq: 0,
         parseFailed: false,
         selectedAgentId: null,
         unviewedFailedIds: [],
@@ -821,6 +874,18 @@ export function useTreeStore() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.activeHome?.homeId])
 
+  // 稳定标识（[] deps，只读 activeHomeRef）：消费方把 fetchRun 放进 effect
+  // 依赖时，raw flush 引起的重渲染不得反复 teardown 请求（U7 评审修复）。
+  const fetchRun = useCallback(async (runId: string) => {
+    const home = activeHomeRef.current
+    if (!home) throw new Error('no active home')
+    const detail = await omtCall<RunDetail & { run: RunSummary & { runId?: string } }>('run/get', {
+      homeId: home.homeId,
+      runId,
+    })
+    return { ...detail, run: { ...detail.run, id: detail.run.runId ?? detail.run.id } }
+  }, [])
+
   return {
     state,
     loadFilters,
@@ -851,15 +916,7 @@ export function useTreeStore() {
       return null
     },
     startDispatch,
-    fetchRun: async (runId: string) => {
-      const home = activeHomeRef.current
-      if (!home) throw new Error('no active home')
-      const detail = await omtCall<RunDetail & { run: RunSummary & { runId?: string } }>('run/get', {
-        homeId: home.homeId,
-        runId,
-      })
-      return { ...detail, run: { ...detail.run, id: detail.run.runId ?? detail.run.id } }
-    },
+    fetchRun,
     updateNode: async (id: string, patch: Record<string, unknown>, revision?: number) => {
       const home = activeHomeRef.current
       if (!home) return 'no active home'

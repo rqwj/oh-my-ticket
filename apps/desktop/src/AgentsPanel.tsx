@@ -8,10 +8,10 @@
  * 按 runId 缓存避免重复拉取；claimed 判定 =
  * executorActor.endsWith('/exec:<execId>')（嵌套命名空间，KD 定稿）。
  */
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { TranscriptEvent } from './bridge'
 import type { AgentRecord, ExecRecord, OmtNode, RunDetail, RunItemView } from './types'
-import { claimedCountForExec, danglingBindingsOf } from './store'
+import { claimedCountForExec, danglingBindingsOf, nodesById } from './store'
 import { TranscriptView } from './TranscriptView'
 
 const CONFIRM_RESET_MS = 3000
@@ -22,13 +22,13 @@ export function agentDisplayName(agent: AgentRecord): string {
 }
 
 /** 最新 exec：lastExecId 指针优先，缺失时回退 execs[] 末位。 */
-export function latestExecOf(agent: AgentRecord): ExecRecord | null {
+function latestExecOf(agent: AgentRecord): ExecRecord | null {
   if (agent.execs.length === 0) return null
   return agent.execs.find(e => e.execId === agent.lastExecId) ?? agent.execs[agent.execs.length - 1]
 }
 
 /** 列表分组：活跃在前、Orphan（不受控）居中、终态殿后。 */
-export function groupAgents(agents: AgentRecord[]): {
+function groupAgents(agents: AgentRecord[]): {
   active: AgentRecord[]
   orphan: AgentRecord[]
   finished: AgentRecord[]
@@ -44,23 +44,13 @@ export function groupAgents(agents: AgentRecord[]): {
   return { active, orphan, finished }
 }
 
-/** nodes 树内按 id 查 title（当前节点展示用；找不到回退 nodeId）。 */
-export function nodeTitleOf(nodes: OmtNode[], id: string): string | null {
-  for (const node of nodes) {
-    if (node.id === id) return node.title
-    const found = node.children ? nodeTitleOf(node.children, id) : null
-    if (found !== null) return found
-  }
-  return null
-}
-
 interface RunStat {
   done: number
   failed: number
   items: RunItemView[]
 }
 
-export function statsOf(detail: RunDetail): RunStat {
+function statsOf(detail: RunDetail): RunStat {
   const items = detail.items ?? []
   return {
     done: items.filter(i => i.state === 'done').length,
@@ -161,6 +151,12 @@ export function AgentsPanel({
 }: Props) {
   const [stats, setStats] = useState<Record<string, RunStat>>({})
   const statsRef = useRef<Record<string, RunStat>>({})
+  // 当前节点标题一次建表（行渲染 O(1) 查询；免每行全树 DFS）
+  const titleById = useMemo(() => {
+    const titles = new Map<string, string>()
+    for (const node of nodesById(nodes).values()) titles.set(node.id, node.title)
+    return titles
+  }, [nodes])
 
   // run item 统计：对列表内出现的 runId 做 run/get 单拉；runId 缓存跨
   // 重渲染复用（agents 重拉不重取）。
@@ -172,8 +168,10 @@ export function AgentsPanel({
       if (!runId || statsRef.current[runId]) continue
       void fetchRun(runId)
         .then(detail => {
-          if (cancelled) return
+          // 缓存写入不受 cancelled 限制：ref 跨 effect 轮次存续，同 runId
+          // 的已完成请求结果永远有效（仅渲染 setState 受过期保护）
           statsRef.current = { ...statsRef.current, [runId]: statsOf(detail) }
+          if (cancelled) return
           setStats(statsRef.current)
         })
         .catch(() => {
@@ -224,7 +222,7 @@ export function AgentsPanel({
     const exec = latestExecOf(agent)
     const stat = exec?.runId ? stats[exec.runId] : undefined
     const claimed = exec && stat ? claimedCountForExec(stat.items, exec.execId) : null
-    const nodeTitle = exec?.nodeId ? nodeTitleOf(nodes, exec.nodeId) : null
+    const nodeTitle = exec?.nodeId ? titleById.get(exec.nodeId) ?? null : null
     const stoppable =
       agent.attachment === 'live' && (agent.status === 'running' || agent.status === 'starting')
     const selectedClass = agent.id === selectedAgentId ? ' selected' : ''

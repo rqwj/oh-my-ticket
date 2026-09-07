@@ -1051,21 +1051,25 @@ fn dispatch_chain(
     let bind_result = agents::write_binding(runtime_dir, home_id, node_id, &agent.id);
     let bind_warning = bind_result.err().map(|e| format!("绑定写入失败：{e}"));
 
+    // ⑤ 之后失败的补偿序列（补偿表：Agent 记录转 Failed + 仅 cancel 本次新建
+    // run）——⑦⑧ 两个失败点共用。
+    let fail_agent_and_compensate = |err: String| -> String {
+        let _ = agents::update_agent_status(
+            runtime_dir,
+            home_id,
+            &agent.id,
+            AgentRecordStatus::Failed,
+            AgentAttachment::None,
+        );
+        compensate_new_run(shared, home_id, &run_id, run_was_newly_created);
+        err
+    };
+
     // ⑦ MCP prepare（U3）。失败按补偿表：Agent 记录转 Failed + cancel 新建 run。
     let cwd = workspace_root_of(home_path);
     let mcp = match crate::mcp_injection::prepare(runtime_dir, &cwd, provider_id, &exec_id, false) {
         Ok(mcp) => mcp,
-        Err(err) => {
-            let _ = agents::update_agent_status(
-                runtime_dir,
-                home_id,
-                &agent.id,
-                AgentRecordStatus::Failed,
-                AgentAttachment::None,
-            );
-            compensate_new_run(shared, home_id, &run_id, run_was_newly_created);
-            return Err(err);
-        }
+        Err(err) => return Err(fail_agent_and_compensate(err)),
     };
 
     // ⑧ spawn（U2）——sink 已由 tauri command 的 Channel 适配而来，穿透到
@@ -1084,18 +1088,9 @@ fn dispatch_chain(
         env_additions,
         mcp,
     };
-    let spawned = manager.spawn(runtime_dir, spawn_req, sink);
-    if spawned.is_err() {
-        let _ = agents::update_agent_status(
-            runtime_dir,
-            home_id,
-            &agent.id,
-            AgentRecordStatus::Failed,
-            AgentAttachment::None,
-        );
-        compensate_new_run(shared, home_id, &run_id, run_was_newly_created);
+    if let Err(err) = manager.spawn(runtime_dir, spawn_req, sink) {
+        return Err(fail_agent_and_compensate(err));
     }
-    spawned.map(|_| ())?;
 
     Ok((
         exec_id,
