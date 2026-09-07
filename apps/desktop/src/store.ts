@@ -14,6 +14,12 @@
  * 字段）、startDispatch（per-dispatch Channel → exec_start，成功后防抖
  * 拉 agents_list）——执行弹窗的数据源（R-B）。
  *
+ * U1b 增量：bag v2 迁移挂在 home 加载路径（refreshHomes/selectHome 每次
+ * 拉 home 后顺带执行；legacy 探测与 v2 投影同一次读，不加 RPC）——旧
+ * opencode 条目写 defaultHarness 并移除旧 `harness` 键；旧 dsh 条目不写
+ * 不删（不静默丢弃），置 legacyDshByHome 提示态。旧 HarnessSelect 路径
+ * （harnessByHome/loadHarness/saveHarness）退役。
+ *
  * U9 增量：bindings 切片——bindingsByHome（bindings_get pull，契约对齐
  * agents）+ 子树继承解析纯函数（resolveBindingForNode / bindingViewForNode
  * / danglingBindingsOf，R-C）+ gcBindings（一键清理，Rust 侧降级冻结）。
@@ -167,8 +173,8 @@ export const HARNESS_BAG_KEY = 'tauri:harness'
 
 /**
  * bag schema v2：`{defaultHarness: <providerId>, approvalAck: {<providerId>:
- * true}}`。旧 schema（`{harness: HarnessConfig}`）不同构——读取只投影 v2 字段、
- * **不改写旧数据**（迁移归 U1b）；写入 read-merge-write 只动 v2 字段。
+ * true}}`。旧 schema（`{harness: HarnessConfig}`）不同构——写入 read-merge-write
+ * 只动 v2 字段；旧数据迁移归 migrateHarnessBag（home 加载路径顺带执行）。
  */
 export interface HarnessBagV2 {
   defaultHarness?: string
@@ -178,46 +184,55 @@ export interface HarnessBagV2 {
 interface RawHarnessBag {
   defaultHarness?: unknown
   approvalAck?: unknown
+  harness?: unknown
   [k: string]: unknown
 }
 
-/** 读 bag 并投影 v2 字段：旧 shape/缺失/读失败 → 视为无默认（不抛错）。 */
-export async function readHarnessBag(homeId: string): Promise<HarnessBagV2> {
+/** readHarnessBag 的返回：v2 字段投影 + 旧 schema 探测（迁移与提示态复用）。 */
+export interface HarnessBagRead extends HarnessBagV2 {
+  /** 旧 `harness.type` 命中即如实报告；无旧字段/读失败 → null。 */
+  legacy: 'opencode' | 'dsh' | null
+}
+
+/** 读 bag 原始形态：读失败 → 空 bag（投影层兜底，不抛错）。 */
+async function readRawHarnessBag(homeId: string): Promise<RawHarnessBag> {
   try {
     const result = await omtCall<{ filters?: RawHarnessBag }>('ui/filters-get', {
       homeId,
       key: HARNESS_BAG_KEY,
     })
-    const bag = (result.filters ?? {}) as RawHarnessBag
-    const v2: HarnessBagV2 = {}
-    if (typeof bag.defaultHarness === 'string' && bag.defaultHarness) {
-      v2.defaultHarness = bag.defaultHarness
-    }
-    if (bag.approvalAck && typeof bag.approvalAck === 'object' && !Array.isArray(bag.approvalAck)) {
-      const ack: Record<string, boolean> = {}
-      for (const [provider, flag] of Object.entries(bag.approvalAck as Record<string, unknown>)) {
-        if (flag === true) ack[provider] = true
-      }
-      v2.approvalAck = ack
-    }
-    return v2
+    return result.filters ?? {}
   } catch {
     return {}
   }
 }
 
+/** raw bag → v2 字段投影 + legacy 探测：纯读，不改写 bag。 */
+function projectHarnessBag(bag: RawHarnessBag): HarnessBagRead {
+  const read: HarnessBagRead = { legacy: null }
+  if (typeof bag.defaultHarness === 'string' && bag.defaultHarness) {
+    read.defaultHarness = bag.defaultHarness
+  }
+  if (bag.approvalAck && typeof bag.approvalAck === 'object' && !Array.isArray(bag.approvalAck)) {
+    const ack: Record<string, boolean> = {}
+    for (const [provider, flag] of Object.entries(bag.approvalAck as Record<string, unknown>)) {
+      if (flag === true) ack[provider] = true
+    }
+    read.approvalAck = ack
+  }
+  const legacyType = (bag.harness as { type?: unknown } | undefined)?.type
+  if (legacyType === 'opencode' || legacyType === 'dsh') read.legacy = legacyType
+  return read
+}
+
+/** 读 bag 并投影 v2 字段 + legacy 探测：旧 shape/缺失/读失败 → 视为无默认（不抛错）。 */
+export async function readHarnessBag(homeId: string): Promise<HarnessBagRead> {
+  return projectHarnessBag(await readRawHarnessBag(homeId))
+}
+
 /** 写 v2 字段：read-merge-write，只动传入的 v2 字段（旧 `harness` 键原样保留）。 */
 export async function writeHarnessBag(homeId: string, patch: HarnessBagV2): Promise<void> {
-  let current: RawHarnessBag = {}
-  try {
-    const result = await omtCall<{ filters?: RawHarnessBag }>('ui/filters-get', {
-      homeId,
-      key: HARNESS_BAG_KEY,
-    })
-    current = result.filters ?? {}
-  } catch {
-    /* 读失败按空 bag 起步（v2 字段仍要写） */
-  }
+  const current = await readRawHarnessBag(homeId)
   const next: RawHarnessBag = { ...current }
   if (patch.defaultHarness !== undefined) next.defaultHarness = patch.defaultHarness
   if (patch.approvalAck !== undefined) {
@@ -242,7 +257,8 @@ export interface TreeState {
   homes: HomeInfo[]
   knownHomes: KnownHome[]
   homeDir?: string
-  harnessByHome: Record<string, import('./HarnessSelect').HarnessConfig>
+  /** U1b：旧 dsh harness 条目的 per-home 提示态（迁移不静默丢弃，设置页提示条） */
+  legacyDshByHome: Record<string, boolean>
   activeHome: HomeInfo | null
   nodes: OmtNode[]
   selectedId: string | null
@@ -270,7 +286,7 @@ export interface TreeState {
 const INITIAL: TreeState = {
   homes: [],
   knownHomes: [],
-  harnessByHome: {},
+  legacyDshByHome: {},
   activeHome: null,
   nodes: [],
   selectedId: null,
@@ -544,7 +560,8 @@ export function useTreeStore() {
       const result = await invoke<{ homes?: HomeInfo[]; homeDir?: string }>('daemon_homes')
       const homes = result.homes ?? []
       void loadKnownHomes()
-      for (const home of homes) void loadHarness(home)
+      // U1b：每个 home 拉到后顺带执行 bag v2 迁移（幂等，旧键清理后为 no-op）
+      for (const home of homes) void migrateHarnessBag(home.homeId)
       if (result.homeDir !== undefined) setState(s => ({ ...s, homeDir: result.homeDir }))
       setState(s => {
         // A homes refresh must NEVER unset an existing selection — a
@@ -642,40 +659,35 @@ export function useTreeStore() {
     }
   }, [])
 
-  const loadHarness = useCallback(async (home: HomeInfo) => {
-    try {
-      const result = await omtCall<{ filters?: Record<string, unknown> }>('ui/filters-get', {
-        homeId: home.homeId,
-        key: 'tauri:harness',
-      })
-      const bag = (result.filters ?? {}) as { harness?: import('./HarnessSelect').HarnessConfig }
-      setState(s => ({
-        ...s,
-        harnessByHome: bag.harness
-          ? { ...s.harnessByHome, [home.homeId]: bag.harness! }
-          : Object.fromEntries(Object.entries(s.harnessByHome).filter(([id]) => id !== home.homeId)),
-      }))
-    } catch {
-      /* bag absent → no harness configured */
+  /**
+   * bag v2 迁移（§四定稿，U1b）：挂在 home 加载路径——refreshHomes 拉完
+   * home 列表 / selectHome 装载 per-home 数据时顺带执行；legacy 探测与 v2
+   * 投影同一次读（readRawHarnessBag，不加 RPC）。语义：
+   * - 旧 opencode 条目且无 v2 defaultHarness → 写 defaultHarness='opencode'
+   *   并移除旧 `harness` 键（迁移完成后旧键已清，重放为 no-op）；
+   * - 旧 dsh 条目 → 不写不删（不静默丢弃），置 legacyDshByHome 提示态
+   *   （设置页提示「dsh harness 后续版本支持，当前配置已保留」）；
+   * - v2 已有 defaultHarness 或无旧字段 → no-op。
+   */
+  const migrateHarnessBag = useCallback(async (homeId: string) => {
+    const raw = await readRawHarnessBag(homeId)
+    const bag = projectHarnessBag(raw)
+    if (bag.legacy === 'dsh') {
+      setState(s =>
+        s.legacyDshByHome[homeId]
+          ? s
+          : { ...s, legacyDshByHome: { ...s.legacyDshByHome, [homeId]: true } },
+      )
+      return
     }
+    if (bag.legacy !== 'opencode' || bag.defaultHarness) return
+    // read-merge-write（writeHarnessBag 同语义）：除移除旧 `harness` 键外，
+    // 其余键（approvalAck 等）原样保留
+    const next: RawHarnessBag = { ...raw }
+    delete next.harness
+    next.defaultHarness = 'opencode'
+    await omtCall('ui/filters-set', { homeId, key: HARNESS_BAG_KEY, filters: next }).catch(() => {})
   }, [])
-
-  const saveHarness = useCallback(
-    async (home: HomeInfo, config: import('./HarnessSelect').HarnessConfig | null) => {
-      setState(s => ({
-        ...s,
-        harnessByHome: config
-          ? { ...s.harnessByHome, [home.homeId]: config }
-          : Object.fromEntries(Object.entries(s.harnessByHome).filter(([id]) => id !== home.homeId)),
-      }))
-      await omtCall('ui/filters-set', {
-        homeId: home.homeId,
-        key: 'tauri:harness',
-        filters: config ? { harness: config } : {},
-      }).catch(() => {})
-    },
-    [],
-  )
 
   const loadRecent = useCallback(async () => {
     try {
@@ -719,9 +731,10 @@ export function useTreeStore() {
       filtersRef.current = {}
       activeHomeRef.current = home
       window.localStorage.setItem(LAST_HOME_KEY, home.homeId)
-      await Promise.all([refreshNodes(home), refreshRuns(home), loadFilters(home), refreshAgents(), refreshBindings()])
+      // U1b：切 home 装载 per-home 数据时顺带执行 bag v2 迁移（幂等）
+      await Promise.all([refreshNodes(home), refreshRuns(home), loadFilters(home), refreshAgents(), refreshBindings(), migrateHarnessBag(home.homeId)])
     },
-    [refreshNodes, refreshRuns, loadFilters, refreshAgents, refreshBindings],
+    [refreshNodes, refreshRuns, loadFilters, refreshAgents, refreshBindings, migrateHarnessBag],
   )
 
   // Declare flow (U5 consumer): register an unregistered home directory,
@@ -806,7 +819,6 @@ export function useTreeStore() {
     state,
     loadFilters,
     loadKnownHomes,
-    saveHarness,
     selectHome,
     selectNode,
     saveFilters,

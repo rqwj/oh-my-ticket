@@ -18,20 +18,19 @@ import type { HomeInfo } from './types'
 import type { KnownHome } from './store'
 import { NOT_A_WORKSPACE_HINT, resolveHomeFromPickedDir } from './workspacePath'
 import { workspaceRootOf } from './homePath'
-import { HarnessSelect, type HarnessConfig } from './HarnessSelect'
 
 interface Props {
   homes: HomeInfo[]
   knownHomes: KnownHome[]
   homeDir?: string
-  harnessByHome: Record<string, HarnessConfig>
-  onSaveHarness: (home: HomeInfo, config: HarnessConfig | null) => Promise<void>
+  /** U1b：legacy dsh harness 条目的 home 集合（迁移不静默丢弃，逐行提示） */
+  legacyDshByHome: Record<string, boolean>
   activeHome: HomeInfo | null
   onSelectHome: (home: HomeInfo) => void
   onDeclare: (path: string) => Promise<string | null>
 }
 
-export function SettingsPanel({ homes, knownHomes, homeDir, harnessByHome, onSaveHarness, activeHome, onSelectHome, onDeclare }: Props) {
+export function SettingsPanel({ homes, knownHomes, homeDir, legacyDshByHome, activeHome, onSelectHome, onDeclare }: Props) {
   const [status, setStatus] = useState<DaemonStatus | null>(null)
   const [declareMessage, setDeclareMessage] = useState<string | null>(null)
   const [isAdmin, setIsAdmin] = useState(false)
@@ -160,9 +159,12 @@ export function SettingsPanel({ homes, knownHomes, homeDir, harnessByHome, onSav
                 <span className="mono home-path">{workspaceRootOf(home.path, homeDir, home.name ?? home.homeId)}</span>
                 {activeHome?.homeId === home.homeId && <span className="row-check">✓</span>}
               </span>
-              <span className="home-row-sub">
-                <HarnessSelect home={home} config={harnessByHome[home.homeId]} onSave={onSaveHarness} />
-              </span>
+              {legacyDshByHome[home.homeId] && (
+                <span className="home-row-sub">
+                  {/* U1b：旧 dsh harness 条目保留在 bag，不静默丢弃（dsh 接入属后续版本） */}
+                  <span className="harness-notice">dsh harness 后续版本支持，当前配置已保留</span>
+                </span>
+              )}
             </button>
           ))}
         </div>

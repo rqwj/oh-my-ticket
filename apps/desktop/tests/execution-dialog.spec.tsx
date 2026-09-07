@@ -502,7 +502,7 @@ describe('U6 store 切片', () => {
     }
   })
 
-  it('readHarnessBag：旧 shape 不改写；v2 字段如实读出；缺失/读失败 → 空', async () => {
+  it('readHarnessBag：旧 shape 不改写（legacy 探测如实报告）；v2 字段如实读出；缺失/读失败 → 空', async () => {
     invokeMock.mockImplementation(async (cmd: string, args: { method: string }) => {
       if (cmd === 'omt_call' && args.method === 'ui/filters-get') {
         return { filters: { harness: { type: 'dsh', mode: 'dev' }, defaultHarness: 'omp', approvalAck: { omp: true, bad: 'no' } } }
@@ -511,11 +511,12 @@ describe('U6 store 切片', () => {
     })
     const { readHarnessBag } = await import('../src/store')
     await act(async () => {
-      expect(await readHarnessBag('h1')).toEqual({ defaultHarness: 'omp', approvalAck: { omp: true } })
+      // U1b：返回值扩展 legacy 探测字段（旧 harness.type 命中即报告，读不删改）
+      expect(await readHarnessBag('h1')).toEqual({ defaultHarness: 'omp', approvalAck: { omp: true }, legacy: 'dsh' })
     })
     invokeMock.mockRejectedValue(new Error('x'))
     await act(async () => {
-      expect(await readHarnessBag('h1')).toEqual({})
+      expect(await readHarnessBag('h1')).toEqual({ legacy: null })
     })
   })
 

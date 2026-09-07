@@ -387,58 +387,125 @@ describe('详情页线上契约（顶层 body + children summaries）', () => {
   })
 })
 
-describe('agent harness 设置（每 workspace）', () => {
+describe('bag v2 迁移（U1b：旧 tauri:harness 条目，home 加载路径顺带执行）', () => {
   beforeEach(() => invokeMock.mockReset())
 
   const home = { homeId: 'h1', kind: 'workspace', path: '/tmp/ws/.omt' }
 
-  it('选择类型后探测安装位置并保存配置到 tauri:harness bag', async () => {
-    invokeMock.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
-      if (cmd === 'harness_detect') {
-        return Promise.resolve({ installed: true, path: '/usr/local/bin/dsh', version: 'dsh 0.9.0' })
-      }
-      return Promise.resolve({})
-    })
-    const { render, screen, fireEvent, waitFor } = await import('@testing-library/react')
-    const { HarnessSelect } = await import('../src/HarnessSelect')
-    const saved: Array<unknown> = []
-    render(<HarnessSelect home={home} config={undefined} onSave={(_h, cfg) => { saved.push(cfg); return Promise.resolve() }} />)
-
-    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'dsh' } })
-    await waitFor(() => expect(saved.length).toBe(1))
-    expect(saved[0]).toMatchObject({ type: 'dsh', mode: 'install', installPath: '/usr/local/bin/dsh', version: 'dsh 0.9.0' })
-  })
-
-  it('未检测到安装时提示；dsh 可转开发模式', async () => {
-    invokeMock.mockImplementation((cmd: string) => {
-      if (cmd === 'harness_detect') return Promise.resolve({ installed: false })
-      return Promise.resolve({})
-    })
-    const { render, screen, fireEvent, waitFor } = await import('@testing-library/react')
-    const { HarnessSelect } = await import('../src/HarnessSelect')
-    const saved: Array<unknown> = []
-    render(<HarnessSelect home={home} config={undefined} onSave={(_h, cfg) => { saved.push(cfg); return Promise.resolve() }} />)
-
-    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'dsh' } })
-    await waitFor(() => expect(screen.queryByText(/未在 PATH 检测到 dsh/)).toBeTruthy())
-    expect(saved[0]).toMatchObject({ type: 'dsh', mode: 'dev' })
-  })
-
-  it('harness 配置经 bag 读写（key=tauri:harness）', async () => {
-    invokeMock.mockResolvedValue({})
-    const { useTreeStore } = await import('../src/store')
-    const { renderHook, act } = await import('@testing-library/react')
-    const { result, unmount } = renderHook(() => useTreeStore())
-    await act(async () => {
-      await result.current.saveHarness(home, { type: 'opencode', mode: 'install', installPath: '/opt/opencode' })
-    })
-    const call = invokeMock.mock.calls.find(
-      c => c[0] === 'omt_call' && (c[1] as { method: string }).method === 'ui/filters-set',
+  // 内存版 bag daemon：filters-get 读 `bag`，filters-set 写回（模拟真实落盘）。
+  const bagDaemon = (getBag: () => Record<string, unknown>, setBag: (b: Record<string, unknown>) => void) =>
+    invokeMock.mockImplementation(
+      async (cmd: string, args?: { method?: string; params?: Record<string, unknown> }) => {
+        if (cmd === 'daemon_homes') return { homes: [home], homeDir: '/tmp' }
+        if (cmd === 'omt_call') {
+          if (args?.method === 'ui/filters-get') {
+            return args.params?.key === 'tauri:harness' ? { filters: getBag() } : { filters: {} }
+          }
+          if (args?.method === 'ui/filters-set') {
+            setBag((args!.params!.filters ?? {}) as Record<string, unknown>)
+            return {}
+          }
+          return {}
+        }
+        return {}
+      },
     )
-    expect((call![1] as { params: { key: string; filters: unknown } }).params.key).toBe('tauri:harness')
-    expect((call![1] as { params: { filters: { harness: unknown } } }).params.filters.harness)
-      .toMatchObject({ type: 'opencode', installPath: '/opt/opencode' })
+
+  const harnessSetCalls = () =>
+    invokeMock.mock.calls.filter(
+      c =>
+        c[0] === 'omt_call' &&
+        (c[1] as { method: string }).method === 'ui/filters-set' &&
+        (c[1] as { params: { key: string } }).params.key === 'tauri:harness',
+    )
+
+  it('旧 opencode 条目 → 写 defaultHarness 并移除旧 harness 字段；迁移后 v2 读侧生效', async () => {
+    let bag: Record<string, unknown> = {
+      harness: { type: 'opencode', mode: 'install', installPath: '/opt/opencode', version: '1.0' },
+    }
+    bagDaemon(
+      () => bag,
+      next => { bag = next },
+    )
+    const { useTreeStore, readHarnessBag } = await import('../src/store')
+    const { renderHook, waitFor, act } = await import('@testing-library/react')
+    const { result, unmount } = renderHook(() => useTreeStore())
+
+    // refreshHomes 拉 home 列表后顺带迁移（boot effect 自动触发）
+    await waitFor(() => expect(harnessSetCalls().length).toBeGreaterThan(0))
+    const params = (
+      harnessSetCalls()[0][1] as { params: { homeId: string; key: string; filters: Record<string, unknown> } }
+    ).params
+    expect(params.key).toBe('tauri:harness')
+    // read-merge-write：旧 harness 键移除，v2 只写 defaultHarness
+    expect(params.filters).toEqual({ defaultHarness: 'opencode' })
+
+    // v2 读侧：迁移后 defaultHarness 生效、旧字段已清（legacy 探测回 null）
+    await act(async () => {
+      expect(await readHarnessBag('h1')).toEqual({ defaultHarness: 'opencode', legacy: null })
+    })
+    // opencode 迁移不置 dsh 提示态
+    expect(result.current.state.legacyDshByHome).toEqual({})
     unmount()
+  })
+
+  it('旧 dsh 条目 → 不写不删（旧字段原样）+ legacyDshByHome 提示态出现', async () => {
+    let bag: Record<string, unknown> = { harness: { type: 'dsh', mode: 'dev', devPath: '/code/dsh' } }
+    bagDaemon(() => bag, () => {}) // set 不落盘 → 若误写，读侧 legacy 不会消失
+    const { useTreeStore, readHarnessBag } = await import('../src/store')
+    const { renderHook, waitFor, act } = await import('@testing-library/react')
+    const { result, unmount } = renderHook(() => useTreeStore())
+
+    await waitFor(() => expect(result.current.state.legacyDshByHome['h1']).toBe(true))
+    expect(harnessSetCalls()).toHaveLength(0) // 不静默丢弃：零写入
+    await act(async () => {
+      expect(await readHarnessBag('h1')).toEqual({ legacy: 'dsh' })
+    })
+    unmount()
+  })
+
+  it('幂等：迁移完成后二次加载不再写', async () => {
+    let bag: Record<string, unknown> = {
+      harness: { type: 'opencode', mode: 'install', installPath: '/opt/opencode' },
+    }
+    bagDaemon(
+      () => bag,
+      next => { bag = next },
+    )
+    const { useTreeStore } = await import('../src/store')
+    const { renderHook, waitFor, act } = await import('@testing-library/react')
+    const { result, unmount } = renderHook(() => useTreeStore())
+
+    await waitFor(() => expect(harnessSetCalls().length).toBeGreaterThan(0))
+    // boot 内 refreshHomes 与 selectHome 的并发迁移落定后再计数
+    await act(async () => { await new Promise(r => setTimeout(r, 20)) })
+    const writes = harnessSetCalls().length
+
+    await act(async () => { await result.current.refreshHomes() })
+    await act(async () => { await new Promise(r => setTimeout(r, 20)) })
+    expect(harnessSetCalls().length).toBe(writes) // 旧键已清 → 重放 no-op
+    unmount()
+  })
+
+  it('设置页对 legacy dsh home 显示「后续版本支持」提示条', async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'daemon_status') return { running: true, pid: 1, generation: 1, endpoint: 'x', spawned_by_us: false }
+      return {}
+    })
+    const { SettingsPanel } = await import('../src/SettingsPanel')
+    const { render, screen, waitFor } = await import('@testing-library/react')
+    render(
+      <SettingsPanel
+        homes={[home]}
+        knownHomes={[]}
+        legacyDshByHome={{ h1: true }}
+        activeHome={home}
+        onSelectHome={() => {}}
+        onDeclare={() => Promise.resolve(null)}
+      />,
+    )
+    await waitFor(() => expect(screen.queryByText(/dsh harness 后续版本支持/)).toBeTruthy())
+    expect(screen.queryByText(/当前配置已保留/)).toBeTruthy()
   })
 })
 

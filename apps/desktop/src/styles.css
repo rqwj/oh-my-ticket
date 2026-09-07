@@ -272,12 +272,9 @@ body {
 }
 .md-link { color: var(--accent); cursor: default; }
 
-/* workspace 行右侧 harness 选择器 */
+/* U1b：旧 dsh harness 条目的迁移提示（设置页 home 行；旧选择器已退役） */
 .row-spacer { flex: 1; }
-.harness-select { display: inline-flex; align-items: center; gap: 6px; }
-.harness-type { font-size: 12px; padding: 2px 8px; }
-.harness-path { color: var(--muted); font-size: 11px; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.harness-notice { color: var(--danger); font-size: 11px; }
+.harness-notice { color: var(--muted); font-size: 11px; }
 
 .run-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .run-progress { color: var(--muted); font-size: 12px; font-family: ui-monospace, monospace; }
