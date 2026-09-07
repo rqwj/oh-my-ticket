@@ -7,6 +7,7 @@
  * 树节点自动切详情；Agents 标签带未查看 Failed 计数 badge。
  * U9：树 badge 的绑定数据（bindingsByHome/agents）与 Agents 面一键清理
  * 接线；派发成功后 refreshBindings（R-C）。
+ * U8/R-D：树与 splitter 仅 Tickets 视图渲染（Runs/设置全宽）。
  */
 import { useCallback, useState } from 'react'
 import { WorkspaceSwitcher } from './WorkspaceSwitcher'
@@ -100,7 +101,8 @@ export function App() {
       </nav>
       {state.error && <p className="error-banner">{state.error}</p>}
       <div className="content">
-        {state.activeHome && (
+        {/* U8/R-D：树与 splitter 仅 Tickets 视图渲染——Runs/设置自然全宽 */}
+        {view === 'detail' && state.activeHome && (
           <div className="tree-wrap" style={{ width: treeWidth }}>
           <TreePanel
             nodes={state.nodes}
@@ -115,7 +117,7 @@ export function App() {
           />
           </div>
         )}
-        <div className="splitter" onPointerDown={startDrag} role="separator" aria-orientation="vertical" />
+        {view === 'detail' && <div className="splitter" onPointerDown={startDrag} role="separator" aria-orientation="vertical" />}
         <section className={`center-pane${view === 'detail' && ticketTab === 'agents' ? ' agents-pane' : ''}`}>
           {view === 'detail' && (
             <>
