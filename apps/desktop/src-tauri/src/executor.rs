@@ -80,8 +80,8 @@ pub enum Terminal {
     Killed(KillReason),
 }
 
-/// spawn 入参（U4 链步骤 ⑧；args 顺序由调用方保证——用户 extra_args 在前、
-/// desktop 注入的 flag 在后，后者覆盖前者）。
+/// spawn 入参（U4 链步骤 ⑧；args 顺序由 `harness::compose_launch_args` 统一
+/// 保证——用户 extra_args 在前、desktop 注入的 flag 在后，后者覆盖前者）。
 pub struct SpawnRequest {
     pub exec_id: String,
     pub agent_id: String,
@@ -843,6 +843,8 @@ fn wait_for<T>(mut check: impl FnMut() -> Option<T>, timeout: Duration) -> Optio
 // DISPATCH_LOCK 定义在文件头部（line 37）。
 
 /// exec_start 的成功返回。
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ExecStartOutcome {
     pub exec_id: String,
     pub agent_id: String,
@@ -926,7 +928,8 @@ fn dispatch_chain(
     home_path: &Path,
     node_id: &str,
     provider_id: &str,
-    _persistent_mcp: bool,
+    unattended: bool,
+    sink: EventSink,
 ) -> Result<(String, String, String, Vec<String>), String> {
     let dispatch_id = format!(
         "d-{}-{}",
@@ -960,8 +963,8 @@ fn dispatch_chain(
     daemon_rpc(shared, "node/execute", exec_params)?;
 
     // ③ ensure-run
-    let run_id = if let Some(existing) = active_runs.first() {
-        existing.clone()
+    let (run_id, run_was_newly_created) = if let Some(existing) = active_runs.first() {
+        (existing.clone(), false)
     } else {
         let resp = daemon_rpc(
             shared,
@@ -973,7 +976,7 @@ fn dispatch_chain(
                 "commandId": format!("{dispatch_id}:create"),
             }),
         )?;
-        resp["id"].as_str().unwrap_or_default().to_string()
+        (resp["id"].as_str().unwrap_or_default().to_string(), true)
     };
 
     // ④ run/control start（仅新建/Pending；复用 Running 跳过）
@@ -1010,9 +1013,20 @@ fn dispatch_chain(
         }
     }
 
-    // ⑤ register Agent (U4a)
+    // ⑧ 前置：launch 解析（U6/R-B——接真实用户配置；无配置/未启用 → Err）。
+    // 语义上属步骤 ⑧，但提前到 ⑤ 之前执行：NewExec 要落真实 binary 路径与
+    // args（§3.1：路径与 args 可落盘，env 值绝不），且解析失败时同 ①–④ 一样
+    // 不留 Agent 记录（补偿表）。
+    let plan = harness::resolve_launch(runtime_dir, provider_id)?;
+    let prompt = DISPATCH_PROMPT.replace("{run_id}", &run_id);
+    let args = harness::compose_launch_args(&plan, unattended, &prompt);
+    // 保存时 validate_env 已拒保留键；这里防御性再滤一次（手工改写的
+    // config.json 不得炸 spawn 入口的硬校验）。
+    let env_additions = plan.sanitized_env();
+
+    // ⑤ register Agent (U4a)。失败按补偿表 cancel 本次新建 run（不留记录）。
     let exec_id = format!("exec-{}", crate::atomic_json::unique_suffix());
-    let agent = agents::register_agent(
+    let agent = match agents::register_agent(
         runtime_dir,
         home_id,
         provider_id,
@@ -1020,24 +1034,43 @@ fn dispatch_chain(
             exec_id: exec_id.clone(),
             node_id: Some(node_id.to_string()),
             run_id: Some(run_id.clone()),
-            binary_path: None,
-            binary_args: vec![],
+            binary_path: Some(plan.program.display().to_string()),
+            // 与 transcript header 的 session_start args 镜像（含 prompt——
+            // desktop 模板 + run_id，非敏感；secrets 见 sanitize_args 纪律）
+            binary_args: args.clone(),
         },
-    )?;
+    ) {
+        Ok(agent) => agent,
+        Err(err) => {
+            compensate_new_run(shared, home_id, &run_id, run_was_newly_created);
+            return Err(err);
+        }
+    };
 
     // ⑥ bindings 写入（写失败→警告不阻断）
     let bind_result = agents::write_binding(runtime_dir, home_id, node_id, &agent.id);
     let bind_warning = bind_result.err().map(|e| format!("绑定写入失败：{e}"));
 
-    // ⑦ MCP prepare（U3）
+    // ⑦ MCP prepare（U3）。失败按补偿表：Agent 记录转 Failed + cancel 新建 run。
     let cwd = workspace_root_of(home_path);
-    let mcp = crate::mcp_injection::prepare(runtime_dir, &cwd, provider_id, &exec_id, false)?;
+    let mcp = match crate::mcp_injection::prepare(runtime_dir, &cwd, provider_id, &exec_id, false) {
+        Ok(mcp) => mcp,
+        Err(err) => {
+            let _ = agents::update_agent_status(
+                runtime_dir,
+                home_id,
+                &agent.id,
+                AgentRecordStatus::Failed,
+                AgentAttachment::None,
+            );
+            compensate_new_run(shared, home_id, &run_id, run_was_newly_created);
+            return Err(err);
+        }
+    };
 
-    // ⑧ spawn（U2）
-    let resolve = harness::resolve_program(&harness::HarnessUserConfig::default(), provider_id)?;
-    let prompt = DISPATCH_PROMPT.replace("{run_id}", &run_id);
-    let args = vec![prompt];
-
+    // ⑧ spawn（U2）——sink 已由 tauri command 的 Channel 适配而来，穿透到
+    // 事件泵（U5 transcript 流的数据源，KD-D3：不进 daemon 事件流）。
+    // 同步失败按补偿表处理（此时不可能有 item 被 claim）。
     let spawn_req = SpawnRequest {
         exec_id: exec_id.clone(),
         agent_id: agent.id.clone(),
@@ -1046,13 +1079,23 @@ fn dispatch_chain(
         harness: provider_id.to_string(),
         node_id: Some(node_id.to_string()),
         run_id: Some(run_id.clone()),
-        program: resolve,
+        program: plan.program,
         args,
-        env_additions: BTreeMap::new(),
+        env_additions,
         mcp,
     };
-    let sink: EventSink = Arc::new(|_| {}); // U5 替换为 Channel
-    manager.spawn(runtime_dir, spawn_req, sink)?;
+    let spawned = manager.spawn(runtime_dir, spawn_req, sink);
+    if spawned.is_err() {
+        let _ = agents::update_agent_status(
+            runtime_dir,
+            home_id,
+            &agent.id,
+            AgentRecordStatus::Failed,
+            AgentAttachment::None,
+        );
+        compensate_new_run(shared, home_id, &run_id, run_was_newly_created);
+    }
+    spawned.map(|_| ())?;
 
     Ok((
         exec_id,
@@ -1091,13 +1134,14 @@ pub fn exec_start_impl(
     home_path: &Path,
     node_id: &str,
     provider_id: &str,
-    _on_event: EventSink,
+    unattended: bool,
+    sink: EventSink,
 ) -> Result<ExecStartOutcome, String> {
     let _guard = DISPATCH_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    let (exec_id, agent_id, run_id, warnings) = match dispatch_chain(
+    let (exec_id, agent_id, run_id, warnings) = dispatch_chain(
         shared,
         manager,
         runtime_dir,
@@ -1105,15 +1149,9 @@ pub fn exec_start_impl(
         home_path,
         node_id,
         provider_id,
-        false,
-    ) {
-        Ok(result) => result,
-        Err(err) => {
-            // 补偿：⑤⑦ 失败 cancel 新建 run（补偿在 dispatch_chain 内部处理
-            // spawn 失败；此处处理的是 dispatch_chain 整体 Err）
-            return Err(err);
-        }
-    };
+        unattended,
+        sink,
+    )?;
 
     Ok(ExecStartOutcome {
         exec_id,
@@ -1121,6 +1159,39 @@ pub fn exec_start_impl(
         run_id,
         warnings,
     })
+}
+
+/// U6 (R-B)：exec_start tauri command（§3.4 统一入口，内含 §3.3 链）。
+/// Tauri Channel → EventSink 适配后穿透 dispatch_chain 到 manager.spawn——
+/// transcript 事件随子进程生命周期推送（KD-D3），Channel 归前端所有。
+/// `home_path` 是 `.omt` 目录（前端取 activeHome.path；cwd 剥尾见 §3.6.4）。
+#[allow(clippy::too_many_arguments)] // tauri command 入参面由协议定，不宜收敛
+#[tauri::command(async)]
+pub fn exec_start(
+    shared: tauri::State<'_, SharedSession>,
+    state: tauri::State<'_, crate::state::ExecutionState>,
+    home_id: String,
+    home_path: String,
+    node_id: String,
+    harness: String,
+    unattended: bool,
+    channel: tauri::ipc::Channel<serde_json::Value>,
+) -> Result<ExecStartOutcome, String> {
+    let sink: EventSink = Arc::new(move |value| {
+        let _ = channel.send(value);
+    });
+    let runtime_dir = daemon::runtime_dir();
+    exec_start_impl(
+        &shared,
+        &state.inner().0,
+        &runtime_dir,
+        &home_id,
+        Path::new(&home_path),
+        &node_id,
+        &harness,
+        unattended,
+        sink,
+    )
 }
 
 /// F-U2-13 + F-U2-1 联动：signal 分支偏好 stop_reason + kill_all 同步收口。
@@ -2145,6 +2216,23 @@ mod tests {
             !launcher_path.exists(),
             "spawn 失败必须释放已准备的 MCP 注入（F-U3-9）"
         );
+    }
+
+    #[test]
+    fn exec_start_outcome_serializes_camel_case() {
+        // U6 wire 契约：前端读 {execId, agentId, runId, warnings}
+        let outcome = ExecStartOutcome {
+            exec_id: "exec-1".into(),
+            agent_id: "agent-1".into(),
+            run_id: "run-1".into(),
+            warnings: vec!["w".into()],
+        };
+        let value = serde_json::to_value(&outcome).unwrap();
+        assert!(value.get("execId").is_some(), "{value}");
+        assert!(value.get("agentId").is_some(), "{value}");
+        assert!(value.get("runId").is_some(), "{value}");
+        assert!(value.get("warnings").is_some(), "{value}");
+        assert!(value.get("exec_id").is_none(), "{value}");
     }
 
     #[test]

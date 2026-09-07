@@ -8,16 +8,23 @@
  * window focus / 派发后主动拉，不进 daemon 事件流）；transcript 经
  * Channel 推送进 ingestTranscriptEvent 归并（每 execId 独立尾窗、raw
  * 50ms 合并刷新、2000 条有界）。
+ *
+ * U6 增量：harness 数据面（harness_list/harness_config_set 封装 +
+ * HarnessEntry）、bag v2 helpers（defaultHarness/approvalAck，只动 v2
+ * 字段）、startDispatch（per-dispatch Channel → exec_start，成功后防抖
+ * 拉 agents_list）——执行弹窗的数据源（R-B）。
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Channel, invoke } from '@tauri-apps/api/core'
 import {
   agentsList,
   execKillOrphan,
+  execStart,
   execStop,
   omtCall,
   subscribeEvents,
   type EventEnvelope,
+  type ExecStartOutcome,
   type TranscriptEvent,
 } from './bridge'
 import type { AgentRecord, HomeInfo, OmtNode, RunDetail, RunSummary, SavedFilters } from './types'
@@ -32,6 +39,111 @@ const RAW_FLUSH_MS = 50 // raw 行合并刷新窗口（避免每行一渲染）
 const EXIT_REPULL_MS = 400 // exit 后 agents_list 防抖重拉（等 Rust 侧落盘收敛）
 
 const EMPTY_TRANSCRIPT: TranscriptEvent[] = []
+
+// ── U6 (R-B/F-U1b-1)：harness 数据面（harness_list wire 投影，U7/U1b 复用）──
+
+/** harness_list 单条投影（Rust harness_entry 的 json! 键位契约）。 */
+export interface HarnessEntry {
+  id: string
+  label: string
+  installed: boolean
+  detectedPath: string | null
+  detectedVersion: string | null
+  enabled: boolean
+  binarySource: 'detected' | 'manual'
+  manualPath: string | null
+  state: 'ready' | 'notDetected' | 'pendingVerification'
+  /** 无人值守放行 flag（弹窗确认文案与预览说明用） */
+  unattendedFlag: string[]
+}
+
+/** harness_list：类型表 × 探测 × 用户配置投影。 */
+export async function harnessList(): Promise<HarnessEntry[]> {
+  const result = await invoke<{ harnesses?: HarnessEntry[] }>('harness_list')
+  return result.harnesses ?? []
+}
+
+/** harness_config_set 的入参形状（Rust HarnessUserConfig 的 serde camelCase）。 */
+export interface HarnessUserConfigInput {
+  enabled: boolean
+  binary: { kind: 'detected' } | { kind: 'manual'; path: string }
+  extraArgs: string[]
+  env: Record<string, string>
+}
+
+/** 保存一个 provider 的用户配置（校验+原子落盘），返回最新投影。U7 复用。 */
+export async function harnessConfigSet(harness: string, config: HarnessUserConfigInput): Promise<HarnessEntry> {
+  return invoke<HarnessEntry>('harness_config_set', { harness, config })
+}
+
+// ── U6 bag v2（§四定稿：key 仍 `tauri:harness`，跟项目走的偏好）────────────
+
+export const HARNESS_BAG_KEY = 'tauri:harness'
+
+/**
+ * bag schema v2：`{defaultHarness: <providerId>, approvalAck: {<providerId>:
+ * true}}`。旧 schema（`{harness: HarnessConfig}`）不同构——读取只投影 v2 字段、
+ * **不改写旧数据**（迁移归 U1b）；写入 read-merge-write 只动 v2 字段。
+ */
+export interface HarnessBagV2 {
+  defaultHarness?: string
+  approvalAck?: Record<string, boolean>
+}
+
+interface RawHarnessBag {
+  defaultHarness?: unknown
+  approvalAck?: unknown
+  [k: string]: unknown
+}
+
+/** 读 bag 并投影 v2 字段：旧 shape/缺失/读失败 → 视为无默认（不抛错）。 */
+export async function readHarnessBag(homeId: string): Promise<HarnessBagV2> {
+  try {
+    const result = await omtCall<{ filters?: RawHarnessBag }>('ui/filters-get', {
+      homeId,
+      key: HARNESS_BAG_KEY,
+    })
+    const bag = (result.filters ?? {}) as RawHarnessBag
+    const v2: HarnessBagV2 = {}
+    if (typeof bag.defaultHarness === 'string' && bag.defaultHarness) {
+      v2.defaultHarness = bag.defaultHarness
+    }
+    if (bag.approvalAck && typeof bag.approvalAck === 'object' && !Array.isArray(bag.approvalAck)) {
+      const ack: Record<string, boolean> = {}
+      for (const [provider, flag] of Object.entries(bag.approvalAck as Record<string, unknown>)) {
+        if (flag === true) ack[provider] = true
+      }
+      v2.approvalAck = ack
+    }
+    return v2
+  } catch {
+    return {}
+  }
+}
+
+/** 写 v2 字段：read-merge-write，只动传入的 v2 字段（旧 `harness` 键原样保留）。 */
+export async function writeHarnessBag(homeId: string, patch: HarnessBagV2): Promise<void> {
+  let current: RawHarnessBag = {}
+  try {
+    const result = await omtCall<{ filters?: RawHarnessBag }>('ui/filters-get', {
+      homeId,
+      key: HARNESS_BAG_KEY,
+    })
+    current = result.filters ?? {}
+  } catch {
+    /* 读失败按空 bag 起步（v2 字段仍要写） */
+  }
+  const next: RawHarnessBag = { ...current }
+  if (patch.defaultHarness !== undefined) next.defaultHarness = patch.defaultHarness
+  if (patch.approvalAck !== undefined) {
+    const existing =
+      current.approvalAck && typeof current.approvalAck === 'object' && !Array.isArray(current.approvalAck)
+        ? (current.approvalAck as Record<string, unknown>)
+        : {}
+    next.approvalAck = { ...existing, ...patch.approvalAck }
+  }
+  await omtCall('ui/filters-set', { homeId, key: HARNESS_BAG_KEY, filters: next }).catch(() => {})
+}
 
 export interface KnownHome {
   path: string
@@ -242,15 +354,35 @@ export function useTreeStore() {
     [scheduleFlush, applyExitLocal, scheduleAgentsRepull, bumpTranscriptVersion],
   )
 
-  // U6 将把本 Channel 传给 exec_start invoke（Rust 泵随子进程生命周期，
-  // KD-D3）；Channel 先建好并接入归并管线，测试经 ingestTranscriptEvent
-  // 直接驱动。
-  const transcriptChannelRef = useRef<Channel<TranscriptEvent> | null>(null)
-  if (transcriptChannelRef.current === null) {
-    const channel = new Channel<TranscriptEvent>()
-    channel.onmessage = ev => ingestTranscriptEvent(ev)
-    transcriptChannelRef.current = channel
-  }
+  // U6：Channel 由 startDispatch 按次创建（Rust 泵随子进程生命周期，KD-D3），
+  // onmessage 直入归并管线；onEvent 兜底供调用方旁路观察。
+  const startDispatch = useCallback(
+    async (options: {
+      home: HomeInfo
+      nodeId: string
+      harness: string
+      unattended: boolean
+      onEvent?: (ev: TranscriptEvent) => void
+    }): Promise<ExecStartOutcome> => {
+      const channel = new Channel<TranscriptEvent>()
+      channel.onmessage = ev => {
+        ingestTranscriptEvent(ev)
+        options.onEvent?.(ev)
+      }
+      const outcome = await execStart({
+        homeId: options.home.homeId,
+        homePath: options.home.path ?? '',
+        nodeId: options.nodeId,
+        harness: options.harness,
+        unattended: options.unattended,
+        channel,
+      })
+      // pull 契约：派发后防抖拉 agents_list（等 Rust 侧 ⑤ 落盘收敛）
+      scheduleAgentsRepull()
+      return outcome
+    },
+    [ingestTranscriptEvent, scheduleAgentsRepull],
+  )
 
   const selectAgent = useCallback((agentId: string) => {
     viewedFailedRef.current.add(agentId)
@@ -569,7 +701,7 @@ export function useTreeStore() {
       }
       return null
     },
-    transcriptChannel: transcriptChannelRef.current,
+    startDispatch,
     fetchRun: async (runId: string) => {
       const home = activeHomeRef.current
       if (!home) throw new Error('no active home')

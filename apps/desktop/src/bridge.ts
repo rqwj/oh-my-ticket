@@ -4,7 +4,7 @@
  * `omt_call`; daemon event envelopes arrive over the `omt://event`
  * Tauri channel.
  */
-import { invoke } from '@tauri-apps/api/core'
+import { Channel, invoke } from '@tauri-apps/api/core'
 import { getVersion } from '@tauri-apps/api/app'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import type { AgentsListResult } from './types'
@@ -149,4 +149,54 @@ export async function execStop(execId: string): Promise<void> {
 /** Orphan 强制 kill（§3.2：Orphan 只读尾随、不可 exec_stop）。pid 取自 transcript 的 session_start 事件。 */
 export async function execKillOrphan(pid: number): Promise<void> {
   return invoke<void>('exec_kill_orphan', { pid })
+}
+
+// ── U6 执行派发（R-B）─────────────────────────────────────────────────────
+
+/** exec_start 成功返回（Rust ExecStartOutcome 的 camelCase 投影）。 */
+export interface ExecStartOutcome {
+  execId: string
+  agentId: string
+  runId: string
+  /** 非阻断警告（如绑定写失败）——成功后作为 Agents 面持久警告条 */
+  warnings: string[]
+}
+
+/**
+ * 派发执行（§3.3 链统一入口）。`channel` 归本函数所有：Rust 事件泵经它推送
+ * transcript envelope（KD-D3：绝不进 daemon 事件流），随子进程生命周期。
+ * `homePath` 是 `.omt` 目录（activeHome.path）；`unattended` 显式放行
+ * （headless 无人应答，flag 由 provider descriptor 提供）。
+ */
+export async function execStart<T = unknown>(options: {
+  homeId: string
+  homePath: string
+  nodeId: string
+  harness: string
+  unattended: boolean
+  channel: Channel<T>
+}): Promise<ExecStartOutcome> {
+  return invoke<ExecStartOutcome>('exec_start', {
+    homeId: options.homeId,
+    homePath: options.homePath,
+    nodeId: options.nodeId,
+    harness: options.harness,
+    unattended: options.unattended,
+    channel: options.channel,
+  })
+}
+
+/**
+ * 弹窗「详情」的只读启动预览。secrets 纪律（§3.1）：env 只回键名不回值；
+ * args 是用户 extra_args，unattendedFlag 是勾选放行后将追加的 flag。
+ */
+export interface HarnessLaunchPreview {
+  program: string
+  args: string[]
+  envKeys: string[]
+  unattendedFlag: string[]
+}
+
+export async function harnessLaunchPreview(harness: string): Promise<HarnessLaunchPreview> {
+  return invoke<HarnessLaunchPreview>('harness_launch_preview', { harness })
 }

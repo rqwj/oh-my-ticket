@@ -201,7 +201,6 @@ pub struct NewExec {
 
 /// 注册新 Agent：分配持久单调序号（display_name = `Agent N`），以
 /// status=Starting 先落盘（§3.2「先于 spawn」，U4 链步骤 ⑤）。
-#[allow(dead_code)] // U4 派发链接线后移除
 pub fn register_agent(
     runtime_dir: &Path,
     home_id: &str,
@@ -245,7 +244,6 @@ pub fn register_agent(
 
 /// 更新 Agent 终态/状态。**仅状态变化才落盘**（§3.2 写合并）——高频派生量
 /// 不触发重写。返回是否实际变化。
-#[allow(dead_code)] // U2 终态迁移接线后移除
 pub fn update_agent_status(
     runtime_dir: &Path,
     home_id: &str,

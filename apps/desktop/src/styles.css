@@ -195,6 +195,43 @@ body {
 .modal-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
 .modal-header h3 { margin: 0; font-size: 15px; }
 
+/* U6 执行弹窗（R-B） */
+.warn-banner {
+  background: rgba(210, 153, 34, 0.12); border: 1px solid #d29922;
+  color: #d29922; padding: 8px 12px; border-radius: 6px; font-size: 13px;
+  margin-bottom: 12px;
+}
+.dispatch-row { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; }
+.dispatch-row select { flex: 1; }
+.dispatch-guidance { text-align: center; padding: 12px 0; }
+.dispatch-guidance .empty-hint { margin-bottom: 12px; }
+.dispatch-detail {
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 10px 12px; margin-bottom: 12px; font-size: 13px;
+}
+.preview-grid { display: grid; grid-template-columns: 84px 1fr; gap: 6px 12px; margin: 0 0 10px; }
+.preview-grid dt { color: var(--muted); }
+.preview-grid dd { margin: 0; word-break: break-all; }
+.dispatch-members-label { margin: 0 0 6px; color: var(--muted); font-size: 12px; }
+.ack-box {
+  border: 1px solid #d29922; border-radius: 8px;
+  background: rgba(210, 153, 34, 0.08);
+  padding: 10px 12px; margin-bottom: 12px;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.ack-line { display: flex; gap: 8px; align-items: center; font-size: 13px; cursor: pointer; }
+.ack-line.muted { color: var(--muted); font-size: 12px; }
+.dispatch-actions { display: flex; gap: 8px; justify-content: flex-end; }
+.conflict-box { font-size: 13px; }
+.conflict-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+.conflict-reason { margin: 8px 0 0; font-size: 12px; }
+.dispatch-steps {
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 10px 12px; margin-top: 12px; font-size: 13px;
+}
+.dispatch-steps p { margin: 0 0 6px; color: var(--muted); }
+.dispatch-steps ol { margin: 0; padding-left: 20px; }
+
 /* 详情页 v2（对齐 DSH 形态） */
 .detail-toolbar { display: flex; align-items: center; gap: 10px; }
 .detail-select {

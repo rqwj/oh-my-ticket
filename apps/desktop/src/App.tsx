@@ -15,6 +15,8 @@ import { DetailPanel } from './DetailPanel'
 import { RunsPanel } from './RunsPanel'
 import { SettingsPanel } from './SettingsPanel'
 import { AgentsPanel } from './AgentsPanel'
+import { ExecutionDialog } from './ExecutionDialog'
+import type { ExecStartOutcome } from './bridge'
 import './styles.css'
 
 type CenterView = 'detail' | 'runs' | 'settings'
@@ -35,6 +37,29 @@ export function App() {
   const [ticketTab, setTicketTab] = useState<TicketTab>('detail')
   const [treeWidth, setTreeWidth] = useState(initialTreeWidth)
   const [switcherOpen, setSwitcherOpen] = useState(false)
+  // U6：执行弹窗全局门控（R-B）——DetailPanel 的运行按钮只开弹窗；outcome
+  // warnings 作为 Agents 面持久警告条（下次派发或换 workspace 前不清除）。
+  const [dispatchTarget, setDispatchTarget] = useState<{ nodeId: string; title: string } | null>(null)
+  const [dispatchWarnings, setDispatchWarnings] = useState<string[]>([])
+
+  const openDispatch = useCallback((title: string) => {
+    if (!state.selectedId) return
+    setDispatchWarnings([])
+    setDispatchTarget({ nodeId: state.selectedId, title })
+  }, [state.selectedId])
+
+  const switchToAgent = useCallback((agentId: string) => {
+    setDispatchTarget(null)
+    setView('detail')
+    setTicketTab('agents')
+    store.selectAgent(agentId)
+    void store.refreshAgents()
+  }, [store])
+
+  const handleDispatched = useCallback((outcome: ExecStartOutcome) => {
+    setDispatchWarnings(outcome.warnings ?? [])
+    switchToAgent(outcome.agentId)
+  }, [switchToAgent])
 
   // Drag-to-resize the tree/center splitter: pointer captured on the
   // divider, width clamped 240–720px, persisted across launches.
@@ -113,25 +138,35 @@ export function App() {
                       onUpdated={store.updateNode}
                       onSelect={store.selectNode}
                       onChanged={() => state.activeHome && void store.refreshNodes(state.activeHome)}
+                      onDispatch={openDispatch}
                     />
                   )}
                   {!state.selectedId && <p className="empty-hint">从左侧选择一个 ticket</p>}
                 </>
               )}
               {ticketTab === 'agents' && state.activeHome && (
-                <AgentsPanel
-                  agents={state.agents}
-                  parseFailed={state.parseFailed}
-                  selectedAgentId={state.selectedAgentId}
-                  nodes={state.nodes}
-                  fetchRun={store.fetchRun}
-                  eventsOf={store.transcriptWindow}
-                  pidOf={store.sessionPidOf}
-                  onSelectAgent={store.selectAgent}
-                  onStopAgent={execId => void store.stopAgent(execId)}
-                  onKillOrphan={pid => void store.killOrphan(pid)}
-                  onOpenHarnessSettings={() => setView('settings')}
-                />
+                <>
+                  {dispatchWarnings.length > 0 && (
+                    <div className="warn-banner" role="alert">
+                      {dispatchWarnings.map((w, i) => (
+                        <span key={i}>{w}{i < dispatchWarnings.length - 1 ? '；' : ''}</span>
+                      ))}
+                    </div>
+                  )}
+                  <AgentsPanel
+                    agents={state.agents}
+                    parseFailed={state.parseFailed}
+                    selectedAgentId={state.selectedAgentId}
+                    nodes={state.nodes}
+                    fetchRun={store.fetchRun}
+                    eventsOf={store.transcriptWindow}
+                    pidOf={store.sessionPidOf}
+                    onSelectAgent={store.selectAgent}
+                    onStopAgent={execId => void store.stopAgent(execId)}
+                    onKillOrphan={pid => void store.killOrphan(pid)}
+                    onOpenHarnessSettings={() => setView('settings')}
+                  />
+                </>
               )}
             </>
           )}
@@ -168,6 +203,20 @@ export function App() {
           onSelect={home => void store.selectHome(home)}
           onDeclare={store.declareHome}
           onClose={() => setSwitcherOpen(false)}
+        />
+      )}
+      {dispatchTarget && state.activeHome && (
+        <ExecutionDialog
+          home={state.activeHome}
+          nodeId={dispatchTarget.nodeId}
+          nodeTitle={dispatchTarget.title}
+          nodes={state.nodes}
+          agents={state.agents}
+          startDispatch={store.startDispatch}
+          onClose={() => setDispatchTarget(null)}
+          onDispatched={handleDispatched}
+          onSelectExistingAgent={switchToAgent}
+          onOpenHarnessSettings={() => setView('settings')}
         />
       )}
     </main>

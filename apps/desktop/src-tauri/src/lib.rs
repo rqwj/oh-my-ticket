@@ -62,7 +62,9 @@ pub fn run() {
             rpc_bridge::dsh_plugin_install,
             harness::harness_list,
             harness::harness_config_set,
+            harness::harness_launch_preview,
             agents::agents_list,
+            executor::exec_start,
             executor::exec_stop,
             executor::exec_kill_orphan,
         ])

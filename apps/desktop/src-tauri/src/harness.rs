@@ -241,8 +241,6 @@ pub fn upsert_config(
 
 /// exec_start 时的 binary 解析：`Detected` 现场重探（不落死路径），
 /// `Manual` 校验文件存在且可执行；错误信息带解析后的完整路径（§3.1）。
-/// （U2 spawn 链接线后成为唯一入口，届时移除 dead_code 标注。）
-#[allow(dead_code)]
 pub fn resolve_program(cfg: &HarnessUserConfig, binary_name: &str) -> Result<PathBuf, String> {
     match &cfg.binary {
         BinarySource::Detected => which_binary(binary_name).ok_or_else(|| {
@@ -272,6 +270,93 @@ pub fn resolve_program(cfg: &HarnessUserConfig, binary_name: &str) -> Result<Pat
             Ok(candidate)
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// U6 (R-B)：exec_start 的 launch 解析（真实用户配置）与预览投影
+// ---------------------------------------------------------------------------
+
+/// 一次派发的启动解析结果（§3.1：binary 现场解析、args/env 来自用户配置）。
+#[derive(Debug)]
+pub struct LaunchPlan {
+    pub program: PathBuf,
+    pub extra_args: Vec<String>,
+    /// 无人值守放行 flag（descriptor 静态值；unattended=true 时由
+    /// `compose_launch_args` 追加）
+    pub unattended_flag: Vec<String>,
+    pub env: BTreeMap<String, String>,
+}
+
+impl LaunchPlan {
+    /// spawn env_additions：保留键防御性再滤一次（保存时 validate_env 已拒，
+    /// 手工改写的 config.json 不得经此路径破坏 desktop 注入——§3.1 spawn env
+    /// 合并规则，`manager.spawn` 侧还有第三道硬校验）。
+    pub fn sanitized_env(&self) -> BTreeMap<String, String> {
+        self.env
+            .iter()
+            .filter(|(k, _)| !matches!(k.as_str(), "OMT_RUNTIME_DIR" | "OMT_HOME" | "PATH"))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+}
+
+/// exec_start 的 launch 解析：读真实用户配置（无配置/未启用 → Err，含可读
+/// 文案——R-B 的预览与放行 flag 因此才是实话），binary 按 BinarySource 现场解析。
+pub fn resolve_launch(runtime_dir: &Path, provider_id: &str) -> Result<LaunchPlan, String> {
+    let descriptor = descriptor_of(provider_id)
+        .ok_or_else(|| format!("unsupported harness type: {provider_id}"))?;
+    let configs = load_configs(runtime_dir);
+    let cfg = configs.get(provider_id).ok_or_else(|| {
+        format!("harness {provider_id} 尚未配置：请到 设置 → Harnesses 完成配置并启用")
+    })?;
+    if !cfg.enabled {
+        return Err(format!(
+            "harness {provider_id} 未启用：请到 设置 → Harnesses 启用后再派发"
+        ));
+    }
+    let program = resolve_program(cfg, descriptor.binary_name)?;
+    Ok(LaunchPlan {
+        program,
+        extra_args: cfg.extra_args.clone(),
+        unattended_flag: descriptor
+            .unattended_flag
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+        env: cfg.env.clone(),
+    })
+}
+
+/// SpawnRequest doc 注释的 args 契约（顺序由本函数统一保证，调用方不再各自
+/// 拼装）：`[extra_args..., (unattended=true 时 unattended_flag), prompt]`。
+/// desktop 注入的 flag 在用户 args 之后——同名 flag 以 desktop 的为准。
+pub fn compose_launch_args(plan: &LaunchPlan, unattended: bool, prompt: &str) -> Vec<String> {
+    let mut args = plan.extra_args.clone();
+    if unattended {
+        args.extend(plan.unattended_flag.iter().cloned());
+    }
+    args.push(prompt.to_string());
+    args
+}
+
+/// 弹窗「详情」预览投影：program/args（用户 extra_args）/env 只回键名/
+/// unattendedFlag（§3.1 secrets 纪律——env 值绝不离开 Rust 侧）。
+fn launch_preview_value(plan: &LaunchPlan) -> serde_json::Value {
+    serde_json::json!({
+        "program": plan.program.display().to_string(),
+        "args": plan.extra_args,
+        "envKeys": plan.env.keys().collect::<Vec<&String>>(),
+        "unattendedFlag": plan.unattended_flag,
+    })
+}
+
+/// 执行弹窗「详情」的只读预览数据面（`harness_launch_preview`）：入参
+/// providerId，返回 {program, args, envKeys, unattendedFlag}。
+#[tauri::command(async)]
+pub fn harness_launch_preview(harness: String) -> Result<serde_json::Value, String> {
+    let runtime_dir = daemon::runtime_dir();
+    let plan = resolve_launch(&runtime_dir, &harness)?;
+    Ok(launch_preview_value(&plan))
 }
 
 // ---------------------------------------------------------------------------
@@ -593,6 +678,123 @@ mod tests {
         // Detected：binary 未在 PATH 时报错信息含 binary 名（现场重探语义由 U2 集成验证）
         let detected_missing = HarnessUserConfig::default();
         assert!(resolve_program(&detected_missing, "definitely-not-on-path-xyz").is_err());
+    }
+
+    // ── U6 (R-B)：launch 解析接真实用户配置 ────────────────────────────────
+
+    #[test]
+    fn compose_launch_args_extra_args_first_flag_then_prompt() {
+        let plan = LaunchPlan {
+            program: PathBuf::from("/usr/local/bin/omp"),
+            extra_args: vec!["--model".to_string(), "k3".to_string()],
+            unattended_flag: vec!["--yolo".to_string()],
+            env: BTreeMap::new(),
+        };
+        // SpawnRequest doc 契约：用户 extra_args 在前、desktop 注入 flag 在后
+        //（覆盖用户同名 flag）、prompt 收尾
+        let args = compose_launch_args(&plan, true, "PROMPT");
+        assert_eq!(
+            args,
+            vec!["--model", "k3", "--yolo", "PROMPT"],
+            "unattended=true 时 args 必须含 unattended_flag 且顺序正确"
+        );
+        assert_eq!(
+            compose_launch_args(&plan, false, "PROMPT"),
+            vec!["--model", "k3", "PROMPT"],
+            "unattended=false 不得追加放行 flag"
+        );
+    }
+
+    #[test]
+    fn resolve_launch_requires_enabled_user_config() {
+        let dir = tempfile::tempdir().unwrap();
+        // 无配置 → Err（含可读文案）
+        let err = resolve_launch(dir.path(), "omp").unwrap_err();
+        assert!(err.contains("omp"), "{err}");
+        // 未启用 → Err
+        upsert_config(
+            dir.path(),
+            "omp",
+            HarnessUserConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let err = resolve_launch(dir.path(), "omp").unwrap_err();
+        assert!(err.contains("未启用"), "{err}");
+        // enabled + Manual 可执行路径 → program/flags/extra_args 如实解析
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let tool = dir.path().join("omp-tool");
+            std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+            upsert_config(
+                dir.path(),
+                "omp",
+                HarnessUserConfig {
+                    enabled: true,
+                    binary: BinarySource::Manual {
+                        path: tool.display().to_string(),
+                    },
+                    extra_args: vec!["--model".to_string()],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let plan = resolve_launch(dir.path(), "omp").unwrap();
+            assert_eq!(plan.program, tool);
+            assert_eq!(plan.unattended_flag, vec!["--yolo".to_string()]);
+            assert_eq!(plan.extra_args, vec!["--model".to_string()]);
+        }
+        // 未知 provider → Err
+        assert!(resolve_launch(dir.path(), "definitely-not-a-provider").is_err());
+    }
+
+    #[test]
+    fn sanitized_env_filters_reserved_keys_defensively() {
+        // 保存时 validate_env 已拒绝保留键；这里防御手工改写的 config.json
+        let mut env = BTreeMap::new();
+        env.insert("MY_FLAG".to_string(), "1".to_string());
+        for reserved in ["OMT_RUNTIME_DIR", "OMT_HOME", "PATH"] {
+            env.insert(reserved.to_string(), "/evil".to_string());
+        }
+        let plan = LaunchPlan {
+            program: PathBuf::from("/bin/omp"),
+            extra_args: vec![],
+            unattended_flag: vec![],
+            env,
+        };
+        let filtered = plan.sanitized_env();
+        assert_eq!(filtered.len(), 1, "{filtered:?}");
+        assert_eq!(filtered.get("MY_FLAG").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn launch_preview_projects_env_keys_never_values() {
+        // §3.1 secrets 纪律：预览只回键名，任何位置不得出现 env 值
+        let mut env = BTreeMap::new();
+        env.insert("API_KEY".to_string(), "sk-secret-value".to_string());
+        let plan = LaunchPlan {
+            program: PathBuf::from("/bin/omp"),
+            extra_args: vec!["--model".to_string()],
+            unattended_flag: vec!["--yolo".to_string()],
+            env,
+        };
+        let value = launch_preview_value(&plan);
+        let keys: Vec<&str> = value["envKeys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|k| k.as_str().unwrap())
+            .collect();
+        assert_eq!(keys, vec!["API_KEY"]);
+        let text = serde_json::to_string(&value).unwrap();
+        assert!(!text.contains("sk-secret-value"), "{text}");
+        assert_eq!(value["program"], "/bin/omp");
+        assert_eq!(value["args"], serde_json::json!(["--model"]));
+        assert_eq!(value["unattendedFlag"], serde_json::json!(["--yolo"]));
     }
 
     #[cfg(unix)]
