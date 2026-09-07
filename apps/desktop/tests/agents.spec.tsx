@@ -1,0 +1,419 @@
+/**
+ * U5 agents/transcript 面板测试：事件按 execId 归并、尾窗有界、raw 合并
+ * 刷新、跟随判定（纯函数 + jsdom 滚动度量覆写）、两段式终止、Failed
+ * badge、列表呈现（displayName / Orphan 角标 / 零 claim 标注 / 空态）。
+ * Mock 边界沿用 store.spec 的 tauri invoke 工厂——按 §3.6.8 补导出
+ * Channel（凡 import Channel 的模块在旧 mock 下会崩）。
+ */
+import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
+import { cleanup, fireEvent, render, screen, act } from '@testing-library/react'
+import type { AgentRecord, ExecRecord, RunDetail } from '../src/types'
+import type { TranscriptEvent } from '../src/bridge'
+
+afterEach(cleanup)
+
+const invokeMock = vi.fn()
+// §3.6.8：mock 工厂必须可 new 且 onmessage 可注入（对齐 @tauri-apps/api
+// Channel 的消费方式：前端只赋 onmessage，Rust 侧推流）
+class ChannelMock {
+  onmessage: ((message: unknown) => void) | null = null
+  static instances: ChannelMock[] = []
+  constructor() {
+    ChannelMock.instances.push(this)
+  }
+  /** 测试注入入口：模拟 Rust 推流 */
+  send(message: unknown) {
+    this.onmessage?.(message)
+  }
+  toJSON() {
+    return '__CHANNEL__'
+  }
+}
+vi.mock('@tauri-apps/api/core', () => ({
+  invoke: (...args: unknown[]) => invokeMock(...args),
+  Channel: ChannelMock,
+}))
+vi.mock('@tauri-apps/api/event', () => ({
+  listen: vi.fn().mockResolvedValue(() => {}),
+}))
+
+// ── fixture 工厂 ──────────────────────────────────────────────────────────
+
+const raw = (execId: string, seq: number, text: string, stream: 'stdout' | 'stderr' = 'stdout'): TranscriptEvent =>
+  ({ execId, seq, ts: String(1000 + seq), kind: 'raw', stream, text })
+const sessionStart = (execId: string, pid: number): TranscriptEvent =>
+  ({ execId, seq: 0, ts: '900', kind: 'session_start', harness: 'omp', program: '/bin/omp', args: ['--x'], cwd: '/ws', pid })
+const exitEvent = (execId: string, status: 'exited' | 'failed' | 'killed'): TranscriptEvent =>
+  ({ execId, seq: 999, ts: '2000', kind: 'exit', status, code: status === 'failed' ? 1 : 0, killReason: null, durationMs: 5 })
+
+const makeExec = (execId: string, runId: string | null = null): ExecRecord => ({
+  execId,
+  nodeId: null,
+  runId,
+  startedAt: '1000',
+  exitCode: null,
+  killReason: null,
+  failureDetail: null,
+  harnessSessionId: null,
+  transcriptFile: null,
+  binaryPath: null,
+  binaryArgs: [],
+})
+
+function makeAgent(id: string, execId: string, over: Partial<AgentRecord> = {}): AgentRecord {
+  return {
+    id,
+    displayName: `Agent ${id}`,
+    title: null,
+    harness: 'omp',
+    status: 'running',
+    attachment: 'live',
+    lastExecId: execId,
+    lastSessionId: null,
+    execs: [makeExec(execId)],
+    ...over,
+  }
+}
+
+const runDetail = (items: Array<{ state: string; executorActor?: string }>): RunDetail =>
+  ({ run: { id: 'RUN-1', status: 'running' }, items: items.map(i => ({ nodeId: 'T-1', state: i.state, attempts: 1, executorActor: i.executorActor })) })
+
+const noop = () => {}
+
+async function setupStore() {
+  const { useTreeStore } = await import('../src/store')
+  const { renderHook } = await import('@testing-library/react')
+  return renderHook(() => useTreeStore())
+}
+
+interface PanelProps {
+  agents: AgentRecord[]
+  parseFailed: boolean
+  selectedAgentId: string | null
+  nodes: Array<{ id: string; type: string; title: string; status: string; priority: number; children?: Array<{ id: string; type: string; title: string; status: string; priority: number }> }>
+  fetchRun: (runId: string) => Promise<RunDetail>
+  eventsOf: (execId: string) => TranscriptEvent[]
+  pidOf: (execId: string) => number | null
+  onSelectAgent: (id: string) => void
+  onStopAgent: (execId: string) => void
+  onKillOrphan: (pid: number) => void
+  onOpenHarnessSettings: () => void
+}
+
+async function renderPanel(over: Partial<PanelProps> = {}) {
+  const { AgentsPanel } = await import('../src/AgentsPanel')
+  const props: PanelProps = {
+    agents: [],
+    parseFailed: false,
+    selectedAgentId: null,
+    nodes: [],
+    fetchRun: vi.fn().mockResolvedValue(runDetail([])),
+    eventsOf: () => [],
+    pidOf: () => null,
+    onSelectAgent: noop,
+    onStopAgent: noop,
+    onKillOrphan: noop,
+    onOpenHarnessSettings: noop,
+    ...over,
+  }
+  render(<AgentsPanel {...props} />)
+  return props
+}
+
+// ── store：事件归并 / 尾窗 / 合并刷新 / badge ─────────────────────────────
+
+describe('U5 store: transcript 归并', () => {
+  beforeEach(() => {
+    invokeMock.mockReset()
+    invokeMock.mockResolvedValue({})
+  })
+
+  it('多 agent 事件按 execId 归并；切换灌入互不串窗', async () => {
+    vi.useFakeTimers()
+    try {
+      const { result } = await setupStore()
+      act(() => {
+        result.current.ingestTranscriptEvent(raw('exec-a', 0, 'A0'))
+        result.current.ingestTranscriptEvent(raw('exec-b', 0, 'B0'))
+        result.current.ingestTranscriptEvent(raw('exec-a', 1, 'A1'))
+      })
+      act(() => { vi.advanceTimersByTime(60) })
+      const textsOf = (execId: string) =>
+        result.current.transcriptWindow(execId).map(e => (e.kind === 'raw' ? e.text : ''))
+      expect(textsOf('exec-a')).toEqual(['A0', 'A1'])
+      expect(textsOf('exec-b')).toEqual(['B0'])
+      // 继续给 A 灌事件，B 的尾窗保留（每 exec 独立尾窗）
+      act(() => { result.current.ingestTranscriptEvent(raw('exec-a', 2, 'A2')) })
+      act(() => { vi.advanceTimersByTime(60) })
+      expect(result.current.transcriptWindow('exec-b')).toHaveLength(1)
+      expect(result.current.transcriptWindow('exec-a')).toHaveLength(3)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('单 exec 超 2000 条 → 尾窗有界（丢最旧）', async () => {
+    vi.useFakeTimers()
+    try {
+      const { result } = await setupStore()
+      act(() => {
+        for (let i = 0; i < 2500; i++) result.current.ingestTranscriptEvent(raw('exec-cap', i, `t${i}`))
+      })
+      act(() => { vi.advanceTimersByTime(60) })
+      const tail = result.current.transcriptWindow('exec-cap')
+      expect(tail).toHaveLength(2000)
+      expect((tail[0] as { text: string }).text).toBe('t500')
+      expect((tail[1999] as { text: string }).text).toBe('t2499')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('raw 事件 50ms 合并刷新：500 条灌入只递增一次窗口版本', async () => {
+    vi.useFakeTimers()
+    try {
+      const { result } = await setupStore()
+      const before = result.current.state.transcriptVersion
+      act(() => {
+        for (let i = 0; i < 500; i++) result.current.ingestTranscriptEvent(raw('exec-flush', i, `x${i}`))
+      })
+      // flush 窗口未到期：不触发渲染信号
+      expect(result.current.state.transcriptVersion).toBe(before)
+      act(() => { vi.advanceTimersByTime(50) })
+      expect(result.current.state.transcriptVersion).toBe(before + 1)
+      expect(result.current.transcriptWindow('exec-flush')).toHaveLength(500)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('exit failed 事件：本地 status/attachment 联动 + badge +1；选中清零', async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === 'agents_list') {
+        return Promise.resolve({ agents: [makeAgent('agent-a', 'exec-a')], agentSeq: 1, parseFailed: false })
+      }
+      return Promise.resolve({})
+    })
+    const { result } = await setupStore()
+    await act(async () => {
+      await result.current.selectHome({ homeId: 'h1', kind: 'workspace', path: '/tmp/ws/.omt' })
+    })
+    expect(result.current.state.agents).toHaveLength(1)
+    act(() => { result.current.ingestTranscriptEvent(exitEvent('exec-a', 'failed')) })
+    expect(result.current.state.agents[0].status).toBe('failed')
+    expect(result.current.state.agents[0].attachment).toBe('none')
+    expect(result.current.state.unviewedFailedIds).toEqual(['agent-a'])
+    // 选中该 agent → badge 清除且不复活
+    act(() => { result.current.selectAgent('agent-a') })
+    expect(result.current.state.unviewedFailedIds).toEqual([])
+    await act(async () => { await result.current.refreshAgents() })
+    expect(result.current.state.unviewedFailedIds).toEqual([])
+  })
+})
+
+describe('U5 store: claimed 判定', () => {
+  it('claimed 判定用 endsWith（嵌套 actor 命名空间，防前缀撞名）', async () => {
+    const { claimedCountForExec } = await import('../src/store')
+    const items = [
+      { executorActor: 'mcp:4242/exec:exec-a' }, // 嵌套命名空间：命中
+      { executorActor: 'mcp:9/exec:exec-ab' },   // 前缀撞名：不得计入
+      { executorActor: 'exec:exec-a' },          // 裸 actor（无命名空间）：不命中
+      { executorActor: 'cli:1' },
+      {},
+    ]
+    expect(claimedCountForExec(items, 'exec-a')).toBe(1)
+  })
+})
+
+// ── 纯函数：跟随判定 / 窗口切片 / 空闲判定 ────────────────────────────────
+
+describe('U5 纯函数（TranscriptView 视口语义）', () => {
+  it('shouldFollow：贴底/阈值内跟随，上滚解除', async () => {
+    const { shouldFollow } = await import('../src/TranscriptView')
+    // scrollHeight=1000 / clientHeight=500 → 最大 scrollTop=500
+    expect(shouldFollow(500, 1000, 500)).toBe(true) // 贴底
+    expect(shouldFollow(460, 1000, 500)).toBe(true) // 距底 40px（阈值内）
+    expect(shouldFollow(459, 1000, 500)).toBe(false) // 距底 41px（出阈值）
+    expect(shouldFollow(200, 1000, 500)).toBe(false)
+  })
+
+  it('visibleRange：视口 + overscan 切片且不越界', async () => {
+    const { visibleRange } = await import('../src/TranscriptView')
+    expect(visibleRange(0, 440, 100)).toEqual({ start: 0, end: 40 })
+    expect(visibleRange(2200, 440, 100)).toEqual({ start: 90, end: 100 })
+    expect(visibleRange(0, 440, 0)).toEqual({ start: 0, end: 0 })
+  })
+
+  it('isIdle：live 且距最后事件超阈值判空闲', async () => {
+    const { isIdle } = await import('../src/TranscriptView')
+    expect(isIdle(undefined, 999_999)).toBe(false)
+    expect(isIdle(1000, 61_001)).toBe(true) // 60001ms > 阈值
+    expect(isIdle(1000, 61_000)).toBe(false) // 恰在阈值上不计
+  })
+})
+
+// ── TranscriptView：跟随 / pill / 行渲染 ──────────────────────────────────
+
+describe('U5 TranscriptView 自动跟随', () => {
+  it('上滚后新事件不抢滚动位、pill 计数递增；点击回贴底并恢复跟随', async () => {
+    const { TranscriptView } = await import('../src/TranscriptView')
+    const events0 = Array.from({ length: 50 }, (_, i) => raw('exec-a', i, `line-${i}`))
+    const agent = makeAgent('agent-a', 'exec-a')
+    const { rerender } = render(<TranscriptView agent={agent} events={events0} />)
+    const scrollEl = document.querySelector('.t-scroll') as HTMLElement
+    expect(scrollEl).toBeTruthy()
+    // jsdom 无布局：覆写该实例的滚动度量（getter/setter 捕获赋值）
+    let scrollTop = 0
+    Object.defineProperty(scrollEl, 'scrollTop', { get: () => scrollTop, set: (v: number) => { scrollTop = v }, configurable: true })
+    Object.defineProperty(scrollEl, 'clientHeight', { value: 500, configurable: true })
+    Object.defineProperty(scrollEl, 'scrollHeight', { value: 1000, configurable: true })
+    // 初始挂载时 jsdom 度量尚未注入（scrollHeight=0）——覆写后以新数组
+    // rerender 触发贴底效果
+    rerender(<TranscriptView agent={agent} events={[...events0]} />)
+    expect(scrollTop).toBe(1000)
+    // 模拟上滚 → 解除跟随
+    act(() => {
+      scrollTop = 300
+      fireEvent.scroll(scrollEl)
+    })
+    // 新事件到达：不抢滚动位，pill 出现且计数递增
+    const events1 = [...events0, raw('exec-a', 50, 'line-50'), raw('exec-a', 51, 'line-51')]
+    rerender(<TranscriptView agent={agent} events={events1} />)
+    expect(scrollTop).toBe(300)
+    expect(screen.getByText('回到最新 (2)')).toBeTruthy()
+    // 点击 pill → 回贴底 + 恢复跟随 + pill 消失
+    fireEvent.click(screen.getByText(/回到最新/))
+    expect(scrollTop).toBe(1000)
+    expect(screen.queryByText(/回到最新/)).toBeNull()
+  })
+
+  it('行渲染：stdout/stderr 区分、session_start/exit 结构化呈现', async () => {
+    const { TranscriptView } = await import('../src/TranscriptView')
+    const events = [
+      sessionStart('exec-a', 4242),
+      raw('exec-a', 1, 'out-line'),
+      raw('exec-a', 2, 'err-line', 'stderr'),
+      exitEvent('exec-a', 'exited'),
+    ]
+    const { container } = render(<TranscriptView agent={makeAgent('agent-a', 'exec-a', { status: 'exited' })} events={events} />)
+    expect(container.querySelector('.t-start')?.textContent).toContain('pid 4242')
+    expect(container.querySelector('.t-stderr')?.textContent).toBe('err-line')
+    const stderrCount = container.querySelectorAll('.t-stderr').length
+    expect(stderrCount).toBe(1)
+    expect(container.querySelector('.t-exit')?.textContent).toContain('code 0')
+  })
+
+  it('live agent 超过空闲阈值提示「长时间无输出」', async () => {
+    const { TranscriptView } = await import('../src/TranscriptView')
+    const stale = { ...raw('exec-a', 0, 'old'), ts: String(Date.now() - 120_000) }
+    render(<TranscriptView agent={makeAgent('agent-a', 'exec-a')} events={[stale]} />)
+    expect(screen.getByText(/长时间无输出/)).toBeTruthy()
+  })
+})
+
+// ── AgentsPanel：列表呈现 / 两段式终止 / Orphan / 空态 ────────────────────
+
+describe('U5 AgentsPanel 列表', () => {
+  beforeEach(() => invokeMock.mockReset())
+
+  it('条目渲染 display_name：title 优先，回退记录 displayName', async () => {
+    await renderPanel({
+      agents: [
+        makeAgent('a1', 'exec-a', { displayName: 'Agent 1', title: '重构登录' }),
+        makeAgent('a2', 'exec-b', { displayName: 'Agent 2', title: null, status: 'exited' }),
+      ],
+    })
+    expect(screen.getByText('重构登录')).toBeTruthy()
+    expect(screen.getByText('Agent 2')).toBeTruthy()
+  })
+
+  it('run item 统计（完成 N / 失败 M）走 fetchRun 渲染', async () => {
+    await renderPanel({
+      agents: [makeAgent('a1', 'exec-a', { execs: [makeExec('exec-a', 'RUN-1')] })],
+      fetchRun: vi.fn().mockResolvedValue(runDetail([
+        { state: 'done', executorActor: 'mcp:1/exec:exec-a' },
+        { state: 'running', executorActor: 'mcp:1/exec:exec-a' },
+        { state: 'failed', executorActor: 'cli:9' },
+      ])),
+    })
+    await act(async () => { await Promise.resolve() })
+    expect(screen.getByText(/完成 1 \/ 失败 1/)).toBeTruthy()
+  })
+
+  it('终止两段式：首击显示 N 且不调用 stop；二击调用', async () => {
+    const onStopAgent = vi.fn()
+    await renderPanel({
+      agents: [makeAgent('a1', 'exec-a', { execs: [makeExec('exec-a', 'RUN-1')] })],
+      // 不选中 agent：行内按钮与 TranscriptView 头部按钮只保留行内一个
+      fetchRun: vi.fn().mockResolvedValue(runDetail([
+        { state: 'running', executorActor: 'mcp:4242/exec:exec-a' },
+        { state: 'running', executorActor: 'mcp:4242/exec:exec-a' },
+        { state: 'done', executorActor: 'cli:1' },
+      ])),
+      onStopAgent,
+    })
+    await act(async () => { await Promise.resolve() })
+    fireEvent.click(screen.getByRole('button', { name: '终止' }))
+    expect(onStopAgent).not.toHaveBeenCalled()
+    expect(screen.getByText('确认终止：将释放 2 个已认领项')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: '确认终止' }))
+    expect(onStopAgent).toHaveBeenCalledWith('exec-a')
+  })
+
+  it('确认态 3s 无操作还原', async () => {
+    vi.useFakeTimers()
+    try {
+      await renderPanel({
+        agents: [makeAgent('a1', 'exec-a', { execs: [makeExec('exec-a', 'RUN-1')] })],
+        fetchRun: vi.fn().mockResolvedValue(runDetail([])),
+      })
+      await act(async () => { await Promise.resolve() })
+      fireEvent.click(screen.getByRole('button', { name: '终止' }))
+      expect(screen.getByRole('button', { name: '确认终止' })).toBeTruthy()
+      act(() => { vi.advanceTimersByTime(3000) })
+      expect(screen.queryByRole('button', { name: '确认终止' })).toBeNull()
+      expect(screen.getByRole('button', { name: '终止' })).toBeTruthy()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('Orphan 行带「不受控·只读」角标与「强制 kill pid」，不可软终止', async () => {
+    const onKillOrphan = vi.fn()
+    await renderPanel({
+      agents: [makeAgent('o1', 'exec-o', { attachment: 'orphan' })],
+      pidOf: () => 4711,
+      onKillOrphan,
+    })
+    expect(screen.getByText('不受控·只读')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: '终止' })).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: '强制 kill pid' }))
+    expect(onKillOrphan).toHaveBeenCalledWith(4711)
+  })
+
+  it('零 claim 退出标注「未认领任何项」', async () => {
+    await renderPanel({
+      agents: [makeAgent('a1', 'exec-a', { status: 'exited', attachment: 'none', execs: [makeExec('exec-a', 'RUN-1')] })],
+      fetchRun: vi.fn().mockResolvedValue(runDetail([{ state: 'done', executorActor: 'cli:1' }])),
+    })
+    await act(async () => { await Promise.resolve() })
+    expect(screen.getByText('未认领任何项')).toBeTruthy()
+  })
+
+  it('空态文案 + 配置 Harness 入口；parseFailed 降级提示', async () => {
+    const onOpenHarnessSettings = vi.fn()
+    await renderPanel({ onOpenHarnessSettings, parseFailed: true })
+    expect(screen.getByText(/尚无 Agent/)).toBeTruthy()
+    expect(screen.getByText(/agents\.json 解析失败/)).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: '配置 Harness' }))
+    expect(onOpenHarnessSettings).toHaveBeenCalled()
+  })
+
+  it('当前节点名从 nodes 树解析（execs[].nodeId → title）', async () => {
+    await renderPanel({
+      agents: [makeAgent('a1', 'exec-a', { execs: [{ ...makeExec('exec-a'), nodeId: 'T-42' }] })],
+      nodes: [{ id: 'EPIC-1', type: 'epic', title: '根 Epic', status: 'open', priority: 0, children: [{ id: 'T-42', type: 'ticket', title: '登录修复', status: 'open', priority: 0 }] }],
+    })
+    expect(screen.getByText(/登录修复/)).toBeTruthy()
+  })
+})

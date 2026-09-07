@@ -3,15 +3,35 @@
  * bridge. Pull-based freshness contract (plan U10 Approach): the home
  * list re-pulls on window focus (no cross-surface push signal in v1);
  * per-home ticket data streams through events/resume subscriptions.
+ *
+ * U5 增量：executions/agents 切片——agents_list 走 pull（tab 首开 /
+ * window focus / 派发后主动拉，不进 daemon 事件流）；transcript 经
+ * Channel 推送进 ingestTranscriptEvent 归并（每 execId 独立尾窗、raw
+ * 50ms 合并刷新、2000 条有界）。
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { invoke } from '@tauri-apps/api/core'
-import { omtCall, subscribeEvents, type EventEnvelope } from './bridge'
-import type { HomeInfo, OmtNode, RunDetail, RunSummary, SavedFilters } from './types'
+import { Channel, invoke } from '@tauri-apps/api/core'
+import {
+  agentsList,
+  execKillOrphan,
+  execStop,
+  omtCall,
+  subscribeEvents,
+  type EventEnvelope,
+  type TranscriptEvent,
+} from './bridge'
+import type { AgentRecord, HomeInfo, OmtNode, RunDetail, RunSummary, SavedFilters } from './types'
 
 const FILTERS_KEY = 'tauri:ui' // KD3: surface-prefixed bag key
 const LAST_HOME_KEY = 'omt-desktop-last-home' // 启动恢复：最后选择的 workspace homeId
 const RECENT_KEY = 'recent' // KD3's single shared cross-surface key (R4)
+
+// ── U5 agents/transcript 常量 ─────────────────────────────────────────────
+const TRANSCRIPT_TAIL_CAP = 2000 // 每 exec 尾窗上限：丢最旧（内存上界 = agent 数 × cap）
+const RAW_FLUSH_MS = 50 // raw 行合并刷新窗口（避免每行一渲染）
+const EXIT_REPULL_MS = 400 // exit 后 agents_list 防抖重拉（等 Rust 侧落盘收敛）
+
+const EMPTY_TRANSCRIPT: TranscriptEvent[] = []
 
 export interface KnownHome {
   path: string
@@ -32,6 +52,16 @@ export interface TreeState {
   filters: SavedFilters
   recentIds: string[]
   runs: RunSummary[]
+  /** U5：当前 home 的 agent 列表（运行中 + 历史，跨重启保留） */
+  agents: AgentRecord[]
+  agentSeq: number
+  /** agents.json 解析失败（前端提示降级；U9 据此冻结 GC） */
+  parseFailed: boolean
+  selectedAgentId: string | null
+  /** 本 home 未查看的 Failed agent id（tab badge；选中即清除） */
+  unviewedFailedIds: string[]
+  /** 尾窗渲染信号：一次 raw 合并 flush 递增 1（高频事件不逐条渲染） */
+  transcriptVersion: number
   loading: boolean
   error: string | null
 }
@@ -46,6 +76,12 @@ const INITIAL: TreeState = {
   filters: {},
   recentIds: [],
   runs: [],
+  agents: [],
+  agentSeq: 0,
+  parseFailed: false,
+  selectedAgentId: null,
+  unviewedFailedIds: [],
+  transcriptVersion: 0,
   loading: true,
   error: null,
 }
@@ -65,6 +101,20 @@ export function presentError(error: unknown): string {
   return text
 }
 
+/**
+ * exec 的 claimed 判定（KD 定稿）：daemon 对 kind=mcp 的显式 actor 做基
+ * 命名空间嵌套，实际授予形如 `mcp:<pid>/exec:<execId>`，MCP 进程重启会换
+ * pid——必须 endsWith，不能精确相等。裸 `exec:<execId>`（无命名空间）不算
+ * desktop exec 的持有项。
+ */
+export function claimedCountForExec(
+  items: ReadonlyArray<{ executorActor?: string }>,
+  execId: string,
+): number {
+  const suffix = `/exec:${execId}`
+  return items.filter(i => typeof i.executorActor === 'string' && i.executorActor.endsWith(suffix)).length
+}
+
 export function useTreeStore() {
   const [state, setState] = useState<TreeState>(INITIAL)
   const disposers = useRef<Array<() => void>>([])
@@ -79,6 +129,157 @@ export function useTreeStore() {
     filtersRef.current = state.filters
     activeHomeRef.current = state.activeHome
   }, [state.filters, state.activeHome])
+
+  // ── U5：executions/agents 切片 ──────────────────────────────────────────
+  // 尾窗与 pending buffer 留在 ref：高频 raw 事件不进 React 调度，
+  // transcriptVersion 是唯一的渲染信号（50ms 合并 flush 一次 +1）。
+  const transcriptsRef = useRef<Map<string, TranscriptEvent[]>>(new Map())
+  const pendingRawRef = useRef<Map<string, TranscriptEvent[]>>(new Map())
+  const flushTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  const repullTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  // 已查看过的 Failed agent（选中即记入）：badge 重算时不复活
+  const viewedFailedRef = useRef<Set<string>>(new Set())
+
+  const bumpTranscriptVersion = useCallback(() => {
+    setState(s => ({ ...s, transcriptVersion: s.transcriptVersion + 1 }))
+  }, [])
+
+  const flushPendingRaw = useCallback(() => {
+    flushTimerRef.current = undefined
+    if (pendingRawRef.current.size === 0) return
+    for (const [execId, events] of pendingRawRef.current) {
+      const tail = transcriptsRef.current.get(execId) ?? []
+      for (const ev of events) tail.push(ev)
+      // 尾窗有界：丢最旧（与选中无关，全部活跃 exec 都保）
+      if (tail.length > TRANSCRIPT_TAIL_CAP) tail.splice(0, tail.length - TRANSCRIPT_TAIL_CAP)
+      transcriptsRef.current.set(execId, tail)
+    }
+    pendingRawRef.current.clear()
+    bumpTranscriptVersion()
+  }, [bumpTranscriptVersion])
+
+  const scheduleFlush = useCallback(() => {
+    if (flushTimerRef.current !== undefined) return
+    flushTimerRef.current = setTimeout(flushPendingRaw, RAW_FLUSH_MS)
+  }, [flushPendingRaw])
+
+  // agents_list pull（§四）：tab 首开 / window focus / 派发后主动拉；
+  // agents 是机器本地数据，不进 daemon 事件流。Failed badge 集合随 pull
+  // 重算（viewedFailedRef 保证已查看的不复活）。
+  const refreshAgents = useCallback(async () => {
+    const home = activeHomeRef.current
+    if (!home) return
+    try {
+      const result = await agentsList(home.homeId)
+      // 归一化放 setState 之外：updater 在 React 渲染期执行，落到本函数
+      // try/catch 之外（测试 mock 返回 {} 时不得炸渲染）
+      const agents = result.agents ?? []
+      setState(s => ({
+        ...s,
+        agents,
+        agentSeq: result.agentSeq ?? 0,
+        parseFailed: result.parseFailed ?? false,
+        unviewedFailedIds: agents
+          .filter(a => a.status === 'failed' && !viewedFailedRef.current.has(a.id))
+          .map(a => a.id),
+        error: null,
+      }))
+    } catch {
+      /* agents 面是补充面——拉取失败不打断主流程 */
+    }
+  }, [])
+
+  // exit 后防抖重拉：本地乐观更新让 UI 即时反应，重拉收敛 Rust 落盘后的
+  // 权威形态（exit code / failure detail）。
+  const scheduleAgentsRepull = useCallback(() => {
+    clearTimeout(repullTimerRef.current)
+    repullTimerRef.current = setTimeout(() => { void refreshAgents() }, EXIT_REPULL_MS)
+  }, [refreshAgents])
+
+  // exit 事件的本地联动：更新对应 agent 的 status/attachment（乐观），
+  // Failed 计入未查看 badge。
+  const applyExitLocal = useCallback((ev: Extract<TranscriptEvent, { kind: 'exit' }>) => {
+    setState(s => {
+      let failedAgentId: string | null = null
+      const agents = s.agents.map(a => {
+        if (!a.execs.some(e => e.execId === ev.execId)) return a
+        failedAgentId = a.id
+        return { ...a, status: ev.status, attachment: 'none' as const }
+      })
+      const unviewedFailedIds =
+        failedAgentId !== null &&
+        ev.status === 'failed' &&
+        !viewedFailedRef.current.has(failedAgentId) &&
+        !s.unviewedFailedIds.includes(failedAgentId)
+          ? [...s.unviewedFailedIds, failedAgentId]
+          : s.unviewedFailedIds
+      return { ...s, agents, unviewedFailedIds }
+    })
+  }, [])
+
+  const ingestTranscriptEvent = useCallback(
+    (ev: TranscriptEvent) => {
+      if (!ev || typeof ev.execId !== 'string') return
+      if (ev.kind === 'raw') {
+        // 50ms 合并：raw 行进 pending buffer，一次 flush 一次渲染
+        const pending = pendingRawRef.current.get(ev.execId) ?? []
+        pending.push(ev)
+        pendingRawRef.current.set(ev.execId, pending)
+        scheduleFlush()
+        return
+      }
+      // session_start / exit 低频且影响状态：立即入窗
+      const tail = transcriptsRef.current.get(ev.execId) ?? []
+      tail.push(ev)
+      if (tail.length > TRANSCRIPT_TAIL_CAP) tail.splice(0, tail.length - TRANSCRIPT_TAIL_CAP)
+      transcriptsRef.current.set(ev.execId, tail)
+      if (ev.kind === 'exit') {
+        applyExitLocal(ev)
+        scheduleAgentsRepull()
+      }
+      bumpTranscriptVersion()
+    },
+    [scheduleFlush, applyExitLocal, scheduleAgentsRepull, bumpTranscriptVersion],
+  )
+
+  // U6 将把本 Channel 传给 exec_start invoke（Rust 泵随子进程生命周期，
+  // KD-D3）；Channel 先建好并接入归并管线，测试经 ingestTranscriptEvent
+  // 直接驱动。
+  const transcriptChannelRef = useRef<Channel<TranscriptEvent> | null>(null)
+  if (transcriptChannelRef.current === null) {
+    const channel = new Channel<TranscriptEvent>()
+    channel.onmessage = ev => ingestTranscriptEvent(ev)
+    transcriptChannelRef.current = channel
+  }
+
+  const selectAgent = useCallback((agentId: string) => {
+    viewedFailedRef.current.add(agentId)
+    setState(s => ({
+      ...s,
+      selectedAgentId: agentId,
+      unviewedFailedIds: s.unviewedFailedIds.filter(id => id !== agentId),
+    }))
+  }, [])
+
+  const stopAgent = useCallback(async (execId: string) => {
+    try {
+      await execStop(execId)
+    } catch (error) {
+      setState(s => ({ ...s, error: presentError(error) }))
+    }
+  }, [])
+
+  const killOrphan = useCallback(
+    async (pid: number) => {
+      try {
+        await execKillOrphan(pid)
+        scheduleAgentsRepull()
+      } catch (error) {
+        setState(s => ({ ...s, error: presentError(error) }))
+      }
+    },
+    [scheduleAgentsRepull],
+  )
 
   const refreshHomes = useCallback(async () => {
     try {
@@ -241,13 +442,27 @@ export function useTreeStore() {
 
   const selectHome = useCallback(
     async (home: HomeInfo) => {
-      setState(s => ({ ...s, activeHome: home, selectedId: null, nodes: [], runs: [], filters: {} }))
+      setState(s => ({
+        ...s,
+        activeHome: home,
+        selectedId: null,
+        nodes: [],
+        runs: [],
+        filters: {},
+        // U5：切换 home 重置 agents 视图态（尾窗按 execId 键控，跨 home 保留）
+        agents: [],
+        agentSeq: 0,
+        parseFailed: false,
+        selectedAgentId: null,
+        unviewedFailedIds: [],
+      }))
+      viewedFailedRef.current.clear()
       filtersRef.current = {}
       activeHomeRef.current = home
       window.localStorage.setItem(LAST_HOME_KEY, home.homeId)
-      await Promise.all([refreshNodes(home), refreshRuns(home), loadFilters(home)])
+      await Promise.all([refreshNodes(home), refreshRuns(home), loadFilters(home), refreshAgents()])
     },
-    [refreshNodes, refreshRuns, loadFilters],
+    [refreshNodes, refreshRuns, loadFilters, refreshAgents],
   )
 
   // Declare flow (U5 consumer): register an unregistered home directory,
@@ -308,14 +523,18 @@ export function useTreeStore() {
   }, [state.activeHome, refreshNodes, refreshRuns])
 
   // Boot + pull-based home freshness on window focus (v1 contract).
+  // U5：agents_list 同享 focus 重拉（§四 pull 契约）。
   useEffect(() => {
     void refreshHomes()
     void loadKnownHomes()
     void loadRecent()
-    const onFocus = () => void refreshHomes()
+    const onFocus = () => {
+      void refreshHomes()
+      void refreshAgents()
+    }
     window.addEventListener('focus', onFocus)
     return () => window.removeEventListener('focus', onFocus)
-  }, [refreshHomes, loadRecent])
+  }, [refreshHomes, loadRecent, refreshAgents])
 
   // Load per-home data whenever the active home changes.
   useEffect(() => {
@@ -334,6 +553,23 @@ export function useTreeStore() {
     declareHome,
     refreshHomes,
     refreshNodes,
+    // ── U5：agents / transcript 切片 ─────────────────────────────────────
+    refreshAgents,
+    selectAgent,
+    stopAgent,
+    killOrphan,
+    ingestTranscriptEvent,
+    /** 某 exec 的尾窗（无则空数组）；数组原地追加，UI 以 transcriptVersion 感知 */
+    transcriptWindow: (execId: string): TranscriptEvent[] =>
+      transcriptsRef.current.get(execId) ?? EMPTY_TRANSCRIPT,
+    /** orphan 强杀所需 pid——只存在于 transcript 的 session_start 事件里 */
+    sessionPidOf: (execId: string): number | null => {
+      for (const ev of transcriptsRef.current.get(execId) ?? []) {
+        if (ev.kind === 'session_start') return ev.pid
+      }
+      return null
+    },
+    transcriptChannel: transcriptChannelRef.current,
     fetchRun: async (runId: string) => {
       const home = activeHomeRef.current
       if (!home) throw new Error('no active home')

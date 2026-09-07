@@ -8,9 +8,24 @@ import { cleanup, render, screen, waitFor } from '@testing-library/react'
 afterEach(cleanup)
 
 const invokeMock = vi.fn()
-vi.mock('@tauri-apps/api/core', () => ({
-  invoke: (...args: unknown[]) => invokeMock(...args),
-}))
+// §3.6.8：mock 工厂必须导出 Channel（凡 import Channel 的模块在只导出
+// invoke 的旧 mock 下会崩）。类定义收在工厂内：vi.mock 工厂先于模块体
+// 求值，外部类声明会踩 TDZ。
+vi.mock('@tauri-apps/api/core', () => {
+  class ChannelMock {
+    onmessage: ((message: unknown) => void) | null = null
+    send(message: unknown) {
+      this.onmessage?.(message)
+    }
+    toJSON() {
+      return '__CHANNEL__'
+    }
+  }
+  return {
+    invoke: (...args: unknown[]) => invokeMock(...args),
+    Channel: ChannelMock,
+  }
+})
 vi.mock('@tauri-apps/api/event', () => ({
   listen: vi.fn().mockResolvedValue(() => {}),
 }))

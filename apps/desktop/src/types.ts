@@ -102,3 +102,44 @@ export const NEXT_TYPES: Record<NodeType, NodeType | null> = {
   ticket: 'subticket',
   subticket: null,
 }
+
+// ── U5 Agents（R-E；wire 契约 = agents_list 的 serde camelCase 投影）──────
+
+export type AgentStatus = 'starting' | 'running' | 'exited' | 'failed' | 'killed'
+
+/** 可控性正交字段（§3.2）：orphan = 重启后 pid 仍活（只读尾随、不可 stop） */
+export type AgentAttachment = 'none' | 'live' | 'orphan'
+
+export interface ExecRecord {
+  execId: string
+  nodeId: string | null
+  runId: string | null
+  /** epoch 毫秒字符串（字典序 = 时间序；展示格式化由前端负责） */
+  startedAt: string
+  exitCode: number | null
+  killReason: string | null
+  failureDetail: string | null
+  harnessSessionId: string | null
+  transcriptFile: string | null
+  binaryPath: string | null
+  binaryArgs: string[]
+}
+
+export interface AgentRecord {
+  id: string
+  displayName: string
+  /** harness 返回前为 null——display 名回退 displayName（P0 即 Agent N） */
+  title: string | null
+  harness: string
+  status: AgentStatus
+  attachment: AgentAttachment
+  lastExecId: string | null
+  lastSessionId: string | null
+  execs: ExecRecord[]
+}
+
+export interface AgentsListResult {
+  agents: AgentRecord[]
+  agentSeq: number
+  parseFailed: boolean
+}

@@ -2,6 +2,9 @@
  * U10 app shell: tree (left) + detail/runs (center) + settings (toggle).
  * KD4 — fresh visual design; only domain concepts and status-color
  * semantics align with the DSH surface.
+ *
+ * U5：Tickets 视图的 center-pane 内层 tab「详情 | Agents」（R-E）——选中
+ * 树节点自动切详情；Agents 标签带未查看 Failed 计数 badge。
  */
 import { useCallback, useState } from 'react'
 import { WorkspaceSwitcher } from './WorkspaceSwitcher'
@@ -11,9 +14,11 @@ import { TreePanel } from './TreePanel'
 import { DetailPanel } from './DetailPanel'
 import { RunsPanel } from './RunsPanel'
 import { SettingsPanel } from './SettingsPanel'
+import { AgentsPanel } from './AgentsPanel'
 import './styles.css'
 
 type CenterView = 'detail' | 'runs' | 'settings'
+type TicketTab = 'detail' | 'agents'
 
 const TREE_WIDTH_KEY = 'omt-desktop-tree-width'
 const clampWidth = (px: number) => Math.min(720, Math.max(240, Math.round(px)))
@@ -27,6 +32,7 @@ export function App() {
   const store = useTreeStore()
   const { state } = store
   const [view, setView] = useState<CenterView>('detail')
+  const [ticketTab, setTicketTab] = useState<TicketTab>('detail')
   const [treeWidth, setTreeWidth] = useState(initialTreeWidth)
   const [switcherOpen, setSwitcherOpen] = useState(false)
 
@@ -72,23 +78,63 @@ export function App() {
             filters={state.filters}
             recentIds={state.recentIds}
             selectedId={state.selectedId}
-            onSelect={id => { store.selectNode(id); setView('detail') }}
+            onSelect={id => { store.selectNode(id); setView('detail'); setTicketTab('detail') }}
             onFilters={patch => state.activeHome && void store.saveFilters(state.activeHome, patch)}
           />
           </div>
         )}
         <div className="splitter" onPointerDown={startDrag} role="separator" aria-orientation="vertical" />
-        <section className="center-pane">
-          {view === 'detail' && state.activeHome && state.selectedId && (
-            <DetailPanel
-              home={state.activeHome}
-              nodeId={state.selectedId}
-              onUpdated={store.updateNode}
-              onSelect={store.selectNode}
-              onChanged={() => state.activeHome && void store.refreshNodes(state.activeHome)}
-            />
+        <section className={`center-pane${view === 'detail' && ticketTab === 'agents' ? ' agents-pane' : ''}`}>
+          {view === 'detail' && (
+            <>
+              <div className="inner-tabs">
+                <button
+                  className={`inner-tab${ticketTab === 'detail' ? ' active' : ''}`}
+                  onClick={() => setTicketTab('detail')}
+                >
+                  详情
+                </button>
+                <button
+                  className={`inner-tab${ticketTab === 'agents' ? ' active' : ''}`}
+                  onClick={() => { setTicketTab('agents'); void store.refreshAgents() }}
+                >
+                  Agents
+                  {state.unviewedFailedIds.length > 0 && (
+                    <span className="tab-badge">{state.unviewedFailedIds.length}</span>
+                  )}
+                </button>
+              </div>
+              {ticketTab === 'detail' && (
+                <>
+                  {state.activeHome && state.selectedId && (
+                    <DetailPanel
+                      home={state.activeHome}
+                      nodeId={state.selectedId}
+                      onUpdated={store.updateNode}
+                      onSelect={store.selectNode}
+                      onChanged={() => state.activeHome && void store.refreshNodes(state.activeHome)}
+                    />
+                  )}
+                  {!state.selectedId && <p className="empty-hint">从左侧选择一个 ticket</p>}
+                </>
+              )}
+              {ticketTab === 'agents' && state.activeHome && (
+                <AgentsPanel
+                  agents={state.agents}
+                  parseFailed={state.parseFailed}
+                  selectedAgentId={state.selectedAgentId}
+                  nodes={state.nodes}
+                  fetchRun={store.fetchRun}
+                  eventsOf={store.transcriptWindow}
+                  pidOf={store.sessionPidOf}
+                  onSelectAgent={store.selectAgent}
+                  onStopAgent={execId => void store.stopAgent(execId)}
+                  onKillOrphan={pid => void store.killOrphan(pid)}
+                  onOpenHarnessSettings={() => setView('settings')}
+                />
+              )}
+            </>
           )}
-          {view === 'detail' && !state.selectedId && <p className="empty-hint">从左侧选择一个 ticket</p>}
           {view === 'runs' && state.activeHome && (
             <RunsPanel
               home={state.activeHome}

@@ -309,6 +309,30 @@ pub fn agents_list(home_id: String) -> Result<serde_json::Value, String> {
     }))
 }
 
+/// U4 步骤 ⑥：写入 bindings.json（显式绑定 nodeId → agentId）。
+/// 原子写（tmp+rename，先例 atomic_json）；写失败由调用方转为警告。
+#[allow(dead_code)]
+pub fn write_binding(
+    runtime_dir: &Path,
+    home_id: &str,
+    node_id: &str,
+    agent_id: &str,
+) -> Result<(), String> {
+    let dir = runtime_dir.join("agents").join(home_id);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create agents dir: {e}"))?;
+    let path = dir.join("bindings.json");
+    // read-merge-write（进程内锁由调用方 DISPATCH_LOCK 保证；文件级 tmp+rename）
+    let mut bindings: BTreeMap<String, String> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default();
+    bindings.insert(node_id.to_string(), agent_id.to_string());
+    let text = serde_json::to_string_pretty(&bindings).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &text).map_err(|e| format!("write tmp: {e}"))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("rename: {e}"))
+}
+
 #[cfg(test)]
 #[allow(dead_code)]
 mod tests {
@@ -469,28 +493,4 @@ mod tests {
         // 幂等：再次 demote 无新增
         assert_eq!(demote_live_agents(&runtime).unwrap(), 0);
     }
-}
-
-/// U4 步骤 ⑥：写入 bindings.json（显式绑定 nodeId → agentId）。
-/// 原子写（tmp+rename，先例 atomic_json）；写失败由调用方转为警告。
-#[allow(dead_code)]
-pub fn write_binding(
-    runtime_dir: &Path,
-    home_id: &str,
-    node_id: &str,
-    agent_id: &str,
-) -> Result<(), String> {
-    let dir = runtime_dir.join("agents").join(home_id);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("create agents dir: {e}"))?;
-    let path = dir.join("bindings.json");
-    // read-merge-write（进程内锁由调用方 DISPATCH_LOCK 保证；文件级 tmp+rename）
-    let mut bindings: BTreeMap<String, String> = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default();
-    bindings.insert(node_id.to_string(), agent_id.to_string());
-    let text = serde_json::to_string_pretty(&bindings).map_err(|e| e.to_string())?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &text).map_err(|e| format!("write tmp: {e}"))?;
-    std::fs::rename(&tmp, &path).map_err(|e| format!("rename: {e}"))
 }

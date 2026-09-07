@@ -226,6 +226,13 @@ where
     ))
 }
 
+/// 进程内单调序号（与 pid 组合生成唯一 tmp/state 后缀）。
+pub fn unique_suffix() -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{}-{}", std::process::id(), seq)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,11 +369,4 @@ mod tests {
         let (map, _) = read_json::<BTreeMap<String, String>>(&path).unwrap();
         assert_eq!(map.len(), 8, "{map:?}");
     }
-}
-
-/// 进程内单调序号（与 pid 组合生成唯一 tmp/state 后缀）。
-pub fn unique_suffix() -> String {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    format!("{}-{}", std::process::id(), seq)
 }

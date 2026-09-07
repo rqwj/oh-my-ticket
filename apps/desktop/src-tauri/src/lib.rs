@@ -64,6 +64,7 @@ pub fn run() {
             harness::harness_config_set,
             agents::agents_list,
             executor::exec_stop,
+            executor::exec_kill_orphan,
         ])
         .build(tauri::generate_context!())
         .expect("error while building oh-my-ticket desktop")

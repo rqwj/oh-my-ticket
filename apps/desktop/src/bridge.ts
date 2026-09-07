@@ -7,6 +7,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { getVersion } from '@tauri-apps/api/app'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import type { AgentsListResult } from './types'
 
 export interface DaemonStatus {
   running: boolean
@@ -94,4 +95,58 @@ export async function subscribeEvents(
     const envelope = event.payload
     if (envelope?.homeId === homeId) onEnvelope(envelope)
   })
+}
+
+// ── U5 Agents / transcript（R-E）──────────────────────────────────────────
+// TranscriptEvent 经 Tauri Channel 推送（随子进程生命周期，KD-D3：绝不进
+// daemon 事件流）。三类事件统一 §5.3 envelope：{execId, seq, ts, kind, ...}。
+
+export interface SessionStartEvent {
+  execId: string
+  seq: number
+  /** epoch 毫秒字符串（Rust 侧 agents::now_epoch_ms，字典序 = 时间序） */
+  ts: string
+  kind: 'session_start'
+  harness: string
+  program: string
+  args: string[]
+  cwd: string
+  pid: number
+}
+
+export interface RawTranscriptEvent {
+  execId: string
+  seq: number
+  ts: string
+  kind: 'raw'
+  stream: 'stdout' | 'stderr'
+  text: string
+}
+
+export interface ExitTranscriptEvent {
+  execId: string
+  seq: number
+  ts: string
+  kind: 'exit'
+  status: 'exited' | 'failed' | 'killed'
+  code: number | null
+  killReason: string | null
+  durationMs: number
+}
+
+export type TranscriptEvent = SessionStartEvent | RawTranscriptEvent | ExitTranscriptEvent
+
+/** agents_list（F-U4a-8）：pull 契约 = tab 首开 / window focus / 派发后主动拉。 */
+export async function agentsList(homeId: string): Promise<AgentsListResult> {
+  return invoke<AgentsListResult>('agents_list', { homeId })
+}
+
+/** 终止一个 exec（幂等：已终态/不存在的 execId 返回成功）。 */
+export async function execStop(execId: string): Promise<void> {
+  return invoke<void>('exec_stop', { execId })
+}
+
+/** Orphan 强制 kill（§3.2：Orphan 只读尾随、不可 exec_stop）。pid 取自 transcript 的 session_start 事件。 */
+export async function execKillOrphan(pid: number): Promise<void> {
+  return invoke<void>('exec_kill_orphan', { pid })
 }

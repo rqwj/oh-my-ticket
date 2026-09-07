@@ -125,6 +125,10 @@ pub struct ExecSession {
     pub started: Instant,
     /// 事件出口（waiter 与 kill_all 路径共用；U4 接 Tauri Channel）
     sink: EventSink,
+    /// 事件序号（F-U2-6：三类事件统一 §5.3 envelope——`{execId, seq, ts,
+    /// kind, ...}`）。计数器随 ExecSession 创建（session_start 发出前），
+    /// session_start 恒为 seq 0，之后严格递增。
+    seq: AtomicU64,
     first_event_seen: AtomicBool,
     /// 终止方设置的原因：exec_stop=User、kill_all=AppExit、watchdog=MaxDuration
     stop_reason: Mutex<Option<KillReason>>,
@@ -452,6 +456,7 @@ impl ExecutionManager {
             mcp: req.mcp.clone(),
             started,
             sink: on_event.clone(),
+            seq: AtomicU64::new(0),
             first_event_seen: AtomicBool::new(false),
             stop_reason: Mutex::new(None),
             terminal: Mutex::new(None),
@@ -461,8 +466,12 @@ impl ExecutionManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(req.exec_id.clone(), session.clone());
 
+        // F-U2-6：session_start 与 raw/exit 同构——统一携带 seq/ts
+        let start_seq = session.seq.fetch_add(1, Ordering::Relaxed);
         on_event(serde_json::json!({
             "execId": req.exec_id,
+            "seq": start_seq,
+            "ts": agents::now_epoch_ms(),
             "kind": "session_start",
             "harness": req.harness,
             "program": session.program.display().to_string(),
@@ -472,14 +481,12 @@ impl ExecutionManager {
         }));
 
         // stdout/stderr 读线程：逐行 → 事件回调 + raw.log 追加。
-        let seq = Arc::new(AtomicU64::new(0));
         let mut readers = Vec::new();
         if let Some(out) = child.stdout.take() {
             readers.push(spawn_reader(
                 out,
                 "stdout",
                 session.clone(),
-                seq.clone(),
                 on_event.clone(),
             ));
         }
@@ -488,7 +495,6 @@ impl ExecutionManager {
                 err,
                 "stderr",
                 session.clone(),
-                seq.clone(),
                 on_event.clone(),
             ));
         }
@@ -640,7 +646,6 @@ fn spawn_reader(
     pipe: impl std::io::Read + Send + 'static,
     stream: &'static str,
     session: Arc<ExecSession>,
-    seq: Arc<AtomicU64>,
     on_event: EventSink,
 ) -> std::thread::JoinHandle<()> {
     let mut log = std::fs::OpenOptions::new()
@@ -654,7 +659,7 @@ fn spawn_reader(
         for line in reader.lines() {
             let Ok(line) = line else { break };
             session.first_event_seen.store(true, Ordering::Relaxed);
-            let n = seq.fetch_add(1, Ordering::Relaxed);
+            let n = session.seq.fetch_add(1, Ordering::Relaxed);
             on_event(serde_json::json!({
                 "execId": session.exec_id,
                 "seq": n,
@@ -764,8 +769,12 @@ fn finish_terminal(session: &ExecSession, terminal: &Terminal) {
         },
     );
     let duration_ms = session.started.elapsed().as_millis() as u64;
+    // F-U2-6：exit 事件同样携带 seq/ts（与 session_start、raw 同构）
+    let exit_seq = session.seq.fetch_add(1, Ordering::Relaxed);
     (session.sink)(serde_json::json!({
         "execId": session.exec_id,
+        "seq": exit_seq,
+        "ts": agents::now_epoch_ms(),
         "kind": "exit",
         "status": match status {
             AgentRecordStatus::Exited => "exited",
@@ -792,6 +801,28 @@ pub fn exec_stop(
     exec_id: String,
 ) -> Result<(), String> {
     state.0.exec_stop(&exec_id)
+}
+
+/// Orphan 强制 kill（§3.2 契约：Orphan=重启后 pid 仍活、只读尾随、不可
+/// exec_stop，提供「强制 kill pid」逃生口）。仅 SIGKILL 单 pid——重启后
+/// 进程组归属不可信，不做 killpg。pid 由前端取自 transcript 的
+/// session_start 事件。
+pub fn kill_orphan_pid(pid: u32) -> Result<(), String> {
+    // u32 → i32 防回绕：负值 pid 是 killpg 语义，绝不能经此路径发出
+    let pid_i = i32::try_from(pid).map_err(|_| format!("pid 越界: {pid}"))?;
+    let rc = unsafe { libc::kill(pid_i, libc::SIGKILL) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(format!("kill({pid}, SIGKILL) 失败: {err}"));
+    }
+    Ok(())
+}
+
+/// Orphan 的「强制 kill pid」tauri command（计划 U5 Files 的已记录偏离：
+/// §3.2:108 要求该控件存在但 Files 漏列了实现面）。
+#[tauri::command(async)]
+pub fn exec_kill_orphan(pid: u32) -> Result<(), String> {
+    kill_orphan_pid(pid)
 }
 
 /// 轮询等待条件成立（非阻塞检查 + 50ms 步进）；测试与等待线程共用。
@@ -915,7 +946,7 @@ fn dispatch_chain(
     }
     let active_runs: Vec<String> = node_resp["runs"]
         .as_array()
-        .map(|v| v.clone())
+        .cloned()
         .unwrap_or_default()
         .iter()
         .filter_map(|r| r["runId"].as_str().map(<str as ToOwned>::to_owned))
@@ -1450,6 +1481,7 @@ mod tests {
             mcp: McpInjection::None,
             started: Instant::now(),
             sink: Arc::new(|_| {}),
+            seq: AtomicU64::new(0),
             first_event_seen: AtomicBool::new(true),
             stop_reason: Mutex::new(Some(KillReason::AppExit)),
             terminal: Mutex::new(None),
@@ -1507,6 +1539,7 @@ mod tests {
             mcp: McpInjection::None,
             started: Instant::now(),
             sink: Arc::new(|_| {}),
+            seq: AtomicU64::new(0),
             first_event_seen: AtomicBool::new(true),
             stop_reason: Mutex::new(Some(KillReason::AppExit)),
             terminal: Mutex::new(None),
@@ -1741,6 +1774,97 @@ mod tests {
             "session_start 的 args 必须脱敏"
         );
         let _ = manager.exec_stop("exec-args");
+    }
+
+    #[test]
+    fn event_envelope_is_uniform_across_all_kinds() {
+        // F-U2-6：三类事件统一 §5.3 envelope——{execId, seq, ts, kind, ...}；
+        // session_start 恒为 seq 0，后续事件 seq 严格递增（ts 为 epoch 毫秒
+        // 字符串）。
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        let home_path = dir.path().join("ws").join(".omt");
+        std::fs::create_dir_all(&home_path).unwrap();
+        let manager = ExecutionManager::with_limits(STARTUP_WINDOW, DEFAULT_MAX_DURATION);
+        let script = write_script(dir.path(), "envelope", "echo hi\nexit 0\n");
+        let (tx, rx) = mpsc::channel();
+        let sink: EventSink = Arc::new(move |v| {
+            let _ = tx.send(v);
+        });
+        let session = manager
+            .spawn(
+                &runtime,
+                SpawnRequest {
+                    exec_id: "exec-envelope".into(),
+                    agent_id: "agent-envelope".into(),
+                    home_id: "h_test".into(),
+                    home_path: home_path.clone(),
+                    harness: "fake".into(),
+                    node_id: None,
+                    run_id: None,
+                    program: script,
+                    args: vec![],
+                    env_additions: BTreeMap::new(),
+                    mcp: McpInjection::None,
+                },
+                sink,
+            )
+            .unwrap();
+        let terminal = wait_for(|| session.terminal(), Duration::from_secs(5));
+        assert!(
+            matches!(terminal, Some(Terminal::Exited(0))),
+            "{terminal:?}"
+        );
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        for kind in ["session_start", "raw", "exit"] {
+            let event = events
+                .iter()
+                .find(|e| e["kind"] == kind)
+                .unwrap_or_else(|| panic!("缺少 {kind} 事件"));
+            assert!(event["seq"].is_u64(), "{kind} 缺 seq: {event}");
+            let ts = event["ts"].as_str().unwrap_or_default();
+            assert!(
+                !ts.is_empty() && ts.chars().all(|c| c.is_ascii_digit()),
+                "{kind} 的 ts 应为 epoch 毫秒字符串: {event}"
+            );
+            assert_eq!(event["execId"], "exec-envelope", "{kind} 缺 execId");
+        }
+        let mut seqs: Vec<u64> = events.iter().filter_map(|e| e["seq"].as_u64()).collect();
+        seqs.sort_unstable();
+        assert_eq!(seqs.first(), Some(&0), "session_start 应为 seq 0");
+        assert!(
+            seqs.windows(2).all(|w| w[0] < w[1]),
+            "seq 必须严格递增: {seqs:?}"
+        );
+    }
+
+    #[test]
+    fn kill_orphan_pid_kills_living_process() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        kill_orphan_pid(pid).expect("存活 pid 应 kill 成功");
+        let status = child.wait().unwrap();
+        #[cfg(unix)]
+        assert!(
+            status.signal() == Some(libc::SIGKILL),
+            "目标应死于 SIGKILL: {status:?}"
+        );
+    }
+
+    #[test]
+    fn kill_orphan_pid_errors_when_no_such_process() {
+        // pid_max 现实上界远低于 i32::MAX：取上界附近的 pid 必然 ESRCH——
+        // 不用「已收割 pid」防理论上的 pid 复用误杀无辜进程。
+        let err = kill_orphan_pid((i32::MAX - 1) as u32).expect_err("不存在的 pid 应报错");
+        assert!(err.contains("失败"), "{err}");
     }
 
     #[test]

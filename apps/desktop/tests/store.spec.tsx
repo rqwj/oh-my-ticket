@@ -13,9 +13,25 @@ import { presentError } from '../src/store'
 
 afterEach(cleanup)
 const invokeMock = vi.fn()
-vi.mock('@tauri-apps/api/core', () => ({
-  invoke: (...args: unknown[]) => invokeMock(...args),
-}))
+// §3.6.8：mock 工厂必须导出 Channel（凡 import Channel 的模块——U5 起
+// store.ts 建转录 Channel——在只导出 invoke 的旧 mock 下会崩）。可 new、
+// onmessage 可注入（对齐 @tauri-apps/api Channel 的消费方式）。类定义
+// 收在工厂内：vi.mock 工厂先于模块体求值，外部类声明会踩 TDZ。
+vi.mock('@tauri-apps/api/core', () => {
+  class ChannelMock {
+    onmessage: ((message: unknown) => void) | null = null
+    send(message: unknown) {
+      this.onmessage?.(message)
+    }
+    toJSON() {
+      return '__CHANNEL__'
+    }
+  }
+  return {
+    invoke: (...args: unknown[]) => invokeMock(...args),
+    Channel: ChannelMock,
+  }
+})
 vi.mock('@tauri-apps/api/event', () => ({
   listen: vi.fn().mockResolvedValue(() => {}),
 }))

@@ -1,0 +1,290 @@
+/**
+ * U5 (R-E): Agents 面板 —— agent 列表（运行中 + 历史，跨重启保留）+
+ * 选中 agent 的 TranscriptView。列表按 status 分组（Running/Starting 在
+ * 前，Exited/Failed/Killed 次之）；Orphan 行带「不受控·只读」角标：只读
+ * 尾随、不可 exec_stop，仅提供「强制 kill pid」（§3.2）。
+ *
+ * run item 统计走 run/get 单 run 拉取（§四：不挂 run/list 全量刷新），
+ * 按 runId 缓存避免重复拉取；claimed 判定 =
+ * executorActor.endsWith('/exec:<execId>')（嵌套命名空间，KD 定稿）。
+ */
+import { useEffect, useRef, useState } from 'react'
+import type { TranscriptEvent } from './bridge'
+import type { AgentRecord, ExecRecord, OmtNode, RunDetail, RunItemView } from './types'
+import { claimedCountForExec } from './store'
+import { TranscriptView } from './TranscriptView'
+
+const CONFIRM_RESET_MS = 3000
+
+/** 展示名：harness 给出的 title 优先，回退记录 displayName（P0 即 Agent N）。 */
+export function agentDisplayName(agent: AgentRecord): string {
+  return agent.title ?? agent.displayName
+}
+
+/** 最新 exec：lastExecId 指针优先，缺失时回退 execs[] 末位。 */
+export function latestExecOf(agent: AgentRecord): ExecRecord | null {
+  if (agent.execs.length === 0) return null
+  return agent.execs.find(e => e.execId === agent.lastExecId) ?? agent.execs[agent.execs.length - 1]
+}
+
+/** 列表分组：活跃在前、Orphan（不受控）居中、终态殿后。 */
+export function groupAgents(agents: AgentRecord[]): {
+  active: AgentRecord[]
+  orphan: AgentRecord[]
+  finished: AgentRecord[]
+} {
+  const active: AgentRecord[] = []
+  const orphan: AgentRecord[] = []
+  const finished: AgentRecord[] = []
+  for (const agent of agents) {
+    if (agent.attachment === 'orphan') orphan.push(agent)
+    else if (agent.status === 'running' || agent.status === 'starting') active.push(agent)
+    else finished.push(agent)
+  }
+  return { active, orphan, finished }
+}
+
+/** nodes 树内按 id 查 title（当前节点展示用；找不到回退 nodeId）。 */
+export function nodeTitleOf(nodes: OmtNode[], id: string): string | null {
+  for (const node of nodes) {
+    if (node.id === id) return node.title
+    const found = node.children ? nodeTitleOf(node.children, id) : null
+    if (found !== null) return found
+  }
+  return null
+}
+
+interface RunStat {
+  done: number
+  failed: number
+  items: RunItemView[]
+}
+
+export function statsOf(detail: RunDetail): RunStat {
+  const items = detail.items ?? []
+  return {
+    done: items.filter(i => i.state === 'done').length,
+    failed: items.filter(i => i.state === 'failed').length,
+    items,
+  }
+}
+
+/**
+ * 两段式终止控件（原 §九-8）：首击变行内「确认终止：将释放 N 个已认领项」
+ * （N 未知时省略计数），3s 无操作还原，二击执行。
+ */
+export function ConfirmStopButton({
+  claimed,
+  onConfirm,
+}: {
+  claimed: number | null
+  onConfirm: () => void
+}) {
+  const [arming, setArming] = useState(false)
+  useEffect(() => {
+    if (!arming) return
+    const timer = setTimeout(() => setArming(false), CONFIRM_RESET_MS)
+    return () => clearTimeout(timer)
+  }, [arming])
+  if (!arming) {
+    return (
+      <button
+        className="chip agent-stop-btn"
+        onClick={event => {
+          event.stopPropagation()
+          setArming(true)
+        }}
+      >
+        终止
+      </button>
+    )
+  }
+  return (
+    <span className="confirm-stop" onClick={event => event.stopPropagation()}>
+      确认终止{claimed !== null ? `：将释放 ${claimed} 个已认领项` : ''}
+      <button
+        className="chip active"
+        onClick={event => {
+          event.stopPropagation()
+          onConfirm()
+        }}
+      >
+        确认终止
+      </button>
+      <button
+        className="chip"
+        onClick={event => {
+          event.stopPropagation()
+          setArming(false)
+        }}
+      >
+        取消
+      </button>
+    </span>
+  )
+}
+
+interface Props {
+  agents: AgentRecord[]
+  parseFailed: boolean
+  selectedAgentId: string | null
+  nodes: OmtNode[]
+  fetchRun: (runId: string) => Promise<RunDetail>
+  eventsOf: (execId: string) => TranscriptEvent[]
+  pidOf: (execId: string) => number | null
+  onSelectAgent: (id: string) => void
+  onStopAgent: (execId: string) => void
+  onKillOrphan: (pid: number) => void
+  onOpenHarnessSettings: () => void
+}
+
+export function AgentsPanel({
+  agents,
+  parseFailed,
+  selectedAgentId,
+  nodes,
+  fetchRun,
+  eventsOf,
+  pidOf,
+  onSelectAgent,
+  onStopAgent,
+  onKillOrphan,
+  onOpenHarnessSettings,
+}: Props) {
+  const [stats, setStats] = useState<Record<string, RunStat>>({})
+  const statsRef = useRef<Record<string, RunStat>>({})
+
+  // run item 统计：对列表内出现的 runId 做 run/get 单拉；runId 缓存跨
+  // 重渲染复用（agents 重拉不重取）。
+  useEffect(() => {
+    let cancelled = false
+    for (const agent of agents) {
+      const exec = latestExecOf(agent)
+      const runId = exec?.runId
+      if (!runId || statsRef.current[runId]) continue
+      void fetchRun(runId)
+        .then(detail => {
+          if (cancelled) return
+          statsRef.current = { ...statsRef.current, [runId]: statsOf(detail) }
+          setStats(statsRef.current)
+        })
+        .catch(() => {
+          /* 统计是展示增强——失败留白 */
+        })
+    }
+    return () => {
+      cancelled = true
+    }
+  }, [agents, fetchRun])
+
+  if (agents.length === 0) {
+    return (
+      <div className="agents-empty">
+        {parseFailed && (
+          <p className="error-banner">agents.json 解析失败——已降级为空列表（损坏文件已留证 .corrupt-*）</p>
+        )}
+        <p className="empty-hint">尚无 Agent——在 ticket 详情点『运行』派发</p>
+        <button className="chip" onClick={onOpenHarnessSettings}>
+          配置 Harness
+        </button>
+      </div>
+    )
+  }
+
+  const groups = groupAgents(agents)
+  const selected = agents.find(a => a.id === selectedAgentId) ?? null
+  const selectedExec = selected ? latestExecOf(selected) : null
+  const selectedStat = selectedExec?.runId ? stats[selectedExec.runId] : undefined
+  const selectedClaimed =
+    selectedExec && selectedStat ? claimedCountForExec(selectedStat.items, selectedExec.execId) : null
+
+  const renderRow = (agent: AgentRecord) => {
+    const exec = latestExecOf(agent)
+    const stat = exec?.runId ? stats[exec.runId] : undefined
+    const claimed = exec && stat ? claimedCountForExec(stat.items, exec.execId) : null
+    const nodeTitle = exec?.nodeId ? nodeTitleOf(nodes, exec.nodeId) : null
+    const stoppable =
+      agent.attachment === 'live' && (agent.status === 'running' || agent.status === 'starting')
+    const selectedClass = agent.id === selectedAgentId ? ' selected' : ''
+    const orphanPid = agent.attachment === 'orphan' && exec ? pidOf(exec.execId) : null
+    return (
+      <div
+        key={agent.id}
+        className={`agent-row${selectedClass}`}
+        role="button"
+        tabIndex={0}
+        onClick={() => onSelectAgent(agent.id)}
+        onKeyDown={event => {
+          if (event.key === 'Enter') onSelectAgent(agent.id)
+        }}
+      >
+        <div className="agent-row-main">
+          <span className="agent-name">{agentDisplayName(agent)}</span>
+          <span className={`chip agent-status st-${agent.status}`}>{agent.status}</span>
+          {agent.attachment === 'orphan' && (
+            <span className="orphan-badge" title="重启后 pid 仍存活：只读尾随，不可受控终止">
+              不受控·只读
+            </span>
+          )}
+          <span className="row-spacer" />
+          {stoppable && exec && (
+            <ConfirmStopButton claimed={claimed} onConfirm={() => onStopAgent(exec.execId)} />
+          )}
+          {agent.attachment === 'orphan' &&
+            (orphanPid !== null ? (
+              <button
+                className="chip agent-kill-btn"
+                onClick={event => {
+                  event.stopPropagation()
+                  onKillOrphan(orphanPid)
+                }}
+              >
+                强制 kill pid
+              </button>
+            ) : (
+              <span className="agent-kill-btn orphan-badge" title="pid 来自 transcript 的 session_start 事件，回放后可用">
+                强制 kill pid
+              </span>
+            ))}
+        </div>
+        <div className="agent-row-sub">
+          <span className="mono">{agent.harness}</span>
+          {nodeTitle && <span className="node-title">· {nodeTitle}</span>}
+          {stat && <span className="run-progress">完成 {stat.done} / 失败 {stat.failed}</span>}
+          {agent.status === 'exited' && stat && claimed === 0 && (
+            <span className="agent-unclaimed">未认领任何项</span>
+          )}
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="agents-layout">
+      <div className="agents-list">
+        {parseFailed && (
+          <p className="error-banner">agents.json 解析失败——已降级为空列表（损坏文件已留证 .corrupt-*）</p>
+        )}
+        {groups.active.length > 0 && <p className="agents-group-label">运行中</p>}
+        {groups.active.map(renderRow)}
+        {groups.orphan.length > 0 && <p className="agents-group-label">不受控（重启遗留）</p>}
+        {groups.orphan.map(renderRow)}
+        {groups.finished.length > 0 && <p className="agents-group-label">已结束</p>}
+        {groups.finished.map(renderRow)}
+      </div>
+      <div className="agents-transcript">
+        {selected && selectedExec ? (
+          <TranscriptView
+            key={selectedExec.execId}
+            agent={selected}
+            events={eventsOf(selectedExec.execId)}
+            claimed={selectedClaimed}
+            onStopAgent={() => onStopAgent(selectedExec.execId)}
+          />
+        ) : (
+          <TranscriptView agent={null} events={[]} />
+        )}
+      </div>
+    </div>
+  )
+}
