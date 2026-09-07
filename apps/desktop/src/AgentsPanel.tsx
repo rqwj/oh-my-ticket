@@ -11,7 +11,7 @@
 import { useEffect, useRef, useState } from 'react'
 import type { TranscriptEvent } from './bridge'
 import type { AgentRecord, ExecRecord, OmtNode, RunDetail, RunItemView } from './types'
-import { claimedCountForExec } from './store'
+import { claimedCountForExec, danglingBindingsOf } from './store'
 import { TranscriptView } from './TranscriptView'
 
 const CONFIRM_RESET_MS = 3000
@@ -129,6 +129,9 @@ interface Props {
   parseFailed: boolean
   selectedAgentId: string | null
   nodes: OmtNode[]
+  /** U9：显式绑定表 + 降级标志——悬空绑定计数与清理按钮的数据源 */
+  bindings?: Record<string, string>
+  bindingsDegraded?: boolean
   fetchRun: (runId: string) => Promise<RunDetail>
   eventsOf: (execId: string) => TranscriptEvent[]
   pidOf: (execId: string) => number | null
@@ -136,6 +139,8 @@ interface Props {
   onStopAgent: (execId: string) => void
   onKillOrphan: (pid: number) => void
   onOpenHarnessSettings: () => void
+  /** U9：一键清理悬空绑定（bindings_gc，成功后 App/store 侧重拉绑定表） */
+  onGcBindings?: () => void
 }
 
 export function AgentsPanel({
@@ -143,6 +148,8 @@ export function AgentsPanel({
   parseFailed,
   selectedAgentId,
   nodes,
+  bindings = {},
+  bindingsDegraded = false,
   fetchRun,
   eventsOf,
   pidOf,
@@ -150,6 +157,7 @@ export function AgentsPanel({
   onStopAgent,
   onKillOrphan,
   onOpenHarnessSettings,
+  onGcBindings,
 }: Props) {
   const [stats, setStats] = useState<Record<string, RunStat>>({})
   const statsRef = useRef<Record<string, RunStat>>({})
@@ -177,6 +185,19 @@ export function AgentsPanel({
     }
   }, [agents, fetchRun])
 
+  // U9：悬空绑定（agentId 不在当前 agents 列表）。降级期间冻结悬空判定
+  // （bindingsDegraded / parseFailed——降级空表会把全部绑定误判失效）。
+  const dangling = bindingsDegraded || parseFailed ? [] : danglingBindingsOf(bindings, agents)
+  const gcBar =
+    onGcBindings && dangling.length > 0 ? (
+      <div className="gc-bar">
+        <span className="empty-hint">{dangling.length} 条绑定指向不存在的 Agent</span>
+        <button className="chip" onClick={onGcBindings}>
+          清理失效绑定 ({dangling.length})
+        </button>
+      </div>
+    ) : null
+
   if (agents.length === 0) {
     return (
       <div className="agents-empty">
@@ -184,6 +205,7 @@ export function AgentsPanel({
           <p className="error-banner">agents.json 解析失败——已降级为空列表（损坏文件已留证 .corrupt-*）</p>
         )}
         <p className="empty-hint">尚无 Agent——在 ticket 详情点『运行』派发</p>
+        {gcBar}
         <button className="chip" onClick={onOpenHarnessSettings}>
           配置 Harness
         </button>
@@ -265,6 +287,7 @@ export function AgentsPanel({
         {parseFailed && (
           <p className="error-banner">agents.json 解析失败——已降级为空列表（损坏文件已留证 .corrupt-*）</p>
         )}
+        {gcBar}
         {groups.active.length > 0 && <p className="agents-group-label">运行中</p>}
         {groups.active.map(renderRow)}
         {groups.orphan.length > 0 && <p className="agents-group-label">不受控（重启遗留）</p>}

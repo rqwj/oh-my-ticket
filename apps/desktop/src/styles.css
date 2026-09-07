@@ -348,6 +348,21 @@ body {
   align-items: center; justify-content: center; gap: 12px;
 }
 
+/* ── U9：绑定 badge 与一键清理（R-C）────────────────────────────────── */
+.binding-badge {
+  display: inline-flex; align-items: center;
+  font-size: 10px; font-weight: 600; padding: 0 7px;
+  border-radius: 999px; flex-shrink: 0; line-height: 16px;
+}
+.binding-badge.direct { color: #0d1117; background: #a371f7; }
+.binding-badge.inherited { color: var(--muted); border: 1px solid var(--border); }
+.binding-badge.dangling { color: var(--danger); border: 1px solid var(--danger); }
+.gc-bar {
+  display: flex; gap: 8px; align-items: center; justify-content: space-between;
+  padding: 2px 2px 6px;
+}
+.binding-hint strong { font-weight: 700; }
+
 /* ── U5：TranscriptView（手写虚拟化 + 自动跟随）───────────────────────── */
 .transcript-view { display: flex; flex-direction: column; flex: 1; min-height: 0; }
 .transcript-hint { padding: 24px 0; text-align: center; }

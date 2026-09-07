@@ -5,6 +5,8 @@
  *
  * U5：Tickets 视图的 center-pane 内层 tab「详情 | Agents」（R-E）——选中
  * 树节点自动切详情；Agents 标签带未查看 Failed 计数 badge。
+ * U9：树 badge 的绑定数据（bindingsByHome/agents）与 Agents 面一键清理
+ * 接线；派发成功后 refreshBindings（R-C）。
  */
 import { useCallback, useState } from 'react'
 import { WorkspaceSwitcher } from './WorkspaceSwitcher'
@@ -58,8 +60,10 @@ export function App() {
 
   const handleDispatched = useCallback((outcome: ExecStartOutcome) => {
     setDispatchWarnings(outcome.warnings ?? [])
+    // U9 pull 契约：派发成功后重拉绑定表（⑥ 写入已先于 exec_start 返回）
+    void store.refreshBindings()
     switchToAgent(outcome.agentId)
-  }, [switchToAgent])
+  }, [switchToAgent, store])
 
   // Drag-to-resize the tree/center splitter: pointer captured on the
   // divider, width clamped 240–720px, persisted across launches.
@@ -103,6 +107,9 @@ export function App() {
             filters={state.filters}
             recentIds={state.recentIds}
             selectedId={state.selectedId}
+            bindings={state.bindingsByHome[state.activeHome.homeId] ?? {}}
+            agents={state.agents}
+            bindingsDegraded={state.bindingsParseFailed}
             onSelect={id => { store.selectNode(id); setView('detail'); setTicketTab('detail') }}
             onFilters={patch => state.activeHome && void store.saveFilters(state.activeHome, patch)}
           />
@@ -158,12 +165,15 @@ export function App() {
                     parseFailed={state.parseFailed}
                     selectedAgentId={state.selectedAgentId}
                     nodes={state.nodes}
+                    bindings={state.bindingsByHome[state.activeHome.homeId] ?? {}}
+                    bindingsDegraded={state.bindingsParseFailed}
                     fetchRun={store.fetchRun}
                     eventsOf={store.transcriptWindow}
                     pidOf={store.sessionPidOf}
                     onSelectAgent={store.selectAgent}
                     onStopAgent={execId => void store.stopAgent(execId)}
                     onKillOrphan={pid => void store.killOrphan(pid)}
+                    onGcBindings={() => void store.gcBindings()}
                     onOpenHarnessSettings={() => setView('settings')}
                   />
                 </>

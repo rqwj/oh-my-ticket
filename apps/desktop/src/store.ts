@@ -13,11 +13,17 @@
  * HarnessEntry）、bag v2 helpers（defaultHarness/approvalAck，只动 v2
  * 字段）、startDispatch（per-dispatch Channel → exec_start，成功后防抖
  * 拉 agents_list）——执行弹窗的数据源（R-B）。
+ *
+ * U9 增量：bindings 切片——bindingsByHome（bindings_get pull，契约对齐
+ * agents）+ 子树继承解析纯函数（resolveBindingForNode / bindingViewForNode
+ * / danglingBindingsOf，R-C）+ gcBindings（一键清理，Rust 侧降级冻结）。
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Channel, invoke } from '@tauri-apps/api/core'
 import {
   agentsList,
+  bindingsGet,
+  bindingsGc,
   execKillOrphan,
   execStart,
   execStop,
@@ -69,6 +75,85 @@ export interface HarnessUserConfigInput {
   binary: { kind: 'detected' } | { kind: 'manual'; path: string }
   extraArgs: string[]
   env: Record<string, string>
+}
+
+// ── U9（R-C）绑定解析纯函数：显式绑定只写派发节点，读侧沿祖先链取最近 ───────
+
+/** resolveBindingForNode 的解析结果（badge/弹窗预选共用的中间形态）。 */
+export type ResolvedBinding =
+  | { agentId: string; source: 'direct' }
+  | { agentId: string; source: 'inherited'; viaNodeId: string }
+
+/**
+ * 子树继承解析（§U9 Approach）：沿祖先链（parentId 上溯）取最近绑定——
+ * 自身命中为 direct，祖先命中为 inherited（viaNodeId = 提供绑定的最近
+ * 祖先）。绑定不因 archived 失效：archived 祖先的绑定仍参与解析（badge
+ * 只是跳过渲染，restore 后回归）。
+ */
+export function resolveBindingForNode(
+  bindings: Record<string, string>,
+  nodes: OmtNode[],
+  nodeId: string,
+): ResolvedBinding | null {
+  const byId = new Map<string, OmtNode>()
+  const walk = (list: OmtNode[]) => {
+    for (const node of list) {
+      byId.set(node.id, node)
+      if (node.children) walk(node.children)
+    }
+  }
+  walk(nodes)
+  let current = byId.get(nodeId)
+  while (current) {
+    const agentId = bindings[current.id]
+    if (agentId) {
+      return current.id === nodeId
+        ? { agentId, source: 'direct' }
+        : { agentId, source: 'inherited', viaNodeId: current.id }
+    }
+    current = current.parentId ? byId.get(current.parentId) : undefined
+  }
+  return null
+}
+
+/** badge 渲染视图：解析结果 × agents 现况（TreePanel NodeRow 消费）。 */
+export type NodeBindingView =
+  | { state: 'direct'; agentId: string; agent: AgentRecord }
+  | { state: 'inherited'; agentId: string; agent: AgentRecord; viaNodeId: string }
+  | { state: 'dangling'; agentId: string; agent: null }
+
+/**
+ * 悬空判定：agentId 不在当前 agents 列表 → 失效。`degraded`（parseFailed）
+ * 时冻结悬空判定并返回 null（数据降级——降级空表会把全部绑定误判失效，
+ * §3.6.6 的读侧对称纪律）。
+ */
+export function bindingViewForNode(
+  bindings: Record<string, string>,
+  nodes: OmtNode[],
+  nodeId: string,
+  agents: AgentRecord[],
+  degraded: boolean,
+): NodeBindingView | null {
+  const resolved = resolveBindingForNode(bindings, nodes, nodeId)
+  if (!resolved) return null
+  const agent = agents.find(a => a.id === resolved.agentId) ?? null
+  if (!agent) {
+    return degraded ? null : { state: 'dangling', agentId: resolved.agentId, agent: null }
+  }
+  return resolved.source === 'direct'
+    ? { state: 'direct', agentId: resolved.agentId, agent }
+    : { state: 'inherited', agentId: resolved.agentId, agent, viaNodeId: resolved.viaNodeId }
+}
+
+/** 悬空绑定清单（Agents 面一键清理的计数与存在性依据；降级期间不消费）。 */
+export function danglingBindingsOf(
+  bindings: Record<string, string>,
+  agents: AgentRecord[],
+): Array<{ nodeId: string; agentId: string }> {
+  const ids = new Set(agents.map(a => a.id))
+  return Object.entries(bindings)
+    .filter(([, agentId]) => !ids.has(agentId))
+    .map(([nodeId, agentId]) => ({ nodeId, agentId }))
 }
 
 /** 保存一个 provider 的用户配置（校验+原子落盘），返回最新投影。U7 复用。 */
@@ -172,6 +257,10 @@ export interface TreeState {
   selectedAgentId: string | null
   /** 本 home 未查看的 Failed agent id（tab badge；选中即清除） */
   unviewedFailedIds: string[]
+  /** U9：各 home 的显式绑定表（nodeId → agentId；读侧做继承解析） */
+  bindingsByHome: Record<string, Record<string, string>>
+  /** 当前 home 绑定数据降级（bindings_get parseFailed，粘性）——悬空判定冻结 */
+  bindingsParseFailed: boolean
   /** 尾窗渲染信号：一次 raw 合并 flush 递增 1（高频事件不逐条渲染） */
   transcriptVersion: number
   loading: boolean
@@ -193,6 +282,8 @@ const INITIAL: TreeState = {
   parseFailed: false,
   selectedAgentId: null,
   unviewedFailedIds: [],
+  bindingsByHome: {},
+  bindingsParseFailed: false,
   transcriptVersion: 0,
   loading: true,
   error: null,
@@ -301,6 +392,38 @@ export function useTreeStore() {
     }
   }, [])
 
+  // bindings_get pull（§四，契约对齐 agents）：selectHome / window focus /
+  // 派发后主动拉；按 home 键入 bindingsByHome。失败不打断主流程（badge 与
+  // 弹窗预选静默缺席）。
+  const refreshBindings = useCallback(async () => {
+    const home = activeHomeRef.current
+    if (!home) return
+    try {
+      const result = await bindingsGet(home.homeId)
+      const bindings = result.bindings ?? {}
+      setState(s => ({
+        ...s,
+        bindingsByHome: { ...s.bindingsByHome, [home.homeId]: bindings },
+        bindingsParseFailed: result.parseFailed ?? false,
+      }))
+    } catch {
+      /* 绑定是补充面——拉取失败不打断主流程 */
+    }
+  }, [])
+
+  // U9 一键清理（Agents 面）：bindings_gc，成功后重拉绑定表。Rust 侧在
+  // agents.json 降级时拒绝（§3.6.6 GC 冻结），错误如实进全局 error。
+  const gcBindings = useCallback(async () => {
+    const home = activeHomeRef.current
+    if (!home) return
+    try {
+      await bindingsGc(home.homeId)
+      await refreshBindings()
+    } catch (error) {
+      setState(s => ({ ...s, error: presentError(error) }))
+    }
+  }, [refreshBindings])
+
   // exit 后防抖重拉：本地乐观更新让 UI 即时反应，重拉收敛 Rust 落盘后的
   // 权威形态（exit code / failure detail）。
   const scheduleAgentsRepull = useCallback(() => {
@@ -377,11 +500,13 @@ export function useTreeStore() {
         unattended: options.unattended,
         channel,
       })
-      // pull 契约：派发后防抖拉 agents_list（等 Rust 侧 ⑤ 落盘收敛）
+      // pull 契约：派发后拉 agents_list（防抖等 Rust 侧 ⑤ 落盘收敛）；
+      // 绑定写在链步骤 ⑥、先于 exec_start 返回，直接拉即可
       scheduleAgentsRepull()
+      void refreshBindings()
       return outcome
     },
-    [ingestTranscriptEvent, scheduleAgentsRepull],
+    [ingestTranscriptEvent, scheduleAgentsRepull, refreshBindings],
   )
 
   const selectAgent = useCallback((agentId: string) => {
@@ -587,14 +712,16 @@ export function useTreeStore() {
         parseFailed: false,
         selectedAgentId: null,
         unviewedFailedIds: [],
+        // U9：绑定降级标志随 home 切换重置（表按 home 键保留）
+        bindingsParseFailed: false,
       }))
       viewedFailedRef.current.clear()
       filtersRef.current = {}
       activeHomeRef.current = home
       window.localStorage.setItem(LAST_HOME_KEY, home.homeId)
-      await Promise.all([refreshNodes(home), refreshRuns(home), loadFilters(home), refreshAgents()])
+      await Promise.all([refreshNodes(home), refreshRuns(home), loadFilters(home), refreshAgents(), refreshBindings()])
     },
-    [refreshNodes, refreshRuns, loadFilters, refreshAgents],
+    [refreshNodes, refreshRuns, loadFilters, refreshAgents, refreshBindings],
   )
 
   // Declare flow (U5 consumer): register an unregistered home directory,
@@ -655,7 +782,7 @@ export function useTreeStore() {
   }, [state.activeHome, refreshNodes, refreshRuns])
 
   // Boot + pull-based home freshness on window focus (v1 contract).
-  // U5：agents_list 同享 focus 重拉（§四 pull 契约）。
+  // U5：agents_list 同享 focus 重拉；U9：bindings_get 同（§四 pull 契约）。
   useEffect(() => {
     void refreshHomes()
     void loadKnownHomes()
@@ -663,10 +790,11 @@ export function useTreeStore() {
     const onFocus = () => {
       void refreshHomes()
       void refreshAgents()
+      void refreshBindings()
     }
     window.addEventListener('focus', onFocus)
     return () => window.removeEventListener('focus', onFocus)
-  }, [refreshHomes, loadRecent, refreshAgents])
+  }, [refreshHomes, loadRecent, refreshAgents, refreshBindings])
 
   // Load per-home data whenever the active home changes.
   useEffect(() => {
@@ -691,6 +819,9 @@ export function useTreeStore() {
     stopAgent,
     killOrphan,
     ingestTranscriptEvent,
+    // ── U9：绑定切片（R-C）───────────────────────────────────────────────
+    refreshBindings,
+    gcBindings,
     /** 某 exec 的尾窗（无则空数组）；数组原地追加，UI 以 transcriptVersion 感知 */
     transcriptWindow: (execId: string): TranscriptEvent[] =>
       transcriptsRef.current.get(execId) ?? EMPTY_TRANSCRIPT,

@@ -10,10 +10,16 @@
  * run-status-gate（仅 Pending）+ 成员差集门控，不可用即禁用并说明原因。
  * 提交态机（§九-7）：派发中禁用、>5s 展开 ①–⑧ 静态降级进度、成功关弹窗
  * 回调、失败就地内联报错不关弹窗。
+ *
+ * U9（R-C）绑定预选：resolveBindingForNode 命中且 agent 存在时顶部提示
+ * 「将派发至 <displayName> 的绑定（直接/继承自 <节点>）」；会话续接（U11）
+ * 未接入，当前诚实行为 = harness 默认值优先取绑定 agent 的 harness 字段
+ * （优先级：绑定 agent.harness > bag defaultHarness > 首个 enabled）。
+ * 悬空绑定（agent 不在列表）与数据降级（parseFailed）不提示、不覆盖默认。
  */
 import { useEffect, useMemo, useState } from 'react'
-import { omtCall, harnessLaunchPreview, type ExecStartOutcome, type HarnessLaunchPreview } from './bridge'
-import { readHarnessBag, writeHarnessBag, harnessList, type HarnessEntry } from './store'
+import { omtCall, harnessLaunchPreview, bindingsGet, type ExecStartOutcome, type HarnessLaunchPreview } from './bridge'
+import { readHarnessBag, writeHarnessBag, harnessList, resolveBindingForNode, type HarnessEntry, type ResolvedBinding } from './store'
 import { agentDisplayName } from './AgentsPanel'
 import type { AgentRecord, HomeInfo, OmtNode } from './types'
 
@@ -102,6 +108,9 @@ export function ExecutionDialog({
   const [harnesses, setHarnesses] = useState<HarnessEntry[] | null>(null)
   const [selected, setSelected] = useState('')
   const [fallbackNotice, setFallbackNotice] = useState<string | null>(null)
+  // U9：命中的绑定（直接/继承）与对应 agent（存在才提示/预选）
+  const [bound, setBound] = useState<ResolvedBinding | null>(null)
+  const [boundAgent, setBoundAgent] = useState<AgentRecord | null>(null)
   const [ackMap, setAckMap] = useState<Record<string, boolean>>({})
   const [confirmChecked, setConfirmChecked] = useState(false)
   const [rememberChecked, setRememberChecked] = useState(false)
@@ -134,23 +143,42 @@ export function ExecutionDialog({
           : null
 
   // 挂载：harness 投影 + bag v2（default/approvalAck）+ 活跃 run 检测
+  // + 绑定表（U9；拉取失败/降级 → 无绑定预选，不阻断弹窗）
   useEffect(() => {
     let disposed = false
     void (async () => {
       try {
-        const [list, bag, detail] = await Promise.all([
+        const [list, bag, detail, bindings] = await Promise.all([
           harnessList(),
           readHarnessBag(home.homeId),
           omtCall<NodeRunsWire>('node/get', { homeId: home.homeId, nodeId }),
+          bindingsGet(home.homeId).catch(() => null),
         ])
         if (disposed) return
         setHarnesses(list)
         setAckMap(bag.approvalAck ?? {})
-        // 默认选中：bag defaultHarness 校验 enabled，失效回退首个 enabled 并提示
+        // 默认选中（U9 优先级）：绑定 agent.harness > bag defaultHarness >
+        // 首个 enabled。绑定悬空（agent 不在列表）或数据降级（parseFailed）
+        // 时按无绑定处理——不做悬空判定、不覆盖默认链路。
         const enabled = list.filter(h => h.enabled)
         if (enabled.length === 0) return
+        let boundHit: ResolvedBinding | null = null
+        let boundHitAgent: AgentRecord | null = null
+        if (bindings && !bindings.parseFailed) {
+          const resolved = resolveBindingForNode(bindings.bindings ?? {}, nodes, nodeId)
+          const agent = resolved ? agents.find(a => a.id === resolved.agentId) ?? null : null
+          if (resolved && agent) {
+            boundHit = resolved
+            boundHitAgent = agent
+          }
+        }
         const def = bag.defaultHarness
-        if (def && enabled.some(h => h.id === def)) {
+        const boundEntry = boundHitAgent ? enabled.find(h => h.id === boundHitAgent.harness) : undefined
+        if (boundEntry && boundHitAgent) {
+          setSelected(boundEntry.id)
+          setBound(boundHit)
+          setBoundAgent(boundHitAgent)
+        } else if (def && enabled.some(h => h.id === def)) {
           setSelected(def)
         } else {
           setSelected(enabled[0].id)
@@ -284,6 +312,15 @@ export function ExecutionDialog({
 
         {error && <p className="error-banner">{error}</p>}
         {fallbackNotice && <p className="info-banner">{fallbackNotice}</p>}
+        {bound && boundAgent && (
+          // U9（R-C）：绑定预选提示——agent 目标派发延后 U11（会话续接未
+          // 接入），当前诚实行为 = 默认 harness 取绑定 agent 的 harness。
+          <p className="info-banner binding-hint">
+            将派发至 <strong>{agentDisplayName(boundAgent)}</strong> 的绑定
+            （{bound.source === 'direct' ? '直接' : `继承自 ${memberTitle(bound.viaNodeId)}`}）。
+            会话续接（U11）接入后可直接派发至该 Agent。
+          </p>
+        )}
 
         {harnesses !== null && enabledHarnesses.length === 0 ? (
           // 零可用 → 引导前往设置（U7 落地 Harnesses tab 后即达管理面）

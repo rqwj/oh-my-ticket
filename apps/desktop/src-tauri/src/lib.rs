@@ -64,6 +64,8 @@ pub fn run() {
             harness::harness_config_set,
             harness::harness_launch_preview,
             agents::agents_list,
+            agents::bindings_get,
+            agents::bindings_gc,
             executor::exec_start,
             executor::exec_stop,
             executor::exec_kill_orphan,

@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::atomic_json::{read_json, update_json};
+use crate::atomic_json::{has_unrecovered_corrupt, read_json, update_json};
 use crate::daemon;
 
 // ---------------------------------------------------------------------------
@@ -131,6 +131,16 @@ pub(crate) fn validate_home_id(home_id: &str) -> Result<(), String> {
 pub fn agents_path(runtime_dir: &Path, home_id: &str) -> Result<PathBuf, String> {
     validate_home_id(home_id)?;
     Ok(runtime_dir.join("agents").join(home_id).join("agents.json"))
+}
+
+/// bindings.json 路径（§3.1 存储：`agents/<home-id>/bindings.json`，显式
+/// 绑定 nodeId → agentId）。home-id 校验与 agents_path 同源防穿越。
+pub fn bindings_path(runtime_dir: &Path, home_id: &str) -> Result<PathBuf, String> {
+    validate_home_id(home_id)?;
+    Ok(runtime_dir
+        .join("agents")
+        .join(home_id)
+        .join("bindings.json"))
 }
 
 pub(crate) fn now_epoch_ms() -> String {
@@ -297,9 +307,15 @@ pub fn update_exec(
 /// 数据已降级；U9 据此冻结 GC）。
 #[tauri::command(async)]
 pub fn agents_list(home_id: String) -> Result<serde_json::Value, String> {
-    let runtime_dir = daemon::runtime_dir();
-    let path = agents_path(&runtime_dir, &home_id)?;
+    agents_list_in(&daemon::runtime_dir(), &home_id)
+}
+
+fn agents_list_in(runtime_dir: &Path, home_id: &str) -> Result<serde_json::Value, String> {
+    let path = agents_path(runtime_dir, home_id)?;
     let (file, parse_failed) = read_json::<AgentsFile>(&path)?;
+    // F-U4a-1 修法 (b)：粘性 parseFailed——损坏文件被 rename 后的后续读取
+    // 仍视为降级（同目录存在 .corrupt-* 留证），U9 的 GC 冻结据此持续生效。
+    let parse_failed = parse_failed || has_unrecovered_corrupt(&path);
     Ok(serde_json::json!({
         "agents": file.agents,
         "agentSeq": file.meta.agent_seq,
@@ -308,27 +324,98 @@ pub fn agents_list(home_id: String) -> Result<serde_json::Value, String> {
 }
 
 /// U4 步骤 ⑥：写入 bindings.json（显式绑定 nodeId → agentId）。
-/// 原子写（tmp+rename，先例 atomic_json）；写失败由调用方转为警告。
-#[allow(dead_code)]
+/// F-U15-1 第三条写路径：走 atomic_json 的 read-merge-write（进程内锁 +
+/// companion flock + tmp/rename + corrupt 降级留证）——不再依赖调用方的
+/// DISPATCH_LOCK 做写互斥。写失败由调用方（U4 链）转为警告不阻断。
 pub fn write_binding(
     runtime_dir: &Path,
     home_id: &str,
     node_id: &str,
     agent_id: &str,
 ) -> Result<(), String> {
-    let dir = runtime_dir.join("agents").join(home_id);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("create agents dir: {e}"))?;
-    let path = dir.join("bindings.json");
-    // read-merge-write（进程内锁由调用方 DISPATCH_LOCK 保证；文件级 tmp+rename）
-    let mut bindings: BTreeMap<String, String> = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default();
-    bindings.insert(node_id.to_string(), agent_id.to_string());
-    let text = serde_json::to_string_pretty(&bindings).map_err(|e| e.to_string())?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &text).map_err(|e| format!("write tmp: {e}"))?;
-    std::fs::rename(&tmp, &path).map_err(|e| format!("rename: {e}"))
+    let path = bindings_path(runtime_dir, home_id)?;
+    update_json(&path, |bindings: &mut BTreeMap<String, String>| {
+        bindings.insert(node_id.to_string(), agent_id.to_string());
+        true
+    })
+    .map(|_| ())
+}
+
+/// bindings 表的进程内读取（同 write_binding 的锁语义；不存在 → 空表）。
+fn read_bindings(runtime_dir: &Path, home_id: &str) -> Result<BTreeMap<String, String>, String> {
+    let path = bindings_path(runtime_dir, home_id)?;
+    Ok(read_json::<BTreeMap<String, String>>(&path)?.0)
+}
+
+/// U9（§3.4）：显式绑定表投影。`parseFailed` 粘性语义同 agents_list
+/// （F-U4a-1），且**叠加 agents.json 的降级态**——悬空判定（agentId 是否
+/// 存在）依赖健康的 agents 数据，任一文件降级时前端都不得做悬空判定。
+#[tauri::command(async)]
+pub fn bindings_get(home_id: String) -> Result<serde_json::Value, String> {
+    bindings_get_in(&daemon::runtime_dir(), &home_id)
+}
+
+fn bindings_get_in(runtime_dir: &Path, home_id: &str) -> Result<serde_json::Value, String> {
+    let bindings = read_bindings(runtime_dir, home_id)?;
+    let bindings_path = bindings_path(runtime_dir, home_id)?;
+    let agents_path = agents_path(runtime_dir, home_id)?;
+    // 读一次 agents.json：让「此刻损坏」也进粘性留证（rename 发生在本读），
+    // 与 agents_list 的判定完全同源。
+    let (_, agents_parse_failed) = read_json::<AgentsFile>(&agents_path)?;
+    let parse_failed = has_unrecovered_corrupt(&bindings_path)
+        || has_unrecovered_corrupt(&agents_path)
+        || agents_parse_failed;
+    Ok(serde_json::json!({
+        "bindings": bindings,
+        "parseFailed": parse_failed,
+    }))
+}
+
+/// U9（§3.4）：用户触发的一键清理——移除 agentId 已不存在于 agents.json 的
+/// 绑定项，返回移除数与清理后的表。§3.6.6 硬规则：**bindings 非空且
+/// agents.json 无法给出有效 agent 表时冻结**（解析失败 / 粘性 corrupt 残留
+/// F-U4a-1 / 文件缺失任一情形）——「desktop 是唯一写者」不覆盖手工删除、
+/// 同步工具误删、部分恢复等异常路径，无法证明 agent 表有效时绝不能把绑定
+/// 按空表全清。bindings 为空时 GC 本来就是 no-op，正常返回 0。
+#[tauri::command(async)]
+pub fn bindings_gc(home_id: String) -> Result<serde_json::Value, String> {
+    bindings_gc_in(&daemon::runtime_dir(), &home_id)
+}
+
+fn bindings_gc_in(runtime_dir: &Path, home_id: &str) -> Result<serde_json::Value, String> {
+    let bindings_file = bindings_path(runtime_dir, home_id)?;
+    // 空 bindings → 无害 no-op，先于 agents 有效性检查返回（缺失的
+    // agents.json 不必挡住 0 移除路径）。
+    let existing = read_bindings(runtime_dir, home_id)?;
+    if existing.is_empty() {
+        return Ok(serde_json::json!({ "removed": 0, "bindings": existing }));
+    }
+    let agents_path = agents_path(runtime_dir, home_id)?;
+    // 缺失判定必须在 read_json 之前采集：损坏文件会在读时被 rename 成
+    // .corrupt-<ts>，之后 exists() 就永远是 false 了。
+    let agents_missing = !agents_path.exists();
+    let (agents, agents_parse_failed) = read_json::<AgentsFile>(&agents_path)?;
+    if agents_missing || agents_parse_failed || has_unrecovered_corrupt(&agents_path) {
+        return Err(
+            "agents.json 无法给出有效 agent 表（缺失 / 解析失败 / .corrupt-* 留证未恢复）——绑定清理已冻结"
+                .to_string(),
+        );
+    }
+    let live_ids: std::collections::HashSet<String> =
+        agents.agents.iter().map(|a| a.id.clone()).collect();
+    let mut removed = 0usize;
+    // bindings.json 自身损坏降级为空表时无项可移（removed=0、不落盘），对
+    // 留证无损；agentId 判定以 agents.json 的 agents[].id 为准。
+    let (table, _) = update_json(&bindings_file, |bindings: &mut BTreeMap<String, String>| {
+        let before = bindings.len();
+        bindings.retain(|_, agent_id| live_ids.contains(agent_id));
+        removed = before - bindings.len();
+        removed > 0
+    })?;
+    Ok(serde_json::json!({
+        "removed": removed,
+        "bindings": table,
+    }))
 }
 
 #[cfg(test)]
@@ -490,5 +577,177 @@ mod tests {
         );
         // 幂等：再次 demote 无新增
         assert_eq!(demote_live_agents(&runtime).unwrap(), 0);
+    }
+
+    #[test]
+    fn parse_failed_is_sticky_across_reads() {
+        // F-U4a-1：损坏 → 第一次读（rename 后返回默认 + parseFailed=true）→
+        // 第二次读 → parseFailed 仍必须为 true（粘性），否则 U9 的 GC 冻结
+        // 在第二次读后失效，会把全部绑定当悬空清掉（§3.6.6 要防的事故）。
+        let (_dir, runtime, home) = temp_runtime();
+        let path = agents_path(&runtime, &home).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{ broken").unwrap();
+        let first = agents_list_in(&runtime, &home).unwrap();
+        assert_eq!(first["parseFailed"], true);
+        let second = agents_list_in(&runtime, &home).unwrap();
+        assert_eq!(
+            second["parseFailed"], true,
+            "第二次读取 parseFailed 不得翻回 false（粘性判定）"
+        );
+    }
+
+    #[test]
+    fn write_binding_on_corrupt_file_downgrades_with_evidence() {
+        // F-U15-1 第三条写路径：bindings.json 必须走 atomic_json——损坏文件
+        // 要改名 .corrupt-<ts> 留证后从空开始，而不是被静默覆盖（丢留证）。
+        let (_dir, runtime, home) = temp_runtime();
+        let path = bindings_path(&runtime, &home).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{ broken").unwrap();
+        write_binding(&runtime, &home, "T-1", "agent-exec-1").unwrap();
+        let names: Vec<String> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            names
+                .iter()
+                .any(|n| n.starts_with("bindings.json.corrupt-")),
+            "损坏文件必须留证 .corrupt-*: {names:?}"
+        );
+        let bindings: BTreeMap<String, String> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            bindings.get("T-1").map(String::as_str),
+            Some("agent-exec-1")
+        );
+    }
+
+    #[test]
+    fn concurrent_write_binding_does_not_lose_bindings() {
+        // atomic_json 迁移后的锁语义：并发写不得丢更新（先例
+        // concurrent_register_does_not_lose_agents）
+        let (_dir, runtime, home) = temp_runtime();
+        std::thread::scope(|scope| {
+            for i in 0..6u32 {
+                let runtime = runtime.clone();
+                let home = home.clone();
+                scope.spawn(move || {
+                    write_binding(
+                        &runtime,
+                        &home,
+                        &format!("T-{i}"),
+                        &format!("agent-exec-{i}"),
+                    )
+                    .unwrap();
+                });
+            }
+        });
+        let bindings = read_bindings(&runtime, &home).unwrap();
+        assert_eq!(bindings.len(), 6, "{bindings:?}");
+        let leftovers: Vec<String> =
+            std::fs::read_dir(bindings_path(&runtime, &home).unwrap().parent().unwrap())
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .filter(|n| n.contains(".json.tmp-"))
+                .collect();
+        assert!(leftovers.is_empty(), "rename 后不应残留 tmp: {leftovers:?}");
+    }
+
+    #[test]
+    fn bindings_get_projects_table_and_sticky_parse_failed() {
+        let (_dir, runtime, home) = temp_runtime();
+        write_binding(&runtime, &home, "T-1", "agent-exec-1").unwrap();
+        write_binding(&runtime, &home, "T-2", "agent-exec-1").unwrap();
+        let result = bindings_get_in(&runtime, &home).unwrap();
+        assert_eq!(result["bindings"]["T-1"], "agent-exec-1");
+        assert_eq!(result["bindings"]["T-2"], "agent-exec-1");
+        assert_eq!(result["parseFailed"], false);
+
+        // agents.json 损坏 → bindings_get 的 parseFailed 粘性置位（悬空判定
+        // 依赖 agents 数据，降级期间前端不得判悬空）
+        let agents_file = agents_path(&runtime, &home).unwrap();
+        std::fs::write(&agents_file, "{ broken").unwrap();
+        let _ = read_json::<AgentsFile>(&agents_file).unwrap();
+        let degraded = bindings_get_in(&runtime, &home).unwrap();
+        assert_eq!(
+            degraded["bindings"]["T-1"], "agent-exec-1",
+            "绑定表不因 agents 降级而丢"
+        );
+        assert_eq!(degraded["parseFailed"], true);
+    }
+
+    fn seed_agents(runtime: &Path, home: &str, exec_suffixes: &[&str]) {
+        // register_agent 的 id = `agent-<execId>`——后缀即得 agent-a1 形态的 id
+        for s in exec_suffixes {
+            register_agent(runtime, home, "omp", new_exec(s)).unwrap();
+        }
+    }
+
+    #[test]
+    fn bindings_gc_removes_only_dangling_and_persists() {
+        let (_dir, runtime, home) = temp_runtime();
+        seed_agents(&runtime, &home, &["a1", "a2"]);
+        write_binding(&runtime, &home, "T-keep-1", "agent-a1").unwrap();
+        write_binding(&runtime, &home, "T-keep-2", "agent-a2").unwrap();
+        write_binding(&runtime, &home, "T-dangling", "agent-gone").unwrap();
+
+        let result = bindings_gc_in(&runtime, &home).unwrap();
+        assert_eq!(result["removed"], 1);
+        assert_eq!(result["bindings"]["T-keep-1"], "agent-a1");
+        assert_eq!(result["bindings"]["T-keep-2"], "agent-a2");
+        assert!(result["bindings"].get("T-dangling").is_none());
+
+        // 清理后文件内容断言：落盘形态与返回表一致
+        let persisted = read_bindings(&runtime, &home).unwrap();
+        assert_eq!(persisted.len(), 2);
+        assert!(!persisted.contains_key("T-dangling"));
+    }
+
+    #[test]
+    fn bindings_gc_frozen_while_agents_corrupt() {
+        // §3.6.6 硬规则：解析失败期间冻结 GC——绝不能把全部绑定当悬空清掉
+        let (_dir, runtime, home) = temp_runtime();
+        write_binding(&runtime, &home, "T-1", "agent-x").unwrap();
+        write_binding(&runtime, &home, "T-2", "agent-y").unwrap();
+        let agents_file = agents_path(&runtime, &home).unwrap();
+        std::fs::write(&agents_file, "{ broken").unwrap();
+        let _ = read_json::<AgentsFile>(&agents_file).unwrap();
+
+        let err = bindings_gc_in(&runtime, &home).unwrap_err();
+        assert!(err.contains("冻结"), "{err}");
+        // 文件内容断言：绑定原样保留
+        let persisted = read_bindings(&runtime, &home).unwrap();
+        assert_eq!(persisted.len(), 2, "{persisted:?}");
+        assert_eq!(persisted.get("T-1").map(String::as_str), Some("agent-x"));
+    }
+
+    #[test]
+    fn bindings_gc_frozen_when_agents_file_missing() {
+        // §3.6.6 收紧：agents.json 缺失（手工删除/同步工具误删/部分恢复）
+        // 同样无法证明 agent 表有效——非空绑定必须冻结，不得按空表全清。
+        let (_dir, runtime, home) = temp_runtime();
+        write_binding(&runtime, &home, "T-1", "agent-x").unwrap();
+        write_binding(&runtime, &home, "T-2", "agent-y").unwrap();
+        assert!(!agents_path(&runtime, &home).unwrap().exists());
+
+        let err = bindings_gc_in(&runtime, &home).unwrap_err();
+        assert!(err.contains("冻结"), "{err}");
+        let persisted = read_bindings(&runtime, &home).unwrap();
+        assert_eq!(persisted.len(), 2, "缺失路径下绑定原样保留: {persisted:?}");
+    }
+
+    #[test]
+    fn bindings_gc_empty_bindings_is_noop_zero_even_when_agents_missing() {
+        // 空 bindings 本来就是 no-op：先于 agents 有效性检查返回 0——
+        // agents.json 缺失也不冻结无害路径。
+        let (_dir, runtime, home) = temp_runtime();
+        assert!(!agents_path(&runtime, &home).unwrap().exists());
+        let result = bindings_gc_in(&runtime, &home).unwrap();
+        assert_eq!(result["removed"], 0);
+        assert_eq!(result["bindings"], serde_json::json!({}));
     }
 }

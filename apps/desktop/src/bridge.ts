@@ -7,7 +7,7 @@
 import { Channel, invoke } from '@tauri-apps/api/core'
 import { getVersion } from '@tauri-apps/api/app'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-import type { AgentsListResult } from './types'
+import type { AgentsListResult, BindingsGcResult, BindingsResult } from './types'
 
 export interface DaemonStatus {
   running: boolean
@@ -139,6 +139,27 @@ export type TranscriptEvent = SessionStartEvent | RawTranscriptEvent | ExitTrans
 /** agents_list（F-U4a-8）：pull 契约 = tab 首开 / window focus / 派发后主动拉。 */
 export async function agentsList(homeId: string): Promise<AgentsListResult> {
   return invoke<AgentsListResult>('agents_list', { homeId })
+}
+
+// ── U9 绑定（R-C）─────────────────────────────────────────────────────────
+
+/**
+ * bindings_get（§3.4）：显式绑定表——前端做子树继承解析与 badge 渲染。
+ * pull 契约对齐 agents：selectHome / window focus / 派发后主动拉（不进
+ * daemon 事件流，§四）。parseFailed 粘性语义同 agents_list 且叠加
+ * agents.json 降级态：为 true 时前端不得做悬空判定（数据降级）。
+ */
+export async function bindingsGet(homeId: string): Promise<BindingsResult> {
+  return invoke<BindingsResult>('bindings_get', { homeId })
+}
+
+/**
+ * bindings_gc（§3.4，用户触发的一键清理）：移除 agentId 不存在于
+ * agents.json 的绑定项。Rust 侧在 agents.json 解析失败/粘性 corrupt 残留
+ * 时拒绝执行（§3.6.6 硬规则：解析失败期间冻结 GC）。
+ */
+export async function bindingsGc(homeId: string): Promise<BindingsGcResult> {
+  return invoke<BindingsGcResult>('bindings_gc', { homeId })
 }
 
 /** 终止一个 exec（幂等：已终态/不存在的 execId 返回成功）。 */

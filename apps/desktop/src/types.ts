@@ -143,3 +143,18 @@ export interface AgentsListResult {
   agentSeq: number
   parseFailed: boolean
 }
+
+// ── U9 Bindings（R-C；wire 契约 = bindings_get / bindings_gc 的 json! 投影）──
+
+/** bindings_get：显式绑定 nodeId → agentId。parseFailed 粘性语义同
+ *  agents_list（F-U4a-1），且叠加 agents.json 降级态——悬空判定冻结依据。 */
+export interface BindingsResult {
+  bindings: Record<string, string>
+  parseFailed: boolean
+}
+
+/** bindings_gc：移除 agentId 不存在于 agents.json 的绑定项。 */
+export interface BindingsGcResult {
+  removed: number
+  bindings: Record<string, string>
+}

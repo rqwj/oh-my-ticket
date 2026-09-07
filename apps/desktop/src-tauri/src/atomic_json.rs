@@ -160,6 +160,32 @@ where
     read_json_locked::<T>(path)
 }
 
+/// 粘性损坏判定（F-U4a-1 修法 (b)）：同目录存在本文件的 `.corrupt-*` 留证
+/// 即 true。`parse_failed` 是瞬态信号——损坏文件被 rename 后第二次读看到
+/// 「文件不存在 → 默认值 + parse_failed=false」，U9 据此冻结的 GC 会在
+/// 第二次读后失效；粘性判定让「解析失败期间」持续到留证被移走为止（U10
+/// reconcile 重建成功后把 `.corrupt-*` 移入 recovered/ 解除）。
+pub fn has_unrecovered_corrupt(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if name.is_empty() {
+        return false;
+    }
+    let dir = match path.parent() {
+        Some(dir) => dir,
+        None => return false,
+    };
+    let prefix = format!("{name}.corrupt-");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries
+        .flatten()
+        .any(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+}
+
 fn read_json_locked<T>(path: &Path) -> Result<(T, bool), String>
 where
     T: Default + serde::Serialize + serde::de::DeserializeOwned,
@@ -271,6 +297,24 @@ mod tests {
                 .any(|n| n.starts_with("agents.json.corrupt-")),
             "{restored:?}"
         );
+    }
+
+    #[test]
+    fn unrecovered_corrupt_is_sticky_and_scoped_per_file() {
+        // F-U4a-1 修法 (b)：.corrupt-* 留证存在 → 粘性 true；无留证/无目录
+        // → false；判定只看本文件前缀，不跨文件误报。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agents.json");
+        assert!(!has_unrecovered_corrupt(&path));
+
+        std::fs::write(&path, "{ broken").unwrap();
+        let _ = read_json::<BTreeMap<String, String>>(&path).unwrap();
+        assert!(
+            has_unrecovered_corrupt(&path),
+            "rename 后粘性判定必须仍为 true（第二次读不再翻 false）"
+        );
+        // 同目录其他文件不受影响
+        assert!(!has_unrecovered_corrupt(&dir.path().join("bindings.json")));
     }
 
     #[test]
