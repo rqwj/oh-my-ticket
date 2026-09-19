@@ -2599,7 +2599,7 @@ dependencies = [
 
 [[package]]
 name = "oh-my-ticket-desktop"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "libc",
  "omt-client",
@@ -2616,7 +2616,7 @@ dependencies = [
 
 [[package]]
 name = "omt-client"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "libc",
  "omt-domain",
@@ -2626,7 +2626,7 @@ dependencies = [
 
 [[package]]
 name = "omt-contracts"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "jsonschema",
  "regress",
@@ -2638,7 +2638,7 @@ dependencies = [
 
 [[package]]
 name = "omt-domain"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "omt-contracts",
  "serde",
@@ -2647,7 +2647,7 @@ dependencies = [
 
 [[package]]
 name = "omt-runtime"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "getrandom 0.3.4",
  "libc",
@@ -2663,7 +2663,7 @@ dependencies = [
 
 [[package]]
 name = "omt-storage"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "fs4",
  "getrandom 0.3.4",
