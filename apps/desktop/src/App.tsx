@@ -179,10 +179,9 @@ export function App() {
                     bindingsDegraded={state.bindingsParseFailed}
                     fetchRun={store.fetchRun}
                     eventsOf={store.transcriptWindow}
-                    pidOf={store.sessionPidOf}
                     onSelectAgent={store.selectAgent}
                     onStopAgent={execId => void store.stopAgent(execId)}
-                    onKillOrphan={pid => void store.killOrphan(pid)}
+                    onKillOrphan={(agentId, execId) => void store.killOrphan(agentId, execId)}
                     onGcBindings={() => void store.gcBindings()}
                     onOpenHarnessSettings={() => setView('settings')}
                   />

@@ -101,6 +101,7 @@ pub struct SpawnRequest {
 
 /// 事件回调（tauri Channel 的 mpsc 替身）。
 pub type EventSink = Arc<dyn Fn(serde_json::Value) + Send + Sync>;
+type LeaseRelease = Arc<dyn Fn(&str, &str, &str) + Send + Sync>;
 
 /// 单个 exec 的注册表条目（Arc 共享给读线程/等待线程）。
 pub struct ExecSession {
@@ -121,6 +122,7 @@ pub struct ExecSession {
     pub raw_log: PathBuf,
     pub runtime_dir: PathBuf,
     pub mcp: McpInjection,
+    lease_release: Option<LeaseRelease>,
     /// spawn 时刻（durationMs 与 kill 兜底计算用）
     pub started: Instant,
     /// 事件出口（waiter 与 kill_all 路径共用；U4 接 Tauri Channel）
@@ -208,7 +210,7 @@ fn sanitize_line(line: &str) -> String {
     }
     match cut {
         Some(idx) if idx <= line.len() && line.is_char_boundary(idx) => {
-            format!("{} ***", &line[..idx].trim_end())
+            format!("{} ***", line[..idx].trim_end())
         }
         _ => line.to_string(),
     }
@@ -220,10 +222,12 @@ fn sanitize_stderr_tail(tail: &str) -> String {
         .map(sanitize_line)
         .collect::<Vec<_>>()
         .join("\n");
-    joined.truncate(STDERR_TAIL_MAX_CHARS);
-    // truncate 可能切在多字节字符中间——按字符边界收缩
-    while !joined.is_empty() && !joined.is_char_boundary(joined.len()) {
-        joined.pop();
+    if joined.len() > STDERR_TAIL_MAX_CHARS {
+        let mut end = STDERR_TAIL_MAX_CHARS;
+        while !joined.is_char_boundary(end) {
+            end -= 1;
+        }
+        joined.truncate(end);
     }
     joined
 }
@@ -277,7 +281,7 @@ pub fn workspace_root_of(home_path: &Path) -> PathBuf {
 #[derive(Default)]
 pub struct ExecutionManager {
     sessions: Mutex<HashMap<String, Arc<ExecSession>>>,
-    shared: Mutex<Option<Arc<SharedSession>>>,
+    lease_release: Mutex<Option<LeaseRelease>>,
     startup_window: Option<Duration>,
     max_duration: Option<Duration>,
     /// kill_all 的有界等待时长（SIGTERM 后给优雅退出的宽限；测试可缩短）
@@ -305,17 +309,12 @@ impl ExecutionManager {
     /// U4：注入 daemon 会话（租约释放的 RPC 通道）。
     pub fn set_shared_session(&self, shared: Arc<SharedSession>) {
         *self
-            .shared
+            .lease_release
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(shared);
-    }
-
-    fn shared(&self) -> Result<Arc<SharedSession>, String> {
-        self.shared
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-            .ok_or_else(|| "daemon session not yet established".to_string())
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(Arc::new(move |home_id, run_id, exec_id| {
+                release_lease_on_terminal(&shared, home_id, run_id, exec_id);
+            }));
     }
 
     /// 测试用：默认 KILL_GRACE
@@ -331,7 +330,7 @@ impl ExecutionManager {
     ) -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
-            shared: Mutex::new(None),
+            lease_release: Mutex::new(None),
             startup_window: Some(startup_window),
             max_duration: Some(max_duration),
             kill_grace: Some(kill_grace),
@@ -454,6 +453,11 @@ impl ExecutionManager {
             raw_log,
             runtime_dir: runtime_dir.to_path_buf(),
             mcp: req.mcp.clone(),
+            lease_release: self
+                .lease_release
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
             started,
             sink: on_event.clone(),
             seq: AtomicU64::new(0),
@@ -465,6 +469,21 @@ impl ExecutionManager {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(req.exec_id.clone(), session.clone());
+
+        // Orphan kill authorization depends on a Rust-captured pid plus a
+        // kernel-derived process start identity. A pid alone is reusable and
+        // therefore never sufficient authority to signal a process.
+        let process_start_id = process_start_identity(pid).ok();
+        let _ = agents::update_exec(
+            runtime_dir,
+            &req.home_id,
+            &req.agent_id,
+            &req.exec_id,
+            |exec| {
+                exec.pid = Some(pid);
+                exec.process_start_id.clone_from(&process_start_id);
+            },
+        );
 
         // F-U2-6：session_start 与 raw/exit 同构——统一携带 seq/ts
         let start_seq = session.seq.fetch_add(1, Ordering::Relaxed);
@@ -768,6 +787,9 @@ fn finish_terminal(session: &ExecSession, terminal: &Terminal) {
             Terminal::Killed(reason) => exec.kill_reason = Some(reason.key()),
         },
     );
+    if let (Some(release), Some(run_id)) = (&session.lease_release, &session.run_id) {
+        release(&session.home_id, run_id, &session.exec_id);
+    }
     let duration_ms = session.started.elapsed().as_millis() as u64;
     // F-U2-6：exit 事件同样携带 seq/ts（与 session_start、raw 同构）
     let exit_seq = session.seq.fetch_add(1, Ordering::Relaxed);
@@ -803,26 +825,107 @@ pub fn exec_stop(
     state.0.exec_stop(&exec_id)
 }
 
-/// Orphan 强制 kill（§3.2 契约：Orphan=重启后 pid 仍活、只读尾随、不可
-/// exec_stop，提供「强制 kill pid」逃生口）。仅 SIGKILL 单 pid——重启后
-/// 进程组归属不可信，不做 killpg。pid 由前端取自 transcript 的
-/// session_start 事件。
-pub fn kill_orphan_pid(pid: u32) -> Result<(), String> {
-    // u32 → i32 防回绕：负值 pid 是 killpg 语义，绝不能经此路径发出
+#[cfg(target_os = "macos")]
+fn process_start_identity(pid: u32) -> Result<String, String> {
+    let pid_i = i32::try_from(pid).map_err(|_| format!("pid 越界: {pid}"))?;
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>();
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid_i,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size as i32,
+        )
+    };
+    if read != size as i32 {
+        return Err(format!(
+            "读取 pid {pid} 起始身份失败: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let info = unsafe { info.assume_init() };
+    Ok(format!(
+        "macos:{}:{}",
+        info.pbi_start_tvsec, info.pbi_start_tvusec
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn process_start_identity(pid: u32) -> Result<String, String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .map_err(|err| format!("读取 pid {pid} 起始身份失败: {err}"))?;
+    // comm 被括号包围且可含空格；从最后一个 ')' 后开始，字段 3(state)
+    // 到字段 22(starttime) 的零基偏移为 19。
+    let after_comm = stat
+        .rfind(')')
+        .and_then(|end| stat.get(end + 1..))
+        .ok_or_else(|| format!("pid {pid} stat 格式无效"))?;
+    let start_ticks = after_comm
+        .split_whitespace()
+        .nth(19)
+        .ok_or_else(|| format!("pid {pid} stat 缺少 starttime"))?;
+    Ok(format!("linux:{start_ticks}"))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn process_start_identity(pid: u32) -> Result<String, String> {
+    Err(format!("当前平台不支持验证 pid {pid} 的起始身份"))
+}
+
+/// Orphan 强制 kill：只接受持久化 agent/exec 身份，pid 与内核进程起始标识
+/// 均由 Rust 侧读取并比对。仅 SIGKILL 单 pid——重启后进程组归属不可信。
+pub fn kill_orphan(
+    runtime_dir: &Path,
+    home_id: &str,
+    agent_id: &str,
+    exec_id: &str,
+) -> Result<(), String> {
+    let agent = agents::get_agent(runtime_dir, home_id, agent_id)?
+        .ok_or_else(|| format!("agent 不存在: {agent_id}"))?;
+    if agent.attachment != AgentAttachment::Orphan {
+        return Err(format!("agent {agent_id} 不是 orphan，拒绝强制终止"));
+    }
+    let exec = agent
+        .execs
+        .iter()
+        .find(|exec| exec.exec_id == exec_id)
+        .ok_or_else(|| format!("exec {exec_id} 不属于 agent {agent_id}"))?;
+    let pid = exec
+        .pid
+        .ok_or_else(|| format!("exec {exec_id} 缺少持久化 pid，拒绝强制终止"))?;
+    let expected_start = exec
+        .process_start_id
+        .as_deref()
+        .ok_or_else(|| format!("exec {exec_id} 缺少持久化进程起始身份，拒绝强制终止"))?;
+    let actual_start = process_start_identity(pid)?;
+    if actual_start != expected_start {
+        return Err(format!("pid {pid} 已被复用或身份不匹配，拒绝强制终止"));
+    }
     let pid_i = i32::try_from(pid).map_err(|_| format!("pid 越界: {pid}"))?;
     let rc = unsafe { libc::kill(pid_i, libc::SIGKILL) };
     if rc != 0 {
         let err = std::io::Error::last_os_error();
         return Err(format!("kill({pid}, SIGKILL) 失败: {err}"));
     }
+    let _ = agents::update_agent_status(
+        runtime_dir,
+        home_id,
+        agent_id,
+        AgentRecordStatus::Killed,
+        AgentAttachment::None,
+    );
+    let _ = agents::update_exec(runtime_dir, home_id, agent_id, exec_id, |exec| {
+        exec.kill_reason = Some("orphan".to_string());
+    });
     Ok(())
 }
 
-/// Orphan 的「强制 kill pid」tauri command（计划 U5 Files 的已记录偏离：
-/// §3.2:108 要求该控件存在但 Files 漏列了实现面）。
+/// Orphan 强杀 tauri command。Renderer 只能提交持久化记录身份，不能提交 pid。
 #[tauri::command(async)]
-pub fn exec_kill_orphan(pid: u32) -> Result<(), String> {
-    kill_orphan_pid(pid)
+pub fn exec_kill_orphan(home_id: String, agent_id: String, exec_id: String) -> Result<(), String> {
+    kill_orphan(&daemon::runtime_dir(), &home_id, &agent_id, &exec_id)
 }
 
 /// 轮询等待条件成立（非阻塞检查 + 50ms 步进）；测试与等待线程共用。
@@ -1038,7 +1141,7 @@ fn dispatch_chain(
             binary_path: Some(plan.program.display().to_string()),
             // 与 transcript header 的 session_start args 镜像（含 prompt——
             // desktop 模板 + run_id，非敏感；secrets 见 sanitize_args 纪律）
-            binary_args: args.clone(),
+            binary_args: sanitize_args(&args),
         },
     ) {
         Ok(agent) => agent,
@@ -1128,6 +1231,9 @@ pub fn exec_start_impl(
     unattended: bool,
     sink: EventSink,
 ) -> Result<ExecStartOutcome, String> {
+    // SharedSession 的 clone 共享同一个内部 mutex；终态线程由此获得 daemon
+    // RPC 通道，而不会另建连接或持有 tauri::State 生命周期。
+    manager.set_shared_session(Arc::new(shared.clone()));
     let _guard = DISPATCH_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1536,6 +1642,7 @@ mod tests {
                 .join("exec-race.raw.log"),
             runtime_dir: runtime.clone(),
             mcp: McpInjection::None,
+            lease_release: None,
             started: Instant::now(),
             sink: Arc::new(|_| {}),
             seq: AtomicU64::new(0),
@@ -1594,6 +1701,7 @@ mod tests {
             raw_log: runtime.join("transcripts").join("h_test").join("x.raw.log"),
             runtime_dir: runtime.clone(),
             mcp: McpInjection::None,
+            lease_release: None,
             started: Instant::now(),
             sink: Arc::new(|_| {}),
             seq: AtomicU64::new(0),
@@ -1764,6 +1872,75 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_stderr_tail_truncates_on_utf8_boundary() {
+        let tail = "界".repeat(STDERR_TAIL_MAX_CHARS);
+        let sanitized = sanitize_stderr_tail(&tail);
+        assert!(sanitized.len() <= STDERR_TAIL_MAX_CHARS);
+        assert!(sanitized.is_char_boundary(sanitized.len()));
+        assert!(!sanitized.is_empty());
+    }
+
+    #[test]
+    fn terminal_finalization_releases_run_lease_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        let home_path = dir.path().join("ws").join(".omt");
+        std::fs::create_dir_all(&home_path).unwrap();
+        let manager = ExecutionManager::with_limits(STARTUP_WINDOW, DEFAULT_MAX_DURATION);
+        let (lease_tx, lease_rx) = mpsc::channel();
+        *manager
+            .lease_release
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(Arc::new(move |home_id, run_id, exec_id| {
+                let _ =
+                    lease_tx.send((home_id.to_string(), run_id.to_string(), exec_id.to_string()));
+            }));
+        let agent = agents::register_agent(
+            &runtime,
+            "h_test",
+            "fake",
+            NewExec {
+                exec_id: "exec-lease".into(),
+                node_id: Some("node-1".into()),
+                run_id: Some("run-1".into()),
+                binary_path: None,
+                binary_args: vec![],
+            },
+        )
+        .unwrap();
+        let script = write_script(dir.path(), "lease-exit", "exit 0");
+        let session = manager
+            .spawn(
+                &runtime,
+                SpawnRequest {
+                    exec_id: "exec-lease".into(),
+                    agent_id: agent.id,
+                    home_id: "h_test".into(),
+                    home_path,
+                    harness: "fake".into(),
+                    node_id: Some("node-1".into()),
+                    run_id: Some("run-1".into()),
+                    program: script,
+                    args: vec![],
+                    env_additions: BTreeMap::new(),
+                    mcp: McpInjection::None,
+                },
+                Arc::new(|_| {}),
+            )
+            .unwrap();
+        let released = lease_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("终态路径应调用租约释放");
+        assert_eq!(
+            released,
+            ("h_test".into(), "run-1".into(), "exec-lease".into())
+        );
+        assert!(session.terminal().is_some());
+        assert!(lease_rx.try_recv().is_err(), "幂等终态不得重复释放租约");
+    }
+
+    #[test]
     fn sanitize_args_redacts_key_value_flags() {
         let args = vec![
             "--model".to_string(),
@@ -1900,14 +2077,46 @@ mod tests {
     }
 
     #[test]
-    fn kill_orphan_pid_kills_living_process() {
+    fn kill_orphan_resolves_persisted_identity_and_kills_living_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        let home_id = "h_test";
         let mut child = std::process::Command::new("/bin/sh")
             .arg("-c")
             .arg("sleep 30")
             .spawn()
             .unwrap();
         let pid = child.id();
-        kill_orphan_pid(pid).expect("存活 pid 应 kill 成功");
+        let start_id = process_start_identity(pid).unwrap();
+        let agent = agents::register_agent(
+            &runtime,
+            home_id,
+            "fake",
+            NewExec {
+                exec_id: "exec-orphan".into(),
+                node_id: None,
+                run_id: None,
+                binary_path: None,
+                binary_args: vec![],
+            },
+        )
+        .unwrap();
+        agents::update_exec(&runtime, home_id, &agent.id, "exec-orphan", |exec| {
+            exec.pid = Some(pid);
+            exec.process_start_id = Some(start_id.clone());
+        })
+        .unwrap();
+        agents::update_agent_status(
+            &runtime,
+            home_id,
+            &agent.id,
+            AgentRecordStatus::Running,
+            AgentAttachment::Orphan,
+        )
+        .unwrap();
+
+        kill_orphan(&runtime, home_id, &agent.id, "exec-orphan")
+            .expect("持久化身份匹配的 orphan 应 kill 成功");
         let status = child.wait().unwrap();
         #[cfg(unix)]
         assert!(
@@ -1917,11 +2126,45 @@ mod tests {
     }
 
     #[test]
-    fn kill_orphan_pid_errors_when_no_such_process() {
-        // pid_max 现实上界远低于 i32::MAX：取上界附近的 pid 必然 ESRCH——
-        // 不用「已收割 pid」防理论上的 pid 复用误杀无辜进程。
-        let err = kill_orphan_pid((i32::MAX - 1) as u32).expect_err("不存在的 pid 应报错");
-        assert!(err.contains("失败"), "{err}");
+    fn kill_orphan_rejects_non_orphan_even_with_valid_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        let home_id = "h_test";
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let start_id = process_start_identity(pid).unwrap();
+        let agent = agents::register_agent(
+            &runtime,
+            home_id,
+            "fake",
+            NewExec {
+                exec_id: "exec-live".into(),
+                node_id: None,
+                run_id: None,
+                binary_path: None,
+                binary_args: vec![],
+            },
+        )
+        .unwrap();
+        agents::update_exec(&runtime, home_id, &agent.id, "exec-live", |exec| {
+            exec.pid = Some(pid);
+            exec.process_start_id = Some(start_id.clone());
+        })
+        .unwrap();
+
+        let err = kill_orphan(&runtime, home_id, &agent.id, "exec-live")
+            .expect_err("renderer 不得借 live agent 身份强杀任意 pid");
+        assert!(err.contains("不是 orphan"), "{err}");
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "被拒绝的目标必须仍存活"
+        );
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        let _ = child.wait();
     }
 
     #[test]
@@ -2414,6 +2657,11 @@ mod tests {
                 binary: harness::BinarySource::Manual {
                     path: program.display().to_string(),
                 },
+                extra_args: vec![
+                    "--api-key".to_string(),
+                    "sk-persisted-secret".to_string(),
+                    "--token=also-secret".to_string(),
+                ],
                 ..Default::default()
             },
         )
@@ -2438,6 +2686,14 @@ mod tests {
         assert_eq!(file.agents.len(), 1, "{err}");
         assert_eq!(file.agents[0].status, AgentRecordStatus::Failed);
         assert_eq!(file.agents[0].attachment, AgentAttachment::None);
+        let persisted_args = &file.agents[0].execs[0].binary_args;
+        assert_eq!(&persisted_args[..3], ["--api-key", "***", "--token=***"]);
+        assert!(
+            !serde_json::to_string(&file)
+                .unwrap()
+                .contains("persisted-secret"),
+            "agents.json 不得持久化 argv secret"
+        );
         // 仅新建 run 被补偿 cancel
         let cancels = fake.cancel_params();
         assert_eq!(cancels.len(), 1, "应恰好一次补偿 cancel: {err}");

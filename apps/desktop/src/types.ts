@@ -123,6 +123,9 @@ export interface ExecRecord {
   transcriptFile: string | null
   binaryPath: string | null
   binaryArgs: string[]
+  /** Rust-captured process identity; never accepted from the renderer for kill authorization. */
+  pid: number | null
+  processStartId: string | null
 }
 
 export interface AgentRecord {

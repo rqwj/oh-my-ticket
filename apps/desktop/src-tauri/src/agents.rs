@@ -76,6 +76,10 @@ pub struct ExecRecord {
     /// binary 路径与非敏感 args（不记 env 值）
     pub binary_path: Option<String>,
     pub binary_args: Vec<String>,
+    /// Spawn 后由 Rust 侧持久化。Orphan 强杀只从本记录解析 pid，并同时校验
+    /// 内核进程起始标识，绝不信任 renderer 传入的裸 pid。
+    pub pid: Option<u32>,
+    pub process_start_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -250,6 +254,21 @@ pub fn register_agent(
         .last()
         .cloned()
         .ok_or_else(|| "register_agent: record vanished".to_string())
+}
+
+/// 按持久化身份读取单个 agent。Orphan 管理命令用此函数在 Rust 侧完成
+/// home/agent/exec 归属校验，避免 renderer 直接提供可被滥用的 pid。
+pub fn get_agent(
+    runtime_dir: &Path,
+    home_id: &str,
+    agent_id: &str,
+) -> Result<Option<AgentRecord>, String> {
+    let path = agents_path(runtime_dir, home_id)?;
+    let (file, parse_failed) = read_json::<AgentsFile>(&path)?;
+    if parse_failed || has_unrecovered_corrupt(&path) {
+        return Err("agents.json 已损坏，拒绝解析 orphan 进程身份".to_string());
+    }
+    Ok(file.agents.into_iter().find(|agent| agent.id == agent_id))
 }
 
 /// 更新 Agent 终态/状态。**仅状态变化才落盘**（§3.2 写合并）——高频派生量

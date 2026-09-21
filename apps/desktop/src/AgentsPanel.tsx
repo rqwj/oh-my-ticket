@@ -63,10 +63,9 @@ interface Props {
   bindingsDegraded?: boolean
   fetchRun: (runId: string) => Promise<RunDetail>
   eventsOf: (execId: string) => TranscriptEvent[]
-  pidOf: (execId: string) => number | null
   onSelectAgent: (id: string) => void
   onStopAgent: (execId: string) => void
-  onKillOrphan: (pid: number) => void
+  onKillOrphan: (agentId: string, execId: string) => void
   onOpenHarnessSettings: () => void
   /** U9：一键清理悬空绑定（bindings_gc，成功后 App/store 侧重拉绑定表） */
   onGcBindings?: () => void
@@ -81,7 +80,6 @@ export function AgentsPanel({
   bindingsDegraded = false,
   fetchRun,
   eventsOf,
-  pidOf,
   onSelectAgent,
   onStopAgent,
   onKillOrphan,
@@ -161,7 +159,6 @@ export function AgentsPanel({
     const stoppable =
       agent.attachment === 'live' && (agent.status === 'running' || agent.status === 'starting')
     const selectedClass = agent.id === selectedAgentId ? ' selected' : ''
-    const orphanPid = agent.attachment === 'orphan' && exec ? pidOf(exec.execId) : null
     return (
       <div
         key={agent.id}
@@ -185,22 +182,17 @@ export function AgentsPanel({
           {stoppable && exec && (
             <ConfirmStopButton claimed={claimed} onConfirm={() => onStopAgent(exec.execId)} />
           )}
-          {agent.attachment === 'orphan' &&
-            (orphanPid !== null ? (
-              <button
-                className="chip agent-kill-btn"
-                onClick={event => {
-                  event.stopPropagation()
-                  onKillOrphan(orphanPid)
-                }}
-              >
-                强制 kill pid
-              </button>
-            ) : (
-              <span className="agent-kill-btn orphan-badge" title="pid 来自 transcript 的 session_start 事件，回放后可用">
-                强制 kill pid
-              </span>
-            ))}
+          {agent.attachment === 'orphan' && exec && (
+            <button
+              className="chip agent-kill-btn"
+              onClick={event => {
+                event.stopPropagation()
+                onKillOrphan(agent.id, exec.execId)
+              }}
+            >
+              强制终止
+            </button>
+          )}
         </div>
         <div className="agent-row-sub">
           <span className="mono">{agent.harness}</span>

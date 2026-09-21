@@ -399,6 +399,11 @@ export function useTreeStore() {
   // (updateNode/fetchRun) must read the LATEST home, not the render
   // frame their closure captured.
   const activeHomeRef = useRef<HomeInfo | null>(null)
+  // Pulls may resolve out of order while the user switches homes (or when a
+  // focus/dispatch refresh overlaps another refresh). Only the newest request
+  // for the still-active home may update current-home state.
+  const agentsRequestSeqRef = useRef(0)
+  const bindingsRequestSeqRef = useRef(0)
   useEffect(() => {
     filtersRef.current = state.filters
     activeHomeRef.current = state.activeHome
@@ -439,8 +444,13 @@ export function useTreeStore() {
   const refreshAgents = useCallback(async () => {
     const home = activeHomeRef.current
     if (!home) return
+    const requestSeq = ++agentsRequestSeqRef.current
     try {
       const result = await agentsList(home.homeId)
+      if (
+        activeHomeRef.current?.homeId !== home.homeId
+        || agentsRequestSeqRef.current !== requestSeq
+      ) return
       // 归一化放 setState 之外：updater 在 React 渲染期执行，落到本函数
       // try/catch 之外（测试 mock 返回 {} 时不得炸渲染）
       const agents = result.agents ?? []
@@ -464,8 +474,13 @@ export function useTreeStore() {
   const refreshBindings = useCallback(async () => {
     const home = activeHomeRef.current
     if (!home) return
+    const requestSeq = ++bindingsRequestSeqRef.current
     try {
       const result = await bindingsGet(home.homeId)
+      if (
+        activeHomeRef.current?.homeId !== home.homeId
+        || bindingsRequestSeqRef.current !== requestSeq
+      ) return
       const bindings = result.bindings ?? {}
       setState(s => ({
         ...s,
@@ -589,9 +604,11 @@ export function useTreeStore() {
   }, [])
 
   const killOrphan = useCallback(
-    async (pid: number) => {
+    async (agentId: string, execId: string) => {
+      const home = activeHomeRef.current
+      if (!home) return
       try {
-        await execKillOrphan(pid)
+        await execKillOrphan(home.homeId, agentId, execId)
         scheduleAgentsRepull()
       } catch (error) {
         setState(s => ({ ...s, error: presentError(error) }))
@@ -894,13 +911,6 @@ export function useTreeStore() {
     /** 某 exec 的尾窗（无则空数组）；数组原地追加，UI 以 transcriptVersion 感知 */
     transcriptWindow: (execId: string): TranscriptEvent[] =>
       transcriptsRef.current.get(execId) ?? EMPTY_TRANSCRIPT,
-    /** orphan 强杀所需 pid——只存在于 transcript 的 session_start 事件里 */
-    sessionPidOf: (execId: string): number | null => {
-      for (const ev of transcriptsRef.current.get(execId) ?? []) {
-        if (ev.kind === 'session_start') return ev.pid
-      }
-      return null
-    },
     startDispatch,
     fetchRun,
     updateNode: async (id: string, patch: Record<string, unknown>, revision?: number) => {

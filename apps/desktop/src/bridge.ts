@@ -167,9 +167,9 @@ export async function execStop(execId: string): Promise<void> {
   return invoke<void>('exec_stop', { execId })
 }
 
-/** Orphan 强制 kill（§3.2：Orphan 只读尾随、不可 exec_stop）。pid 取自 transcript 的 session_start 事件。 */
-export async function execKillOrphan(pid: number): Promise<void> {
-  return invoke<void>('exec_kill_orphan', { pid })
+/** Orphan 强制 kill：Rust 侧从持久化 agent/exec 身份解析并验证 pid。 */
+export async function execKillOrphan(homeId: string, agentId: string, execId: string): Promise<void> {
+  return invoke<void>('exec_kill_orphan', { homeId, agentId, execId })
 }
 
 // ── U6 执行派发（R-B）─────────────────────────────────────────────────────

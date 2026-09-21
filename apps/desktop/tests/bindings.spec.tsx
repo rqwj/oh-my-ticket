@@ -256,7 +256,6 @@ async function renderAgentsPanel(over: Record<string, unknown> = {}) {
     nodes: [] as OmtNode[],
     fetchRun: vi.fn().mockResolvedValue({ run: { id: 'R' }, items: [] }),
     eventsOf: () => [],
-    pidOf: () => null,
     onSelectAgent: noop,
     onStopAgent: noop,
     onKillOrphan: noop,

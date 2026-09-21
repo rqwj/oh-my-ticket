@@ -1,7 +1,7 @@
 # Oh-My-Ticket (OMT)
 
 ![version](https://img.shields.io/badge/version-0.6.5-blue)
-![tests](https://img.shields.io/badge/tests-447%20passing-brightgreen)
+![tests](https://img.shields.io/badge/tests-root%20%2B%20desktop-brightgreen)
 ![platform](https://img.shields.io/badge/platform-DeepSeek%20Harness-purple)
 ![dsh](https://img.shields.io/badge/DeepSeek%20Harness%20tested-0.1.5--rc.2-blue)
 
@@ -94,14 +94,14 @@ run 批次纪律（创建/认领/报告/续跑响应）。
 
 ```sh
 # 本仓库构建并打包：
-pnpm install && pnpm build && npm pack    # → dsh-oh-my-ticket-0.6.4.tgz
+pnpm install && pnpm build && npm pack    # → dsh-oh-my-ticket-0.6.5.tgz
 
 # 安装进目标 DSH profile（profile 的 dsh.profile.bundles 依次为）：
 #   @deepseek-ai/dsh-base, @deepseek-ai/dsh-web-app, dsh-oh-my-ticket
-pnpm dsh plugin --profile <profile> add /path/to/dsh-oh-my-ticket-0.6.4.tgz
+pnpm dsh plugin --profile <profile> add /path/to/dsh-oh-my-ticket-0.6.5.tgz
 
 # 或直接从 npm 安装已发布版本：
-pnpm dsh plugin --profile <profile> add dsh-oh-my-ticket@0.6.4
+pnpm dsh plugin --profile <profile> add dsh-oh-my-ticket@0.6.5
 ```
 
 daemon 二进制随主包以 optionalDependency 自动带入（`@oh-my-ticket/darwin-arm64`），
@@ -131,8 +131,8 @@ host 半构建会把 `dsh-tools` / `schemastery` / `cosmokit` 内联进 `lib/ind
 pnpm build        # lib/index.js（host 半）+ lib/client.js（浏览器半）
 pnpm watch        # 增量重建
 pnpm typecheck    # tsc --noEmit
-pnpm test         # vitest（314 例）
-pnpm sync-version 0.6.2   # 统一升级四端版本号（Cargo.toml 为权威源）
+pnpm test         # 根目录 vitest 套件（desktop 套件需在 apps/desktop 单独运行）
+pnpm sync-version <version>   # 统一升级四端版本号（Cargo.toml 为权威源）
 ```
 
 ### 仓库结构
@@ -142,10 +142,9 @@ pnpm sync-version 0.6.2   # 统一升级四端版本号（Cargo.toml 为权威�
 ├── cordis.patch.yml      # 组合层：insert omt 行
 ├── tsdown.config.ts      # host 半 + client bundle 构建
 ├── src/
-│   ├── index.ts          # host 插件入口（home 解析 + core 装配 + 工具/skill/hook 注册）
+│   ├── index.ts          # host 插件入口（daemon client + 工具/skill/hook 注册）
 │   ├── host/
-│   │   ├── core/store/markdown/files/pool   # 数据核心：SQLite + Markdown 双写、多 home 池
-│   │   ├── rpc/events/changes               # 浏览器通道：RPC 端点 + SSE 变更推送
+│   │   ├── service/rpc/events               # daemon 生命周期、浏览器 RPC 与 SSE 推送
 │   │   ├── tools/skill                      # omt_* 工具面 + omt / omt-runs skill
 │   │   ├── running/recent/idle-hook/disposed-hook/notify-hook   # 执行态与提醒
 │   │   └── ui-state.ts                      # 过滤器持久化（ui-filters.json）
@@ -154,10 +153,10 @@ pnpm sync-version 0.6.2   # 统一升级四端版本号（Cargo.toml 为权威�
 │       ├── controller.ts # snapshot stores 与全部异步流
 │       └── components/   # TicketPanel（共享树面板）+ Drawer/FloatWindow/TicketTab 三壳
 │                         # + DocPanel/RunsView/RunPicker/TurnTickets 等
-├── crates/               # Rust 工作区：omt-runtime（daemon）/ omt-client / omt-storage 等
+├── crates/               # ticket/domain 权威：daemon、CLI/MCP、存储与共享 Rust client
 ├── packages/client-ts/   # TS daemon 客户端（discover-or-spawn、握手、RPC、事件流重放）
-├── apps/desktop/         # Tauri 桌面端
-├── tests/                # vitest 单测（连同 packages/client-ts 共 28 文件 / 314 例）
+├── apps/desktop/         # Tauri 桌面端 + 本地 harness/agent 执行平面及独立测试套件
+├── tests/                # 根目录 vitest 单测（desktop 测试位于 apps/desktop/tests）
 └── .omt/tickets/         # 本项目的 ticket 库（SQLite 索引已 gitignore，可 omt_reindex 重建）
 ```
 

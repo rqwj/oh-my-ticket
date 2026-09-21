@@ -80,6 +80,12 @@ const runDetail = (items: Array<{ state: string; executorActor?: string }>): Run
 
 const noop = () => {}
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  const promise = new Promise<T>(done => { resolve = done })
+  return { promise, resolve }
+}
+
 async function setupStore() {
   const { useTreeStore } = await import('../src/store')
   const { renderHook } = await import('@testing-library/react')
@@ -93,10 +99,9 @@ interface PanelProps {
   nodes: Array<{ id: string; type: string; title: string; status: string; priority: number; children?: Array<{ id: string; type: string; title: string; status: string; priority: number }> }>
   fetchRun: (runId: string) => Promise<RunDetail>
   eventsOf: (execId: string) => TranscriptEvent[]
-  pidOf: (execId: string) => number | null
   onSelectAgent: (id: string) => void
   onStopAgent: (execId: string) => void
-  onKillOrphan: (pid: number) => void
+  onKillOrphan: (agentId: string, execId: string) => void
   onOpenHarnessSettings: () => void
 }
 
@@ -109,7 +114,6 @@ async function renderPanel(over: Partial<PanelProps> = {}) {
     nodes: [],
     fetchRun: vi.fn().mockResolvedValue(runDetail([])),
     eventsOf: () => [],
-    pidOf: () => null,
     onSelectAgent: noop,
     onStopAgent: noop,
     onKillOrphan: noop,
@@ -187,19 +191,6 @@ describe('U5 store: transcript 归并', () => {
     }
   })
 
-  it('sessionPidOf：session_start 事件给出 pid；仅 raw 事件的 exec → null', async () => {
-    invokeMock.mockReset()
-    invokeMock.mockResolvedValue({})
-    const { result } = await setupStore()
-    // session_start 低频事件立即入窗（不经 50ms raw 合并）
-    act(() => { result.current.ingestTranscriptEvent(sessionStart('exec-s', 4242)) })
-    act(() => { result.current.ingestTranscriptEvent(raw('exec-r', 0, 'out')) })
-    expect(result.current.sessionPidOf('exec-s')).toBe(4242)
-    // orphan 强杀依赖 session_start——只有 raw 事件（或无事件）时 pid 缺失
-    expect(result.current.sessionPidOf('exec-r')).toBeNull()
-    expect(result.current.sessionPidOf('exec-missing')).toBeNull()
-  })
-
   it('exit failed 事件：本地 status/attachment 联动 + badge +1；选中清零', async () => {
     invokeMock.mockImplementation((cmd: string) => {
       if (cmd === 'agents_list') {
@@ -221,6 +212,47 @@ describe('U5 store: transcript 归并', () => {
     expect(result.current.state.unviewedFailedIds).toEqual([])
     await act(async () => { await result.current.refreshAgents() })
     expect(result.current.state.unviewedFailedIds).toEqual([])
+  })
+
+  it('切换 workspace 后丢弃上一个 home 延迟返回的 agents/bindings 结果', async () => {
+    const agentsH1 = deferred<unknown>()
+    const agentsH2 = deferred<unknown>()
+    const bindingsH1 = deferred<unknown>()
+    const bindingsH2 = deferred<unknown>()
+    invokeMock.mockImplementation((cmd: string, args?: { homeId?: string }) => {
+      if (cmd === 'agents_list') return args?.homeId === 'h1' ? agentsH1.promise : agentsH2.promise
+      if (cmd === 'bindings_get') return args?.homeId === 'h1' ? bindingsH1.promise : bindingsH2.promise
+      return Promise.resolve({})
+    })
+    const { result } = await setupStore()
+    const home1 = { homeId: 'h1', kind: 'workspace' as const, path: '/tmp/h1/.omt' }
+    const home2 = { homeId: 'h2', kind: 'workspace' as const, path: '/tmp/h2/.omt' }
+
+    let selectH1!: Promise<void>
+    act(() => { selectH1 = result.current.selectHome(home1) })
+    let selectH2!: Promise<void>
+    act(() => { selectH2 = result.current.selectHome(home2) })
+
+    await act(async () => {
+      agentsH2.resolve({ agents: [makeAgent('agent-h2', 'exec-h2')], parseFailed: false })
+      bindingsH2.resolve({ bindings: { 'T-2': 'agent-h2' }, parseFailed: true })
+      await selectH2
+    })
+    expect(result.current.state.activeHome?.homeId).toBe('h2')
+    expect(result.current.state.agents.map(agent => agent.id)).toEqual(['agent-h2'])
+    expect(result.current.state.bindingsByHome.h2).toEqual({ 'T-2': 'agent-h2' })
+    expect(result.current.state.bindingsParseFailed).toBe(true)
+
+    await act(async () => {
+      agentsH1.resolve({ agents: [makeAgent('agent-h1', 'exec-h1')], parseFailed: true })
+      bindingsH1.resolve({ bindings: { 'T-1': 'agent-h1' }, parseFailed: false })
+      await selectH1
+    })
+    expect(result.current.state.activeHome?.homeId).toBe('h2')
+    expect(result.current.state.agents.map(agent => agent.id)).toEqual(['agent-h2'])
+    expect(result.current.state.parseFailed).toBe(false)
+    expect(result.current.state.bindingsByHome.h2).toEqual({ 'T-2': 'agent-h2' })
+    expect(result.current.state.bindingsParseFailed).toBe(true)
   })
 })
 
@@ -299,8 +331,13 @@ describe('U9/U5 store 动作：gcBindings / stopAgent / killOrphan', () => {
       const { result } = await setupStore()
       await act(async () => { await result.current.selectHome(home) })
       const before = invokeMock.mock.calls.filter(c => c[0] === 'agents_list').length
-      await act(async () => { await result.current.killOrphan(4711) })
+      await act(async () => { await result.current.killOrphan('agent-o', 'exec-o') })
       expect(result.current.state.error).toBeNull()
+      expect(invokeMock).toHaveBeenCalledWith('exec_kill_orphan', {
+        homeId: 'h1',
+        agentId: 'agent-o',
+        execId: 'exec-o',
+      })
       // 400ms 防抖（等 Rust 侧落盘收敛）到期才重拉
       act(() => { vi.advanceTimersByTime(500) })
       const after = invokeMock.mock.calls.filter(c => c[0] === 'agents_list').length
@@ -488,32 +525,16 @@ describe('U5 AgentsPanel 列表', () => {
     }
   })
 
-  it('Orphan 行带「不受控·只读」角标与「强制 kill pid」，不可软终止', async () => {
+  it('Orphan 行按持久化 agent/exec 身份强制终止，不向 renderer 暴露 pid 授权', async () => {
     const onKillOrphan = vi.fn()
     await renderPanel({
       agents: [makeAgent('o1', 'exec-o', { attachment: 'orphan' })],
-      pidOf: () => 4711,
       onKillOrphan,
     })
     expect(screen.getByText('不受控·只读')).toBeTruthy()
     expect(screen.queryByRole('button', { name: '终止' })).toBeNull()
-    fireEvent.click(screen.getByRole('button', { name: '强制 kill pid' }))
-    expect(onKillOrphan).toHaveBeenCalledWith(4711)
-  })
-
-  it('Orphan 且 pid 缺失（transcript 未回放）→ kill 控件退化为非按钮占位，onKillOrphan 不触发', async () => {
-    const onKillOrphan = vi.fn()
-    await renderPanel({
-      agents: [makeAgent('o1', 'exec-o', { attachment: 'orphan' })],
-      pidOf: () => null,
-      onKillOrphan,
-    })
-    // pid 为 null：占位是 span（非按钮），点击不触发强杀
-    const placeholder = screen.getByText('强制 kill pid')
-    expect(placeholder.tagName).toBe('SPAN')
-    expect(screen.queryByRole('button', { name: '强制 kill pid' })).toBeNull()
-    fireEvent.click(placeholder)
-    expect(onKillOrphan).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: '强制终止' }))
+    expect(onKillOrphan).toHaveBeenCalledWith('o1', 'exec-o')
   })
 
   it('零 claim 退出标注「未认领任何项」', async () => {

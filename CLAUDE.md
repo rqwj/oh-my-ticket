@@ -1,6 +1,7 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides Claude Code-specific orientation. `AGENTS.md` is the canonical repository guide;
+read it first and treat this file as supplemental detail.
 
 ## What this is
 
@@ -9,7 +10,7 @@ Oh-My-Ticket (OMT): a ticket-management plugin for DSH (DeepSeek Harness) implem
 batch-handing tickets to a model for execution with a state machine, progress tracking, and a
 trust policy backstop.
 
-The repo is **four surfaces sharing one Rust runtime**:
+The repo has **two runtime planes across four main source surfaces**:
 
 1. **`crates/`** — the Rust core (`omt-domain`, `omt-storage`, `omt-client`, `omt-runtime`). This is
    the single source of truth for domain logic, persistence, and the daemon. Ships two binaries:
@@ -20,8 +21,9 @@ The repo is **four surfaces sharing one Rust runtime**:
 3. **`packages/client-ts/`** (`@omt/client-ts`) — shared TS protocol bindings + daemon
    discover-or-spawn/handshake/reconnect client, generated from `schema/*.schema.json`. Consumed
    by both the DSH plugin and the desktop app.
-4. **`apps/desktop/`** — a Tauri 2 desktop app (React + Rust `src-tauri`, using `omt-client`
-   directly) that bundles the daemon as a sidecar binary.
+4. **`apps/desktop/`** — a Tauri 2 desktop app. Its React UI uses a Rust backend that both talks to
+   `omt-client` and owns a separate local execution plane: harness configuration, agent/binding
+   persistence, child-process lifecycle, dispatch, and temporary MCP injection.
 
 `schema/*.schema.json` is the single source of truth for the wire protocol; both the Rust bindings
 (`omt-contracts`, via `typify`/`schemars`) and `@omt/client-ts` are generated from it — never
@@ -42,7 +44,7 @@ pnpm watch                   # incremental rebuild during dev
 pnpm typecheck                # tsc --noEmit
 pnpm test                    # vitest run (root suite; excludes corpus/, apps/, .dsh-checkout/)
 pnpm build:daemon             # cargo build -p omt-runtime (needed before daemon-fixture tests)
-pnpm sync-version 0.6.2       # bump version in lockstep across Cargo.toml/package.json/tauri.conf.json
+pnpm sync-version <version>   # bump version in lockstep across Cargo.toml/package.json/tauri.conf.json
 pnpm gen                      # regenerate @omt/client-ts bindings from schema/*.schema.json
 ```
 
@@ -120,8 +122,22 @@ daemon (discovery is descriptor-based) — never introduce a second directory co
   in `docs/runtime/config.md`), handshakes as kind `"dsh"`, and reconnects with capped backoff.
   All `omt_*` tool calls and RPC/SSE traffic route through this one client lifecycle.
 - The daemon binary is intentionally the *same* binary across the DSH plugin, the CLI, and the
-  desktop sidecar — logic lives once in Rust; TS/Tauri layers are thin adapters. Do not port
-  domain logic back into TypeScript.
+  desktop sidecar. Ticket/domain logic lives once in the daemon-facing Rust crates; do not port it
+  into TypeScript. The desktop Tauri backend is not only an adapter: its local execution plane is
+  implemented in `harness.rs`, `agents.rs`, `executor.rs`, `atomic_json.rs`, and
+  `mcp_injection.rs`.
+
+### Desktop execution plane (`apps/desktop/`)
+
+- `src-tauri/src/harness.rs` owns harness discovery, configuration, launch resolution, and
+  environment policy.
+- `src-tauri/src/agents.rs` and `atomic_json.rs` own persisted local agent/binding state.
+- `src-tauri/src/executor.rs` owns dispatch, child processes, transcript events, terminal cleanup,
+  and run-lease release.
+- `src-tauri/src/mcp_injection.rs` owns temporary provider-specific MCP configuration and crash
+  recovery.
+- React execution state is centralized in `src/store.ts`; UI coverage lives in
+  `apps/desktop/tests/`, while Rust execution tests live beside the Tauri modules.
 
 ### DSH plugin internals (`src/`)
 

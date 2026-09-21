@@ -10,7 +10,7 @@
 //! by the bridge afterwards (it owns the reader thread).
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use omt_client::Enrollment;
 
@@ -70,11 +70,12 @@ impl DaemonSession {
 }
 
 /// Process-wide session holder (tauri state).
-pub struct SharedSession(pub Mutex<Option<DaemonSession>>);
+#[derive(Clone)]
+pub struct SharedSession(pub Arc<Mutex<Option<DaemonSession>>>);
 
 impl SharedSession {
     pub fn new() -> Self {
-        Self(Mutex::new(None))
+        Self(Arc::new(Mutex::new(None)))
     }
 }
 
