@@ -36,6 +36,13 @@ vi.mock('@tauri-apps/api/core', () => ({
 vi.mock('@tauri-apps/api/event', () => ({
   listen: vi.fn().mockResolvedValue(() => {}),
 }))
+// U16：通知插件 mock
+const sendNotificationMock = vi.fn()
+vi.mock('@tauri-apps/plugin-notification', () => ({
+  isPermissionGranted: vi.fn().mockResolvedValue(true),
+  requestPermission: vi.fn().mockResolvedValue('granted'),
+  sendNotification: (...args: unknown[]) => sendNotificationMock(...args),
+}))
 
 // ── fixture 工厂 ──────────────────────────────────────────────────────────
 
@@ -212,6 +219,31 @@ describe('U5 store: transcript 归并', () => {
     expect(result.current.state.unviewedFailedIds).toEqual([])
     await act(async () => { await result.current.refreshAgents() })
     expect(result.current.state.unviewedFailedIds).toEqual([])
+  })
+
+  it('U16：exit failed → 系统通知（agent 名 + 终止详情）；exited 不通知', async () => {
+    sendNotificationMock.mockClear()
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === 'agents_list')
+        return Promise.resolve({ agents: [makeAgent('agent-n', 'exec-n', { title: '冒烟任务' })], agentSeq: 1, parseFailed: false })
+      return Promise.resolve({})
+    })
+    const { result } = await setupStore()
+    await act(async () => {
+      await result.current.selectHome({ homeId: 'h1', kind: 'workspace', path: '/tmp/ws/.omt' })
+    })
+    // exited：不通知
+    act(() => { result.current.ingestTranscriptEvent(exitEvent('exec-n', 'exited')) })
+    await act(async () => { await Promise.resolve() })
+    expect(sendNotificationMock).not.toHaveBeenCalled()
+    // failed：通知带 agent 标题与退出码
+    act(() => { result.current.ingestTranscriptEvent(exitEvent('exec-n', 'failed')) })
+    await act(async () => { await Promise.resolve(); await Promise.resolve() })
+    expect(sendNotificationMock).toHaveBeenCalledTimes(1)
+    const note = sendNotificationMock.mock.calls[0][0] as { title: string; body: string }
+    expect(note.title).toContain('失败')
+    expect(note.title).toContain('冒烟任务')
+    expect(note.body).toMatch(/exit 1/)
   })
 
   it('切换 workspace 后丢弃上一个 home 延迟返回的 agents/bindings 结果', async () => {

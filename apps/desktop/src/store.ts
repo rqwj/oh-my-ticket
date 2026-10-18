@@ -25,6 +25,11 @@
  * / danglingBindingsOf，R-C）+ gcBindings（一键清理，Rust 侧降级冻结）。
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
+import {
+  isPermissionGranted,
+  requestPermission,
+  sendNotification,
+} from '@tauri-apps/plugin-notification'
 import { Channel, invoke } from '@tauri-apps/api/core'
 import {
   agentsList,
@@ -426,6 +431,8 @@ export function useTreeStore() {
   // (updateNode/fetchRun) must read the LATEST home, not the render
   // frame their closure captured.
   const activeHomeRef = useRef<HomeInfo | null>(null)
+  // U16：agents 镜像——通知等异步回调读最新列表（避免闭包过期）
+  const agentsRef = useRef<AgentRecord[]>([])
   // Pulls may resolve out of order while the user switches homes (or when a
   // focus/dispatch refresh overlaps another refresh). Only the newest request
   // for the still-active home may update current-home state.
@@ -434,7 +441,8 @@ export function useTreeStore() {
   useEffect(() => {
     filtersRef.current = state.filters
     activeHomeRef.current = state.activeHome
-  }, [state.filters, state.activeHome])
+    agentsRef.current = state.agents
+  }, [state.filters, state.activeHome, state.agents])
 
   // ── U5：executions/agents 切片 ──────────────────────────────────────────
   // 尾窗与 pending buffer 留在 ref：高频 raw 事件不进 React 调度，
@@ -578,6 +586,35 @@ export function useTreeStore() {
     [appendTail, bumpTranscriptVersion],
   )
 
+  /** U16：失败系统通知——agent 名尽力而为（事件流不带 display name，
+   * agents 重拉前的降级文案），失败详情截尾。通知失败静默。 */
+  const notifyFailure = async (ev: Extract<TranscriptEvent, { kind: 'exit' }>) => {
+    try {
+      let granted = await isPermissionGranted()
+      if (!granted) {
+        granted = (await requestPermission()) === 'granted'
+      }
+      if (!granted) return
+      // execId → agent 展示名（就地建表——低频事件不值得常驻索引）
+      let agentName: string | undefined
+      for (const agent of agentsRef.current) {
+        if (agent.execs.some(e => e.execId === ev.execId)) {
+          agentName = agent.title ?? agent.displayName
+          break
+        }
+      }
+      const detail =
+        ev.killReason ? `终止：${ev.killReason}`
+        : `exit ${ev.code ?? '?'}`
+      sendNotification({
+        title: `OMT Agent 失败${agentName ? ` — ${agentName}` : ''}`,
+        body: detail,
+      })
+    } catch {
+      // 通知是增强——任何失败静默
+    }
+  }
+
   const ingestTranscriptEvent = useCallback(
     (ev: TranscriptEvent) => {
       if (!ev || typeof ev.execId !== 'string') return
@@ -594,6 +631,11 @@ export function useTreeStore() {
       if (ev.kind === 'exit') {
         applyExitLocal(ev)
         scheduleAgentsRepull()
+        // U16：失败可见性——Failed 终态发系统通知（用户可能在别的窗口；
+        // exited/killed 不扰民）。权限按需申请，失败静默（通知是增强）。
+        if (ev.status === 'failed') {
+          void notifyFailure(ev)
+        }
       }
       bumpTranscriptVersion()
     },

@@ -35,6 +35,13 @@ vi.mock('@tauri-apps/api/core', () => {
 vi.mock('@tauri-apps/api/event', () => ({
   listen: vi.fn().mockResolvedValue(() => {}),
 }))
+// U16：通知插件 mock（isPermissionGranted/requestPermission/sendNotification）
+const sendNotificationMock = vi.fn()
+vi.mock('@tauri-apps/plugin-notification', () => ({
+  isPermissionGranted: vi.fn().mockResolvedValue(true),
+  requestPermission: vi.fn().mockResolvedValue('granted'),
+  sendNotification: (...args: unknown[]) => sendNotificationMock(...args),
+}))
 
 describe('presentError contract copy', () => {
   it('QUOTA_EXCEEDED(rule=open-homes) names the limit and the remedy', () => {
