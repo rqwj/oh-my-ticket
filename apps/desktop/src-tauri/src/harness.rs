@@ -112,6 +112,42 @@ pub(crate) fn probe_version(binary: &Path, args: &[&str], timeout_secs: u64) -> 
     line
 }
 
+/// 超时捕获完整 stdout（probe_version 的全量变体——模型列表要整份输出）。
+pub(crate) fn capture_with_timeout(
+    binary: &Path,
+    args: &[&str],
+    timeout_secs: u64,
+) -> Option<String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(binary)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null())
+        .env("PATH", augmented_path())
+        .spawn()
+        .ok()?;
+    let mut pipe = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = pipe.read_to_string(&mut buf);
+        buf
+    });
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let output = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break reader.join().ok().filter(|_| status.success()),
+            Ok(None) if Instant::now() >= deadline => break None,
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(_) => return None,
+        }
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+    output.map(|text| text.trim().to_string())
+}
+
 // ---------------------------------------------------------------------------
 // 静态类型表（计划 §3.1）
 // ---------------------------------------------------------------------------
@@ -126,6 +162,30 @@ pub struct HarnessDescriptor {
     /// 无人值守放行 flag（U6 权限知情确认勾选后追加；omp `--approval-mode
     /// write` 无 TTY 实测结论回填前按官方文档记 `--yolo`，显式传避免默认漂移）
     pub unattended_flag: &'static [&'static str],
+    /// prompt 传递渠道（F-ACC-6：opencode 对位置参数 lstat 判文件附件，
+    /// 多行长 prompt 被当路径 ENAMETOOLONG 启动即炸——改走文件附着）
+    pub prompt_channel: PromptChannel,
+    /// 子命令前缀（F-ACC-7：`--auto`/`-f` 均为 `opencode run` 的子命令
+    /// flag，缺 `run` 时根命令不识别 → 打印帮助退出 1）。omp 无子命令。
+    pub argv_prefix: &'static [&'static str],
+    /// 无头/一次性模式 flag（F-ACC-12：omp 不加 `-p` 会起 TUI，向无终端
+    /// 的管道发能力查询序列后挂起）。opencode 的 `run` 子命令本身即一次性。
+    pub headless_flags: &'static [&'static str],
+    /// 「终端登录」按钮在 Terminal 里运行的交互命令（订阅/OAuth 认证
+    /// 无法在无头进程内完成）。omp 裸跑进 TUI /login；opencode 走
+    /// `auth login` 子命令。
+    pub login_args: &'static [&'static str],
+    /// 指定模型的 flag（值接一个 model id；两家同为 `--model`）。
+    pub model_args: &'static [&'static str],
+}
+
+/// dispatch prompt 的传递渠道（provider 适配差异，注册表静态声明）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptChannel {
+    /// prompt 作为最后一个位置参数（omp 等）
+    Argv,
+    /// prompt 写 per-exec 文件，argv 只留 `-f <path>` + 短指令（opencode）
+    FileAttach,
 }
 
 pub const REGISTRY: &[HarnessDescriptor] = &[
@@ -135,13 +195,25 @@ pub const REGISTRY: &[HarnessDescriptor] = &[
         binary_name: "opencode",
         probe_args: &["--version"],
         unattended_flag: &["--auto"],
+        prompt_channel: PromptChannel::FileAttach,
+        argv_prefix: &["run"],
+        headless_flags: &[],
+        login_args: &["auth", "login"],
+        model_args: &["--model"],
     },
     HarnessDescriptor {
         id: "omp",
         label: "OMP (oh-my-pi)",
         binary_name: "omp",
         probe_args: &["--version"],
-        unattended_flag: &["--yolo"],
+        // F-ACC-12（F-U1-4 实测回填）：裸 `--yolo` 在 omp v18.0.9 不存在，
+        // 真实放行 flag 是 `--approval-mode=yolo`（always-ask|write|yolo）
+        unattended_flag: &["--approval-mode=yolo"],
+        prompt_channel: PromptChannel::Argv,
+        argv_prefix: &[],
+        headless_flags: &["-p"],
+        login_args: &[],
+        model_args: &["--model"],
     },
 ];
 
@@ -285,6 +357,14 @@ pub struct LaunchPlan {
     /// `compose_launch_args` 追加）
     pub unattended_flag: Vec<String>,
     pub env: BTreeMap<String, String>,
+    /// prompt 传递渠道（descriptor 静态值）
+    pub prompt_channel: PromptChannel,
+    /// 子命令前缀（descriptor 静态值，如 opencode 的 `run`）
+    pub argv_prefix: Vec<String>,
+    /// 无头模式 flag（descriptor 静态值，如 omp 的 `-p`）
+    pub headless_flags: Vec<String>,
+    /// 指定模型的 flag（descriptor 静态值，两家同为 --model）
+    pub model_args: Vec<String>,
 }
 
 impl LaunchPlan {
@@ -324,18 +404,85 @@ pub fn resolve_launch(runtime_dir: &Path, provider_id: &str) -> Result<LaunchPla
             .map(|s| (*s).to_string())
             .collect(),
         env: cfg.env.clone(),
+        prompt_channel: descriptor.prompt_channel,
+        argv_prefix: descriptor
+            .argv_prefix
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+        headless_flags: descriptor
+            .headless_flags
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+        model_args: descriptor
+            .model_args
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
     })
 }
 
-/// SpawnRequest doc 注释的 args 契约（顺序由本函数统一保证，调用方不再各自
-/// 拼装）：`[extra_args..., (unattended=true 时 unattended_flag), prompt]`。
+/// FileAttach 渠道的 per-exec prompt 文件路径（纯函数，无 IO）：
+/// `<runtime>/transcripts/<home>/<exec>.prompt.md`。非该渠道返回 None。
+/// 路径确定性——调用方先定路径（compose/Agent 记录用），写盘时机自定。
+pub fn prompt_file_path(
+    runtime_dir: &Path,
+    home_id: &str,
+    exec_id: &str,
+    channel: PromptChannel,
+) -> Option<PathBuf> {
+    if channel == PromptChannel::FileAttach {
+        Some(
+            runtime_dir
+                .join("transcripts")
+                .join(home_id)
+                .join(format!("{exec_id}.prompt.md")),
+        )
+    } else {
+        None
+    }
+}
+
+/// FileAttach 渠道的短指令：完整 DISPATCH_PROMPT 在附着文件里，argv 保持
+/// 单行短串（ENAMETOOLONG 的另一道保险）。
+const ATTACH_MESSAGE: &str = "Execute the task in the attached file. Follow its rules exactly.";
+
+/// SpawnRequest args 契约（顺序由本函数统一保证，调用方不再各自拼装）：
+/// `[argv_prefix..., headless_flags..., extra_args..., (unattended=true 时
+/// unattended_flag), (model), message, -f <prompt_file>]`（FileAttach）/
+/// `[..., prompt]`（Argv）。model 经 validate_model_id 后方可入参。
+/// 子命令前缀在最前（F-ACC-7：opencode 的 flag 属 `run` 子命令）；
 /// desktop 注入的 flag 在用户 args 之后——同名 flag 以 desktop 的为准。
-pub fn compose_launch_args(plan: &LaunchPlan, unattended: bool, prompt: &str) -> Vec<String> {
-    let mut args = plan.extra_args.clone();
+/// FileAttach 渠道（F-ACC-6）prompt 落 per-exec 文件，argv 只留短指令；
+/// **message 必须在 `-f` 之前**（F-ACC-8：yargs 数组 flag 贪心吞噬后续
+/// 位置参数，`-f <file> <msg>` 的 msg 会被当成第二个文件 → "File not
+/// found"，已本机复现）。prompt_file 为 None 时防御性回落 argv prompt。
+pub fn compose_launch_args(
+    plan: &LaunchPlan,
+    unattended: bool,
+    prompt: &str,
+    prompt_file: Option<&Path>,
+    model: Option<&str>,
+) -> Vec<String> {
+    let mut args = plan.argv_prefix.clone();
+    args.extend(plan.headless_flags.iter().cloned());
+    args.extend(plan.extra_args.iter().cloned());
     if unattended {
         args.extend(plan.unattended_flag.iter().cloned());
     }
-    args.push(prompt.to_string());
+    if let Some(model) = model {
+        args.extend(plan.model_args.iter().map(|s| (*s).to_string()));
+        args.push(model.to_string());
+    }
+    match (plan.prompt_channel, prompt_file) {
+        (PromptChannel::FileAttach, Some(file)) => {
+            args.push(ATTACH_MESSAGE.to_string());
+            args.push("-f".to_string());
+            args.push(file.display().to_string());
+        }
+        _ => args.push(prompt.to_string()),
+    }
     args
 }
 
@@ -357,6 +504,196 @@ pub fn harness_launch_preview(harness: String) -> Result<serde_json::Value, Stri
     let runtime_dir = daemon::runtime_dir();
     let plan = resolve_launch(&runtime_dir, &harness)?;
     Ok(launch_preview_value(&plan))
+}
+
+// ---------------------------------------------------------------------------
+// 终端登录（F-ACC-13）：订阅/OAuth 认证无法在无头派发进程内完成——
+// 设置页「终端登录」按钮在本机 Terminal 里启动 harness 的交互命令。
+// ---------------------------------------------------------------------------
+
+/// 登录用的 binary 解析：与派发不同，**不要求 enabled**（用户通常先登录
+/// 再启用）。Manual 路径须存在；Detected 走增广 PATH 现场重探。
+fn resolve_login_program(runtime_dir: &Path, provider_id: &str) -> Result<PathBuf, String> {
+    let descriptor = descriptor_of(provider_id)
+        .ok_or_else(|| format!("unsupported harness type: {provider_id}"))?;
+    if let Some(cfg) = load_configs(runtime_dir).get(provider_id) {
+        if let BinarySource::Manual { path } = &cfg.binary {
+            let p = PathBuf::from(path);
+            if p.is_file() {
+                return Ok(p);
+            }
+            return Err(format!("Manual binary 不存在：{path}"));
+        }
+    }
+    which_binary(descriptor.binary_name).ok_or_else(|| {
+        format!(
+            "PATH 上未找到 {}，请先安装或在设置中手动指定",
+            descriptor.binary_name
+        )
+    })
+}
+
+/// POSIX 单引号 shell 转义：`'` → `'\''`（路径含空格/引号时保持单参数）。
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// AppleScript 字符串字面量转义：`\` 与 `"`（osascript -e 的 do script 参数）。
+fn escape_applescript_string(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// 组装 `osascript -e` 的源码：activate 前置（Terminal 抢到前台），
+/// do script 在新 Terminal 窗口运行登录命令。纯函数供测试。
+fn terminal_login_script(shell_command: &str) -> String {
+    format!(
+        "tell application \"Terminal\"\nactivate\ndo script \"{}\"\nend tell",
+        escape_applescript_string(shell_command)
+    )
+}
+
+// ---------------------------------------------------------------------------
+// 模型列表（执行弹窗下拉）：`<binary> models` 零成本本地命令，输出格式
+// per-provider 解析。解析器是纯函数（真实输出 fixture 钉在测试里）。
+// ---------------------------------------------------------------------------
+
+/// 一个可选模型（group 供下拉分组显示；omp 的 provider 组头 / opencode
+/// 的 id 前缀）。
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ModelEntry {
+    pub id: String,
+    pub group: Option<String>,
+}
+
+/// 派发入参的 model id 校验：非空、限 `[A-Za-z0-9._:/-]`、≤128——防
+/// argv 注入（换行/空白/新 flag）。拒绝时返回可读文案。
+pub fn validate_model_id(model: &str) -> Result<(), String> {
+    let ok_len = !model.is_empty() && model.len() <= 128;
+    // 不得以 '-' 开头——`--model --flag` 会被 CLI 当新 flag 解析（注入面）
+    let ok_prefix = !model.starts_with('-');
+    let ok_chars = model
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '/' | '-'));
+    if ok_len && ok_prefix && ok_chars {
+        Ok(())
+    } else {
+        Err(format!(
+            "非法 model id「{model}」：仅允许字母/数字/._:/-（长度 ≤128）"
+        ))
+    }
+}
+
+/// opencode `models`：每行 `provider/model`（纯行输出，无表头）。
+fn parse_opencode_models(output: &str) -> Vec<ModelEntry> {
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            // 严格形状：恰一个 '/'，两侧非空——排除任何提示/警告行
+            let parts: Vec<&str> = line.split('/').collect();
+            parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty()
+        })
+        .map(|line| ModelEntry {
+            id: line.to_string(),
+            group: Some(line.split('/').next().unwrap_or(line).to_string()),
+        })
+        .collect()
+}
+
+/// omp `models`：provider 组头 `name (N)` + 表格行 `│ model │ … │`。
+fn parse_omp_models(output: &str) -> Vec<ModelEntry> {
+    let mut models = Vec::new();
+    let mut group: Option<String> = None;
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if let Some(stripped) = trimmed.strip_prefix('│') {
+            // 表格数据行：取第一格（│ 后到下一个 │）
+            if let Some(end) = stripped.find('│') {
+                let id = stripped[..end].trim();
+                if id != "model"
+                    && !id.is_empty()
+                    && id.chars().all(|c| {
+                        c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '/' | '-')
+                    })
+                {
+                    models.push(ModelEntry {
+                        id: id.to_string(),
+                        group: group.clone(),
+                    });
+                }
+            }
+            continue;
+        }
+        // 组头：`kimi-code (7)` 形状（数字 + 括号收尾）
+        if let Some(paren) = trimmed.rfind(" (") {
+            let (name, tail) = trimmed.split_at(paren);
+            let digits: String = tail
+                .trim_start_matches(" (")
+                .trim_end_matches(')')
+                .chars()
+                .filter(|c| c.is_ascii_digit())
+                .collect();
+            if !name.is_empty() && !digits.is_empty() {
+                group = Some(name.to_string());
+            }
+        }
+    }
+    models
+}
+
+fn parse_models_output(provider_id: &str, output: &str) -> Vec<ModelEntry> {
+    match provider_id {
+        "opencode" => parse_opencode_models(output),
+        "omp" => parse_omp_models(output),
+        _ => Vec::new(),
+    }
+}
+
+/// 执行弹窗「模型」下拉数据面（`harness_list_models`）：运行
+/// `<binary> models`（≤8s，失败/超时 → 可读 Err，弹窗降级隐藏下拉）。
+#[tauri::command(async)]
+pub fn harness_list_models(harness: String) -> Result<serde_json::Value, String> {
+    let runtime_dir = daemon::runtime_dir();
+    let program = resolve_login_program(&runtime_dir, &harness)?;
+    let output = capture_with_timeout(&program, &["models"], 8).ok_or_else(|| {
+        format!(
+            "运行 {} models 失败（未安装/超时）——模型下拉不可用",
+            program.display()
+        )
+    })?;
+    let models = parse_models_output(&harness, &output);
+    Ok(serde_json::json!({ "models": models }))
+}
+
+/// 设置页「终端登录」（`harness_open_login`）：在 Terminal 里运行
+/// `<binary> <login_args>`（omp 裸跑 TUI；opencode 走 `auth login`）。
+/// 仅 macOS（osascript / Terminal.app）；命令在用户 Terminal 中交互，
+/// 凭据落在 harness 自己的全局存储（~/.omp 等），OMT 不经手。
+#[tauri::command(async)]
+pub fn harness_open_login(harness: String) -> Result<serde_json::Value, String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = &harness;
+        return Err("终端登录目前仅支持 macOS（Terminal.app + osascript）".to_string());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let runtime_dir = daemon::runtime_dir();
+        let program = resolve_login_program(&runtime_dir, &harness)?;
+        let descriptor = descriptor_of(&harness).expect("checked in resolve_login_program");
+        let mut shell_command = shell_quote(&program.display().to_string());
+        for arg in descriptor.login_args {
+            shell_command.push(' ');
+            shell_command.push_str(&shell_quote(arg));
+        }
+        let script = terminal_login_script(&shell_command);
+        std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(&script)
+            .spawn()
+            .map_err(|e| format!("打开 Terminal 失败：{e}"))?;
+        Ok(serde_json::json!({ "opened": true, "program": program.display().to_string() }))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -693,22 +1030,211 @@ mod tests {
         let plan = LaunchPlan {
             program: PathBuf::from("/usr/local/bin/omp"),
             extra_args: vec!["--model".to_string(), "k3".to_string()],
-            unattended_flag: vec!["--yolo".to_string()],
+            unattended_flag: vec!["--approval-mode=yolo".to_string()],
             env: BTreeMap::new(),
+            prompt_channel: PromptChannel::Argv,
+            argv_prefix: vec![],
+            headless_flags: vec!["-p".to_string()],
+            model_args: vec!["--model".to_string()],
         };
         // SpawnRequest doc 契约：用户 extra_args 在前、desktop 注入 flag 在后
         //（覆盖用户同名 flag）、prompt 收尾
-        let args = compose_launch_args(&plan, true, "PROMPT");
+        let args = compose_launch_args(&plan, true, "PROMPT", None, None);
         assert_eq!(
             args,
-            vec!["--model", "k3", "--yolo", "PROMPT"],
-            "unattended=true 时 args 必须含 unattended_flag 且顺序正确"
+            vec!["-p", "--model", "k3", "--approval-mode=yolo", "PROMPT"],
+            "unattended=true 时 args 必须含 headless 与放行 flag 且顺序正确"
         );
         assert_eq!(
-            compose_launch_args(&plan, false, "PROMPT"),
-            vec!["--model", "k3", "PROMPT"],
-            "unattended=false 不得追加放行 flag"
+            compose_launch_args(&plan, false, "PROMPT", None, None),
+            vec!["-p", "--model", "k3", "PROMPT"],
+            "unattended=false 不得追加放行 flag（headless 始终在）"
         );
+    }
+
+    /// 模型解析：两家真实输出 fixture 钉形状（opencode 纯行 / omp 分组表格，
+    /// 表头行 `│ model │` 不得误收）。
+    #[test]
+    fn parse_models_output_handles_both_providers() {
+        let oc = parse_models_output(
+            "opencode",
+            "opencode/glm-5.3-flash-free\nzai-coding-plan/glm-4.7\nnot-a-model-line\n",
+        );
+        assert_eq!(
+            oc,
+            vec![
+                ModelEntry {
+                    id: "opencode/glm-5.3-flash-free".into(),
+                    group: Some("opencode".into())
+                },
+                ModelEntry {
+                    id: "zai-coding-plan/glm-4.7".into(),
+                    group: Some("zai-coding-plan".into())
+                },
+            ]
+        );
+        let omp_out = concat!(
+            "kimi-code (7)\n",
+            "┌───────────┬─────────┐\n",
+            "│ model     │ context │\n",
+            "├───────────┼─────────┤\n",
+            "│ k3        │      1M │\n",
+            "│ kimi-k2.5 │    262K │\n",
+        );
+        let omp = parse_models_output("omp", omp_out);
+        assert_eq!(
+            omp,
+            vec![
+                ModelEntry {
+                    id: "k3".into(),
+                    group: Some("kimi-code".into())
+                },
+                ModelEntry {
+                    id: "kimi-k2.5".into(),
+                    group: Some("kimi-code".into())
+                },
+            ]
+        );
+    }
+
+    /// model id 校验：正常 id 放行；argv 注入形状（换行/空白/flag 前缀/
+    /// 空/超长）拒绝。
+    #[test]
+    fn validate_model_id_rejects_injection_shapes() {
+        assert!(validate_model_id("zai-coding-plan/glm-4.7").is_ok());
+        assert!(validate_model_id("k3").is_ok());
+        for bad in ["", "k3 -x", "k3\n--flag", "--flag", &"a".repeat(129)] {
+            assert!(validate_model_id(bad).is_err(), "应拒绝: {bad:?}");
+        }
+    }
+
+    /// compose：model 位于 unattended flag 之后、prompt 位之前。
+    #[test]
+    fn compose_launch_args_places_model_before_prompt() {
+        let plan = LaunchPlan {
+            program: PathBuf::from("/usr/local/bin/omp"),
+            extra_args: vec![],
+            unattended_flag: vec!["--approval-mode=yolo".to_string()],
+            env: BTreeMap::new(),
+            prompt_channel: PromptChannel::Argv,
+            argv_prefix: vec![],
+            headless_flags: vec!["-p".to_string()],
+            model_args: vec!["--model".to_string()],
+        };
+        assert_eq!(
+            compose_launch_args(&plan, true, "PROMPT", None, Some("k3")),
+            vec!["-p", "--approval-mode=yolo", "--model", "k3", "PROMPT"],
+        );
+    }
+
+    /// F-ACC-13：终端登录脚本的转义——敌意路径（空格/单引号/双引号/
+    /// 反斜杠）不得破坏 shell 引号或 AppleScript 字面量。
+    #[test]
+    fn terminal_login_script_escapes_hostile_paths() {
+        let normal = shell_quote("/opt/homebrew/bin/omp");
+        assert_eq!(normal, "'/opt/homebrew/bin/omp'");
+        let hostile = shell_quote("/x/my omp/y'z\"w");
+        // 单引号 → '\''，整串仍被引号包裹
+        assert!(hostile.starts_with("'/x/my omp"), "{hostile}");
+        assert!(hostile.contains(r"'\''"), "单引号必须转义: {hostile}");
+
+        let script = terminal_login_script(&hostile);
+        assert!(script.contains("activate"), "Terminal 抢前置前: {script}");
+        // 期望行手写字面量（shell 单引号转义 + AppleScript 反斜杠/双引号
+        // 转义各就各位）——精确钉住两级转义的产物
+        let line = script.lines().nth(2).unwrap_or_default();
+        assert_eq!(
+            line, r##"do script "'/x/my omp/y'\\''z\"w'""##,
+            "敌意路径的两级转义: {script}"
+        );
+
+        // registry：omp 裸跑（TUI /login），opencode 走 auth login
+        assert_eq!(descriptor_of("omp").unwrap().login_args, &[] as &[&str]);
+        assert_eq!(
+            descriptor_of("opencode").unwrap().login_args,
+            &["auth", "login"] as &[&str]
+        );
+    }
+
+    /// F-ACC-13：登录解析不要求 enabled（先登录后启用是常态流）。
+    #[test]
+    fn resolve_login_program_works_without_enabled_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = dir.path().join("omp-tool");
+        std::fs::write(&tool, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&tool, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        upsert_config(
+            dir.path(),
+            "omp",
+            HarnessUserConfig {
+                enabled: false,
+                binary: BinarySource::Manual {
+                    path: tool.display().to_string(),
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let p = resolve_login_program(dir.path(), "omp").expect("未启用也应解析出登录 binary");
+        assert_eq!(p, tool);
+        // Manual 路径不存在 → 可读错误（不静默回落 Detected）
+        upsert_config(
+            dir.path(),
+            "omp",
+            HarnessUserConfig {
+                enabled: false,
+                binary: BinarySource::Manual {
+                    path: dir.path().join("nope").display().to_string(),
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let err = resolve_login_program(dir.path(), "omp").unwrap_err();
+        assert!(err.contains("不存在"), "{err}");
+    }
+
+    /// F-ACC-6 回归：opencode 对位置参数 lstat 判附件，多行长 prompt 被
+    /// 当路径 ENAMETOOLONG——FileAttach 渠道 argv 只留 -f + 短指令。
+    #[test]
+    fn compose_launch_args_file_attach_avoids_long_positional() {
+        let plan = LaunchPlan {
+            program: PathBuf::from("/opencode/bin/opencode"),
+            extra_args: vec![],
+            unattended_flag: vec!["--auto".to_string()],
+            env: BTreeMap::new(),
+            prompt_channel: PromptChannel::FileAttach,
+            argv_prefix: vec!["run".to_string()],
+            headless_flags: vec![],
+            model_args: vec!["--model".to_string()],
+        };
+        let long_prompt = "You are executing tickets…\nrule 1\nrule 2";
+        let args = compose_launch_args(
+            &plan,
+            true,
+            long_prompt,
+            Some(Path::new("/rt/transcripts/h/exec-1.prompt.md")),
+            None,
+        );
+        assert_eq!(
+            args,
+            vec![
+                "run",
+                "--auto",
+                ATTACH_MESSAGE,
+                "-f",
+                "/rt/transcripts/h/exec-1.prompt.md"
+            ]
+        );
+        assert!(
+            !args.iter().any(|a| a.contains('\n')),
+            "argv 不得再含多行 prompt: {args:?}"
+        );
+        // 渠道为 FileAttach 但文件缺失 → 防御性回落 argv prompt
+        let fallback = compose_launch_args(&plan, true, long_prompt, None, None);
+        assert_eq!(fallback.last().map(String::as_str), Some(long_prompt));
     }
 
     #[test]
@@ -751,7 +1277,11 @@ mod tests {
             .unwrap();
             let plan = resolve_launch(dir.path(), "omp").unwrap();
             assert_eq!(plan.program, tool);
-            assert_eq!(plan.unattended_flag, vec!["--yolo".to_string()]);
+            assert_eq!(
+                plan.unattended_flag,
+                vec!["--approval-mode=yolo".to_string()]
+            );
+            assert_eq!(plan.headless_flags, vec!["-p".to_string()]);
             assert_eq!(plan.extra_args, vec!["--model".to_string()]);
         }
         // 未知 provider → Err
@@ -771,6 +1301,10 @@ mod tests {
             extra_args: vec![],
             unattended_flag: vec![],
             env,
+            prompt_channel: PromptChannel::Argv,
+            argv_prefix: vec![],
+            headless_flags: vec![],
+            model_args: vec!["--model".to_string()],
         };
         let filtered = plan.sanitized_env();
         assert_eq!(filtered.len(), 1, "{filtered:?}");
@@ -785,8 +1319,12 @@ mod tests {
         let plan = LaunchPlan {
             program: PathBuf::from("/bin/omp"),
             extra_args: vec!["--model".to_string()],
-            unattended_flag: vec!["--yolo".to_string()],
+            unattended_flag: vec!["--approval-mode=yolo".to_string()],
             env,
+            prompt_channel: PromptChannel::Argv,
+            argv_prefix: vec![],
+            headless_flags: vec![],
+            model_args: vec!["--model".to_string()],
         };
         let value = launch_preview_value(&plan);
         let keys: Vec<&str> = value["envKeys"]
@@ -800,7 +1338,10 @@ mod tests {
         assert!(!text.contains("sk-secret-value"), "{text}");
         assert_eq!(value["program"], "/bin/omp");
         assert_eq!(value["args"], serde_json::json!(["--model"]));
-        assert_eq!(value["unattendedFlag"], serde_json::json!(["--yolo"]));
+        assert_eq!(
+            value["unattendedFlag"],
+            serde_json::json!(["--approval-mode=yolo"])
+        );
     }
 
     #[cfg(unix)]

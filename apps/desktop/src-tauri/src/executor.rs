@@ -1000,13 +1000,15 @@ fn collect_members(
             serde_json::json!({"homeId": home_id, "nodeId": current}),
         )?;
         let node = &resp["node"];
-        let kind = node["kind"].as_str().unwrap_or("");
+        // daemon 序列化契约：views.rs 的 node_view/node_summary 输出
+        // `type`/`nodeId`（见 crates/omt-runtime/src/views.rs）。
+        let node_type = node["type"].as_str().unwrap_or("");
         let status = node["status"].as_str().unwrap_or("");
         let archived = node["archived"].as_bool().unwrap_or(false);
         if archived {
             continue;
         }
-        if matches!(kind, "ticket" | "subticket") {
+        if matches!(node_type, "ticket" | "subticket") {
             let is_executable = !matches!(status, "done" | "skipped");
             if is_executable {
                 members.push(current.clone());
@@ -1014,7 +1016,7 @@ fn collect_members(
         }
         if let Some(children) = resp["children"].as_array() {
             for child in children {
-                if let Some(id) = child["id"].as_str() {
+                if let Some(id) = child["nodeId"].as_str() {
                     queue.push(id.to_string());
                 }
             }
@@ -1037,6 +1039,7 @@ fn dispatch_chain(
     node_id: &str,
     provider_id: &str,
     unattended: bool,
+    model: Option<&str>,
     sink: EventSink,
 ) -> Result<ExecStartOutcome, String> {
     let dispatch_id = format!(
@@ -1082,7 +1085,14 @@ fn dispatch_chain(
                 "commandId": format!("{dispatch_id}:create"),
             }),
         )?;
-        (resp["id"].as_str().unwrap_or_default().to_string(), true)
+        // run/create 返回 run_view_full（dispatch.rs）：run id 在 `run.runId`。
+        // 缺失时显式报错——空 runId 会在后续 run/get 以更迷惑的
+        // `unknown run: (NOT_FOUND)` 爆出（验收 F-ACC-4）。
+        let created = resp["run"]["runId"]
+            .as_str()
+            .ok_or("run/create 响应缺少 run.runId（daemon 契约漂移）")?
+            .to_string();
+        (created, true)
     };
 
     // ④ run/control start（仅新建/Pending；复用 Running 跳过）
@@ -1123,13 +1133,22 @@ fn dispatch_chain(
     // 不留 Agent 记录（补偿表）。
     let plan = harness::resolve_launch(runtime_dir, provider_id)?;
     let prompt = DISPATCH_PROMPT.replace("{run_id}", &run_id);
-    let args = harness::compose_launch_args(&plan, unattended, &prompt);
+    // exec_id 提前生成：prompt 文件名、Agent 记录、spawn 三方共用
+    let exec_id = format!("exec-{}", crate::atomic_json::unique_suffix());
+    // F-ACC-6（验收 ENAMETOOLONG）：opencode 对位置参数 lstat 判文件附件，
+    // 多行长 prompt 被当路径启动即炸。FileAttach 渠道把 prompt 落 per-exec
+    // 文件（与 raw.log 同目录，无 secrets——desktop 模板 + run_id），argv 只
+    // 留 `-f <path>` + 短指令。路径此处确定（compose/注册用），写盘在 ⑦ 后
+    // （失败走补偿表）。
+    let prompt_file =
+        harness::prompt_file_path(runtime_dir, home_id, &exec_id, plan.prompt_channel);
+    let args =
+        harness::compose_launch_args(&plan, unattended, &prompt, prompt_file.as_deref(), model);
     // 保存时 validate_env 已拒保留键；这里防御性再滤一次（手工改写的
     // config.json 不得炸 spawn 入口的硬校验）。
     let env_additions = plan.sanitized_env();
 
     // ⑤ register Agent (U4a)。失败按补偿表 cancel 本次新建 run（不留记录）。
-    let exec_id = format!("exec-{}", crate::atomic_json::unique_suffix());
     let agent = match agents::register_agent(
         runtime_dir,
         home_id,
@@ -1175,6 +1194,21 @@ fn dispatch_chain(
         Ok(mcp) => mcp,
         Err(err) => return Err(fail_agent_and_compensate(err)),
     };
+
+    // F-ACC-6 写盘（⑦ 之后、spawn 之前）：FileAttach 渠道的 prompt 文件，
+    // 失败按补偿表（Agent 转 Failed + cancel 新建 run）。
+    if let Some(path) = &prompt_file {
+        if let Some(dir) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                return Err(fail_agent_and_compensate(format!(
+                    "create transcripts dir: {e}"
+                )));
+            }
+        }
+        if let Err(e) = std::fs::write(path, &prompt) {
+            return Err(fail_agent_and_compensate(format!("write prompt file: {e}")));
+        }
+    }
 
     // ⑧ spawn（U2）——sink 已由 tauri command 的 Channel 适配而来，穿透到
     // 事件泵（U5 transcript 流的数据源，KD-D3：不进 daemon 事件流）。
@@ -1229,8 +1263,13 @@ pub fn exec_start_impl(
     node_id: &str,
     provider_id: &str,
     unattended: bool,
+    model: Option<&str>,
     sink: EventSink,
 ) -> Result<ExecStartOutcome, String> {
+    // model 入参先校验（argv 注入面），非法即拒——不进 dispatch_chain
+    if let Some(model) = model {
+        harness::validate_model_id(model)?;
+    }
     // SharedSession 的 clone 共享同一个内部 mutex；终态线程由此获得 daemon
     // RPC 通道，而不会另建连接或持有 tauri::State 生命周期。
     manager.set_shared_session(Arc::new(shared.clone()));
@@ -1249,6 +1288,7 @@ pub fn exec_start_impl(
         node_id,
         provider_id,
         unattended,
+        model,
         sink,
     )
 }
@@ -1267,6 +1307,7 @@ pub fn exec_start(
     node_id: String,
     harness: String,
     unattended: bool,
+    model: Option<String>,
     channel: tauri::ipc::Channel<serde_json::Value>,
 ) -> Result<ExecStartOutcome, String> {
     let sink: EventSink = Arc::new(move |value| {
@@ -1282,6 +1323,7 @@ pub fn exec_start(
         &node_id,
         &harness,
         unattended,
+        model.as_deref(),
         sink,
     )
 }
@@ -1289,7 +1331,7 @@ pub fn exec_start(
 /// F-U2-13 + F-U2-1 联动：signal 分支偏好 stop_reason + kill_all 同步收口。
 /// 终态租约释放（§3.3 补充）：Killed/Exited/Failed 后释放本 exec 持有的项。
 fn release_lease_on_terminal(shared: &SharedSession, home_id: &str, run_id: &str, exec_id: &str) {
-    // run/get 查 items 中 executor_session_id 以 /exec:<exec_id> 结尾的 in-flight 项
+    // run/get 查 items 中 executor_actor 以 /exec:<exec_id> 结尾的 in-flight 项
     let resp = match daemon_rpc(
         shared,
         "run/get",
@@ -1298,38 +1340,46 @@ fn release_lease_on_terminal(shared: &SharedSession, home_id: &str, run_id: &str
         Ok(r) => r,
         Err(_) => return,
     };
+    for node_id in held_running_nodes(&resp, exec_id) {
+        // admin report failed（无 leaseToken，Administrator 授权路径）
+        let _ = daemon_rpc(
+            shared,
+            "run/report",
+            serde_json::json!({
+                "homeId": home_id, "runId": run_id, "nodeId": node_id,
+                "outcome": "failed",
+                "note": format!("exec {exec_id} terminated (kill/app-exit)"),
+            }),
+        );
+        // retry 回 pending
+        let _ = daemon_rpc(
+            shared,
+            "run/control",
+            serde_json::json!({
+                "homeId": home_id, "runId": run_id,
+                "action": "retry", "nodeId": node_id,
+            }),
+        );
+    }
+}
+
+/// run/get 响应中本 exec（actor 后缀匹配）仍持有的 running item 的 nodeId。
+/// 字段契约：views.rs `run_item_view` 序列化为 `executorActor`/`nodeId`/`state`。
+fn held_running_nodes(resp: &serde_json::Value, exec_id: &str) -> Vec<String> {
     let suffix = format!("/exec:{exec_id}");
     let empty_items: Vec<serde_json::Value> = Vec::new();
-    let items = resp["items"].as_array().unwrap_or(&empty_items);
-    for item in items {
-        let executor = item["executorSessionId"].as_str().unwrap_or_default();
-        if !executor.ends_with(&suffix) {
-            continue;
-        }
-        let node_id = item["nodeId"].as_str().unwrap_or_default();
-        let state = item["state"].as_str().unwrap_or_default();
-        if matches!(state, "running") {
-            // admin report failed（无 leaseToken，Administrator 授权路径）
-            let _ = daemon_rpc(
-                shared,
-                "run/report",
-                serde_json::json!({
-                    "homeId": home_id, "runId": run_id, "nodeId": node_id,
-                    "outcome": "failed",
-                    "note": format!("exec {exec_id} terminated (kill/app-exit)"),
-                }),
-            );
-            // retry 回 pending
-            let _ = daemon_rpc(
-                shared,
-                "run/control",
-                serde_json::json!({
-                    "homeId": home_id, "runId": run_id,
-                    "action": "retry", "nodeId": node_id,
-                }),
-            );
-        }
-    }
+    resp["items"]
+        .as_array()
+        .unwrap_or(&empty_items)
+        .iter()
+        .filter(|item| {
+            item["executorActor"]
+                .as_str()
+                .is_some_and(|actor| actor.ends_with(&suffix))
+                && item["state"].as_str() == Some("running")
+        })
+        .filter_map(|item| item["nodeId"].as_str().map(str::to_owned))
+        .collect()
 }
 
 #[cfg(test)]
@@ -2510,7 +2560,15 @@ mod tests {
             Ok(match method {
                 "node/get" => self.node_get.clone(),
                 "run/get" => self.run_get.clone(),
-                "run/create" => serde_json::json!({ "id": self.run_create_id }),
+                // 镜像 daemon run/create 的 run_view_full 形状（run.runId）
+                "run/create" => serde_json::json!({
+                    "run": {
+                        "homeId": "h_test",
+                        "runId": self.run_create_id,
+                        "status": "pending",
+                    },
+                    "items": [],
+                }),
                 _ => serde_json::json!({}),
             })
         }
@@ -2538,9 +2596,19 @@ mod tests {
 
     /// node/get 预置响应：同时满足 ① 预检（`runs`）与 collect_members
     /// （`node` 可执行 ticket + 空 `children` 收敛遍历）。
+    /// 形状镜像 daemon 真实序列化（views.rs node_view / dispatch.rs node/get：
+    /// `nodeId`/`type`/`archived`）——字段名漂移会让本组测试失败。
     fn dispatch_node_get(runs: serde_json::Value) -> serde_json::Value {
         serde_json::json!({
-            "node": { "id": "t1", "kind": "ticket", "status": "pending" },
+            "node": {
+                "homeId": "h_test",
+                "nodeId": "t1",
+                "type": "ticket",
+                "title": "t1",
+                "status": "open",
+                "archived": false,
+                "priority": "P2",
+            },
             "children": [],
             "runs": runs,
         })
@@ -2548,6 +2616,36 @@ mod tests {
 
     fn dispatch_run_get(status: &str) -> serde_json::Value {
         serde_json::json!({ "run": { "status": status } })
+    }
+
+    /// 通用 node/get 响应（daemon views.rs 真实形状），供子树遍历测试
+    /// 按节点定制 type/status/archived/children。
+    fn node_get_shape(
+        node_id: &str,
+        node_type: &str,
+        status: &str,
+        archived: bool,
+        child_ids: &[&str],
+    ) -> serde_json::Value {
+        let summary = |id: &str| {
+            serde_json::json!({
+                "homeId": "h_test", "nodeId": id, "type": "ticket",
+                "title": id, "status": "open", "archived": false, "priority": "P2",
+            })
+        };
+        serde_json::json!({
+            "node": {
+                "homeId": "h_test",
+                "nodeId": node_id,
+                "type": node_type,
+                "title": node_id,
+                "status": status,
+                "archived": archived,
+                "priority": "P2",
+            },
+            "children": child_ids.iter().map(|c| summary(c)).collect::<Vec<_>>(),
+            "runs": [],
+        })
     }
 
     /// dispatch_chain 夹具：workspace（`.omt` home）+ 已启用的 Manual binary
@@ -2615,7 +2713,7 @@ mod tests {
         let sink: EventSink = Arc::new(|_| {});
 
         let result = dispatch_chain(
-            &rpc, &manager, &runtime, "h_test", &home_path, "t1", "omp", false, sink,
+            &rpc, &manager, &runtime, "h_test", &home_path, "t1", "omp", false, None, sink,
         );
         let err = result.expect_err("register_agent 写失败应使 dispatch_chain 失败");
 
@@ -2677,7 +2775,7 @@ mod tests {
         let sink: EventSink = Arc::new(|_| {});
 
         let result = dispatch_chain(
-            &rpc, &manager, &runtime, "h_test", &home_path, "t1", "omp", false, sink,
+            &rpc, &manager, &runtime, "h_test", &home_path, "t1", "omp", false, None, sink,
         );
         let err = result.expect_err("MCP prepare 失败应使 dispatch_chain 失败");
 
@@ -2687,7 +2785,11 @@ mod tests {
         assert_eq!(file.agents[0].status, AgentRecordStatus::Failed);
         assert_eq!(file.agents[0].attachment, AgentAttachment::None);
         let persisted_args = &file.agents[0].execs[0].binary_args;
-        assert_eq!(&persisted_args[..3], ["--api-key", "***", "--token=***"]);
+        // F-ACC-12：omp 渠道 argv 前置 headless `-p`，其后才是用户 args
+        assert_eq!(
+            &persisted_args[..4],
+            ["-p", "--api-key", "***", "--token=***"]
+        );
         assert!(
             !serde_json::to_string(&file)
                 .unwrap()
@@ -2722,7 +2824,7 @@ mod tests {
         let sink: EventSink = Arc::new(|_| {});
 
         let result = dispatch_chain(
-            &rpc, &manager, &runtime, "h_test", &home_path, "t1", "opencode", false, sink,
+            &rpc, &manager, &runtime, "h_test", &home_path, "t1", "opencode", false, None, sink,
         );
         let err = result.expect_err("spawn 失败应使 dispatch_chain 失败");
         assert!(
@@ -2774,7 +2876,7 @@ mod tests {
         let sink: EventSink = Arc::new(|_| {});
 
         let result = dispatch_chain(
-            &rpc, &manager, &runtime, "h_test", &home_path, "t1", "omp", false, sink,
+            &rpc, &manager, &runtime, "h_test", &home_path, "t1", "omp", false, None, sink,
         );
         assert!(result.is_err(), "prepare 失败应使 dispatch_chain 失败");
 
@@ -2817,7 +2919,7 @@ mod tests {
         let sink: EventSink = Arc::new(|_| {});
 
         let outcome = dispatch_chain(
-            &rpc, &manager, &runtime, "h_test", &home_path, "t1", "opencode", false, sink,
+            &rpc, &manager, &runtime, "h_test", &home_path, "t1", "opencode", false, None, sink,
         )
         .expect("全链应成功");
 
@@ -2825,6 +2927,15 @@ mod tests {
         assert_eq!(outcome.agent_id, format!("agent-{}", outcome.exec_id));
         assert_eq!(outcome.run_id, "run-new-e");
         assert!(outcome.warnings.is_empty(), "{outcome:?}");
+        // F-ACC-6：opencode 渠道 prompt 落 per-exec 文件（argv 避开
+        // ENAMETOOLONG），文件内容含替换后的 run id
+        let prompt_file = runtime
+            .join("transcripts")
+            .join("h_test")
+            .join(format!("{}.prompt.md", outcome.exec_id));
+        let prompt_body = std::fs::read_to_string(&prompt_file)
+            .unwrap_or_else(|_| panic!("prompt 文件应存在: {}", prompt_file.display()));
+        assert!(prompt_body.contains("run-new-e"), "{prompt_body}");
         for method in [
             "node/get",
             "node/execute",
@@ -2844,6 +2955,79 @@ mod tests {
         assert!(
             matches!(terminal, Some(Terminal::Exited(0))),
             "{terminal:?}"
+        );
+    }
+
+    /// 验收回归（真实派发报「无未完成可执行成员」暴露的 mock 漂移）：
+    /// collect_members 必须按 daemon 真实序列化（`type`/`nodeId`）遍历，
+    /// 不能用 mock 自造的 `kind`/`id`。同时守住 done/archived 过滤与
+    /// visited 防环（story-1 带 epic-1 回边）。
+    #[test]
+    fn collect_members_walks_subtree_in_daemon_view_shape() {
+        let mut map = std::collections::HashMap::new();
+        for (id, node_type, status, archived, kids) in [
+            (
+                "epic-1",
+                "epic",
+                "open",
+                false,
+                vec!["story-1", "ticket-arch"],
+            ),
+            (
+                "story-1",
+                "story",
+                "open",
+                false,
+                vec!["ticket-a", "ticket-b", "epic-1"],
+            ),
+            ("ticket-a", "ticket", "open", false, vec![] as Vec<&str>),
+            ("ticket-b", "ticket", "done", false, vec![] as Vec<&str>),
+            ("ticket-arch", "ticket", "open", true, vec![] as Vec<&str>),
+        ] {
+            map.insert(
+                id.to_string(),
+                node_get_shape(id, node_type, status, archived, &kids),
+            );
+        }
+        let rpc = |method: &str, params: serde_json::Value| -> Result<serde_json::Value, String> {
+            assert_eq!(method, "node/get", "成员收集只应调 node/get");
+            let id = params["nodeId"].as_str().unwrap_or_default().to_string();
+            map.get(&id)
+                .cloned()
+                .ok_or_else(|| format!("unexpected node {id}"))
+        };
+        let members = collect_members(&rpc, "h_test", "epic-1").expect("应收集到成员");
+        assert_eq!(members, vec!["ticket-a".to_string()]);
+    }
+
+    /// 验收回归同源第三处：run/get item 的执行器字段是 `executorActor`
+    /// （run_item_view 序列化），旧代码读 `executorSessionId` 恒空导致
+    /// 终态释放匹配不到任何持有项。形状镜像 views.rs run_item_view。
+    #[test]
+    fn held_running_nodes_matches_executor_actor_suffix() {
+        let resp = serde_json::json!({
+            "run": { "homeId": "h_test", "runId": "run-1", "status": "running" },
+            "items": [
+                {
+                    "homeId": "h_test", "runId": "run-1", "nodeId": "node-1",
+                    "position": 0, "state": "running", "attempts": 1, "stalled": false,
+                    "executorActor": "mcp:1234/exec:exec-x",
+                },
+                {
+                    "homeId": "h_test", "runId": "run-1", "nodeId": "node-2",
+                    "position": 1, "state": "running", "attempts": 1, "stalled": false,
+                    "executorActor": "mcp:1234/exec:exec-other",
+                },
+                {
+                    "homeId": "h_test", "runId": "run-1", "nodeId": "node-3",
+                    "position": 2, "state": "succeeded", "attempts": 1, "stalled": false,
+                    "executorActor": "mcp:1234/exec:exec-x",
+                },
+            ],
+        });
+        assert_eq!(
+            held_running_nodes(&resp, "exec-x"),
+            vec!["node-1".to_string()]
         );
     }
 }
