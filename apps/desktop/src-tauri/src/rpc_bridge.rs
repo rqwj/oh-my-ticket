@@ -217,8 +217,10 @@ fn with_session<R>(
     f(guard.as_mut().expect("session just established"))
 }
 
-#[tauri::command]
-pub fn omt_call(
+/// U15：async 化——同步命令在主线程跑，慢 RPC（锁竞争/大响应）会卡 UI；
+/// async 命令进 tauri 线程池。with_session 的锁不跨 await（同步作用域）。
+#[tauri::command(async)]
+pub async fn omt_call(
     shared: State<'_, SharedSession>,
     method: String,
     params: serde_json::Value,
@@ -266,11 +268,136 @@ pub fn daemon_reconnect(shared: State<'_, SharedSession>) -> Result<serde_json::
     daemon_homes(shared)
 }
 
-/// U10 seam: start streaming daemon events for one home to the frontend
-/// over the Tauri event channel (`omt://event`). Spawns a reader thread
-/// paging events/resume; the session's credential authorizes the stream.
-/// (Wired end-to-end in U10 when the tree subscribes; registered now so
-/// the bridge surface is complete.)
+// ---------------------------------------------------------------------------
+// U15：daemon 事件订阅管理器——单线程 + 订阅注册表 + 代际切换。
+// 旧实现每次 events_subscribe 起一个永不退出的线程与独立 daemon 连接，
+// 切 home N 次泄漏 N 份；现在全 app 一条泵线程，命令只更新注册表
+// （代际递增），泵线程察觉代际变化即切换 home/cursor，连接复用。
+// ---------------------------------------------------------------------------
+
+/// 订阅目标（最新者胜）。generation 单调递增——泵线程靠它察觉切换。
+#[derive(Debug, Clone)]
+pub(crate) struct SubscriptionTarget {
+    pub home_id: String,
+    pub since: u64,
+    pub generation: u64,
+}
+
+/// 注册表：命令侧写、泵线程读。`None` = 暂无订阅（泵线程空转等待）。
+pub(crate) struct SubscriptionManager {
+    target: std::sync::Mutex<Option<SubscriptionTarget>>,
+    generation: std::sync::atomic::AtomicU64,
+    /// 泵线程是否已启动（全 app 一次）
+    started: std::sync::atomic::AtomicBool,
+}
+
+impl SubscriptionManager {
+    const fn new() -> Self {
+        Self {
+            target: std::sync::Mutex::new(None),
+            generation: std::sync::atomic::AtomicU64::new(0),
+            started: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// 命令入口：登记/切换订阅目标（不 spawn——线程预算与调用次数无关）。
+    fn set_target(&self, home_id: String, since: u64) -> u64 {
+        let generation = self
+            .generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        *self
+            .target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(SubscriptionTarget {
+            home_id,
+            since,
+            generation,
+        });
+        generation
+    }
+
+    fn current(&self) -> Option<SubscriptionTarget> {
+        self.target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+static SUBSCRIPTIONS: SubscriptionManager = SubscriptionManager::new();
+
+/// 泵线程主体：单连接长期轮询 events/resume；代际变化 → 切 home/cursor
+/// （连接复用）；daemon 失联 → 指数退避重连（目标切换立即重试）；
+/// 无目标 → 轻睡眠等待。emit 经闭包注入（测试不打扰 tauri AppHandle）。
+fn subscription_pump(
+    runtime_dir: std::path::PathBuf,
+    emit: impl Fn(serde_json::Value) + Send + 'static,
+) {
+    let mut client: Option<omt_client::Client> = None;
+    let mut active: Option<SubscriptionTarget> = None;
+    let mut cursor = 0u64;
+    let mut backoff_ms = 250u64;
+    loop {
+        let current = SUBSCRIPTIONS.current();
+        // 代际切换：换 home / 游标重置（连接保留——credential 与 home 无关）
+        if current.as_ref().map(|t| t.generation) != active.as_ref().map(|t| t.generation) {
+            active = current;
+            cursor = active.as_ref().map(|t| t.since).unwrap_or(0);
+            backoff_ms = 250; // 新目标立即全速
+        }
+        let Some(target) = active.clone() else {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            continue;
+        };
+        if client.is_none() {
+            let options = omt_client::EnrollOptions {
+                kind: "desktop".into(),
+                name: Some("oh-my-ticket-desktop-events".into()),
+                actor_namespace: None,
+                operations: None,
+                credential_path: None,
+            };
+            match daemon::live_descriptor(&runtime_dir)
+                .and_then(|d| omt_client::Client::connect_and_enroll(&d, &options).ok())
+            {
+                Some(enrollment) => client = Some(enrollment.client),
+                None => {
+                    std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                    backoff_ms = (backoff_ms * 2).min(5_000);
+                    continue;
+                }
+            }
+        }
+        let page = client.as_mut().expect("client just established").call(
+            "events/resume",
+            serde_json::json!({ "homeId": target.home_id, "cursor": cursor, "limit": 500 }),
+        );
+        match page {
+            Ok(page) => {
+                backoff_ms = 250;
+                let events = page["events"].as_array().cloned().unwrap_or_default();
+                for envelope in &events {
+                    emit(envelope.clone());
+                }
+                let next = page["cursor"].as_u64().unwrap_or(cursor).max(cursor);
+                if events.len() < 500 && next == cursor {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+                cursor = next;
+            }
+            Err(_) => {
+                // daemon 失联/流关闭：弃连接退避重连（前端无需重订阅）
+                client = None;
+                std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                backoff_ms = (backoff_ms * 2).min(5_000);
+            }
+        }
+    }
+}
+
+/// U10 seam（U15 重构）：登记/切换某 home 的事件订阅。幂等线程预算——
+/// 全 app 仅一条泵线程（首次调用时启动），此后调用只更新注册表。
 #[tauri::command]
 pub fn events_subscribe(
     app: AppHandle,
@@ -279,45 +406,55 @@ pub fn events_subscribe(
     since: u64,
 ) -> Result<(), String> {
     let runtime_dir = with_session(&shared, |session| Ok(session.runtime_dir.clone()))?;
-    std::thread::spawn(move || {
-        // Fresh connection per subscription (the shared session is
-        // single-flight by design; readers are independent).
-        let descriptor = match daemon::live_descriptor(&runtime_dir) {
-            Some(descriptor) => descriptor,
-            None => return,
-        };
-        let options = omt_client::EnrollOptions {
-            kind: "desktop".into(),
-            name: Some("oh-my-ticket-desktop-events".into()),
-            actor_namespace: None,
-            operations: None,
-            credential_path: None,
-        };
-        let Ok(mut enrollment) = omt_client::Client::connect_and_enroll(&descriptor, &options)
-        else {
-            return;
-        };
-        let mut cursor = since;
-        loop {
-            let page = match enrollment.client.call(
-                "events/resume",
-                serde_json::json!({ "homeId": home_id, "cursor": cursor, "limit": 500 }),
-            ) {
-                Ok(page) => page,
-                Err(_) => return, // daemon gone or stream closed — frontend re-subscribes
-            };
-            let events = page["events"].as_array().cloned().unwrap_or_default();
-            for envelope in &events {
-                let _ = app.emit("omt://event", envelope.clone());
-            }
-            let next = page["cursor"].as_u64().unwrap_or(cursor).max(cursor);
-            if events.len() < 500 && next == cursor {
-                // Caught up: long-poll cadence — the resume endpoint holds
-                // or returns immediately; back off lightly either way.
-                std::thread::sleep(std::time::Duration::from_millis(250));
-            }
-            cursor = next;
-        }
-    });
+    SUBSCRIPTIONS.set_target(home_id, since);
+    if !SUBSCRIPTIONS
+        .started
+        .swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        std::thread::spawn(move || {
+            subscription_pump(runtime_dir, move |envelope| {
+                let _ = app.emit("omt://event", envelope);
+            });
+        });
+    }
     Ok(())
 }
+
+#[cfg(test)]
+mod subscription_tests {
+    use super::*;
+
+    /// U15：注册表语义——代际单调递增、最新者胜、读侧随时取到当前目标。
+    /// （线程预算由构造保证：set_target 不 spawn，泵线程 started 一次性。）
+    #[test]
+    fn subscription_registry_latest_wins_and_generation_monotonic() {
+        let mgr = SubscriptionManager::new();
+        assert!(mgr.current().is_none());
+        let g1 = mgr.set_target("h1".into(), 0);
+        let g2 = mgr.set_target("h2".into(), 100);
+        assert!(g2 > g1, "代际单调递增");
+        let cur = mgr.current().expect("最新目标可见");
+        assert_eq!(
+            (cur.home_id.as_str(), cur.since, cur.generation),
+            ("h2", 100, g2)
+        );
+    }
+
+    /// U15：线程预算——N 次切换后 started 只翻一次、不新增线程位
+    ///（set_target 为纯注册表写；这里以 started 位 + 代际验证调用无副作用扩散）。
+    #[test]
+    fn subscription_set_target_is_spawn_free() {
+        let mgr = SubscriptionManager::new();
+        for i in 0..10 {
+            mgr.set_target(format!("h{i}"), i as u64);
+        }
+        assert!(
+            !mgr.started.load(std::sync::atomic::Ordering::SeqCst),
+            "set_target 不启动泵线程"
+        );
+        assert_eq!(mgr.current().unwrap().home_id, "h9", "十次切换后最新者胜");
+    }
+}
+
+#[cfg(test)]
+mod other_tests_placeholder {}
