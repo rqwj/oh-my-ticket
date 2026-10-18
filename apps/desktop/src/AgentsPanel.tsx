@@ -63,6 +63,9 @@ interface Props {
   bindingsDegraded?: boolean
   fetchRun: (runId: string) => Promise<RunDetail>
   eventsOf: (execId: string) => TranscriptEvent[]
+  homeId: string
+  /** F-PI-3：历史尾部回载（窗口空且非 live 时从 raw.log 拉取） */
+  loadHistoryTail: (execId: string, homeId: string) => void
   onSelectAgent: (id: string) => void
   onStopAgent: (execId: string) => void
   onKillOrphan: (agentId: string, execId: string) => void
@@ -80,6 +83,8 @@ export function AgentsPanel({
   bindingsDegraded = false,
   fetchRun,
   eventsOf,
+  homeId,
+  loadHistoryTail,
   onSelectAgent,
   onStopAgent,
   onKillOrphan,
@@ -128,6 +133,23 @@ export function AgentsPanel({
         </button>
       </div>
     ) : null
+
+  // F-PI-3：选中非 live 的 exec 且本会话无事件 → 从 raw.log 尾部回载一次
+  //（跨重启的历史 agent；live exec 的事件由 Channel 实时推送，不走此路）。
+  // 选中态在 effect 内自算——hooks 须位于提前 return 之前。
+  useEffect(() => {
+    const selectedAgent = agents.find(a => a.id === selectedAgentId) ?? null
+    const exec = selectedAgent ? latestExecOf(selectedAgent) : null
+    if (!selectedAgent || !exec) return
+    const live =
+      selectedAgent.attachment === 'live' &&
+      (selectedAgent.status === 'running' || selectedAgent.status === 'starting')
+    if (live) return
+    if (eventsOf(exec.execId).length > 0) return
+    loadHistoryTail(exec.execId, homeId)
+    // 每个 execId 只需触发一次；eventsOf 为尾窗快照读
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedAgentId, agents, homeId])
 
   if (agents.length === 0) {
     return (

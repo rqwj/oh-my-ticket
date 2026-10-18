@@ -70,6 +70,7 @@ pub fn run() {
             agents::bindings_gc,
             executor::exec_start,
             executor::exec_stop,
+            executor::exec_transcript_tail,
             executor::exec_kill_orphan,
         ])
         .build(tauri::generate_context!())

@@ -1328,6 +1328,68 @@ pub fn exec_start(
     )
 }
 
+/// 历史 transcript 尾部回载（F-PI-3）：transcript 事件只在运行期经 Channel
+/// 进内存——app 重启后选中历史 agent 时，从 raw.log 尾部重建展示事件。
+/// 行格式 `[stdout] text` / `[stderr] text`（spawn_reader 写入侧契约）。
+#[tauri::command(async)]
+pub fn exec_transcript_tail(
+    home_id: String,
+    exec_id: String,
+    max_lines: Option<usize>,
+) -> Result<Vec<serde_json::Value>, String> {
+    Ok(transcript_tail_from(
+        &daemon::runtime_dir(),
+        &home_id,
+        &exec_id,
+        max_lines,
+    ))
+}
+
+/// `exec_transcript_tail` 的纯核心（测试注入 runtime 目录）。
+fn transcript_tail_from(
+    runtime_dir: &Path,
+    home_id: &str,
+    exec_id: &str,
+    max_lines: Option<usize>,
+) -> Vec<serde_json::Value> {
+    let path = runtime_dir
+        .join("transcripts")
+        .join(home_id)
+        .join(format!("{exec_id}.raw.log"));
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new(); // 无日志（未产出/已清理）→ 空
+    };
+    let max = max_lines.unwrap_or(500).clamp(1, 5000);
+    let lines: Vec<&str> = {
+        let all: Vec<&str> = text.lines().collect();
+        let start = all.len().saturating_sub(max);
+        all[start..].to_vec()
+    };
+    let mut seq = 0u64;
+    let events = lines
+        .iter()
+        .map(|line| {
+            let (stream, body) = if let Some(rest) = line.strip_prefix("[stderr] ") {
+                ("stderr", rest)
+            } else if let Some(rest) = line.strip_prefix("[stdout] ") {
+                ("stdout", rest)
+            } else {
+                ("stdout", *line)
+            };
+            seq += 1;
+            serde_json::json!({
+                "execId": exec_id,
+                "seq": seq,
+                "ts": "0",
+                "kind": "raw",
+                "stream": stream,
+                "text": body,
+            })
+        })
+        .collect();
+    events
+}
+
 /// F-U2-13 + F-U2-1 联动：signal 分支偏好 stop_reason + kill_all 同步收口。
 /// 终态租约释放（§3.3 补充）：Killed/Exited/Failed 后释放本 exec 持有的项。
 fn release_lease_on_terminal(shared: &SharedSession, home_id: &str, run_id: &str, exec_id: &str) {
@@ -2998,6 +3060,31 @@ mod tests {
         };
         let members = collect_members(&rpc, "h_test", "epic-1").expect("应收集到成员");
         assert_eq!(members, vec!["ticket-a".to_string()]);
+    }
+
+    /// F-PI-3：raw.log 尾部回载——前缀解析、截尾上限、无文件空返回。
+    ///（command 是薄封装，这里直接构造等价输入驱动纯逻辑面的最小验证：
+    /// 读文件 + 解析已由格式契约钉住。）
+    #[test]
+    fn transcript_tail_prefix_parse_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        let home_dir = runtime.join("transcripts").join("h_t");
+        std::fs::create_dir_all(&home_dir).unwrap();
+        std::fs::write(
+            home_dir.join("exec-t1.raw.log"),
+            "[stdout] first\n[stderr] boom\n[stdout] third\n".repeat(200),
+        )
+        .unwrap();
+        let events = transcript_tail_from(&runtime, "h_t", "exec-t1", Some(600));
+        assert_eq!(events.len(), 600);
+        assert_eq!(events[0]["stream"], "stdout");
+        assert_eq!(events[0]["text"], "first");
+        // 尾部截断：600 上限只影响行数，不破坏前缀映射
+        assert_eq!(events[1]["stream"], "stderr");
+        assert_eq!(events[1]["text"], "boom");
+        // 无日志 → 空
+        assert!(transcript_tail_from(&runtime, "h_t", "exec-none", None).is_empty());
     }
 
     /// 验收回归同源第三处：run/get item 的执行器字段是 `executorActor`

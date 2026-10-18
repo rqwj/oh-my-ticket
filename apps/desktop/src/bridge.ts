@@ -225,6 +225,16 @@ export async function harnessLaunchPreview(harness: string): Promise<HarnessLaun
   return invoke<HarnessLaunchPreview>('harness_launch_preview', { harness })
 }
 
+/** 历史 transcript 尾部（F-PI-3）：raw.log 尾部重建的展示事件——
+ * app 重启后选中历史 agent 时惰性加载；无日志返回空数组。 */
+export async function execTranscriptTail(
+  execId: string,
+  homeId: string,
+  maxLines = 500,
+): Promise<TranscriptEvent[]> {
+  return invoke<TranscriptEvent[]>('exec_transcript_tail', { execId, homeId, maxLines })
+}
+
 /** 模型列表条目（`<binary> models` 解析产物；group 供下拉分组）。 */
 export interface HarnessModelEntry {
   id: string

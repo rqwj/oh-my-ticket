@@ -197,7 +197,11 @@ export function TranscriptView({ agent, events, claimed = null, onStopAgent }: P
         {live && onStopAgent && <ConfirmStopButton claimed={claimed} onConfirm={onStopAgent} />}
       </div>
       {events.length === 0 ? (
-        <p className="empty-hint transcript-hint">尚无输出——等待 agent 产生事件…</p>
+        <p className="empty-hint transcript-hint">
+          {live
+            ? '尚无输出——等待 agent 产生事件…'
+            : '该执行已结束，无输出记录（历史尾部已尝试回载）'}
+        </p>
       ) : (
         <div className="t-scroll-wrap">
           <div className="t-scroll" ref={scrollRef} onScroll={handleScroll}>

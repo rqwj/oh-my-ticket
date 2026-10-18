@@ -33,6 +33,7 @@ import {
   execKillOrphan,
   execStart,
   execStop,
+  execTranscriptTail,
   omtCall,
   subscribeEvents,
   type EventEnvelope,
@@ -533,6 +534,24 @@ export function useTreeStore() {
     })
   }, [])
 
+  /** F-PI-3：历史尾部回载——窗口为空且非 live 时从 raw.log 惰性拉取。
+   * 直接 appendTail（绕过 raw 合并批处理——一次性整段，无需再批）。 */
+  const loadHistoryTail = useCallback(
+    (execId: string, homeId: string) => {
+      if (transcriptsRef.current.get(execId)?.length) return
+      void execTranscriptTail(execId, homeId)
+        .then(events => {
+          if (!events.length) return
+          // 竞态护栏：期间本会话已有事件（不可能出现的新派发复用同 execId
+          // 不会发生——execId 全局唯一），直接并入
+          appendTail(transcriptsRef.current, execId, events)
+          bumpTranscriptVersion()
+        })
+        .catch(() => {/* raw.log 读取失败 → 保持空窗，不阻断 */})
+    },
+    [appendTail, bumpTranscriptVersion],
+  )
+
   const ingestTranscriptEvent = useCallback(
     (ev: TranscriptEvent) => {
       if (!ev || typeof ev.execId !== 'string') return
@@ -907,6 +926,7 @@ export function useTreeStore() {
     stopAgent,
     killOrphan,
     ingestTranscriptEvent,
+    loadHistoryTail,
     // ── U9：绑定切片（R-C）───────────────────────────────────────────────
     refreshBindings,
     gcBindings,

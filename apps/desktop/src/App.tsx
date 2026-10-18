@@ -179,6 +179,8 @@ export function App() {
                     bindingsDegraded={state.bindingsParseFailed}
                     fetchRun={store.fetchRun}
                     eventsOf={store.transcriptWindow}
+                    homeId={state.activeHome.homeId}
+                    loadHistoryTail={store.loadHistoryTail}
                     onSelectAgent={store.selectAgent}
                     onStopAgent={execId => void store.stopAgent(execId)}
                     onKillOrphan={(agentId, execId) => void store.killOrphan(agentId, execId)}
