@@ -451,6 +451,25 @@ body {
 .t-usage { color: #56d364; font-size: 11px; }
 .t-exit { color: var(--muted); border-top: 1px dashed var(--border); }
 .t-exit.t-failed { color: var(--danger); }
+/* 树面板新建节点表单 */
+.create-node-form { display: flex; flex-direction: column; gap: 6px; padding: 8px; margin-bottom: 6px; border: 1px solid var(--border); border-radius: 8px; }
+
+/* U14：Agents 面板底部信任门裁决弹窗 */
+.trust-gate-popup {
+  position: sticky; bottom: 0; z-index: 3; margin-top: 8px;
+  display: flex; flex-direction: column; gap: 6px;
+  padding: 10px 12px; border: 1px solid #d29922; border-radius: 10px;
+  background: var(--panel-raised); box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.35);
+}
+.trust-gate-popup-title { color: #d29922; margin: 0; font-weight: 600; }
+.trust-gate-popup-row { display: flex; align-items: center; gap: 8px; }
+.trust-gate-popup-title-text { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* U14：信任门（awaiting_confirmation）单元格与流尾提示 */
+.trust-gate-cell { display: inline-flex; align-items: center; gap: 6px; }
+.chip.trust-gate { color: #d29922; border-color: #d29922; }
+.trust-gate-hint { color: #d29922; }
+
 /* U11：定向 agent 的新开/续跑勾选行 */
 .dispatch-resume-row { display: flex; align-items: center; gap: 8px; margin: 4px 0 0; cursor: pointer; }
 

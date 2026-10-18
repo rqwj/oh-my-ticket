@@ -46,6 +46,41 @@ export function RunsPanel({ home, runs, fetchRun, onChanged }: Props) {
     }
   }
 
+  /** U14 信任门确认：admin report done（item AwaitingConfirmation → Done）。 */
+  const confirmItem = async (runId: string, nodeId: string) => {
+    try {
+      await omtCall('run/report', {
+        homeId: home.homeId,
+        runId,
+        nodeId,
+        outcome: 'done',
+        note: '人工确认（信任门 awaiting_confirmation）',
+      })
+      setBanner(null)
+      await open(runId)
+      onChanged()
+    } catch (error) {
+      setBanner(String(error))
+    }
+  }
+
+  /** U14 信任门打回：ticket 重开（node open）——daemon 联动把 item 转
+   * Interrupted（等待重新派发认领），不认可 agent 的完成主张。 */
+  const rejectItem = async (runId: string, nodeId: string) => {
+    try {
+      await omtCall('node/update', {
+        homeId: home.homeId,
+        nodeId,
+        changes: { status: 'open' },
+      })
+      setBanner(null)
+      await open(runId)
+      onChanged()
+    } catch (error) {
+      setBanner(String(error))
+    }
+  }
+
   return (
     <div className="runs-panel">
       <h3>Runs</h3>
@@ -88,7 +123,31 @@ export function RunsPanel({ home, runs, fetchRun, onChanged }: Props) {
               {detail.items.map(item => (
                 <tr key={item.nodeId} className={item.stalled ? 'stalled-row' : ''}>
                   <td><span className="node-id">{item.nodeId}</span>{item.title ? ` ${item.title}` : ''}</td>
-                  <td>{item.state}</td>
+                  <td>
+                    {item.state === 'awaiting_confirmation' ? (
+                      // U14 信任门：agent 绕过 run/report 的完成主张，需人工
+                      // 裁决——确认（report done）或打回（ticket 重开→interrupted）
+                      <span className="trust-gate-cell">
+                        <span className="chip trust-gate">待确认</span>
+                        <button
+                          className="chip active"
+                          title="认可完成：item → done，ticket 保持 done"
+                          onClick={() => void confirmItem(detail.run.id, item.nodeId)}
+                        >
+                          确认
+                        </button>
+                        <button
+                          className="chip"
+                          title="打回：ticket 重开 → item 转 interrupted，可重新派发"
+                          onClick={() => void rejectItem(detail.run.id, item.nodeId)}
+                        >
+                          打回
+                        </button>
+                      </span>
+                    ) : (
+                      item.state
+                    )}
+                  </td>
                   <td>{item.executorActor ?? '—'}</td>
                   <td>{item.attempts}</td>
                   <td className="error-cell">{item.lastError ?? ''}</td>

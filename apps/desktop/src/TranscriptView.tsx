@@ -151,6 +151,8 @@ interface Props {
   onStopAgent?: () => void
   /** U10：空闲 agent 一键续跑（Agents 面板入口；live 时不渲染） */
   onResumeAgent?: () => void
+  /** U14：该 agent 的 run 中待人工确认（信任门）的 item 数——流尾提示指路 */
+  awaitingCount?: number | null
 }
 
 export function TranscriptView({
@@ -159,6 +161,7 @@ export function TranscriptView({
   claimed = null,
   onStopAgent,
   onResumeAgent,
+  awaitingCount = null,
 }: Props) {
   const scrollRef = useRef<HTMLDivElement | null>(null)
   const [follow, setFollow] = useState(true)
@@ -276,6 +279,12 @@ export function TranscriptView({
         </div>
       )}
       {idle && <p className="idle-hint">长时间无输出——agent 可能仍在等待外部操作</p>}
+      {(awaitingCount ?? 0) > 0 && (
+        // U14：信任门提示——agent 的完成主张待人工裁决（Runs 面板处理）
+        <p className="idle-hint trust-gate-hint">
+          ⚠ {awaitingCount} 项完成待人工确认（agent 绕过了 run 纪律的完成上报）——在下方弹窗中「确认 / 打回」
+        </p>
+      )}
     </div>
   )
 }

@@ -9,7 +9,7 @@
  * executorActor.endsWith('/exec:<execId>')（嵌套命名空间，KD 定稿）。
  */
 import { useEffect, useMemo, useRef, useState } from 'react'
-import type { TranscriptEvent } from './bridge'
+import { omtCall, type TranscriptEvent } from './bridge'
 import type { AgentRecord, ExecRecord, OmtNode, RunDetail, RunItemView } from './types'
 import { claimedCountForExec, danglingBindingsOf, nodeTitlesById } from './store'
 import { agentDisplayName, ConfirmStopButton } from './agentUi'
@@ -97,6 +97,83 @@ export function AgentsPanel({
   const [stats, setStats] = useState<Record<string, RunStat>>({})
   /** U10：一键续跑失败的就地报错（成功无需提示——事件流自己会出现） */
   const [resumeError, setResumeError] = useState<string | null>(null)
+  /** U14：信任门弹窗动作报错 */
+  const [gateError, setGateError] = useState<string | null>(null)
+  // U14：全面板待裁决项（底部弹窗）——跨所有已拉取的 run 聚合。普通计算
+  //（不得用 useMemo——须位于提前 return 之前且避免 hooks 位点抖动；stats 规模小）
+  const awaitingItems: Array<{ runId: string; nodeId: string; title?: string }> = []
+  for (const [runId, stat] of Object.entries(stats)) {
+    for (const item of stat.items) {
+      if (item.state === 'awaiting_confirmation') {
+        awaitingItems.push({ runId, nodeId: item.nodeId, title: item.title })
+      }
+    }
+  }
+
+  /** U14 弹窗动作后重拉对应 run（statsRef 缓存会使旧值滞留） */
+  const refreshStat = async (runId: string) => {
+    try {
+      const detail = await fetchRun(runId)
+      statsRef.current[runId] = statsOf(detail)
+      setStats(s => ({ ...s, [runId]: statsOf(detail) }))
+    } catch {
+      // 刷新失败保留旧态——下次挂载/焦点重拉
+    }
+  }
+
+  /** U14 信任门裁决（底部弹窗）：确认 = admin report done */
+  const confirmGateItem = async (runId: string, nodeId: string) => {
+    setGateError(null)
+    try {
+      await omtCall('run/report', {
+        homeId, runId, nodeId, outcome: 'done', note: '人工确认（信任门弹窗）',
+      })
+      await refreshStat(runId)
+    } catch (err) {
+      setGateError(String(err))
+    }
+  }
+
+  /** U14 信任门裁决（底部弹窗）：打回 = ticket 重开（daemon 联动 interrupted） */
+  const rejectGateItem = async (runId: string, nodeId: string) => {
+    setGateError(null)
+    try {
+      await omtCall('node/update', { homeId, nodeId, changes: { status: 'open' } })
+      await refreshStat(runId)
+    } catch (err) {
+      setGateError(String(err))
+    }
+  }
+
+  // U14：信任门裁决弹窗（空列表/外部执行者场景也要可见——两分支共享元素）
+  const gatePopup = awaitingItems.length > 0 && (
+    <div className="trust-gate-popup" role="alertdialog" aria-label="待人工确认的完成">
+      <p className="trust-gate-popup-title">
+        ⚠ {awaitingItems.length} 项完成待人工确认（agent 绕过了 run 纪律的上报）
+      </p>
+      {gateError && <p className="error-banner">{gateError}</p>}
+      {awaitingItems.map(item => (
+        <div className="trust-gate-popup-row" key={`${item.runId}:${item.nodeId}`}>
+          <span className="mono">{item.nodeId}</span>
+          <span className="trust-gate-popup-title-text">{item.title ?? ''}</span>
+          <button
+            className="chip active"
+            title="认可完成：item → done，ticket 保持 done"
+            onClick={() => void confirmGateItem(item.runId, item.nodeId)}
+          >
+            确认
+          </button>
+          <button
+            className="chip"
+            title="打回：ticket 重开 → item 转 interrupted，可重新派发"
+            onClick={() => void rejectGateItem(item.runId, item.nodeId)}
+          >
+            打回
+          </button>
+        </div>
+      ))}
+    </div>
+  )
   const statsRef = useRef<Record<string, RunStat>>({})
   // 当前节点标题一次建表（行渲染 O(1) 查询；免每行全树 DFS）
   const titleById = useMemo(() => nodeTitlesById(nodes), [nodes])
@@ -105,11 +182,8 @@ export function AgentsPanel({
   // 重渲染复用（agents 重拉不重取）。
   useEffect(() => {
     let cancelled = false
-    for (const agent of agents) {
-      const exec = latestExecOf(agent)
-      const runId = exec?.runId
-      if (!runId || statsRef.current[runId]) continue
-      void fetchRun(runId)
+    const pull = (runId: string) =>
+      fetchRun(runId)
         .then(detail => {
           // 缓存写入不受 cancelled 限制：ref 跨 effect 轮次存续，同 runId
           // 的已完成请求结果永远有效（仅渲染 setState 受过期保护）
@@ -120,11 +194,31 @@ export function AgentsPanel({
         .catch(() => {
           /* 统计是展示增强——失败留白 */
         })
+    for (const agent of agents) {
+      const exec = latestExecOf(agent)
+      const runId = exec?.runId
+      if (!runId || statsRef.current[runId]) continue
+      void pull(runId)
     }
+    // U14 兜底扫描（F-U14-5）：信任门可由外部执行者（CLI/其他 MCP 客户端）
+    // 触发，agents 列表无对应记录——对 home 的 running run 再拉一遍详情
+    //（信任门 item 只出现在 running run；失败静默）。
+    void omtCall<{ runs?: Array<{ runId?: string; status: string }> }>('run/list', { homeId })
+      .then(list => {
+        if (cancelled) return
+        // F-U14-6：daemon run/list 的键名是 `runId`（views.rs run_view 契约）——
+        // 首版读 `run.id` 恒 undefined，测试 mock 同错自洽绿、真实数据静默失败
+        for (const run of list.runs ?? []) {
+          const runId = run.runId
+          if (run.status !== 'running' || !runId || statsRef.current[runId]) continue
+          void pull(runId)
+        }
+      })
+      .catch(() => {})
     return () => {
       cancelled = true
     }
-  }, [agents, fetchRun])
+  }, [agents, fetchRun, homeId])
 
   // U9：悬空绑定（agentId 不在当前 agents 列表）。降级期间冻结悬空判定
   // （bindingsDegraded / parseFailed——降级空表会把全部绑定误判失效）。
@@ -163,6 +257,7 @@ export function AgentsPanel({
           <p className="error-banner">agents.json 解析失败——已降级为空列表（损坏文件已留证 .corrupt-*）</p>
         )}
         <p className="empty-hint">尚无 Agent——在 ticket 详情点『运行』派发</p>
+        {gatePopup}
         {gcBar}
         <button className="chip" onClick={onOpenHarnessSettings}>
           配置 Harness
@@ -177,6 +272,10 @@ export function AgentsPanel({
   const selectedStat = selectedExec?.runId ? stats[selectedExec.runId] : undefined
   const selectedClaimed =
     selectedExec && selectedStat ? claimedCountForExec(selectedStat.items, selectedExec.execId) : null
+  // U14：选中 agent 的 run 中待信任门裁决的 item 数（流尾提示条）
+  const selectedAwaiting = selectedStat
+    ? selectedStat.items.filter(i => i.state === 'awaiting_confirmation').length
+    : 0
 
   const renderRow = (agent: AgentRecord) => {
     const exec = latestExecOf(agent)
@@ -256,6 +355,7 @@ export function AgentsPanel({
             events={eventsOf(selectedExec.execId)}
             claimed={selectedClaimed}
             onStopAgent={() => onStopAgent(selectedExec.execId)}
+            awaitingCount={selectedAwaiting}
             onResumeAgent={
               // U10：空闲（非 running/starting）且最新 exec 带 ticket 才可续跑；
               // 结果就地报错（harness 未启用/未做知情确认/守卫拒绝等）
@@ -276,6 +376,7 @@ export function AgentsPanel({
         ) : (
           <TranscriptView agent={null} events={[]} />
         )}
+        {gatePopup}
       </div>
     </div>
   )

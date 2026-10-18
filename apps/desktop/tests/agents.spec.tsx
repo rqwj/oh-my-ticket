@@ -6,7 +6,7 @@
  * Channel（凡 import Channel 的模块在旧 mock 下会崩）。
  */
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
-import { cleanup, fireEvent, render, screen, act } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, act, waitFor, within } from '@testing-library/react'
 import type { AgentRecord, ExecRecord, RunDetail } from '../src/types'
 import type { TranscriptEvent } from '../src/bridge'
 
@@ -532,6 +532,80 @@ describe('U5 TranscriptView 自动跟随', () => {
     const live = makeAgent('agent-r2', 'exec-r2', { status: 'running' })
     rerender(<TranscriptView agent={live} events={[]} onResumeAgent={() => Promise.resolve()} />)
     expect(screen.queryByRole('button', { name: '继续执行' })).toBeNull()
+  })
+
+  it('U14：底部信任门弹窗——待确认项渲染 + 确认/打回动作与刷新', async () => {
+    const { AgentsPanel } = await import('../src/AgentsPanel')
+    let detail: Record<string, unknown> = {
+      run: { id: 'RUN-G', status: 'running' },
+      items: [
+        { nodeId: 'T-G', state: 'awaiting_confirmation', attempts: 1, title: 'Gate' },
+      ],
+    }
+    const calls: Array<{ method: string; params: Record<string, unknown> }> = []
+    invokeMock.mockImplementation(async (_cmd: string, args?: { method: string; params: Record<string, unknown> }) => {
+      if (args?.method === 'run/get') return detail
+      if (args) calls.push(args)
+      if (args?.method === 'run/report') {
+        detail = { run: { id: 'RUN-G', status: 'running' }, items: [{ nodeId: 'T-G', state: 'done', attempts: 1 }] }
+        return {}
+      }
+      if (args?.method === 'node/update') {
+        detail = { run: { id: 'RUN-G', status: 'running' }, items: [{ nodeId: 'T-G', state: 'interrupted', attempts: 1 }] }
+        return {}
+      }
+      return {}
+    })
+    const agent = makeAgent('agent-g', 'exec-g', { status: 'exited' })
+    agent.execs[0].runId = 'RUN-G'
+    // fetchRun 是面板的数据源（读实时可变的 detail——动作后刷新拿新状态）
+    renderPanel({ agents: [agent], fetchRun: async () => detail as never })
+    // 弹窗出现且含待确认项
+    const dialog = await waitFor(() => screen.getByRole('alertdialog'))
+    expect(dialog.textContent).toContain('1 项完成待人工确认')
+    expect(dialog.textContent).toContain('T-G')
+    // 确认 → run/report done + 弹窗消失（刷新后无待确认项）
+    fireEvent.click(within(dialog).getByRole('button', { name: '确认' }))
+    await waitFor(() => {
+      const call = calls.find(c => c.method === 'run/report')
+      expect(call?.params).toMatchObject({ runId: 'RUN-G', nodeId: 'T-G', outcome: 'done' })
+    })
+    await waitFor(() => expect(screen.queryByRole('alertdialog')).toBeNull())
+  })
+
+  it('U14 兜底扫描：外部执行者触发的待确认 run（无 agent 记录）弹窗仍出现', async () => {
+    const { AgentsPanel } = await import('../src/AgentsPanel')
+    invokeMock.mockImplementation(async (_cmd: string, args?: { method: string; params?: { runId?: string } }) => {
+      if (args?.method === 'run/list')
+        return { runs: [{ runId: 'RUN-EXT', status: 'running' }, { runId: 'RUN-OLD', status: 'completed' }] }
+      if (args?.method === 'run/get' && args.params?.runId === 'RUN-EXT')
+        return {
+          run: { id: 'RUN-EXT', status: 'running' },
+          items: [{ nodeId: 'T-EXT', state: 'awaiting_confirmation', attempts: 1, title: '外部' }],
+        }
+      return { run: { id: 'X', status: 'completed' }, items: [] }
+    })
+    // 空列表表面板：仅兜底扫描发现（fetchRun 按 runId 路由到同一 mock 数据）
+    const route = async (_cmd: string, args?: { method: string; params?: { runId?: string } }) => {
+      if (args?.method === 'run/get' && args.params?.runId === 'RUN-EXT')
+        return {
+          run: { id: 'RUN-EXT', status: 'running' },
+          items: [{ nodeId: 'T-EXT', state: 'awaiting_confirmation', attempts: 1, title: '外部' }],
+        }
+      return { run: { id: 'X', status: 'completed' }, items: [] }
+    }
+    renderPanel({ agents: [], fetchRun: (runId: string) => route('omt_call', { method: 'run/get', params: { runId } }) as never })
+    const dialog = await waitFor(() => screen.getByRole('alertdialog'))
+    expect(dialog.textContent).toContain('T-EXT')
+  })
+
+  it('U14：awaitingCount > 0 渲染信任门提示条；0/null 不渲染', async () => {
+    const { TranscriptView } = await import('../src/TranscriptView')
+    const agent = makeAgent('agent-a9', 'exec-a9', { status: 'exited' })
+    const { rerender } = render(<TranscriptView agent={agent} events={[]} awaitingCount={2} />)
+    expect(screen.getByText(/2 项完成待人工确认/)).toBeTruthy()
+    rerender(<TranscriptView agent={agent} events={[]} awaitingCount={0} />)
+    expect(screen.queryByText(/待人工确认/)).toBeNull()
   })
 
   it('行渲染：stdout/stderr 区分、session_start/exit 结构化呈现', async () => {
