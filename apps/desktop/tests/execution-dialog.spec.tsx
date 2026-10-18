@@ -242,6 +242,58 @@ describe('U6 弹窗选择器', () => {
   })
 })
 
+// ── 模型下拉（F-ACC-14）：选模型随派发提交；默认 null；失败降级隐藏 ─────
+
+describe('执行弹窗 模型下拉 (F-ACC-14)', () => {
+  const modelRoutes = (modelsResponse: () => unknown) =>
+    async (cmd: string, args: Record<string, unknown>) => {
+      if (cmd === 'harness_list') return { harnesses: [harnessWire({})] }
+      if (cmd === 'harness_list_models') return modelsResponse()
+      if (cmd === 'omt_call' && args.method === 'ui/filters-get')
+        return { filters: { approvalAck: { omp: true } } }
+      if (cmd === 'omt_call' && args.method === 'node/get')
+        return { node: {}, children: [], runs: [] }
+      throw new Error(`unexpected: ${cmd}`)
+    }
+
+  it('选中模型随派发提交；默认派发不指定（model null）', async () => {
+    const routes = modelRoutes(() => ({
+      models: [
+        { id: 'k3', group: 'kimi-code' },
+        { id: 'kimi-k2.5', group: 'kimi-code' },
+      ],
+    }))
+    // 派发成功后按钮停在「派发中…」（关窗前不禁用回弹）——两次断言
+    // 各自独立挂载，不复用同一弹窗实例
+    const first = await renderDialog({}, routes)
+    await waitFor(() => expect(screen.getByRole('button', { name: '派发' })).toBeTruthy())
+    expect((screen.getByRole('combobox', { name: '执行模型' }) as HTMLSelectElement).value).toBe('')
+    fireEvent.click(screen.getByRole('button', { name: '派发' }))
+    await waitFor(() =>
+      expect(first.startDispatch).toHaveBeenCalledWith(expect.objectContaining({ model: null })),
+    )
+    cleanup()
+    const second = await renderDialog({}, routes)
+    await waitFor(() => expect(screen.getByRole('button', { name: '派发' })).toBeTruthy())
+    fireEvent.change(screen.getByRole('combobox', { name: '执行模型' }), { target: { value: 'k3' } })
+    fireEvent.click(screen.getByRole('button', { name: '派发' }))
+    await waitFor(() =>
+      expect(second.startDispatch).toHaveBeenCalledWith(expect.objectContaining({ model: 'k3' })),
+    )
+  })
+
+  it('模型列表拉取失败 → 下拉降级隐藏，派发不受阻（model null）', async () => {
+    const props = await renderDialog({}, modelRoutes(() => { throw new Error('models timeout') }))
+    await waitFor(() => expect(screen.getByRole('button', { name: '派发' })).toBeTruthy())
+    await flush()
+    expect(screen.queryByRole('combobox', { name: '执行模型' })).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: '派发' }))
+    await waitFor(() =>
+      expect(props.startDispatch).toHaveBeenCalledWith(expect.objectContaining({ model: null })),
+    )
+  })
+})
+
 // ── 权限知情确认（§九-10：显式放行 + per-workspace 记住）──────────────────
 
 describe('U6 权限知情确认', () => {

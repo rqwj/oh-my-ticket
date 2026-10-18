@@ -100,6 +100,36 @@ beforeEach(() => {
   askMock.mockReset()
 })
 
+describe('SettingsPanel Harnesses 终端登录 (F-ACC-13)', () => {
+  it('点击「终端登录」→ harness_open_login 携 providerId，成功后给出引导文案', async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'harness_list')
+        return { harnesses: [harnessWire({ id: 'omp', state: 'ready', installed: true })] }
+      if (cmd === 'harness_open_login') return { opened: true, program: '/opt/homebrew/bin/omp' }
+      return {}
+    })
+    render(<SettingsPanel {...baseProps} />)
+    await openHarnessesTab()
+    fireEvent.click(screen.getByRole('button', { name: '在 Terminal 中登录 OMP (oh-my-pi)' }))
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith('harness_open_login', { harness: 'omp' }),
+    )
+    await waitFor(() => expect(screen.getByText(/已在 Terminal 中启动/)).toBeTruthy())
+  })
+
+  it('打开失败（binary 缺失）→ 错误横幅呈现后端可读文案', async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'harness_list') return { harnesses: [harnessWire({ id: 'omp' })] }
+      if (cmd === 'harness_open_login') throw 'PATH 上未找到 omp，请先安装或在设置中手动指定'
+      return {}
+    })
+    render(<SettingsPanel {...baseProps} />)
+    await openHarnessesTab()
+    fireEvent.click(screen.getByRole('button', { name: '在 Terminal 中登录 OMP (oh-my-pi)' }))
+    await waitFor(() => expect(screen.getByText(/PATH 上未找到 omp/)).toBeTruthy())
+  })
+})
+
 describe('SettingsPanel Harnesses 管理面 (U7)', () => {
   it('启用开关 → harness_config_set 以 enabled 调用，返回的最新投影被渲染', async () => {
     const off = harnessWire({})

@@ -563,6 +563,7 @@ export function useTreeStore() {
       nodeId: string
       harness: string
       unattended: boolean
+      model?: string | null
       onEvent?: (ev: TranscriptEvent) => void
     }): Promise<ExecStartOutcome> => {
       const channel = new Channel<TranscriptEvent>()
@@ -576,6 +577,7 @@ export function useTreeStore() {
         nodeId: options.nodeId,
         harness: options.harness,
         unattended: options.unattended,
+        model: options.model ?? null,
         channel,
       })
       // pull 契约：派发后拉 agents_list（防抖等 Rust 侧 ⑤ 落盘收敛）；

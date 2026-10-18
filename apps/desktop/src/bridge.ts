@@ -195,6 +195,8 @@ export async function execStart(options: {
   nodeId: string
   harness: string
   unattended: boolean
+  /** 指定模型（Rust 侧校验字符集；null = 不指定，用 harness 默认） */
+  model?: string | null
   channel: Channel<TranscriptEvent>
 }): Promise<ExecStartOutcome> {
   return invoke<ExecStartOutcome>('exec_start', {
@@ -203,6 +205,7 @@ export async function execStart(options: {
     nodeId: options.nodeId,
     harness: options.harness,
     unattended: options.unattended,
+    model: options.model ?? null,
     channel: options.channel,
   })
 }
@@ -220,4 +223,23 @@ export interface HarnessLaunchPreview {
 
 export async function harnessLaunchPreview(harness: string): Promise<HarnessLaunchPreview> {
   return invoke<HarnessLaunchPreview>('harness_launch_preview', { harness })
+}
+
+/** 模型列表条目（`<binary> models` 解析产物；group 供下拉分组）。 */
+export interface HarnessModelEntry {
+  id: string
+  group: string | null
+}
+
+/** 执行弹窗「模型」下拉数据面：失败/超时抛可读错误（调用方降级隐藏）。 */
+export async function harnessListModels(harness: string): Promise<HarnessModelEntry[]> {
+  const result = await invoke<{ models?: HarnessModelEntry[] }>('harness_list_models', { harness })
+  return result.models ?? []
+}
+
+/** 终端登录（F-ACC-13）：在本机 Terminal 里启动 harness 的交互登录命令
+ * （omp 裸跑 TUI /login；opencode 走 auth login）。凭据落在 harness 自己
+ * 的全局存储，OMT 不经手。 */
+export async function harnessOpenLogin(harness: string): Promise<void> {
+  await invoke<void>('harness_open_login', { harness })
 }

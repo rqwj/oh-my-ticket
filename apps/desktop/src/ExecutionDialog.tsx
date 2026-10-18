@@ -18,7 +18,7 @@
  * 悬空绑定（agent 不在列表）与数据降级（parseFailed）不提示、不覆盖默认。
  */
 import { useEffect, useMemo, useState } from 'react'
-import { omtCall, harnessLaunchPreview, bindingsGet, type ExecStartOutcome, type HarnessLaunchPreview } from './bridge'
+import { omtCall, harnessLaunchPreview, harnessListModels, bindingsGet, type ExecStartOutcome, type HarnessLaunchPreview, type HarnessModelEntry } from './bridge'
 import { readHarnessBag, writeHarnessBag, harnessList, resolveBindingForNode, nodesById, nodeTitlesById, type HarnessEntry, type ResolvedBinding } from './store'
 import { agentDisplayName } from './agentUi'
 import type { AgentRecord, HomeInfo, OmtNode } from './types'
@@ -57,6 +57,7 @@ interface Props {
     nodeId: string
     harness: string
     unattended: boolean
+    model?: string | null
   }) => Promise<ExecStartOutcome>
   onClose: () => void
   /** 派发成功：App 关弹窗、切 Agents 内层 tab 并选中返回的 agentId */
@@ -108,6 +109,9 @@ export function ExecutionDialog({
   const [confirmChecked, setConfirmChecked] = useState(false)
   const [rememberChecked, setRememberChecked] = useState(false)
   const [detailOpen, setDetailOpen] = useState(false)
+  // 模型下拉（F-ACC-14）：selected harness 变化时拉取；失败置 null 降级隐藏
+  const [models, setModels] = useState<HarnessModelEntry[] | null>(null)
+  const [modelSel, setModelSel] = useState('')
   const [preview, setPreview] = useState<HarnessLaunchPreview | null>(null)
   const [previewError, setPreviewError] = useState<string | null>(null)
   const [conflict, setConflict] = useState<ConflictInfo | null>(null)
@@ -211,6 +215,24 @@ export function ExecutionDialog({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [home.homeId, nodeId])
 
+  // 模型列表（selected 变化即拉；失败/超时降级为不显示下拉——不阻断派发）
+  useEffect(() => {
+    if (!selected) return
+    let disposed = false
+    setModels(null)
+    setModelSel('')
+    harnessListModels(selected)
+      .then(list => {
+        if (!disposed) setModels(list)
+      })
+      .catch(() => {
+        if (!disposed) setModels(null)
+      })
+    return () => {
+      disposed = true
+    }
+  }, [selected])
+
   // 详情展开（或选择变化）：只读启动预览（env 只回键名——secrets 纪律 §3.1）
   useEffect(() => {
     if (!detailOpen || !selected) return
@@ -240,7 +262,13 @@ export function ExecutionDialog({
     setError(null)
     const slowTimer = setTimeout(() => setSlow(true), SLOW_DISPATCH_MS)
     try {
-      const outcome = await startDispatch({ home, nodeId, harness: selected, unattended: true })
+      const outcome = await startDispatch({
+        home,
+        nodeId,
+        harness: selected,
+        unattended: true,
+        model: modelSel || null,
+      })
       clearTimeout(slowTimer)
       // 偏好记忆（bag v2，只动 v2 字段）：defaultHarness 随成功派发记为
       // 本次选择；勾「记住」时再写 approvalAck（另一 workspace 仍要求确认）
@@ -383,6 +411,31 @@ export function ExecutionDialog({
               </select>
               <button className="chip" onClick={() => setDetailOpen(v => !v)}>{detailOpen ? '收起详情' : '详情'}</button>
             </div>
+
+            {models !== null && models.length > 0 && (
+              // 模型下拉（F-ACC-14）：默认不指定（用 harness 自身默认模型）；
+              // 列表拉取失败时整个区块降级隐藏，不阻断派发
+              <div className="dispatch-row">
+                <select
+                  className="detail-select"
+                  aria-label="执行模型"
+                  value={modelSel}
+                  onChange={e => setModelSel(e.target.value)}
+                >
+                  <option value="">模型：默认（不指定）</option>
+                  {Array.from(new Set(models.map(m => m.group).filter((g): g is string => g !== null))).map(group => (
+                    <optgroup key={group} label={group}>
+                      {models.filter(m => m.group === group).map(m => (
+                        <option key={m.id} value={m.id}>{m.id}</option>
+                      ))}
+                    </optgroup>
+                  ))}
+                  {models.filter(m => m.group === null).map(m => (
+                    <option key={m.id} value={m.id}>{m.id}</option>
+                  ))}
+                </select>
+              </div>
+            )}
 
             {detailOpen && (
               <div className="dispatch-detail">

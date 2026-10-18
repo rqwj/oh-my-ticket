@@ -6,11 +6,16 @@
  * 简单可靠的切片语义，raw 行不做 Markdown 渲染（可变高度会破坏窗口
  * 坐标）；stdout/stderr 用样式区分，session_start/exit 结构化呈现。
  *
+ * 行高 22px 不变量（验收 F-ACC-5 回归：行内多行文本曾互相叠印）：虚拟化
+ * 切片单位是**渲染行**而非事件——flattenEvents 把每个事件展开为单条文本
+ * 行（多行 prompt 拆行、`\r` 按换行处理、ANSI 转义/控制符剥除），CSS 的
+ * `white-space: pre` 不再有产生高于 22px 的行的输入。
+ *
  * 自动跟随（原 §九-13）：视口近底（FOLLOW_THRESHOLD_PX）才跟随新事件；
  * 上滚解除跟随并显示「回到最新 (N)」pill，点击回贴底恢复。live 且长时间
  * 无输出（IDLE_THRESHOLD_MS）显示「长时间无输出」提示（§3.2）。
  */
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { TranscriptEvent } from './bridge'
 import type { AgentRecord } from './types'
 import { agentDisplayName, ConfirmStopButton } from './agentUi'
@@ -56,6 +61,56 @@ export function isIdle(
   return nowMs - lastEventTsMs > threshold
 }
 
+/** 渲染行：虚拟化的原子单位，恰好一条单行文本（行高 22px 不变量）。 */
+export interface TranscriptLine {
+  key: string
+  kind: 'start' | 'exit' | 'out' | 'err'
+  /** 仅 exit 行：status === 'failed' 时加 t-failed 红显 */
+  failed?: boolean
+  text: string
+}
+
+const ANSI_PATTERN = /\x1b(?:\[[0-9;?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\))/g
+// 裸 C0 控制符（含垂直制表等）一并剥除——pre 下不可见且扰动行高
+const CONTROL_PATTERN = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g
+
+/** 剥 ANSI 转义（CSI/OSC 序列）与残留控制符；\r\n/\n/\r 留给 splitLines。 */
+export function stripAnsi(text: string): string {
+  return text.replace(ANSI_PATTERN, '').replace(CONTROL_PATTERN, '')
+}
+
+/** 按 \r\n / \n / \r 切行。CSS pre 会把 \r 渲染成换行——在数据层先展开，
+ *  终端式 \r 覆盖重写按行展开呈现（不追踪最终帧，v1 语义）。 */
+export function splitLines(text: string): string[] {
+  return text.split(/\r\n|\n|\r/)
+}
+
+/** 事件流 → 渲染行流（纯函数）。多行来源：session_start 携带的完整
+ *  DISPATCH_PROMPT（argv 内嵌 \n）、子进程输出中的 \r 进度重写。 */
+export function flattenEvents(events: TranscriptEvent[]): TranscriptLine[] {
+  const lines: TranscriptLine[] = []
+  for (const event of events) {
+    let kind: TranscriptLine['kind']
+    let failed = false
+    let text: string
+    if (event.kind === 'session_start') {
+      kind = 'start'
+      text = `▶ ${event.program} ${event.args.join(' ')} · pid ${event.pid} · ${event.cwd}`
+    } else if (event.kind === 'exit') {
+      kind = 'exit'
+      failed = event.status === 'failed'
+      text = `■ ${event.status}${event.code !== null ? ` · code ${event.code}` : ''}${event.killReason ? ` · ${event.killReason}` : ''} · ${(event.durationMs / 1000).toFixed(1)}s`
+    } else {
+      kind = event.stream === 'stderr' ? 'err' : 'out'
+      text = event.text
+    }
+    for (const [i, line] of splitLines(stripAnsi(text)).entries()) {
+      lines.push({ key: `${event.kind}-${event.seq}-${i}`, kind, failed, text: line })
+    }
+  }
+  return lines
+}
+
 interface Props {
   agent: AgentRecord | null
   events: TranscriptEvent[]
@@ -84,17 +139,19 @@ export function TranscriptView({ agent, events, claimed = null, onStopAgent }: P
 
   // events 是 store 尾窗的稳定数组引用（原地追加）——用 length 感知新事件；
   // 身份变化（切换 exec）由父组件按 execId 换 key（整体重挂载）解决。
+  // lines 随 length 变化重展开（数组引用不变，dep 必须含 length）。
+  const lines = useMemo(() => flattenEvents(events), [events, events.length])
   useEffect(() => {
     const el = scrollRef.current
     if (followRef.current) {
-      lastSeenRef.current = events.length
+      lastSeenRef.current = lines.length
       setUnseen(0)
       // 直接赋值 scrollTop（不用 scrollTo：jsdom 无实现，测试以实例属性覆写验证）
       if (el) el.scrollTop = el.scrollHeight
     } else {
-      setUnseen(events.length - lastSeenRef.current)
+      setUnseen(lines.length - lastSeenRef.current)
     }
-    if (el) setRange(visibleRange(el.scrollTop, el.clientHeight, events.length))
+    if (el) setRange(visibleRange(el.scrollTop, el.clientHeight, lines.length))
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [events, events.length])
 
@@ -105,21 +162,21 @@ export function TranscriptView({ agent, events, claimed = null, onStopAgent }: P
     followRef.current = nowFollow
     setFollow(nowFollow)
     if (nowFollow) {
-      lastSeenRef.current = events.length
+      lastSeenRef.current = lines.length
       setUnseen(0)
     }
-    setRange(visibleRange(el.scrollTop, el.clientHeight, events.length))
+    setRange(visibleRange(el.scrollTop, el.clientHeight, lines.length))
   }
 
   const jumpToLatest = () => {
     const el = scrollRef.current
     followRef.current = true
     setFollow(true)
-    lastSeenRef.current = events.length
+    lastSeenRef.current = lines.length
     setUnseen(0)
     if (el) {
       el.scrollTop = el.scrollHeight
-      setRange(visibleRange(el.scrollTop, el.clientHeight, events.length))
+      setRange(visibleRange(el.scrollTop, el.clientHeight, lines.length))
     }
   }
 
@@ -129,7 +186,7 @@ export function TranscriptView({ agent, events, claimed = null, onStopAgent }: P
 
   const lastTsMs = events.length > 0 ? Number(events[events.length - 1].ts) : undefined
   const idle = live && isIdle(lastTsMs, nowTick)
-  const slice = events.slice(range.start, range.end)
+  const slice = lines.slice(range.start, range.end)
 
   return (
     <div className="transcript-view">
@@ -144,11 +201,11 @@ export function TranscriptView({ agent, events, claimed = null, onStopAgent }: P
       ) : (
         <div className="t-scroll-wrap">
           <div className="t-scroll" ref={scrollRef} onScroll={handleScroll}>
-            <div className="t-canvas" style={{ height: events.length * ROW_HEIGHT_PX }}>
-              {slice.map((event, index) => (
+            <div className="t-canvas" style={{ height: lines.length * ROW_HEIGHT_PX }}>
+              {slice.map((line, index) => (
                 <TranscriptRow
-                  key={`${event.kind}-${event.seq}`}
-                  event={event}
+                  key={line.key}
+                  line={line}
                   top={(range.start + index) * ROW_HEIGHT_PX}
                 />
               ))}
@@ -166,27 +223,19 @@ export function TranscriptView({ agent, events, claimed = null, onStopAgent }: P
   )
 }
 
-function TranscriptRow({ event, top }: { event: TranscriptEvent; top: number }) {
+function TranscriptRow({ line, top }: { line: TranscriptLine; top: number }) {
   const style = { top, left: 0, right: 0 } as const
-  if (event.kind === 'session_start') {
+  if (line.kind === 'exit') {
     return (
-      <div className="t-row t-start" style={style}>
-        ▶ {event.program} {event.args.join(' ')} · pid {event.pid} · {event.cwd}
+      <div className={`t-row t-exit${line.failed ? ' t-failed' : ''}`} style={style}>
+        {line.text}
       </div>
     )
   }
-  if (event.kind === 'exit') {
-    return (
-      <div className={`t-row t-exit${event.status === 'failed' ? ' t-failed' : ''}`} style={style}>
-        ■ {event.status}
-        {event.code !== null ? ` · code ${event.code}` : ''}
-        {event.killReason ? ` · ${event.killReason}` : ''} · {(event.durationMs / 1000).toFixed(1)}s
-      </div>
-    )
-  }
+  const cls = line.kind === 'start' ? 't-row t-start' : `t-row${line.kind === 'err' ? ' t-stderr' : ''}`
   return (
-    <div className={`t-row${event.stream === 'stderr' ? ' t-stderr' : ''}`} style={style}>
-      {event.text}
+    <div className={cls} style={style}>
+      {line.text}
     </div>
   )
 }

@@ -18,7 +18,7 @@
  */
 import { useEffect, useState } from 'react'
 import { open as openDialog } from '@tauri-apps/plugin-dialog'
-import { agentsList } from './bridge'
+import { agentsList, harnessOpenLogin } from './bridge'
 import { harnessConfigSet, harnessList, type HarnessEntry, type HarnessUserConfigInput } from './store'
 import type { HomeInfo } from './types'
 
@@ -84,6 +84,7 @@ export function HarnessManagerTab({ homes }: Props) {
   const [selectedId, setSelectedId] = useState('')
   const [draft, setDraft] = useState<HarnessDraft | null>(null)
   const [saving, setSaving] = useState(false)
+  const [loginBusy, setLoginBusy] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
   const [savedNote, setSavedNote] = useState<string | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
@@ -186,6 +187,23 @@ export function HarnessManagerTab({ homes }: Props) {
     const picked = await openDialog({ directory: false, multiple: false, title: '选择 harness 可执行文件' })
     if (typeof picked !== 'string') return // 用户取消
     setDraft(d => (d ? { ...d, manualPath: picked } : d))
+  }
+
+  /** 终端登录（F-ACC-13）：订阅/OAuth 认证须在交互终端里完成——在本机
+   *  Terminal 启动 harness 的登录命令；凭据由 harness 自己保管，OMT 不经手。 */
+  const openLoginTerminal = async () => {
+    if (!selectedId) return
+    setLoginBusy(true)
+    setSaveError(null)
+    setSavedNote(null)
+    try {
+      await harnessOpenLogin(selectedId)
+      setSavedNote('已在 Terminal 中启动——请在其内完成登录（如 omp 的 /login），完成后回到这里直接派发。')
+    } catch (error) {
+      setSaveError(String(error))
+    } finally {
+      setLoginBusy(false)
+    }
   }
 
   const entry = entries?.find(e => e.id === selectedId) ?? null
@@ -367,6 +385,17 @@ export function HarnessManagerTab({ homes }: Props) {
               <button className="chip primary" disabled={saving} onClick={() => void saveDraft()}>
                 {saving ? '保存中…' : '保存'}
               </button>
+              <button
+                className="chip"
+                disabled={loginBusy || saving}
+                aria-label={`在 Terminal 中登录 ${entry.label}`}
+                onClick={() => void openLoginTerminal()}
+              >
+                {loginBusy ? '打开中…' : '终端登录'}
+              </button>
+              <span className="hm-hint">
+                订阅 / OAuth 认证需在终端交互完成（API key 类可直接加到上方 Env，无需登录）。
+              </span>
             </div>
           </div>
         ) : (

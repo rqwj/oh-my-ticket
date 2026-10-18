@@ -367,6 +367,48 @@ describe('U5 纯函数（TranscriptView 视口语义）', () => {
     expect(visibleRange(0, 440, 0)).toEqual({ start: 0, end: 0 })
   })
 
+  // ── F-ACC-5 回归：多行文本曾撑破 22px 行高导致绝对定位行互相叠印 ──
+
+  it('stripAnsi：剥 CSI/OSC 转义与裸控制符', async () => {
+    const { stripAnsi } = await import('../src/TranscriptView')
+    expect(stripAnsi('\u001b[91mError\u001b[0m')).toBe('Error')
+    expect(stripAnsi('\u001b]0;title\u0007after')).toBe('after')
+    expect(stripAnsi('a\u0007b\u0000c\u007f')).toBe('abc')
+  })
+
+  it('flattenEvents：多行 raw / \\r 重写展开为独立行，stderr 语义保留、key 唯一', async () => {
+    const { flattenEvents } = await import('../src/TranscriptView')
+    const lines = flattenEvents([
+      raw('e', 1, 'a\nb\r\nc\rd'),
+      raw('e', 2, '\u001b[91mboom\u001b[0m', 'stderr'),
+    ])
+    expect(lines.map((l) => [l.kind, l.text])).toEqual([
+      ['out', 'a'], ['out', 'b'], ['out', 'c'], ['out', 'd'], ['err', 'boom'],
+    ])
+    expect(new Set(lines.map((l) => l.key)).size).toBe(lines.length)
+  })
+
+  it('flattenEvents：session_start 携带多行 prompt 时按行展开（不再撑破行高）', async () => {
+    const { flattenEvents } = await import('../src/TranscriptView')
+    const lines = flattenEvents([{
+      execId: 'e', seq: 0, ts: '1', kind: 'session_start', harness: 'opencode',
+      program: '/bin/opencode', args: ['--auto', 'You are executing…\nrule 1\nrule 2'],
+      cwd: '/ws', pid: 7,
+    }])
+    expect(lines.length).toBe(3)
+    expect(lines[0].text).toContain('▶ /bin/opencode')
+    expect(lines.every((l) => l.kind === 'start')).toBe(true)
+    expect(lines.every((l) => !l.text.includes('\n') && !l.text.includes('\r'))).toBe(true)
+  })
+
+  it('flattenEvents：exit 行携带 failed 标记与结构化文本', async () => {
+    const { flattenEvents } = await import('../src/TranscriptView')
+    const lines = flattenEvents([exitEvent('e', 'failed')])
+    expect(lines).toEqual([
+      { key: 'exit-999-0', kind: 'exit', failed: true, text: '■ failed · code 1 · 0.0s' },
+    ])
+  })
+
   it('isIdle：live 且距最后事件超阈值判空闲', async () => {
     const { isIdle } = await import('../src/TranscriptView')
     expect(isIdle(undefined, 999_999)).toBe(false)
