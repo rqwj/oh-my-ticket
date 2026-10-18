@@ -1073,6 +1073,15 @@ daemon `run_item_view` 序列化为 `executorActor`（views.rs:130）。恒空 �
 - **jsonl 大行撕裂**：`writeln!` 对数十 KB 事件分段 write，stdout/stderr 两读线程 O_APPEND 追加互相撕裂行（exec-77304 实测 2 条撕裂行）。修复：整行单缓冲 `write_all`（常规文件单次 append write 原子定位）。旧数据撕裂行无害——历史回放跳过畸形行。
 - **状态**：均 fixed（Rust 109 全绿；验收后新卷 0 撕裂）
 
+### §17. U10 启动对账实现记录（2026-10-18）
+
+#### F-U10-1 · v1 范围与实现
+**痛点实证**：验收期间 app 重启后 daemon 侧 run item 卡 running（exec 已被 kill_all 杀死但租约未释放），每次需手动 cancel/reset——共手工处理 5 次。
+- **实现**：demote_live_agents 已有 agent 侧降级（Running→Failed + 「app restarted before exec finished」签名）；U10 补齐 **daemon 侧**——`reconcile_interrupted_execs`：枚举签名命中且未 reconciled 的 exec（`list_reconcile_targets`），逐个执行 §3.3 释放序列（run/get → 本 exec 持有的 running item → admin report failed + retry 回 pending；`release_items_for_exec` 从终态线程路径提取共用），置 `reconciled` 幂等标记。挂点 = `daemon_ensure` 会话建立后一次性后台线程（swap 守卫，不阻塞启动）。
+- **测试**：中断 exec → 释放序列调用形状 + 幂等二跑零调用 + 标记落盘；正常 exec 不参与。附带把 13 处测试等待上限 5s→15s（suite 并行负载增长后轮换 flake，9/10 稳）。
+- **暂缓（open）**：单元包的孤儿 transcript 采纳、pid 复用 cmdline 校验、agents.json 损坏从 transcript 重建——均为窄崩溃窗口/损坏路径，验收未触及；租约对账（真实痛点）已闭环。排期后续小项。
+- 回放半：单元包的 `transcript_open` 已被 F-PI-3 的 `exec_transcript_tail` + 惰性回载覆盖（容错跳坏行具备）。
+
 ### 残留状态核查（第二轮验收后）
 
 失败尝试在 daemon 侧已成功创建 RUN-0001（pending，持有 TICKET-0001，无执行器），EPIC-0001/TICKET-0001 被 node/execute 标为 in_progress。重试无需清理：ensure-run 复用路径按 pending → start 正常接管（已实测 run-get 确认）。
