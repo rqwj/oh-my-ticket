@@ -1053,6 +1053,11 @@ daemon `run_item_view` 序列化为 `executorActor`（views.rs:130）。恒空 �
 - **实现**：bag v2 扩展 `models: {<provider>: <modelId>}`（workspace 级，随 `tauri:harness` 键走 ui/filters，read-merge-write 语义与 defaultHarness/approvalAck 一致）。弹窗：成功派发时记 `models[selected] = 选择值`（空选择 = 清除该 provider 记忆——合并层空串删键、空对象收键）；列表拉取成功后 `bagModels[selected]` 在列表中才 `setModelSel` 预选，不在则回退「默认（不指定）」。
 - **测试**：预选命中直接派发带模型 / 记忆值不在列表回退空 / 派发写入合并（他 provider 保留）/ store 合并语义（覆盖·空串清除·空对象收键）。前端 110 passed。
 
+#### F-U12-4 · feat · `.jsonl` 规范化事件日志 + usage 终态归档（2026-10-18，U10 前置小项）
+原 F-U2-7 派给 U4 的 transcript `.jsonl` 实际未做（只落了 raw.log），U10 reconcile 依赖它；趁 U12 上下文热度补齐。
+- **实现**：spawn 时建 `<execId>.jsonl`（首行 `session_header`{execId, agentId, nodeId, runId, harness, argv(脱敏), startedAt}——F-U2-7 原始定义）；session_start/raw 派生事件/exit 逐行追加（append 行原子）；终态把 `last_usage` 最终快照归档进 `ExecRecord.usage_tokens/usage_cost`（成本承接第一层）。历史回载优先读 jsonl（逐行即事件，header 不进回放窗），无 jsonl 回落 raw.log 嗅探——新旧数据兼容。raw.log 保持原始事实源不变。
+- **测试**：jsonl 形状（header/首尾事件序）入 dispatch_success；tail 优先级（jsonl 在则 raw 干扰不可见、header 剔除）；既有 usage 去重测试仍绿。Rust 106 / 前端 110 / clippy / fmt / build 全绿。
+
 ### 残留状态核查（第二轮验收后）
 
 失败尝试在 daemon 侧已成功创建 RUN-0001（pending，持有 TICKET-0001，无执行器），EPIC-0001/TICKET-0001 被 node/execute 标为 in_progress。重试无需清理：ensure-run 复用路径按 pending → start 正常接管（已实测 run-get 确认）。
