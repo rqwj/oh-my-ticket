@@ -997,8 +997,10 @@ daemon `run_item_view` 序列化为 `executorActor`（views.rs:130）。恒空 �
 验收第六轮：`run__claim` 被拒两次 `INVALID_INPUT: runId: must be a string`——模型声明「tool 暴露的 properties: {}，无法传 runId」。根因：`tool_descriptors` 硬编码 `{type: object, additionalProperties: true}`，没有投影参数契约；daemon 侧校验真实存在，模型侧却拿不到形状。
 - **状态**：fixed（inputSchema 从 `schema/commands.schema.json` `$defs` 投影：显式 action→ParamsDef 映射表 + `include_str!` 编译期内嵌 + 跨文件 `$ref`（common.schema.json）递归内联（SDK 客户端解不了跨文件 $ref）；description 优先取 schema 里的 `Method …` 说明。单元测试 ×2（映射完整性 + run__claim required/内联）+ mcp_spec 扩展断言。实探 tools/list：18 工具全部非空 properties，run__claim required=[homeId,runId]）
 
-#### F-ACC-11 · P2 · open · `omt-runtime/tests/election_race.rs` · election 竞争测试 ~20% 概率双存活
-验收期间全量门偶发：`exactly one daemon must survive` 断言 left=2（5 次单跑 1 败；单线程亦偶发）。与本分支改动无关（election 路径未动，带改动的全量此前连绿两轮）。**open**：需判别是测试时序敏感还是 election 真实缺陷（输家未退），排期独立分析。
+#### F-ACC-11 · P2 · fixed · `omt-runtime/tests/election_race.rs` · election 竞争测试 ~20% 概率双存活（测试时序，非产品缺陷）
+验收期间全量门偶发：`exactly one daemon must survive` 断言 left=2（复现率 ~20-25%）。
+- **判别**：输家路径 = 「判活 → 轮询等 descriptor → DaemonPresent 退出」（bootstrap.rs，contend 循环 50ms 粒度 + 250ms endpoint 探测）；测试在 `wait_for_descriptor` 返回后**立即**采样存活数——输家可能还在下一个轮询拍里，采样时机无界偏早。不变量「恰一存活」在输家 bootstrap 预算（默认 15s）内必然成立。
+- **状态**：fixed（测试改为有界收敛等待：以 descriptor 发布为起点，等至「恰一存活且为 descriptor 发布者」成立，窗口 17s = 输家预算 + 余量；超时才断言失败并保留 stderr 现场。10/10 单跑绿 + workspace 全量绿）
 
 #### F-ACC-12 · P0 · provider-bug · `harness.rs` · omp 缺无头 flag + 放行 flag 记错
 验收第七轮（opencode 已全链路闭环）：omp 派发后无输出且尾部出现终端能力查询序列（`>[<u[>4;0m`）——根因 ①：omp 不加 `-p/--print` 会起 TUI，向无终端的管道发 Kitty 键盘协议等查询后挂起；根因 ②：registry 记的裸 `--yolo` 在 omp v18.0.9 不存在，真实放行 flag 是 `--approval-mode=yolo`（always-ask|write|yolo）——即 F-U1-4 悬置的实测回填项。
@@ -1027,6 +1029,29 @@ daemon `run_item_view` 序列化为 `executorActor`（views.rs:130）。恒空 �
 #### F-PI-3 · P1 · ui-gap · 历史 agent 的 transcript 不回载（raw.log 在盘上却看不到）
 验收：pi 执行成功（Agent 17，claim→echo world→report done，run completed），但重启 app 后选中该 agent——状态 exited、transcript 空。根因：transcript 事件只在运行期经 Channel 进内存（KD-D3），agent 列表跨重启保留但事件不回载，空态文案「等待 agent 产生事件…」对终态 agent 还带误导。旁证排查：三次 exit-1 是 omp 未登录轮（No API key，行号指纹比对 omp 二进制），与 pi 无关。
 - **状态**：fixed（新增 `exec_transcript_tail` 命令：raw.log 尾部（默认 500 行，上限 5000）按 `[stdout]/[stderr]` 前缀重建展示事件；store `loadHistoryTail` 惰性加载（窗口空且非 live 时拉取一次，绕过 raw 合并批处理直入尾窗）；AgentsPanel 选中 effect（hooks 位于提前 return 前——首轮插错位置被 React hooks 规则测试抓住）；终态空窗文案改为诚实表述。Rust 100 / 前端 105 / clippy / fmt / build 全绿）
+
+### §15. U12 结构化 adapter 实现记录（2026-10-18）
+
+#### F-U12-1 · 实测采样（三家属两种格式）
+- **opencode**（`run --format json`）：`{type, timestamp, sessionID, part}`；`text`（finalized 块）/ `reasoning` / `tool_use`（part 为完整 tool part，`state.status=completed|error` 携带 input+output+title）/ `step_finish`（tokens/cost）/ `error`；无终止事件。
+- **pi 与 omp 事件 schema 完全一致**（omp 是 pi fork，`-p --mode json` 同源 NDJSON）：`session`/`agent_*`/`turn_*`/`message_start|end`（系统消息含巨型 sections，必须忽略）/`message_update{assistantMessageEvent: *_start|*_delta|*_end, usage?}`/`tool_execution_*`。增量（*_delta）忽略、取 *_end 聚合。
+- 样本存于 `adapters.rs` 测试 fixture。
+
+#### F-U12-2 · 实现面
+- `adapters.rs` 新建：`parse_line(provider)`（opencode / pi·omp 两解析器 → §5.3 统一事件，平铺字段）+ `parse_line_auto`（历史回载嗅探：`part` 键→opencode、pi 族专有 type→pi/omp、其它→raw）。解析失败/未知一律降级 raw，绝不中断。5 个 fixture 测试。
+- registry `json_args`（opencode `--format json`、pi/omp `--mode json`；空 = raw），compose 插在 headless 后；spawn_reader 逐行解析，parts 为空（已知噪声）不再回落 raw（系统消息巨型载荷绝不透传）。
+- 前端：事件类型联合扩展（assistant_text/thinking、tool_call/result、usage、error）；flattenEvents 映射（thinking 暗淡、tool 蓝显 ⚙/↳、usage 绿 ⚡、input 截 200 字符）；store 结构化事件绕过 raw 合并批处理直接入窗（既有 else 分支天然满足）；历史回载 `exec_transcript_tail` 同走嗅探解析（回放与实时一致，stderr 标注保留）。
+- **暂缓**：单元包的「omp title 事件 → Agent.title」是 RPC 模式（`--mode rpc` 双向帧）专属——print-json 流无 title 事件，随 U11 会话续接（届时评估 RPC）一并处理。dsh 保持 raw（附录 A.1：无结构化流，stderr reasoning 分节是 U-backlog）。
+- 质量门：Rust 104 / 前端 106 / clippy / fmt / build 全绿。**验收待做**：实派发三家看结构化 transcript 呈现。
+
+#### F-U12-3 · P1 · provider-bug · `executor.rs`/adapters · usage 累计快照重复刷屏
+验收实测：pi 派发的 transcript 出现 26 条同值 `⚡ · 13,980 tok · $0.0419`。根因：pi/omp 的 `message_update.usage` 是**会话累计快照**、随每个 message_update 帧（含 delta 帧）重发——U12 首版逐帧透传。也回答了 §15 提出的语义问题：**累计值，取变化点而非求和**。
+- **状态**：fixed（实时流：ExecSession 持 `last_usage` 快照，值不变不发；历史回载：`transcript_tail_from` 同款连续去重；`usage_key` 纯函数。回归测试：26 条同值 + 新值帧 → 恰 2 条 usage。Rust 105 passed）
+
+#### F-DEFAULT-MODEL · feat · 执行弹窗模型记忆（2026-10-18）
+需求：per-provider 记住上次派发选用的模型作为默认，但必须先拉取模型列表、校验记忆值仍在列表中才预选（防列表漂移/换机悬空）。
+- **实现**：bag v2 扩展 `models: {<provider>: <modelId>}`（workspace 级，随 `tauri:harness` 键走 ui/filters，read-merge-write 语义与 defaultHarness/approvalAck 一致）。弹窗：成功派发时记 `models[selected] = 选择值`（空选择 = 清除该 provider 记忆——合并层空串删键、空对象收键）；列表拉取成功后 `bagModels[selected]` 在列表中才 `setModelSel` 预选，不在则回退「默认（不指定）」。
+- **测试**：预选命中直接派发带模型 / 记忆值不在列表回退空 / 派发写入合并（他 provider 保留）/ store 合并语义（覆盖·空串清除·空对象收键）。前端 110 passed。
 
 ### 残留状态核查（第二轮验收后）
 
