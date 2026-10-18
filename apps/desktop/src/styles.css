@@ -443,6 +443,12 @@ body {
 }
 .t-stderr { color: #ffa198; }
 .t-start { color: var(--accent); }
+/* U12 结构化事件行：思考（暗淡斜体）/ 工具调用与结果 / 用量 */
+.t-think { color: var(--muted); font-style: italic; }
+.t-tool { color: #79c0ff; }
+.t-toolres { color: var(--muted); }
+.t-toolres-error { color: var(--danger); }
+.t-usage { color: #56d364; font-size: 11px; }
 .t-exit { color: var(--muted); border-top: 1px dashed var(--border); }
 .t-exit.t-failed { color: var(--danger); }
 .follow-pill {

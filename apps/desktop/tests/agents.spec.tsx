@@ -401,6 +401,34 @@ describe('U5 纯函数（TranscriptView 视口语义）', () => {
     expect(lines.every((l) => !l.text.includes('\n') && !l.text.includes('\r'))).toBe(true)
   })
 
+  it('flattenEvents：U12 结构化事件（text/thinking/tool/usage/error）映射与截断', async () => {
+    const { flattenEvents } = await import('../src/TranscriptView')
+    const base = { execId: 'e', ts: '1' }
+    const lines = flattenEvents([
+      { ...base, seq: 1, kind: 'assistant_text', text: 'DONE' },
+      { ...base, seq: 2, kind: 'assistant_thinking', text: 'step1\nstep2' },
+      { ...base, seq: 3, kind: 'tool_call', name: 'bash', input: { command: 'echo hi' } },
+      { ...base, seq: 4, kind: 'tool_result', summary: 'hi', isError: true },
+      { ...base, seq: 5, kind: 'usage', tokens: 17137, cost: 0.0209 },
+      { ...base, seq: 6, kind: 'error', message: 'boom' },
+    ])
+    expect(lines.map(l => [l.kind, l.text])).toEqual([
+      ['out', 'DONE'],
+      ['think', 'step1'],
+      ['think', 'step2'],
+      ['tool', '⚙ bash {"command":"echo hi"}'],
+      ['toolres', '↳ hi'],
+      ['usage', '⚡ · 17,137 tok · $0.0209'],
+      ['err', '⚠ boom'],
+    ])
+    expect(lines[4].toolError).toBe(true)
+    // 超长 tool input 截断为单行
+    const long = flattenEvents([
+      { ...base, seq: 7, kind: 'tool_call', name: 'write', input: { body: 'x'.repeat(400) } },
+    ])
+    expect(long[0].text.length).toBeLessThanOrEqual(212)
+  })
+
   it('flattenEvents：exit 行携带 failed 标记与结构化文本', async () => {
     const { flattenEvents } = await import('../src/TranscriptView')
     const lines = flattenEvents([exitEvent('e', 'failed')])

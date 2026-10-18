@@ -64,9 +64,11 @@ export function isIdle(
 /** 渲染行：虚拟化的原子单位，恰好一条单行文本（行高 22px 不变量）。 */
 export interface TranscriptLine {
   key: string
-  kind: 'start' | 'exit' | 'out' | 'err'
+  kind: 'start' | 'exit' | 'out' | 'err' | 'think' | 'tool' | 'toolres' | 'usage'
   /** 仅 exit 行：status === 'failed' 时加 t-failed 红显 */
   failed?: boolean
+  /** 仅 toolres 行：isError 红显 */
+  toolError?: boolean
   text: string
 }
 
@@ -92,6 +94,7 @@ export function flattenEvents(events: TranscriptEvent[]): TranscriptLine[] {
   for (const event of events) {
     let kind: TranscriptLine['kind']
     let failed = false
+    let toolError = false
     let text: string
     if (event.kind === 'session_start') {
       kind = 'start'
@@ -100,12 +103,41 @@ export function flattenEvents(events: TranscriptEvent[]): TranscriptLine[] {
       kind = 'exit'
       failed = event.status === 'failed'
       text = `■ ${event.status}${event.code !== null ? ` · code ${event.code}` : ''}${event.killReason ? ` · ${event.killReason}` : ''} · ${(event.durationMs / 1000).toFixed(1)}s`
+    } else if (event.kind === 'assistant_text') {
+      kind = 'out'
+      text = event.text
+    } else if (event.kind === 'assistant_thinking') {
+      kind = 'think'
+      text = event.text
+    } else if (event.kind === 'tool_call') {
+      kind = 'tool'
+      const input = JSON.stringify(event.input ?? {})
+      text = `⚙ ${event.name} ${input.length > 200 ? `${input.slice(0, 200)}…` : input}`
+    } else if (event.kind === 'tool_result') {
+      kind = 'toolres'
+      toolError = event.isError
+      text = `↳ ${event.summary}`
+    } else if (event.kind === 'usage') {
+      kind = 'usage'
+      const tokens = event.tokens != null ? ` · ${event.tokens.toLocaleString()} tok` : ''
+      const cost = event.cost != null ? ` · $${event.cost.toFixed(4)}` : ''
+      text = `⚡${tokens}${cost}`
+    } else if (event.kind === 'error') {
+      kind = 'err'
+      text = `⚠ ${event.message}`
     } else {
       kind = event.stream === 'stderr' ? 'err' : 'out'
       text = event.text
     }
     for (const [i, line] of splitLines(stripAnsi(text)).entries()) {
-      lines.push({ key: `${event.kind}-${event.seq}-${i}`, kind, failed, text: line })
+      // toolError 仅 toolres 行携带（深比较断言面保持最小）
+      lines.push({
+        key: `${event.kind}-${event.seq}-${i}`,
+        kind,
+        failed,
+        ...(kind === 'toolres' ? { toolError } : {}),
+        text: line,
+      })
     }
   }
   return lines
@@ -236,7 +268,20 @@ function TranscriptRow({ line, top }: { line: TranscriptLine; top: number }) {
       </div>
     )
   }
-  const cls = line.kind === 'start' ? 't-row t-start' : `t-row${line.kind === 'err' ? ' t-stderr' : ''}`
+  const cls =
+    line.kind === 'start'
+      ? 't-row t-start'
+      : line.kind === 'err'
+        ? 't-row t-stderr'
+        : line.kind === 'think'
+          ? 't-row t-think'
+          : line.kind === 'tool'
+            ? 't-row t-tool'
+            : line.kind === 'toolres'
+              ? `t-row t-toolres${line.toolError ? ' t-toolres-error' : ''}`
+              : line.kind === 'usage'
+                ? 't-row t-usage'
+                : 't-row'
   return (
     <div className={cls} style={style}>
       {line.text}

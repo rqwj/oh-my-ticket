@@ -125,6 +125,9 @@ pub struct ExecSession {
     lease_release: Option<LeaseRelease>,
     /// spawn 时刻（durationMs 与 kill 兜底计算用）
     pub started: Instant,
+    /// 最近一条 usage 快照（F-U12-3：pi/omp 的 usage 是会话累计值、随每个
+    /// message_update 帧重发——值不变不发，防 transcript 刷屏）
+    pub last_usage: std::sync::Mutex<Option<(u64, Option<f64>)>>,
     /// 事件出口（waiter 与 kill_all 路径共用；U4 接 Tauri Channel）
     sink: EventSink,
     /// 事件序号（F-U2-6：三类事件统一 §5.3 envelope——`{execId, seq, ts,
@@ -459,6 +462,7 @@ impl ExecutionManager {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone(),
             started,
+            last_usage: std::sync::Mutex::new(None),
             sink: on_event.clone(),
             seq: AtomicU64::new(0),
             first_event_seen: AtomicBool::new(false),
@@ -505,6 +509,7 @@ impl ExecutionManager {
             readers.push(spawn_reader(
                 out,
                 "stdout",
+                req.harness.clone(),
                 session.clone(),
                 on_event.clone(),
             ));
@@ -513,6 +518,7 @@ impl ExecutionManager {
             readers.push(spawn_reader(
                 err,
                 "stderr",
+                req.harness.clone(),
                 session.clone(),
                 on_event.clone(),
             ));
@@ -661,9 +667,16 @@ impl ExecutionManager {
     }
 }
 
+/// usage 事件的去重键（tokens + cost；None 字段以 0/无值参与比较）。
+/// 纯函数供测试。
+fn usage_key(part: &serde_json::Value) -> (u64, Option<f64>) {
+    (part["tokens"].as_u64().unwrap_or(0), part["cost"].as_f64())
+}
+
 fn spawn_reader(
     pipe: impl std::io::Read + Send + 'static,
     stream: &'static str,
+    harness: String,
     session: Arc<ExecSession>,
     on_event: EventSink,
 ) -> std::thread::JoinHandle<()> {
@@ -678,15 +691,36 @@ fn spawn_reader(
         for line in reader.lines() {
             let Ok(line) = line else { break };
             session.first_event_seen.store(true, Ordering::Relaxed);
-            let n = session.seq.fetch_add(1, Ordering::Relaxed);
-            on_event(serde_json::json!({
-                "execId": session.exec_id,
-                "seq": n,
-                "ts": agents::now_epoch_ms(),
-                "kind": "raw",
-                "stream": stream,
-                "text": line,
-            }));
+            // U12：JSON 事件流 → 统一事件（adapters.rs；解析失败/未知
+            // harness 一律回落 raw——契约是降级保证可用）
+            let mut parts = crate::adapters::parse_line(&harness, &line);
+            if parts.is_empty() {
+                parts = vec![serde_json::json!({
+                    "kind": "raw",
+                    "stream": stream,
+                    "text": line,
+                })];
+            }
+            for mut part in parts {
+                // F-U12-3：usage 是会话累计快照（pi/omp 每帧重发）——
+                // 值不变不发，transcript 只见变化点
+                if part["kind"] == "usage" {
+                    let key = usage_key(&part);
+                    let mut last = session
+                        .last_usage
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if *last == Some(key) {
+                        continue;
+                    }
+                    *last = Some(key);
+                }
+                let n = session.seq.fetch_add(1, Ordering::Relaxed);
+                part["execId"] = serde_json::json!(session.exec_id);
+                part["seq"] = serde_json::json!(n);
+                part["ts"] = serde_json::json!(agents::now_epoch_ms());
+                on_event(part);
+            }
             if let Some(log) = log.as_mut() {
                 let _ = writeln!(log, "[{stream}] {line}");
             }
@@ -1366,9 +1400,10 @@ fn transcript_tail_from(
         all[start..].to_vec()
     };
     let mut seq = 0u64;
+    let mut last_usage_tail: Option<(u64, Option<f64>)> = None;
     let events = lines
         .iter()
-        .map(|line| {
+        .flat_map(|line| {
             let (stream, body) = if let Some(rest) = line.strip_prefix("[stderr] ") {
                 ("stderr", rest)
             } else if let Some(rest) = line.strip_prefix("[stdout] ") {
@@ -1376,15 +1411,40 @@ fn transcript_tail_from(
             } else {
                 ("stdout", *line)
             };
+            // U12：结构化模式下 raw.log 里是 JSON 行——嗅探解析回结构化
+            // 事件（与实时流一致的历史回放）；非 JSON/嗅探不认识 → raw
+            let mut parts = crate::adapters::parse_line_auto(body);
+            if parts.is_empty() {
+                parts = vec![serde_json::json!({
+                    "kind": "raw",
+                    "stream": stream,
+                    "text": body,
+                })];
+            }
+            // 嗅探回落 raw 时保留真实流标注（adapters 的 raw 兜底固定 stdout）
+            if parts.len() == 1 && parts[0]["kind"] == "raw" {
+                parts[0]["stream"] = serde_json::json!(stream);
+            }
+            parts
+        })
+        // F-U12-3：与实时流同款 usage 去重（累计快照重复帧不发）
+        .filter(|part| {
+            if part["kind"] != "usage" {
+                return true;
+            }
+            let key = usage_key(part);
+            if last_usage_tail == Some(key) {
+                return false;
+            }
+            last_usage_tail = Some(key);
+            true
+        })
+        .map(|mut part| {
             seq += 1;
-            serde_json::json!({
-                "execId": exec_id,
-                "seq": seq,
-                "ts": "0",
-                "kind": "raw",
-                "stream": stream,
-                "text": body,
-            })
+            part["execId"] = serde_json::json!(exec_id);
+            part["seq"] = serde_json::json!(seq);
+            part["ts"] = serde_json::json!("0");
+            part
         })
         .collect();
     events
@@ -1755,6 +1815,7 @@ mod tests {
             runtime_dir: runtime.clone(),
             mcp: McpInjection::None,
             lease_release: None,
+            last_usage: std::sync::Mutex::new(None),
             started: Instant::now(),
             sink: Arc::new(|_| {}),
             seq: AtomicU64::new(0),
@@ -1815,6 +1876,7 @@ mod tests {
             mcp: McpInjection::None,
             lease_release: None,
             started: Instant::now(),
+            last_usage: std::sync::Mutex::new(None),
             sink: Arc::new(|_| {}),
             seq: AtomicU64::new(0),
             first_event_seen: AtomicBool::new(true),
@@ -2847,10 +2909,10 @@ mod tests {
         assert_eq!(file.agents[0].status, AgentRecordStatus::Failed);
         assert_eq!(file.agents[0].attachment, AgentAttachment::None);
         let persisted_args = &file.agents[0].execs[0].binary_args;
-        // F-ACC-12：omp 渠道 argv 前置 headless `-p`，其后才是用户 args
+        // F-ACC-12 + U12：omp 渠道 argv = headless + 结构化流 flag，其后用户 args
         assert_eq!(
-            &persisted_args[..4],
-            ["-p", "--api-key", "***", "--token=***"]
+            &persisted_args[..6],
+            ["-p", "--mode", "json", "--api-key", "***", "--token=***"]
         );
         assert!(
             !serde_json::to_string(&file)
@@ -3085,6 +3147,37 @@ mod tests {
         assert_eq!(events[1]["text"], "boom");
         // 无日志 → 空
         assert!(transcript_tail_from(&runtime, "h_t", "exec-none", None).is_empty());
+    }
+
+    /// F-U12-3：累计 usage 快照重复帧不发（实时 reader 与历史回载同语义）。
+    #[test]
+    fn transcript_tail_dedupes_repeated_usage_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        let home_dir = runtime.join("transcripts").join("h_u");
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let usage_frame = r#"{"type":"message_update","usage":{"totalTokens":13980,"cost":{"total":0.0419}},"assistantMessageEvent":{"type":"thinking_delta","delta":"x"}}"#;
+        let usage_frame2 = r#"{"type":"message_update","usage":{"totalTokens":14210,"cost":{"total":0.0101}},"assistantMessageEvent":{"type":"thinking_delta","delta":"y"}}"#;
+        let mut log = String::new();
+        for _ in 0..26 {
+            log.push_str(&format!("[stdout] {usage_frame}\n"));
+        }
+        log.push_str(&format!("[stdout] {usage_frame2}\n"));
+        log.push_str(&format!("[stdout] {usage_frame2}\n"));
+        std::fs::write(home_dir.join("exec-u.raw.log"), log).unwrap();
+        let events = transcript_tail_from(&runtime, "h_u", "exec-u", None);
+        let usages: Vec<&serde_json::Value> =
+            events.iter().filter(|e| e["kind"] == "usage").collect();
+        assert_eq!(
+            usages.len(),
+            2,
+            "26 条同值快照只发 1 条 + 新值 1 条: {}",
+            serde_json::to_string(&events).unwrap()
+        );
+        assert_eq!(usages[0]["tokens"], 13980);
+        assert_eq!(usages[1]["tokens"], 14210);
+        // delta 帧（thinking_delta）本体不产生 thinking 事件（只 *_end 产生）
+        assert!(events.iter().all(|e| e["kind"] != "assistant_thinking"));
     }
 
     /// 验收回归同源第三处：run/get item 的执行器字段是 `executorActor`

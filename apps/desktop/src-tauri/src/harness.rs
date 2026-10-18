@@ -180,6 +180,9 @@ pub struct HarnessDescriptor {
     /// 模型列表命令参数（F-PI-2：opencode/omp 是 `models` 子命令，pi 是
     /// `--list-models` flag——`pi models` 会被当消息起 TUI 超时失败）。
     pub model_list_args: &'static [&'static str],
+    /// 结构化输出 flag（U12：开 JSON 事件流；空 = raw 透传，未知 harness
+    /// 永远 raw）。实测：opencode `--format json`、pi/omp `--mode json`。
+    pub json_args: &'static [&'static str],
 }
 
 /// dispatch prompt 的传递渠道（provider 适配差异，注册表静态声明）。
@@ -204,6 +207,7 @@ pub const REGISTRY: &[HarnessDescriptor] = &[
         login_args: &["auth", "login"],
         model_args: &["--model"],
         model_list_args: &["models"],
+        json_args: &["--format", "json"],
     },
     HarnessDescriptor {
         id: "omp",
@@ -219,6 +223,7 @@ pub const REGISTRY: &[HarnessDescriptor] = &[
         login_args: &[],
         model_args: &["--model"],
         model_list_args: &["models"],
+        json_args: &["--mode", "json"],
     },
     HarnessDescriptor {
         id: "pi",
@@ -236,6 +241,7 @@ pub const REGISTRY: &[HarnessDescriptor] = &[
         login_args: &[],
         model_args: &["--model"],
         model_list_args: &["--list-models"],
+        json_args: &["--mode", "json"],
     },
 ];
 
@@ -387,6 +393,8 @@ pub struct LaunchPlan {
     pub headless_flags: Vec<String>,
     /// 指定模型的 flag（descriptor 静态值，两家同为 --model）
     pub model_args: Vec<String>,
+    /// 结构化输出 flag（descriptor 静态值；空 = raw）
+    pub json_args: Vec<String>,
 }
 
 impl LaunchPlan {
@@ -442,6 +450,11 @@ pub fn resolve_launch(runtime_dir: &Path, provider_id: &str) -> Result<LaunchPla
             .iter()
             .map(|s| (*s).to_string())
             .collect(),
+        json_args: descriptor
+            .json_args
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
     })
 }
 
@@ -489,6 +502,9 @@ pub fn compose_launch_args(
 ) -> Vec<String> {
     let mut args = plan.argv_prefix.clone();
     args.extend(plan.headless_flags.iter().cloned());
+    // U12：结构化流 flag 紧随模式 flag（opencode `run --format json` /
+    // pi·omp `-p --mode json`）
+    args.extend(plan.json_args.iter().cloned());
     args.extend(plan.extra_args.iter().cloned());
     if unattended {
         args.extend(plan.unattended_flag.iter().cloned());
@@ -1084,6 +1100,7 @@ mod tests {
             argv_prefix: vec![],
             headless_flags: vec!["-p".to_string()],
             model_args: vec!["--model".to_string()],
+            json_args: vec![],
         };
         // SpawnRequest doc 契约：用户 extra_args 在前、desktop 注入 flag 在后
         //（覆盖用户同名 flag）、prompt 收尾
@@ -1168,6 +1185,7 @@ mod tests {
             argv_prefix: vec![],
             headless_flags: vec!["-p".to_string()],
             model_args: vec!["--model".to_string()],
+            json_args: vec![],
         };
         assert_eq!(
             compose_launch_args(&plan, true, "PROMPT", None, Some("k3")),
@@ -1188,15 +1206,24 @@ mod tests {
             argv_prefix: vec![],
             headless_flags: vec!["-p".to_string(), "--approve".to_string()],
             model_args: vec!["--model".to_string()],
+            json_args: vec!["--mode".to_string(), "json".to_string()],
         };
         assert_eq!(
             compose_launch_args(&plan, true, "LONG PROMPT", None, None),
-            vec!["-p", "--approve", "LONG PROMPT"],
+            vec!["-p", "--approve", "--mode", "json", "LONG PROMPT"],
             "无放行 flag 时 unattended=true 不追加任何项"
         );
         assert_eq!(
             compose_launch_args(&plan, true, "P", None, Some("kimi-coding/k3")),
-            vec!["-p", "--approve", "--model", "kimi-coding/k3", "P"],
+            vec![
+                "-p",
+                "--approve",
+                "--mode",
+                "json",
+                "--model",
+                "kimi-coding/k3",
+                "P"
+            ],
         );
     }
 
@@ -1314,6 +1341,7 @@ mod tests {
             argv_prefix: vec!["run".to_string()],
             headless_flags: vec![],
             model_args: vec!["--model".to_string()],
+            json_args: vec![],
         };
         let long_prompt = "You are executing tickets…\nrule 1\nrule 2";
         let args = compose_launch_args(
@@ -1410,6 +1438,7 @@ mod tests {
             argv_prefix: vec![],
             headless_flags: vec![],
             model_args: vec!["--model".to_string()],
+            json_args: vec![],
         };
         let filtered = plan.sanitized_env();
         assert_eq!(filtered.len(), 1, "{filtered:?}");
@@ -1430,6 +1459,7 @@ mod tests {
             argv_prefix: vec![],
             headless_flags: vec![],
             model_args: vec!["--model".to_string()],
+            json_args: vec![],
         };
         let value = launch_preview_value(&plan);
         let keys: Vec<&str> = value["envKeys"]

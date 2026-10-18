@@ -134,7 +134,68 @@ interface ExitTranscriptEvent {
   durationMs: number
 }
 
-export type TranscriptEvent = SessionStartEvent | RawTranscriptEvent | ExitTranscriptEvent
+/** U12 结构化事件（§5.3 折叠为平铺字段；payload 由 adapters.rs 产出） */
+interface AssistantTextEvent {
+  execId: string
+  seq: number
+  ts: string
+  kind: 'assistant_text'
+  text: string
+}
+
+interface AssistantThinkingEvent {
+  execId: string
+  seq: number
+  ts: string
+  kind: 'assistant_thinking'
+  text: string
+}
+
+interface ToolCallEvent {
+  execId: string
+  seq: number
+  ts: string
+  kind: 'tool_call'
+  name: string
+  input: unknown
+}
+
+interface ToolResultEvent {
+  execId: string
+  seq: number
+  ts: string
+  kind: 'tool_result'
+  summary: string
+  isError: boolean
+}
+
+interface UsageEvent {
+  execId: string
+  seq: number
+  ts: string
+  kind: 'usage'
+  tokens?: number | null
+  cost?: number | null
+}
+
+interface ErrorEvent {
+  execId: string
+  seq: number
+  ts: string
+  kind: 'error'
+  message: string
+}
+
+export type TranscriptEvent =
+  | SessionStartEvent
+  | RawTranscriptEvent
+  | ExitTranscriptEvent
+  | AssistantTextEvent
+  | AssistantThinkingEvent
+  | ToolCallEvent
+  | ToolResultEvent
+  | UsageEvent
+  | ErrorEvent
 
 /** agents_list（F-U4a-8）：pull 契约 = tab 首开 / window focus / 派发后主动拉。 */
 export async function agentsList(homeId: string): Promise<AgentsListResult> {

@@ -4,6 +4,7 @@
 //! kind:"desktop", single-entry admin-grant refresh, and the Rust-held
 //! connection bridged to the frontend through tauri commands.
 
+mod adapters;
 mod agents;
 mod atomic_json;
 mod daemon;
