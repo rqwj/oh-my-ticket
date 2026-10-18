@@ -123,6 +123,9 @@ export interface ExecRecord {
   transcriptFile: string | null
   binaryPath: string | null
   binaryArgs: string[]
+  /** F-U12-4：终态归档的会话累计用量（无 usage 事件为 null） */
+  usageTokens?: number | null
+  usageCost?: number | null
   /** Rust-captured process identity; never accepted from the renderer for kill authorization. */
   pid: number | null
   processStartId: string | null

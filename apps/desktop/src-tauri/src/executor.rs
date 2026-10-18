@@ -128,6 +128,9 @@ pub struct ExecSession {
     /// 最近一条 usage 快照（F-U12-3：pi/omp 的 usage 是会话累计值、随每个
     /// message_update 帧重发——值不变不发，防 transcript 刷屏）
     pub last_usage: std::sync::Mutex<Option<(u64, Option<f64>)>>,
+    /// F-U12-4：规范化事件日志（`<execId>.jsonl`，首行 session_header，
+    /// 随后统一事件逐行）——U10 reconcile 与成本承接的持久层。
+    pub events_log: PathBuf,
     /// 事件出口（waiter 与 kill_all 路径共用；U4 接 Tauri Channel）
     sink: EventSink,
     /// 事件序号（F-U2-6：三类事件统一 §5.3 envelope——`{execId, seq, ts,
@@ -404,6 +407,29 @@ impl ExecutionManager {
         if let Some(dir) = raw_log.parent() {
             std::fs::create_dir_all(dir).map_err(|e| format!("create transcripts dir: {e}"))?;
         }
+        // F-U12-4：规范化事件日志——首行 header（F-U2-7 原始定义），随后
+        // spawn_reader 逐行追加统一事件；argv 用脱敏值（secrets 纪律）。
+        let events_log = raw_log.with_file_name(format!("{}.jsonl", req.exec_id));
+        {
+            use std::io::Write as _;
+            let header = serde_json::json!({
+                "kind": "session_header",
+                "execId": req.exec_id,
+                "agentId": req.agent_id,
+                "nodeId": req.node_id,
+                "runId": req.run_id,
+                "harness": req.harness,
+                "argv": sanitized_args,
+                "startedAt": agents::now_epoch_ms(),
+            });
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&events_log)
+                .map_err(|e| format!("create events log: {e}"))?;
+            writeln!(f, "{header}").map_err(|e| format!("write events header: {e}"))?;
+        }
 
         let mut cmd = std::process::Command::new(&req.program);
         cmd.args(&req.args)
@@ -463,6 +489,7 @@ impl ExecutionManager {
                 .clone(),
             started,
             last_usage: std::sync::Mutex::new(None),
+            events_log,
             sink: on_event.clone(),
             seq: AtomicU64::new(0),
             first_event_seen: AtomicBool::new(false),
@@ -489,9 +516,10 @@ impl ExecutionManager {
             },
         );
 
-        // F-U2-6：session_start 与 raw/exit 同构——统一携带 seq/ts
+        // F-U2-6：session_start 与 raw/exit 同构——统一携带 seq/ts；
+        // F-U12-4：同时落 jsonl（事件日志与实时流同源同序）
         let start_seq = session.seq.fetch_add(1, Ordering::Relaxed);
-        on_event(serde_json::json!({
+        let start_event = serde_json::json!({
             "execId": req.exec_id,
             "seq": start_seq,
             "ts": agents::now_epoch_ms(),
@@ -501,7 +529,9 @@ impl ExecutionManager {
             "args": session.args,
             "cwd": cwd.display().to_string(),
             "pid": pid,
-        }));
+        });
+        on_event(start_event.clone());
+        append_event_line(&session, &start_event);
 
         // stdout/stderr 读线程：逐行 → 事件回调 + raw.log 追加。
         let mut readers = Vec::new();
@@ -667,6 +697,19 @@ impl ExecutionManager {
     }
 }
 
+/// F-U12-4：向 `<execId>.jsonl` 追加一行统一事件（打开-写-关的简单实现
+/// ——事件频率远低于 raw 行，且 append 模式保证行原子性）。
+fn append_event_line(session: &ExecSession, event: &serde_json::Value) {
+    use std::io::Write as _;
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&session.events_log)
+    else {
+        return; // 事件日志尽力而为：失败不影响实时流
+    };
+    let _ = writeln!(f, "{event}");
+}
+
 /// usage 事件的去重键（tokens + cost；None 字段以 0/无值参与比较）。
 /// 纯函数供测试。
 fn usage_key(part: &serde_json::Value) -> (u64, Option<f64>) {
@@ -719,7 +762,8 @@ fn spawn_reader(
                 part["execId"] = serde_json::json!(session.exec_id);
                 part["seq"] = serde_json::json!(n);
                 part["ts"] = serde_json::json!(agents::now_epoch_ms());
-                on_event(part);
+                on_event(part.clone());
+                append_event_line(&session, &part);
             }
             if let Some(log) = log.as_mut() {
                 let _ = writeln!(log, "[{stream}] {line}");
@@ -809,16 +853,27 @@ fn finish_terminal(session: &ExecSession, terminal: &Terminal) {
         status,
         AgentAttachment::None,
     );
-    // F-U2-3：exec 终态三字段一次回写（U5 显示退出码、U10 reconcile 依赖）
+    // F-U2-3：exec 终态三字段一次回写（U5 显示退出码、U10 reconcile 依赖）；
+    // F-U12-4：usage 终态归档（去重后的最终累计快照）
+    let final_usage = *session
+        .last_usage
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _ = agents::update_exec(
         runtime_dir,
         &session.home_id,
         &session.agent_id,
         &session.exec_id,
-        |exec| match terminal {
-            Terminal::Exited(code) => exec.exit_code = Some(*code),
-            Terminal::Failed(detail) => exec.failure_detail = Some(detail.clone()),
-            Terminal::Killed(reason) => exec.kill_reason = Some(reason.key()),
+        |exec| {
+            match terminal {
+                Terminal::Exited(code) => exec.exit_code = Some(*code),
+                Terminal::Failed(detail) => exec.failure_detail = Some(detail.clone()),
+                Terminal::Killed(reason) => exec.kill_reason = Some(reason.key()),
+            }
+            if let Some((tokens, cost)) = final_usage {
+                exec.usage_tokens = Some(tokens);
+                exec.usage_cost = cost;
+            }
         },
     );
     if let (Some(release), Some(run_id)) = (&session.lease_release, &session.run_id) {
@@ -827,7 +882,7 @@ fn finish_terminal(session: &ExecSession, terminal: &Terminal) {
     let duration_ms = session.started.elapsed().as_millis() as u64;
     // F-U2-6：exit 事件同样携带 seq/ts（与 session_start、raw 同构）
     let exit_seq = session.seq.fetch_add(1, Ordering::Relaxed);
-    (session.sink)(serde_json::json!({
+    let exit_event = serde_json::json!({
         "execId": session.exec_id,
         "seq": exit_seq,
         "ts": agents::now_epoch_ms(),
@@ -847,7 +902,10 @@ fn finish_terminal(session: &ExecSession, terminal: &Terminal) {
             _ => None,
         },
         "durationMs": duration_ms,
-    }));
+    });
+    (session.sink)(exit_event.clone());
+    // F-U12-4：exit 事件同样落 jsonl（回放含终态行）
+    append_event_line(session, &exit_event);
 }
 
 /// 幂等终止（§3.4）：对已终态/不存在的 execId 直接成功。
@@ -1380,16 +1438,32 @@ pub fn exec_transcript_tail(
 }
 
 /// `exec_transcript_tail` 的纯核心（测试注入 runtime 目录）。
+/// F-U12-4：优先读 `<execId>.jsonl`（规范化事件，逐行即事件——直接尾部
+/// 截取）；不存在（旧数据/未产出）回落 raw.log 嗅探路径。
 fn transcript_tail_from(
     runtime_dir: &Path,
     home_id: &str,
     exec_id: &str,
     max_lines: Option<usize>,
 ) -> Vec<serde_json::Value> {
-    let path = runtime_dir
-        .join("transcripts")
-        .join(home_id)
-        .join(format!("{exec_id}.raw.log"));
+    let dir = runtime_dir.join("transcripts").join(home_id);
+    let jsonl = dir.join(format!("{exec_id}.jsonl"));
+    if let Ok(text) = std::fs::read_to_string(&jsonl) {
+        let max = max_lines.unwrap_or(500).clamp(1, 5000);
+        let events: Vec<serde_json::Value> = text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            // header 行（kind=session_header）与畸形行不进回放窗
+            .filter(|ev| {
+                ev.get("kind")
+                    .and_then(|k| k.as_str())
+                    .is_some_and(|k| k != "session_header")
+            })
+            .collect();
+        let start = events.len().saturating_sub(max);
+        return events[start..].to_vec();
+    }
+    let path = dir.join(format!("{exec_id}.raw.log"));
     let Ok(text) = std::fs::read_to_string(&path) else {
         return Vec::new(); // 无日志（未产出/已清理）→ 空
     };
@@ -1816,6 +1890,10 @@ mod tests {
             mcp: McpInjection::None,
             lease_release: None,
             last_usage: std::sync::Mutex::new(None),
+            events_log: runtime
+                .join("transcripts")
+                .join("h_test")
+                .join("exec-x.jsonl"),
             started: Instant::now(),
             sink: Arc::new(|_| {}),
             seq: AtomicU64::new(0),
@@ -1877,6 +1955,10 @@ mod tests {
             lease_release: None,
             started: Instant::now(),
             last_usage: std::sync::Mutex::new(None),
+            events_log: runtime
+                .join("transcripts")
+                .join("h_test")
+                .join("exec-x.jsonl"),
             sink: Arc::new(|_| {}),
             seq: AtomicU64::new(0),
             first_event_seen: AtomicBool::new(true),
@@ -3080,6 +3162,25 @@ mod tests {
             matches!(terminal, Some(Terminal::Exited(0))),
             "{terminal:?}"
         );
+        // F-U12-4：规范化 jsonl——首行 header、含 session_start 与终态 exit
+        let jsonl = runtime
+            .join("transcripts")
+            .join("h_test")
+            .join(format!("{}.jsonl", outcome.exec_id));
+        let text = std::fs::read_to_string(&jsonl).unwrap();
+        let mut lines = text.lines();
+        let header: serde_json::Value =
+            serde_json::from_str(lines.next().unwrap_or_default()).unwrap();
+        assert_eq!(header["kind"], "session_header");
+        assert_eq!(header["execId"], outcome.exec_id);
+        assert_eq!(header["agentId"], outcome.agent_id);
+        assert_eq!(header["harness"], "opencode");
+        let kinds: Vec<String> = lines
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .map(|e| e["kind"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(kinds.first().map(String::as_str), Some("session_start"));
+        assert_eq!(kinds.last().map(String::as_str), Some("exit"));
     }
 
     /// 验收回归（真实派发报「无未完成可执行成员」暴露的 mock 漂移）：
@@ -3147,6 +3248,41 @@ mod tests {
         assert_eq!(events[1]["text"], "boom");
         // 无日志 → 空
         assert!(transcript_tail_from(&runtime, "h_t", "exec-none", None).is_empty());
+    }
+
+    /// F-U12-4：jsonl 存在时历史回载直读（不再嗅探 raw.log），header 行
+    /// 不进回放窗；无 jsonl 回落 raw 路径。
+    #[test]
+    fn transcript_tail_prefers_normalized_jsonl() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        let home_dir = runtime.join("transcripts").join("h_j");
+        std::fs::create_dir_all(&home_dir).unwrap();
+        std::fs::write(
+            home_dir.join("exec-j.jsonl"),
+            concat!(
+                r#"{"kind":"session_header","execId":"exec-j","agentId":"a","harness":"pi"}"#,
+                "\n",
+                r#"{"kind":"session_start","execId":"exec-j","seq":0,"ts":"1"}"#,
+                "\n",
+                r#"{"kind":"assistant_text","execId":"exec-j","seq":1,"ts":"2","text":"DONE"}"#,
+                "\n",
+                r#"{"kind":"exit","execId":"exec-j","seq":2,"ts":"3","status":"exited"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        // raw.log 放干扰行：jsonl 优先时不可见
+        std::fs::write(home_dir.join("exec-j.raw.log"), "[stdout] NOISE\n").unwrap();
+        let events = transcript_tail_from(&runtime, "h_j", "exec-j", None);
+        assert_eq!(
+            events
+                .iter()
+                .map(|e| e["kind"].as_str().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            vec!["session_start", "assistant_text", "exit"],
+            "header 剔除、raw 干扰不可见"
+        );
     }
 
     /// F-U12-3：累计 usage 快照重复帧不发（实时 reader 与历史回载同语义）。

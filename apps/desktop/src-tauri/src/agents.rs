@@ -80,6 +80,10 @@ pub struct ExecRecord {
     /// 内核进程起始标识，绝不信任 renderer 传入的裸 pid。
     pub pid: Option<u32>,
     pub process_start_id: Option<String>,
+    /// U12 跟进（F-U12-4）：终态归档的会话累计用量（usage 事件去重后的
+    /// 最终快照）——成本承接的第一层落盘。
+    pub usage_tokens: Option<u64>,
+    pub usage_cost: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
