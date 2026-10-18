@@ -34,29 +34,36 @@ fn election_race_elects_exactly_one_winner_and_losers_report_bootstrap_timeout()
     // (its purpose — ensure a daemon exists — is fulfilled); one that saw
     // no live daemon within its poll timeout reports HOME_LOCKED-style
     // BOOTSTRAP_TIMEOUT on stderr.
-    let mut alive = 0usize;
-    let mut winners_pid_alive = false;
-    for proc in &procs {
-        match proc.try_wait() {
-            None => {
+    //
+    // F-ACC-11: losers exit on their NEXT poll tick after this test observes
+    // the descriptor (50ms contend loop / endpoint probe) — sampling the
+    // alive count immediately is racy and flaked ~20%. Settle first: wait
+    // out the losers' bootstrap poll budget (+ grace) for the invariant.
+    let settle_deadline = std::time::Instant::now() + std::time::Duration::from_secs(17);
+    loop {
+        let mut alive = 0usize;
+        let mut winners_pid_alive = false;
+        for proc in &procs {
+            if proc.try_wait().is_none() {
                 alive += 1;
                 if proc.pid() == descriptor.pid {
                     winners_pid_alive = true;
                 }
             }
-            Some(_status) => {}
         }
+        if alive == 1 && winners_pid_alive {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < settle_deadline,
+            "exactly one daemon must survive the election (settle window expired); stderr so far: {:?}",
+            procs
+                .iter()
+                .map(|p| p.stderr_text())
+                .collect::<Vec<_>>()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    assert_eq!(
-        alive,
-        1,
-        "exactly one daemon must survive the election; stderr so far: {:?}",
-        procs.iter().map(|p| p.stderr_text()).collect::<Vec<_>>()
-    );
-    assert!(
-        winners_pid_alive,
-        "the surviving process must be the descriptor publisher"
-    );
 
     // Cleanup: kill the winner.
     for mut proc in procs {
