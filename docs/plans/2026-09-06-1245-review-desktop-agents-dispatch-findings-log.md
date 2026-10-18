@@ -1020,6 +1020,14 @@ daemon `run_item_view` 序列化为 `executorActor`（views.rs:130）。恒空 �
 用户要求在 U12 增加对 pi 的支持。全部按「实测定稿」纪律先行探明（pi 1.0.0 本机）：`-p` 无头、位置参数无 lstat（Argv 渠道）、**`.pi/mcp.json` 项目未受信即被静默忽略 → argv 必须 `--approve`**（防 F-ACC-9 复发）、条目形状无 type 字段、无审批层（unattended_flag 空）、`--mode json`（U12 数据面）、`--list-models` 表格解析、`--session-id` 精确续接（U11）。
 - **状态**：done（REGISTRY pi 条目；mcp_injection 泛化为 ProjectSpec 双命名空间——**omp 目录/条目形状字节级兼容**（19 个既有注入测试原样通过），pi 独立 `harness/pi-injection`/`pi-launchers` + `.pi/mcp.json`；sweep 双 spec；模型解析 + compose/注入/sweep 测试 ×4；弹窗详情对空放行 flag 的文案适配。实烟测：`pi -p --approve --model kimi-coding/k3` → PI-OK。Rust 99 / 前端 105 / clippy / fmt / build 全绿）
 
+#### F-PI-2 · P1 · provider-bug · `harness.rs` · pi 模型列表误用 `models` 子命令（实为 `--list-models` flag）
+验收：选 pi 时模型下拉未渲染（harness_list_models 失败→降级隐藏）。根因：命令对所有 provider 硬编码 `["models"]`——opencode/omp 是子命令，pi 是 flag；`pi models` 把 "models" 当消息（exit 1/TUI），超时失败。又一例「per-provider 差异必须入 descriptor」。
+- **状态**：fixed（descriptor 新增 `model_list_args`：opencode/omp `["models"]`、pi `["--list-models"]`；harness_list_models 改用 descriptor 参数，错误文案带实际命令；registry 断言测试。`pi --list-models` exit 0 / `pi models` exit 1 双向实测。Rust 99 passed）
+
+#### F-PI-3 · P1 · ui-gap · 历史 agent 的 transcript 不回载（raw.log 在盘上却看不到）
+验收：pi 执行成功（Agent 17，claim→echo world→report done，run completed），但重启 app 后选中该 agent——状态 exited、transcript 空。根因：transcript 事件只在运行期经 Channel 进内存（KD-D3），agent 列表跨重启保留但事件不回载，空态文案「等待 agent 产生事件…」对终态 agent 还带误导。旁证排查：三次 exit-1 是 omp 未登录轮（No API key，行号指纹比对 omp 二进制），与 pi 无关。
+- **状态**：fixed（新增 `exec_transcript_tail` 命令：raw.log 尾部（默认 500 行，上限 5000）按 `[stdout]/[stderr]` 前缀重建展示事件；store `loadHistoryTail` 惰性加载（窗口空且非 live 时拉取一次，绕过 raw 合并批处理直入尾窗）；AgentsPanel 选中 effect（hooks 位于提前 return 前——首轮插错位置被 React hooks 规则测试抓住）；终态空窗文案改为诚实表述。Rust 100 / 前端 105 / clippy / fmt / build 全绿）
+
 ### 残留状态核查（第二轮验收后）
 
 失败尝试在 daemon 侧已成功创建 RUN-0001（pending，持有 TICKET-0001，无执行器），EPIC-0001/TICKET-0001 被 node/execute 标为 in_progress。重试无需清理：ensure-run 复用路径按 pending → start 正常接管（已实测 run-get 确认）。
