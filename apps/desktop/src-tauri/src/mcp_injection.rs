@@ -58,6 +58,62 @@ use sha2::{Digest, Sha256};
 use crate::atomic_json::OpenOptionsUnix;
 use crate::daemon;
 
+/// 项目级 MCP 注入的 per-provider 参数。omp 的目录与条目形状是**已持久化
+/// 的兼容面**（在途 state 的 writtenSha 基线、用户机器上的 launcher 目录），
+/// 字节不得变动；pi 走独立命名空间与实测条目形状（`pi mcp add -l` 实测：
+/// 无 `type` 字段）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ProjectSpec {
+    /// `runtime/harness/<ns>-injection` 与 `runtime/harness/<ns>-launchers`
+    pub ns: &'static str,
+    /// workspace 配置相对路径
+    pub rel: &'static str,
+    /// 条目是否带 `"type": "stdio"`（omp 历史形状；pi 形状无此字段）
+    entry_type_stdio: bool,
+}
+
+const OMP_SPEC: ProjectSpec = ProjectSpec {
+    ns: "omp",
+    rel: ".omp/mcp.json",
+    entry_type_stdio: true,
+};
+
+const PI_SPEC: ProjectSpec = ProjectSpec {
+    ns: "pi",
+    rel: ".pi/mcp.json",
+    entry_type_stdio: false,
+};
+
+impl ProjectSpec {
+    fn injection_root(self, runtime_dir: &Path) -> PathBuf {
+        runtime_dir
+            .join("harness")
+            .join(format!("{}-injection", self.ns))
+    }
+    fn launchers_dir(self, runtime_dir: &Path) -> PathBuf {
+        runtime_dir
+            .join("harness")
+            .join(format!("{}-launchers", self.ns))
+    }
+    fn workspace_file(self, workspace_root: &Path) -> PathBuf {
+        workspace_root.join(self.rel)
+    }
+    fn entry(self, launcher: &Path) -> serde_json::Value {
+        if self.entry_type_stdio {
+            serde_json::json!({
+                "type": "stdio",
+                "command": launcher.display().to_string(),
+                "args": [],
+            })
+        } else {
+            serde_json::json!({
+                "command": launcher.display().to_string(),
+                "args": [],
+            })
+        }
+    }
+}
+
 /// 注入结果：spawn 时消费（env），终态时消费（release）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum McpInjection {
@@ -66,14 +122,16 @@ pub enum McpInjection {
         key: String,
         value: String,
     },
-    /// omp workspace 注入——release 时恢复原文件（或外科手术移除本注入）。
-    Omp {
+    /// 项目级 workspace 注入（omp `.omp/mcp.json` / pi `.pi/mcp.json`）——
+    /// release 时恢复原文件（或外科手术移除本注入）。
+    Project {
         workspace_root: PathBuf,
         persistent: bool,
         /// launcher 脚本 id（不含 `.sh` 后缀）：非 persistent 为 exec_id，
         /// persistent 为固定 `"persistent"`。仅供展示/调试——实际删除时机
         /// 由 state.json 的 `launchers` 集合统一管理（F-U3-12）。
         launcher_id: String,
+        spec: ProjectSpec,
     },
 }
 
@@ -87,9 +145,9 @@ impl McpInjection {
     }
 }
 
-/// 进程内串行化 omp 的 prepare/release/refcount（single-instance + U15 后
-/// 跨进程由 omt CLI 共写约定接管）。
-static OMP_LOCK: Mutex<()> = Mutex::new(());
+/// 进程内串行化项目级注入（omp/pi）的 prepare/release/refcount
+/// （single-instance + U15 后跨进程由 omt CLI 共写约定接管）。
+static PROJECT_LOCK: Mutex<()> = Mutex::new(());
 
 /// F-U3-5：`DefaultHasher` 的内部算法不保证跨 Rust 版本稳定——用于
 /// **持久化**比对（workspace hash、写入内容 hash）必须用稳定算法，否则
@@ -116,30 +174,20 @@ fn workspace_hash(workspace_root: &Path) -> String {
     )
 }
 
-fn omp_injection_root(runtime_dir: &Path) -> PathBuf {
-    runtime_dir.join("harness").join("omp-injection")
+fn state_dir(runtime_dir: &Path, workspace_root: &Path, spec: ProjectSpec) -> PathBuf {
+    spec.injection_root(runtime_dir)
+        .join(workspace_hash(workspace_root))
 }
 
-fn omp_state_dir(runtime_dir: &Path, workspace_root: &Path) -> PathBuf {
-    omp_injection_root(runtime_dir).join(workspace_hash(workspace_root))
+fn launcher_path(runtime_dir: &Path, spec: ProjectSpec, launcher_id: &str) -> PathBuf {
+    spec.launchers_dir(runtime_dir)
+        .join(format!("{launcher_id}.sh"))
 }
 
-fn omp_workspace_file(workspace_root: &Path) -> PathBuf {
-    workspace_root.join(".omp").join("mcp.json")
-}
-
-fn omp_launchers_dir(runtime_dir: &Path) -> PathBuf {
-    runtime_dir.join("harness").join("omp-launchers")
-}
-
-fn launcher_path(runtime_dir: &Path, launcher_id: &str) -> PathBuf {
-    omp_launchers_dir(runtime_dir).join(format!("{launcher_id}.sh"))
-}
-
-/// 目录前缀比较用；带尾部分隔符，避免 "omp-launchers" 误匹配
-/// "omp-launchers-other" 这类兄弟目录（纯字符串 `starts_with` 的陷阱）。
-fn omp_launchers_prefix(runtime_dir: &Path) -> String {
-    let mut s = omp_launchers_dir(runtime_dir).display().to_string();
+/// 目录前缀比较用；带尾部分隔符，避免 "x-launchers" 误匹配
+/// "x-launchers-other" 这类兄弟目录（纯字符串 `starts_with` 的陷阱）。
+fn launchers_prefix(runtime_dir: &Path, spec: ProjectSpec) -> String {
+    let mut s = spec.launchers_dir(runtime_dir).display().to_string();
     s.push(std::path::MAIN_SEPARATOR);
     s
 }
@@ -172,12 +220,13 @@ fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
 /// 时不传 `--actor`（persistent 模式：不绑定单次 exec 身份）。
 fn write_launcher(
     runtime_dir: &Path,
+    spec: ProjectSpec,
     launcher_id: &str,
     omt_path: &Path,
     actor: Option<&str>,
 ) -> Result<PathBuf, String> {
     use std::io::Write;
-    let dir = omp_launchers_dir(runtime_dir);
+    let dir = spec.launchers_dir(runtime_dir);
     std::fs::create_dir_all(&dir).map_err(|e| format!("create launcher dir: {e}"))?;
     let path = dir.join(format!("{launcher_id}.sh"));
     let mut file = std::fs::OpenOptions::new()
@@ -203,27 +252,28 @@ fn write_launcher(
     Ok(path)
 }
 
-fn remove_launcher(runtime_dir: &Path, launcher_id: &str) {
-    let _ = std::fs::remove_file(launcher_path(runtime_dir, launcher_id));
+fn remove_launcher(runtime_dir: &Path, spec: ProjectSpec, launcher_id: &str) {
+    let _ = std::fs::remove_file(launcher_path(runtime_dir, spec, launcher_id));
 }
 
-/// omp 合并写入：保留用户已有 servers，注入/更新 `omt` 条目指向 `launcher`。
+/// 项目级合并写入：保留用户已有 servers，注入/更新 `omt` 条目指向
+/// `launcher`（条目形状 per-spec——omp 带 type:stdio 历史形状，pi 实测形状）。
 /// 返回写入内容的 hash（恢复时比对，防覆盖用户 mid-exec 手改）。
-fn merge_omp_mcp(workspace_root: &Path, launcher: &Path) -> Result<String, String> {
-    let file = omp_workspace_file(workspace_root);
+fn merge_project_mcp(
+    workspace_root: &Path,
+    launcher: &Path,
+    spec: ProjectSpec,
+) -> Result<String, String> {
+    let file = spec.workspace_file(workspace_root);
     let mut root = match std::fs::read_to_string(&file) {
         Ok(text) => serde_json::from_str::<serde_json::Value>(&text)
-            .map_err(|e| format!("workspace .omp/mcp.json 不是合法 JSON: {e}"))?,
+            .map_err(|e| format!("workspace {} 不是合法 JSON: {e}", spec.rel))?,
         Err(_) => serde_json::json!({}),
     };
     if !root.is_object() {
-        return Err("workspace .omp/mcp.json 顶层不是对象，拒绝注入".to_string());
+        return Err(format!("workspace {} 顶层不是对象，拒绝注入", spec.rel));
     }
-    root["mcpServers"]["omt"] = serde_json::json!({
-        "type": "stdio",
-        "command": launcher.display().to_string(),
-        "args": [],
-    });
+    root["mcpServers"]["omt"] = spec.entry(launcher);
     let text = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
     write_atomic(&file, &text)?;
     Ok(stable_hash_hex(text.as_bytes()))
@@ -273,10 +323,11 @@ fn remove_omt_entry_if_matches(
 /// （F-U3-10 同款风险，这里换了个触发路径）。
 fn remove_omt_entry_if_under_launchers_dir(
     runtime_dir: &Path,
+    spec: ProjectSpec,
     workspace_file: &Path,
 ) -> Result<(), String> {
-    let prefix = omp_launchers_prefix(runtime_dir);
-    let persistent = launcher_path(runtime_dir, "persistent")
+    let prefix = launchers_prefix(runtime_dir, spec);
+    let persistent = launcher_path(runtime_dir, spec, "persistent")
         .display()
         .to_string();
     remove_omt_entry_if(workspace_file, |cmd| {
@@ -298,36 +349,38 @@ fn write_omp_state(state_dir: &Path, state: &serde_json::Value) -> Result<(), St
 }
 
 /// omp 注入核心（`omt` sidecar 路径可注入以供测试）。
-fn prepare_omp_with(
+fn prepare_project_with(
     omt_path: &Path,
     runtime_dir: &Path,
     workspace_root: &Path,
     exec_id: &str,
     persistent: bool,
+    spec: ProjectSpec,
 ) -> Result<McpInjection, String> {
-    let _guard = OMP_LOCK
+    let _guard = PROJECT_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if persistent {
         // 固定名 launcher：跨多次派发复用，不绑定单次 exec 身份（没有意义——
         // 这条连接的目的是让用户随时手动用 omp 连上 omt，不属于任何 run）。
         let launcher_id = "persistent".to_string();
-        let launcher = write_launcher(runtime_dir, &launcher_id, omt_path, None)?;
+        let launcher = write_launcher(runtime_dir, spec, &launcher_id, omt_path, None)?;
         // 幂等合并，不备份不恢复（设置页「持久保留」开关，U7 透传）。
-        merge_omp_mcp(workspace_root, &launcher)?;
-        return Ok(McpInjection::Omp {
+        merge_project_mcp(workspace_root, &launcher, spec)?;
+        return Ok(McpInjection::Project {
             workspace_root: workspace_root.to_path_buf(),
             persistent: true,
             launcher_id,
+            spec,
         });
     }
     let launcher_id = exec_id.to_string();
     let actor = format!("exec:{exec_id}");
-    let launcher = write_launcher(runtime_dir, &launcher_id, omt_path, Some(&actor))?;
-    let state_dir = omp_state_dir(runtime_dir, workspace_root);
+    let launcher = write_launcher(runtime_dir, spec, &launcher_id, omt_path, Some(&actor))?;
+    let state_dir = state_dir(runtime_dir, workspace_root, spec);
     let mut state = omp_state(&state_dir);
     let refcount = state["refcount"].as_u64().unwrap_or(0);
-    let workspace_file = omp_workspace_file(workspace_root);
+    let workspace_file = spec.workspace_file(workspace_root);
     if refcount == 0 {
         // F-U3-15：先记 `workspace` 再动用户文件——merge 与这次写之间的
         // 崩溃窗口，决定 sweep 到底能不能找到这个目录。
@@ -337,7 +390,7 @@ fn prepare_omp_with(
         // F-U3-15：上一轮崩溃可能在文件里留下了我们自己的旧注入（state 已
         // 丢失，文件没丢）。备份前先剔除，否则未来所有恢复都会把这个残留
         // 当成"用户原始内容"永久保留。persistent 的条目豁免（见函数文档）。
-        remove_omt_entry_if_under_launchers_dir(runtime_dir, &workspace_file)?;
+        remove_omt_entry_if_under_launchers_dir(runtime_dir, spec, &workspace_file)?;
 
         let backup_existed = workspace_file.is_file();
         if backup_existed {
@@ -360,7 +413,7 @@ fn prepare_omp_with(
             }
         }
     }
-    let written_sha = merge_omp_mcp(workspace_root, &launcher)?;
+    let written_sha = merge_project_mcp(workspace_root, &launcher, spec)?;
     state["refcount"] = serde_json::json!(refcount + 1);
     state["writtenSha"] = serde_json::json!(written_sha);
     state["writtenCommand"] = serde_json::json!(launcher.display().to_string());
@@ -381,10 +434,11 @@ fn prepare_omp_with(
         state["launchers"] = serde_json::json!(launchers);
     }
     write_omp_state(&state_dir, &state)?;
-    Ok(McpInjection::Omp {
+    Ok(McpInjection::Project {
         workspace_root: workspace_root.to_path_buf(),
         persistent: false,
         launcher_id,
+        spec,
     })
 }
 
@@ -399,8 +453,9 @@ fn finalize_release(
     state_dir: &Path,
     workspace_root: &Path,
     state: &serde_json::Value,
+    spec: ProjectSpec,
 ) -> Result<(), String> {
-    let workspace_file = omp_workspace_file(workspace_root);
+    let workspace_file = spec.workspace_file(workspace_root);
     let written_sha = state["writtenSha"].as_str().unwrap_or_default();
     let written_command = state["writtenCommand"].as_str().unwrap_or_default();
     let sticky_modified = state["userModified"].as_bool().unwrap_or(false);
@@ -439,7 +494,7 @@ fn finalize_release(
             // F-U3-15：state 不完整（崩溃发生在 writtenCommand 落盘之前），
             // 没有精确 command 可比对——退化为宽匹配，总比永远留着一个
             // 悬空条目强。
-            remove_omt_entry_if_under_launchers_dir(runtime_dir, &workspace_file)?;
+            remove_omt_entry_if_under_launchers_dir(runtime_dir, spec, &workspace_file)?;
         }
     } else if state["backupExisted"].as_bool().unwrap_or(false) {
         let backup = std::fs::read_to_string(state_dir.join("backup.json"))
@@ -452,7 +507,7 @@ fn finalize_release(
     // 要么刚被外科手术清掉引用——无论哪种，都不会再有 launcher 被引用了。
     if let Some(launchers) = state["launchers"].as_array() {
         for id in launchers.iter().filter_map(|v| v.as_str()) {
-            remove_launcher(runtime_dir, id);
+            remove_launcher(runtime_dir, spec, id);
         }
     }
     let _ = std::fs::remove_dir_all(state_dir);
@@ -464,11 +519,15 @@ fn finalize_release(
 /// （F-U3-12）——mcp.json 的 `omt` 条目只会指向"最近一次 merge"的那个
 /// launcher，不一定是当前正在 release 的这个；提前删会让仍被引用的脚本
 /// 消失。
-fn release_omp(runtime_dir: &Path, workspace_root: &Path) -> Result<(), String> {
-    let _guard = OMP_LOCK
+fn release_project(
+    runtime_dir: &Path,
+    workspace_root: &Path,
+    spec: ProjectSpec,
+) -> Result<(), String> {
+    let _guard = PROJECT_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let state_dir = omp_state_dir(runtime_dir, workspace_root);
+    let state_dir = state_dir(runtime_dir, workspace_root, spec);
     let mut state = omp_state(&state_dir);
     let refcount = state["refcount"].as_u64().unwrap_or(0);
     if refcount > 1 {
@@ -476,7 +535,7 @@ fn release_omp(runtime_dir: &Path, workspace_root: &Path) -> Result<(), String> 
         write_omp_state(&state_dir, &state)?;
         return Ok(());
     }
-    finalize_release(runtime_dir, &state_dir, workspace_root, &state)
+    finalize_release(runtime_dir, &state_dir, workspace_root, &state, spec)
 }
 
 /// 注入准备：sidecar 预检 + 按 provider 分派。任何失败=派发失败（绝不
@@ -538,9 +597,24 @@ pub(crate) fn prepare_with(
                 value,
             })
         }
-        "omp" => prepare_omp_with(omt_path, runtime_dir, workspace_root, exec_id, persistent),
+        "omp" => prepare_project_with(
+            omt_path,
+            runtime_dir,
+            workspace_root,
+            exec_id,
+            persistent,
+            OMP_SPEC,
+        ),
+        "pi" => prepare_project_with(
+            omt_path,
+            runtime_dir,
+            workspace_root,
+            exec_id,
+            persistent,
+            PI_SPEC,
+        ),
         other => Err(format!(
-            "provider {other} 无 MCP 注入实现（v1 仅 opencode/omp）"
+            "provider {other} 无 MCP 注入实现（v1 仅 opencode/omp/pi）"
         )),
     }
 }
@@ -549,26 +623,36 @@ pub(crate) fn prepare_with(
 /// 残留由下次启动 sweep 兜底）。
 pub fn release(runtime_dir: &Path, injection: &McpInjection) -> Result<(), String> {
     match injection {
-        McpInjection::Omp {
+        McpInjection::Project {
             workspace_root,
             persistent,
+            spec,
             ..
         } => {
             if *persistent {
                 return Ok(()); // 长期复用，release 是 no-op（F-U3-10）
             }
-            release_omp(runtime_dir, workspace_root)
+            release_project(runtime_dir, workspace_root, *spec)
         }
         _ => Ok(()),
     }
 }
 
-/// desktop 启动清扫：desktop 退出时未正常 release 的 omp 注入（crash 残留）
-/// 逐 workspace 恢复/外科手术清理（F-U3-17：单个失败不中止其余），随后
-/// 清扫真正的孤儿 launcher（F-U3-18：跳过 persistent.sh，它没有 state
-/// 目录、每次正常重启都要继续用）。返回成功处理的 workspace 数。
-pub fn sweep_omp_crash_residue(runtime_dir: &Path) -> Result<usize, String> {
-    let root = omp_injection_root(runtime_dir);
+/// desktop 启动清扫：desktop 退出时未正常 release 的项目级注入（crash
+/// 残留）逐 workspace 恢复/外科手术清理（F-U3-17：单个失败不中止其余），
+/// 随后清扫真正的孤儿 launcher（F-U3-18：跳过 persistent.sh，它没有
+/// state 目录、每次正常重启都要继续用）。omp 与 pi 各自的 state/launcher
+/// 命名空间独立清扫。返回成功处理的 workspace 数。
+pub fn sweep_crash_residue(runtime_dir: &Path) -> Result<usize, String> {
+    let mut swept_total = 0usize;
+    for spec in [OMP_SPEC, PI_SPEC] {
+        swept_total += sweep_spec_crash_residue(runtime_dir, spec)?;
+    }
+    Ok(swept_total)
+}
+
+fn sweep_spec_crash_residue(runtime_dir: &Path, spec: ProjectSpec) -> Result<usize, String> {
+    let root = spec.injection_root(runtime_dir);
     let Ok(entries) = std::fs::read_dir(&root) else {
         return Ok(0);
     };
@@ -582,13 +666,20 @@ pub fn sweep_omp_crash_residue(runtime_dir: &Path) -> Result<usize, String> {
         if workspace.is_empty() {
             continue;
         }
-        let _guard = OMP_LOCK
+        let _guard = PROJECT_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match finalize_release(runtime_dir, &entry.path(), Path::new(workspace), &state) {
+        match finalize_release(
+            runtime_dir,
+            &entry.path(),
+            Path::new(workspace),
+            &state,
+            spec,
+        ) {
             Ok(()) => swept += 1,
             Err(err) => eprintln!(
-                "omp 注入残留清扫失败（{}）：{err}（本次跳过，下次启动重试）",
+                "{} 注入残留清扫失败（{}）：{err}（本次跳过，下次启动重试）",
+                spec.ns,
                 entry.path().display()
             ),
         }
@@ -597,8 +688,8 @@ pub fn sweep_omp_crash_residue(runtime_dir: &Path) -> Result<usize, String> {
     // 上面每个 workspace 的 finalize_release 已经清了自己追踪到的
     // launcher；这里只兜底真正的孤儿（例如 state 目录在记录 `workspace`
     // 之前就整个丢失）。绝不动 persistent.sh。
-    if let Ok(entries) = std::fs::read_dir(omp_launchers_dir(runtime_dir)) {
-        let persistent = launcher_path(runtime_dir, "persistent");
+    if let Ok(entries) = std::fs::read_dir(spec.launchers_dir(runtime_dir)) {
+        let persistent = launcher_path(runtime_dir, spec, "persistent");
         for entry in entries.flatten() {
             let path = entry.path();
             if path != persistent {
@@ -638,7 +729,7 @@ mod tests {
     }
 
     fn launcher_count(runtime: &Path) -> usize {
-        std::fs::read_dir(omp_launchers_dir(runtime))
+        std::fs::read_dir(OMP_SPEC.launchers_dir(runtime))
             .map(|entries| entries.flatten().count())
             .unwrap_or(0)
     }
@@ -693,7 +784,7 @@ mod tests {
         let rig = rig();
         std::fs::create_dir_all(rig.workspace.join(".omp")).unwrap();
         std::fs::write(
-            omp_workspace_file(&rig.workspace),
+            OMP_SPEC.workspace_file(&rig.workspace),
             r#"{ "mcpServers": { "user-server": { "type": "stdio", "command": "u" } } }"#,
         )
         .unwrap();
@@ -706,7 +797,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let merged = std::fs::read_to_string(omp_workspace_file(&rig.workspace)).unwrap();
+        let merged = std::fs::read_to_string(OMP_SPEC.workspace_file(&rig.workspace)).unwrap();
         assert!(merged.contains("user-server"), "用户 server 保留: {merged}");
         assert!(
             merged.contains("omp-launchers"),
@@ -714,7 +805,7 @@ mod tests {
         );
 
         release(&rig.runtime, &injection).unwrap();
-        let restored = std::fs::read_to_string(omp_workspace_file(&rig.workspace)).unwrap();
+        let restored = std::fs::read_to_string(OMP_SPEC.workspace_file(&rig.workspace)).unwrap();
         assert!(
             !restored.contains("\"omt\""),
             "恢复后不含 omt 条目: {restored}"
@@ -735,16 +826,16 @@ mod tests {
             false,
         )
         .unwrap();
-        assert!(omp_workspace_file(&rig.workspace).is_file());
+        assert!(OMP_SPEC.workspace_file(&rig.workspace).is_file());
         release(&rig.runtime, &injection).unwrap();
-        assert!(!omp_workspace_file(&rig.workspace).exists());
+        assert!(!OMP_SPEC.workspace_file(&rig.workspace).exists());
     }
 
     #[test]
     fn omp_refcount_restores_only_after_last_exec() {
         let rig = rig();
         std::fs::create_dir_all(rig.workspace.join(".omp")).unwrap();
-        std::fs::write(omp_workspace_file(&rig.workspace), "{}").unwrap();
+        std::fs::write(OMP_SPEC.workspace_file(&rig.workspace), "{}").unwrap();
         let first = prepare_with(
             &rig.fake_omt,
             &rig.runtime,
@@ -767,7 +858,7 @@ mod tests {
         // 还有 exec-2：不应恢复。F-U3-12：launcher 删除推迟到批次最终
         // release，所以此刻两个 launcher 都还在——mcp.json 此刻仍指向
         // exec-2 的那个，提前删任何一个都有悬空风险。
-        let merged = std::fs::read_to_string(omp_workspace_file(&rig.workspace)).unwrap();
+        let merged = std::fs::read_to_string(OMP_SPEC.workspace_file(&rig.workspace)).unwrap();
         assert!(merged.contains("omp-launchers"));
         assert_eq!(
             launcher_count(&rig.runtime),
@@ -776,7 +867,7 @@ mod tests {
         );
         release(&rig.runtime, &second).unwrap();
         assert_eq!(
-            std::fs::read_to_string(omp_workspace_file(&rig.workspace)).unwrap(),
+            std::fs::read_to_string(OMP_SPEC.workspace_file(&rig.workspace)).unwrap(),
             "{}"
         );
         assert_eq!(launcher_count(&rig.runtime), 0);
@@ -790,7 +881,7 @@ mod tests {
         // 引用的那个，导致 exec-1 剩余运行期间悬空。
         let rig = rig();
         std::fs::create_dir_all(rig.workspace.join(".omp")).unwrap();
-        std::fs::write(omp_workspace_file(&rig.workspace), "{}").unwrap();
+        std::fs::write(OMP_SPEC.workspace_file(&rig.workspace), "{}").unwrap();
         let first = prepare_with(
             &rig.fake_omt,
             &rig.runtime,
@@ -810,7 +901,7 @@ mod tests {
         )
         .unwrap();
         release(&rig.runtime, &_second).unwrap();
-        let merged = std::fs::read_to_string(omp_workspace_file(&rig.workspace)).unwrap();
+        let merged = std::fs::read_to_string(OMP_SPEC.workspace_file(&rig.workspace)).unwrap();
         let referenced = omt_command(&merged).expect("omt 条目应仍存在（exec-1 还没释放）");
         assert!(
             Path::new(&referenced).is_file(),
@@ -818,7 +909,7 @@ mod tests {
         );
         release(&rig.runtime, &first).unwrap();
         assert_eq!(
-            std::fs::read_to_string(omp_workspace_file(&rig.workspace)).unwrap(),
+            std::fs::read_to_string(OMP_SPEC.workspace_file(&rig.workspace)).unwrap(),
             "{}"
         );
         assert_eq!(launcher_count(&rig.runtime), 0);
@@ -828,7 +919,7 @@ mod tests {
     fn omp_user_mid_exec_edit_skips_restore_and_only_removes_own_entry() {
         let rig = rig();
         std::fs::create_dir_all(rig.workspace.join(".omp")).unwrap();
-        std::fs::write(omp_workspace_file(&rig.workspace), "{}").unwrap();
+        std::fs::write(OMP_SPEC.workspace_file(&rig.workspace), "{}").unwrap();
         let injection = prepare_with(
             &rig.fake_omt,
             &rig.runtime,
@@ -839,17 +930,17 @@ mod tests {
         )
         .unwrap();
         // 用户 mid-exec 手改：保留我们的 omt 条目，同时加了自己的 server
-        let merged = std::fs::read_to_string(omp_workspace_file(&rig.workspace)).unwrap();
+        let merged = std::fs::read_to_string(OMP_SPEC.workspace_file(&rig.workspace)).unwrap();
         let mut root: serde_json::Value = serde_json::from_str(&merged).unwrap();
         root["mcpServers"]["mine"] = serde_json::json!({ "type": "stdio", "command": "x" });
         std::fs::write(
-            omp_workspace_file(&rig.workspace),
+            OMP_SPEC.workspace_file(&rig.workspace),
             serde_json::to_string_pretty(&root).unwrap(),
         )
         .unwrap();
         release(&rig.runtime, &injection).unwrap();
         // 我们的条目被外科手术移除，用户自己加的条目保留
-        let after = std::fs::read_to_string(omp_workspace_file(&rig.workspace)).unwrap();
+        let after = std::fs::read_to_string(OMP_SPEC.workspace_file(&rig.workspace)).unwrap();
         let after_json: serde_json::Value = serde_json::from_str(&after).unwrap();
         assert!(after_json["mcpServers"].get("omt").is_none(), "{after}");
         assert!(after_json["mcpServers"].get("mine").is_some(), "{after}");
@@ -862,7 +953,7 @@ mod tests {
         let rig = rig();
         std::fs::create_dir_all(rig.workspace.join(".omp")).unwrap();
         std::fs::write(
-            omp_workspace_file(&rig.workspace),
+            OMP_SPEC.workspace_file(&rig.workspace),
             r#"{"mcpServers":{"user-server":{"type":"stdio","command":"u"}}}"#,
         )
         .unwrap();
@@ -877,12 +968,12 @@ mod tests {
         .unwrap();
         // mid-exec：整份覆盖（不再含我们的 omt 条目）
         std::fs::write(
-            omp_workspace_file(&rig.workspace),
+            OMP_SPEC.workspace_file(&rig.workspace),
             r#"{"mcpServers":{"mine":{"type":"stdio","command":"x"}}}"#,
         )
         .unwrap();
         release(&rig.runtime, &injection).unwrap();
-        let preserved = std::fs::read_dir(omp_injection_root(&rig.runtime))
+        let preserved = std::fs::read_dir(OMP_SPEC.injection_root(&rig.runtime))
             .unwrap()
             .flatten()
             .find(|e| e.path().to_string_lossy().ends_with("last-backup.json"));
@@ -897,7 +988,7 @@ mod tests {
         // prepare 之间的用户改动会被第二次悄悄吸收、最终整体恢复时丢失。
         let rig = rig();
         std::fs::create_dir_all(rig.workspace.join(".omp")).unwrap();
-        std::fs::write(omp_workspace_file(&rig.workspace), "{}").unwrap();
+        std::fs::write(OMP_SPEC.workspace_file(&rig.workspace), "{}").unwrap();
         let first = prepare_with(
             &rig.fake_omt,
             &rig.runtime,
@@ -908,11 +999,11 @@ mod tests {
         )
         .unwrap();
         // 用户在 exec-1 与 exec-2 之间手改
-        let merged = std::fs::read_to_string(omp_workspace_file(&rig.workspace)).unwrap();
+        let merged = std::fs::read_to_string(OMP_SPEC.workspace_file(&rig.workspace)).unwrap();
         let mut root: serde_json::Value = serde_json::from_str(&merged).unwrap();
         root["mcpServers"]["mine"] = serde_json::json!({ "type": "stdio", "command": "x" });
         std::fs::write(
-            omp_workspace_file(&rig.workspace),
+            OMP_SPEC.workspace_file(&rig.workspace),
             serde_json::to_string_pretty(&root).unwrap(),
         )
         .unwrap();
@@ -927,7 +1018,7 @@ mod tests {
         .unwrap();
         release(&rig.runtime, &first).unwrap();
         release(&rig.runtime, &second).unwrap();
-        let after = std::fs::read_to_string(omp_workspace_file(&rig.workspace)).unwrap();
+        let after = std::fs::read_to_string(OMP_SPEC.workspace_file(&rig.workspace)).unwrap();
         assert!(
             after.contains("mine"),
             "用户在重叠 exec 期间的改动应存活: {after}"
@@ -950,7 +1041,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             persistent,
-            McpInjection::Omp {
+            McpInjection::Project {
                 persistent: true,
                 ..
             }
@@ -970,14 +1061,14 @@ mod tests {
         // backup 是 prepare 时刻的内容（已含 persistent 条目），所以恢复后
         // persistent 条目应回来。
         release(&rig.runtime, &scoped).unwrap();
-        let after = std::fs::read_to_string(omp_workspace_file(&rig.workspace)).unwrap();
+        let after = std::fs::read_to_string(OMP_SPEC.workspace_file(&rig.workspace)).unwrap();
         assert!(
             after.contains("persistent"),
             "非 persistent release 后 persistent 注入应完好: {after}"
         );
         // persistent 自身的 release 是 no-op，条目继续在
         release(&rig.runtime, &persistent).unwrap();
-        let still = std::fs::read_to_string(omp_workspace_file(&rig.workspace)).unwrap();
+        let still = std::fs::read_to_string(OMP_SPEC.workspace_file(&rig.workspace)).unwrap();
         assert!(still.contains("persistent"), "{still}");
         assert_eq!(launcher_count(&rig.runtime), 1, "persistent.sh 不受影响");
     }
@@ -986,7 +1077,7 @@ mod tests {
     fn sweep_restores_crash_residue() {
         let rig = rig();
         std::fs::create_dir_all(rig.workspace.join(".omp")).unwrap();
-        std::fs::write(omp_workspace_file(&rig.workspace), "{}").unwrap();
+        std::fs::write(OMP_SPEC.workspace_file(&rig.workspace), "{}").unwrap();
         // prepare 后不 release（模拟 crash）
         prepare_with(
             &rig.fake_omt,
@@ -997,23 +1088,23 @@ mod tests {
             false,
         )
         .unwrap();
-        assert!(omp_workspace_file(&rig.workspace).is_file());
-        let swept = sweep_omp_crash_residue(&rig.runtime).unwrap();
+        assert!(OMP_SPEC.workspace_file(&rig.workspace).is_file());
+        let swept = sweep_crash_residue(&rig.runtime).unwrap();
         assert_eq!(swept, 1);
         assert_eq!(
-            std::fs::read_to_string(omp_workspace_file(&rig.workspace)).unwrap(),
+            std::fs::read_to_string(OMP_SPEC.workspace_file(&rig.workspace)).unwrap(),
             "{}"
         );
         assert_eq!(launcher_count(&rig.runtime), 0);
         // 二次清扫幂等
-        assert_eq!(sweep_omp_crash_residue(&rig.runtime).unwrap(), 0);
+        assert_eq!(sweep_crash_residue(&rig.runtime).unwrap(), 0);
     }
 
     #[test]
     fn sweep_scrubs_own_entry_when_user_modified_mid_crash() {
         let rig = rig();
         std::fs::create_dir_all(rig.workspace.join(".omp")).unwrap();
-        std::fs::write(omp_workspace_file(&rig.workspace), "{}").unwrap();
+        std::fs::write(OMP_SPEC.workspace_file(&rig.workspace), "{}").unwrap();
         prepare_with(
             &rig.fake_omt,
             &rig.runtime,
@@ -1024,16 +1115,16 @@ mod tests {
         )
         .unwrap();
         // 用户在崩溃前又手改了一次
-        let merged = std::fs::read_to_string(omp_workspace_file(&rig.workspace)).unwrap();
+        let merged = std::fs::read_to_string(OMP_SPEC.workspace_file(&rig.workspace)).unwrap();
         let mut root: serde_json::Value = serde_json::from_str(&merged).unwrap();
         root["mcpServers"]["mine"] = serde_json::json!({ "type": "stdio", "command": "x" });
         std::fs::write(
-            omp_workspace_file(&rig.workspace),
+            OMP_SPEC.workspace_file(&rig.workspace),
             serde_json::to_string_pretty(&root).unwrap(),
         )
         .unwrap();
-        sweep_omp_crash_residue(&rig.runtime).unwrap();
-        let after = std::fs::read_to_string(omp_workspace_file(&rig.workspace)).unwrap();
+        sweep_crash_residue(&rig.runtime).unwrap();
+        let after = std::fs::read_to_string(OMP_SPEC.workspace_file(&rig.workspace)).unwrap();
         let after_json: serde_json::Value = serde_json::from_str(&after).unwrap();
         assert!(after_json["mcpServers"].get("omt").is_none(), "{after}");
         assert!(after_json["mcpServers"].get("mine").is_some(), "{after}");
@@ -1046,11 +1137,11 @@ mod tests {
         // 没有 writtenCommand/writtenSha。
         let rig = rig();
         std::fs::create_dir_all(rig.workspace.join(".omp")).unwrap();
-        let launcher = launcher_path(&rig.runtime, "exec-orphan");
+        let launcher = launcher_path(&rig.runtime, OMP_SPEC, "exec-orphan");
         std::fs::create_dir_all(launcher.parent().unwrap()).unwrap();
         std::fs::write(&launcher, "#!/bin/sh\n").unwrap();
         std::fs::write(
-            omp_workspace_file(&rig.workspace),
+            OMP_SPEC.workspace_file(&rig.workspace),
             serde_json::json!({
                 "mcpServers": {
                     "omt": { "type": "stdio", "command": launcher.display().to_string(), "args": [] }
@@ -1059,7 +1150,7 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        let state_dir = omp_state_dir(&rig.runtime, &rig.workspace);
+        let state_dir = state_dir(&rig.runtime, &rig.workspace, OMP_SPEC);
         std::fs::create_dir_all(&state_dir).unwrap();
         std::fs::write(
             state_dir.join("state.json"),
@@ -1068,8 +1159,8 @@ mod tests {
         )
         .unwrap();
 
-        sweep_omp_crash_residue(&rig.runtime).unwrap();
-        let after = std::fs::read_to_string(omp_workspace_file(&rig.workspace)).unwrap();
+        sweep_crash_residue(&rig.runtime).unwrap();
+        let after = std::fs::read_to_string(OMP_SPEC.workspace_file(&rig.workspace)).unwrap();
         let after_json: serde_json::Value = serde_json::from_str(&after).unwrap();
         assert!(after_json["mcpServers"].get("omt").is_none(), "{after}");
     }
@@ -1081,9 +1172,9 @@ mod tests {
         // 这个残留当成"用户原始内容"备份下来。
         let rig = rig();
         std::fs::create_dir_all(rig.workspace.join(".omp")).unwrap();
-        let stale_launcher = launcher_path(&rig.runtime, "exec-stale");
+        let stale_launcher = launcher_path(&rig.runtime, OMP_SPEC, "exec-stale");
         std::fs::write(
-            omp_workspace_file(&rig.workspace),
+            OMP_SPEC.workspace_file(&rig.workspace),
             serde_json::json!({
                 "mcpServers": {
                     "user-server": { "type": "stdio", "command": "u" },
@@ -1104,7 +1195,7 @@ mod tests {
         )
         .unwrap();
         release(&rig.runtime, &injection).unwrap();
-        let restored = std::fs::read_to_string(omp_workspace_file(&rig.workspace)).unwrap();
+        let restored = std::fs::read_to_string(OMP_SPEC.workspace_file(&rig.workspace)).unwrap();
         let restored_json: serde_json::Value = serde_json::from_str(&restored).unwrap();
         assert!(
             restored_json["mcpServers"].get("user-server").is_some(),
@@ -1130,12 +1221,12 @@ mod tests {
         .unwrap();
         assert!(matches!(
             injection,
-            McpInjection::Omp {
+            McpInjection::Project {
                 persistent: true,
                 ..
             }
         ));
-        let merged = std::fs::read_to_string(omp_workspace_file(&rig.workspace)).unwrap();
+        let merged = std::fs::read_to_string(OMP_SPEC.workspace_file(&rig.workspace)).unwrap();
         assert!(merged.contains("omp-launchers"));
         assert!(
             !merged.contains("--actor"),
@@ -1143,7 +1234,7 @@ mod tests {
         );
         // persistent 模式 release 是 no-op：条目与 launcher 都还在
         release(&rig.runtime, &injection).unwrap();
-        assert!(omp_workspace_file(&rig.workspace).is_file());
+        assert!(OMP_SPEC.workspace_file(&rig.workspace).is_file());
         assert_eq!(launcher_count(&rig.runtime), 1);
     }
 
@@ -1163,13 +1254,13 @@ mod tests {
         .unwrap();
         let _ = persistent;
         assert_eq!(launcher_count(&rig.runtime), 1);
-        sweep_omp_crash_residue(&rig.runtime).unwrap();
+        sweep_crash_residue(&rig.runtime).unwrap();
         assert_eq!(
             launcher_count(&rig.runtime),
             1,
             "persistent launcher 必须挺过每次启动的 sweep"
         );
-        assert!(launcher_path(&rig.runtime, "persistent").is_file());
+        assert!(launcher_path(&rig.runtime, OMP_SPEC, "persistent").is_file());
     }
 
     #[test]
@@ -1195,5 +1286,87 @@ mod tests {
             false
         )
         .is_err());
+    }
+
+    /// F-PI：pi 注入 roundtrip——`.pi/mcp.json` 条目用实测形状（无
+    /// type:stdio），state/launcher 与 omp 命名空间独立（同 workspace
+    /// 双 provider 互不干扰），release 恢复。
+    #[test]
+    fn pi_injection_roundtrip_shape_and_namespace() {
+        let rig = rig();
+        let inject = prepare_with(
+            &rig.fake_omt,
+            &rig.runtime,
+            &rig.workspace,
+            "pi",
+            "exec-pi-1",
+            false,
+        )
+        .expect("pi prepare");
+        let pi_file = rig.workspace.join(".pi").join("mcp.json");
+        let merged = std::fs::read_to_string(&pi_file).unwrap();
+        // 实测形状：command 字符串 + args 数组，且无 type 字段
+        let root: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        assert!(
+            root["mcpServers"]["omt"].get("type").is_none(),
+            "pi 条目不得带 type 字段: {merged}"
+        );
+        assert!(omt_command(&merged).is_some());
+        // omp 的文件/目录不受影响
+        assert!(!OMP_SPEC.workspace_file(&rig.workspace).exists());
+        assert!(PI_SPEC
+            .injection_root(&rig.runtime)
+            .join(workspace_hash(&rig.workspace))
+            .is_dir());
+        // omp 同 workspace 并行 prepare → 各自 refcount 独立
+        let _omp_inject = prepare_with(
+            &rig.fake_omt,
+            &rig.runtime,
+            &rig.workspace,
+            "omp",
+            "exec-omp-1",
+            false,
+        )
+        .expect("omp prepare");
+        assert!(OMP_SPEC.workspace_file(&rig.workspace).exists());
+        let omp_state = std::fs::read_to_string(
+            OMP_SPEC
+                .injection_root(&rig.runtime)
+                .join(workspace_hash(&rig.workspace))
+                .join("state.json"),
+        )
+        .unwrap();
+        assert_eq!(
+            omp_state.parse::<serde_json::Value>().unwrap()["refcount"],
+            1
+        );
+
+        release(&rig.runtime, &inject).unwrap();
+        assert!(
+            !pi_file.exists(),
+            "refcount 归零后 pi 配置恢复（原不存在→删除）"
+        );
+        // omp 注入仍在
+        assert!(OMP_SPEC.workspace_file(&rig.workspace).exists());
+    }
+
+    /// F-PI：pi crash 残留由 sweep_crash_residue 一并清扫。
+    #[test]
+    fn pi_crash_residue_is_swept() {
+        let rig = rig();
+        let _ = prepare_with(
+            &rig.fake_omt,
+            &rig.runtime,
+            &rig.workspace,
+            "pi",
+            "exec-pi-crash",
+            false,
+        )
+        .unwrap();
+        assert!(rig.workspace.join(".pi").join("mcp.json").exists());
+        let swept = sweep_crash_residue(&rig.runtime).unwrap();
+        assert!(swept >= 1, "至少清扫 pi 一个 workspace");
+        assert!(!rig.workspace.join(".pi").join("mcp.json").exists());
+        assert_eq!(sweep_crash_residue(&rig.runtime).unwrap(), 0);
     }
 }

@@ -450,8 +450,9 @@ export function ExecutionDialog({
                     <dd className="mono">{preview.envKeys.length > 0 ? preview.envKeys.join(' ') : '（无）'}</dd>
                     <dt>无人值守</dt>
                     <dd>
-                      确认派发将追加 <span className="mono">{preview.unattendedFlag.join(' ')}</span>，harness 将
-                      无人值守执行文件/命令操作
+                      {preview.unattendedFlag.length > 0
+                        ? <>确认派发将追加 <span className="mono">{preview.unattendedFlag.join(' ')}</span>，harness 将无人值守执行文件/命令操作</>
+                        : <>该 harness 的无头模式本身即无人值守（无附加放行 flag），将直接执行文件/命令操作</>}
                     </dd>
                   </dl>
                 )}

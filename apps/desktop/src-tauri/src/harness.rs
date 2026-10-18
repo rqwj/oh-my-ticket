@@ -215,6 +215,22 @@ pub const REGISTRY: &[HarnessDescriptor] = &[
         login_args: &[],
         model_args: &["--model"],
     },
+    HarnessDescriptor {
+        id: "pi",
+        label: "Pi",
+        binary_name: "pi",
+        probe_args: &["--version"],
+        // pi 1.0.0 实测：基础无 omp 式审批层，-p 非交互模式工具自动执行
+        unattended_flag: &[],
+        prompt_channel: PromptChannel::Argv,
+        argv_prefix: &[],
+        // --approve（信任项目文件）是 MCP 注入的硬前提——pi mcp add 实测
+        // 提示「项目未受信则 .pi/mcp.json 被忽略」，漏掉即重演 F-ACC-9
+        // 式静默无工具。位置参数消息无 lstat 行为（长 prompt 可直传）。
+        headless_flags: &["-p", "--approve"],
+        login_args: &[],
+        model_args: &["--model"],
+    },
 ];
 
 pub fn descriptor_of(id: &str) -> Option<&'static HarnessDescriptor> {
@@ -641,10 +657,32 @@ fn parse_omp_models(output: &str) -> Vec<ModelEntry> {
     models
 }
 
+/// pi `--list-models`：空白对齐表格，表头 `provider model context …`，
+/// 取前两列组成 `provider/model` id（pi `--model` 支持 provider/id 形式）。
+fn parse_pi_models(output: &str) -> Vec<ModelEntry> {
+    let mut models = Vec::new();
+    for line in output.lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 2 || cols[0] == "provider" {
+            continue;
+        }
+        let (provider, model) = (cols[0], cols[1]);
+        let id = format!("{provider}/{model}");
+        if validate_model_id(&id).is_ok() {
+            models.push(ModelEntry {
+                id,
+                group: Some(provider.to_string()),
+            });
+        }
+    }
+    models
+}
+
 fn parse_models_output(provider_id: &str, output: &str) -> Vec<ModelEntry> {
     match provider_id {
         "opencode" => parse_opencode_models(output),
         "omp" => parse_omp_models(output),
+        "pi" => parse_pi_models(output),
         _ => Vec::new(),
     }
 }
@@ -1124,6 +1162,54 @@ mod tests {
         assert_eq!(
             compose_launch_args(&plan, true, "PROMPT", None, Some("k3")),
             vec!["-p", "--approval-mode=yolo", "--model", "k3", "PROMPT"],
+        );
+    }
+
+    /// F-PI：pi 的 argv 形态——`-p --approve`（MCP 注入需信任项目文件），
+    /// 无放行 flag，prompt 位置参数直传。
+    #[test]
+    fn compose_launch_args_pi_headless_with_approve() {
+        let plan = LaunchPlan {
+            program: PathBuf::from("/usr/local/bin/pi"),
+            extra_args: vec![],
+            unattended_flag: vec![],
+            env: BTreeMap::new(),
+            prompt_channel: PromptChannel::Argv,
+            argv_prefix: vec![],
+            headless_flags: vec!["-p".to_string(), "--approve".to_string()],
+            model_args: vec!["--model".to_string()],
+        };
+        assert_eq!(
+            compose_launch_args(&plan, true, "LONG PROMPT", None, None),
+            vec!["-p", "--approve", "LONG PROMPT"],
+            "无放行 flag 时 unattended=true 不追加任何项"
+        );
+        assert_eq!(
+            compose_launch_args(&plan, true, "P", None, Some("kimi-coding/k3")),
+            vec!["-p", "--approve", "--model", "kimi-coding/k3", "P"],
+        );
+    }
+
+    /// F-PI：pi --list-models 表格解析（表头跳过，provider/model 组 id）。
+    #[test]
+    fn parse_pi_models_table() {
+        let out = concat!(
+            "provider     model                      context  max-out  thinking  images\n",
+            "kimi-coding  k3                         1.0M     131.1K   yes       yes\n",
+            "openai       gpt-4.1                    1.0M     32.8K    no        no\n",
+        );
+        assert_eq!(
+            parse_models_output("pi", out),
+            vec![
+                ModelEntry {
+                    id: "kimi-coding/k3".into(),
+                    group: Some("kimi-coding".into())
+                },
+                ModelEntry {
+                    id: "openai/gpt-4.1".into(),
+                    group: Some("openai".into())
+                },
+            ]
         );
     }
 
