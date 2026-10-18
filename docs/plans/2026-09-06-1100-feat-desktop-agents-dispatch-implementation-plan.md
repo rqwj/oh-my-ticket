@@ -536,7 +536,7 @@ stateDiagram-v2
 
 ## 八、后续迭代 backlog
 
-1. **provider 扩充**：claude（`--session-id` 预指派 + `--mcp-config` + stream-json）、codex（`exec resume` + `--json` + config.toml MCP）、dsh（**插件直装** + stderr reasoning 流 + session 日志富 transcript）——base_design 附录 A 备齐。
+1. **provider 扩充**：claude（`--session-id` 预指派 + `--mcp-config` + stream-json）、codex（`exec resume` + `--json` + config.toml MCP）、dsh（**插件直装** + stderr reasoning 流 + session 日志富 transcript）——base_design 附录 A 备齐。**0.2.1-rc.2 更新（2026-09-18）**：dsh adapter 应改走 `--json` NDJSON 事件流（`text`/`thinking`/`tool_call`/`tool_result`/`final`，远优于 stderr 解析），续跑直接用 `--session-id <id>`（原生支持，KD-D8 的 dsh 例外解除）；注意 headless 0.2.1 只认 env/`.env` 凭据（GUI 保存的被禁用）。
 2. **一键安装 harness**：官网推荐方式装到默认位置（检测不到时的引导升级）。
 3. ~~**权限策略持久配置**（per-harness 默认审批模式）~~ → per-workspace 知情确认记忆已进 P0（U6 / bag v2 `approvalAck`）；剩余为**细粒度 allowlist**（opencode `OPENCODE_PERMISSION` / agent-level permissions、omp `--approval-mode write` 若实测可用）与 env 值进 OS keychain。
 4. **MCP 桥接子 tab**（omt 注入状态展示 + 用户额外 MCP server）。

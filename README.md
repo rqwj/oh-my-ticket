@@ -3,7 +3,7 @@
 ![version](https://img.shields.io/badge/version-0.6.6-blue)
 ![tests](https://img.shields.io/badge/tests-root%20%2B%20desktop-brightgreen)
 ![platform](https://img.shields.io/badge/platform-DeepSeek%20Harness-purple)
-![dsh](https://img.shields.io/badge/DeepSeek%20Harness%20tested-0.1.5--rc.2-blue)
+![dsh](https://img.shields.io/badge/DeepSeek%20Harness%20tested-0.2.1--rc.2-blue)
 
 **DSH 的 ticket 管理插件**：`Epic → Story → [SubStory] → Ticket → [SubTicket]` 五级任务体系，
 SQLite 存元数据与层级关系，Markdown 存正文。ticket 随项目走（`.omt/` 目录可直接进 git），

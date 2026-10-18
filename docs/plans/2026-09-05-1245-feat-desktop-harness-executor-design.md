@@ -323,7 +323,7 @@ desktop 若以非默认 runtime dir 运行 daemon，spawn harness 时必须把 `
 - **KD-D5 harness 注册表表驱动**：探测/无头命令/流格式/MCP 注入四元组集中于 Rust 单表，前端动态拉取，消除两处硬编码（§5.1）。
 - **KD-D6 transcript 不落项目 `.omt`**：落 runtime dir，避免 ticket 库（可进 git）被日志污染（§5.6）。
 - **KD-D7 会话与 app 同生命周期**：desktop 退出 = 执行终止，run 恢复交给既有租约过期 → interrupted → retry 路径，不引入守护进程（§5.2、§3.1-C）。
-- **KD-D8 会话连续性按 descriptor 能力驱动**：首跑捕获 harness session id（claude 走 `--session-id` 预指派最稳，其余从事件流捕获，dsh 只能 diff sessions 目录 best-effort），按 `nodeId + harness id` 持久化映射，续跑经 descriptor 的 resume argv 模板；dsh headless v0.1.2-rc.1 不支持续跑，UI 隐藏该选项、以 ticket 承载上下文兜底，并向 dsh 侧提出 headless resume 诉求（§5.4.1、附录 A.5）。
+- **KD-D8 会话连续性按 descriptor 能力驱动**：首跑捕获 harness session id（claude 走 `--session-id` 预指派最稳，其余从事件流捕获，dsh 只能 diff sessions 目录 best-effort），按 `nodeId + harness id` 持久化映射，续跑经 descriptor 的 resume argv 模板；dsh headless v0.1.2-rc.1 不支持续跑，UI 隐藏该选项、以 ticket 承载上下文兜底，并向 dsh 侧提出 headless resume 诉求（§5.4.1、附录 A.5）。（**0.2.1-rc.2 修订**：dsh headless 已原生支持 `--session-id` 续跑——附录 A.5 修订注，此例外的 UI 隐藏设计解除。）
 
 ---
 
@@ -366,9 +366,15 @@ desktop 若以非默认 runtime dir 运行 daemon，spawn harness 时必须把 `
 
 ### A.1 dsh（DeepSeek Harness 0.1.x，本机 nvm 全局安装）
 
+> **0.2.1-rc.2 修订（2026-09-18）**：headless bundle 发生重大增强——
+> ① 新增 `--json` flag（NDJSON 事件流到 stdout：`session`/`status`/`text`/`thinking`/`tool_call`/`tool_result`/`final`/`error`，8 KiB string 封顶、32 KiB 行、64 层嵌套），「无结构化输出模式」结论作废；
+> ② 新增 `--session-id <id>` 续跑（经 `agents.resume`，拒绝 subagent/fork/cwd 不匹配），task 可来自 stdin；
+> ③ headless patch 禁用 credentials/authorization/deepseek-account plugin——只用 env/cwd `.env` 注入凭据（desktop 的 env 注入路径不受影响）；
+> ④ 默认输出协议（stderr reasoning / stdout 最终答案 / exit 0|1）不变。仓库依赖已升 0.2.1-rc.2（fd7eba6）。
+
 - **调用形态**：`dsh --profile headless "<task>"`。headless 是普通 profile（`~/.dsh/profiles/headless/`，bundles = `@deepseek-ai/dsh-base` + `@deepseek-ai/dsh-headless`），launcher 语义："answer one task, print the result, and exit"。
 - **输出契约**（`@deepseek-ai/dsh-headless` README，本机 `~/.dsh/profiles/node_modules/` 可读源码与 cordis.patch.yml）：one-shot、无交互跟进；每个非空 provider reasoning delta 流式写 **stderr**（`dsh: reasoning:` 分节标题、连续 delta 归一节）；**最终答案写 stdout** 后退出；exit 0 = 完成，1 = 中止/出错；空/空白 task 是 usage error（先于运行拒绝，exit 1）；`--help` 只打印帮助不执行。该 bundle 不挂 Host/HTTP/浏览器层，无端口残留。
-- **无结构化输出模式**：headless profile 自身 flags 仅 `-h`；无 JSON 事件流选项。`DSH_TOOLS_MODE` env 控制 PTC 工具模式。
+- **无结构化输出模式**：headless profile 自身 flags 仅 `-h`；无 JSON 事件流选项。`DSH_TOOLS_MODE` env 控制 PTC 工具模式。（0.2.1 起已有 `--json`，见顶部修订）
 - **富 transcript 备选**：会话按 cwd 归档于 `~/.dsh/sessions/<munged-cwd>/session-<uuid>/session.jsonl.zstd`——typed JSONL（`session` / `permission/preset` / `sandbox/mode` / `approval/policy` / `model/selection` / `agent/inbox/spliced`…，含 seq/time/data），zstd 压缩。desktop 启动执行后 diff 出新增 session 目录即可关联本次运行。
 - **OMT 集成的原生优势**：omt 即 dsh 插件。`dsh plugin --profile headless add dsh-oh-my-ticket@<ver>` 把全套 `omt_*` 工具与 system prompt/skill 直接装进 headless profile（desktop 已有 `dsh_plugin_install` 封装同款命令），claim/report 纪律原生成立，无需 MCP。备选 `--patch` overlay 插入。
 
@@ -398,6 +404,12 @@ desktop 若以非默认 runtime dir 运行 daemon，spawn harness 时必须把 `
 4. 新增硬性要求：desktop 必须为每家 harness 显式设定权限策略（尤其 omp 默认 yolo），并在 UI 呈现。
 
 ### A.5 会话连续性核实记录（2026-09-06，本机版本实测）
+
+> **0.2.1-rc.2 修订（2026-09-18）**：dsh headless 新增 `--session-id <id>` 与
+> `sessionId` config——经 `agents.resume({resumeSessionId})` 采纳持久化 session
+> （拒绝 subagent/fork/preset 不匹配/cwd 不匹配/进程内活跃）。下方「dsh 不支持
+> 续跑」的结论基于 0.1.x，**已作废**——KD-D8 的 dsh 例外与 UI 隐藏续跑选项的
+> 设计随之解除，desktop 只需在 spawn argv 加 `--session-id <lastSessionId>`。
 
 - **claude**（本机 `~/.local/bin/claude`，`claude --help`）：`--session-id <uuid>`——"Use a specific session ID for the conversation (must be a valid UUID)"（预指派，首跑无需捕获）；`-r/--resume [value]`——"Resume a conversation by session ID"；`-c/--continue`；`--fork-session`——"When resuming, create a new session ID instead of reusing the original"。stream-json 的 `system/init` 与 `result` 事件携带 `session_id`。
 - **codex**（本机 brew，`codex exec --help` / `codex exec resume --help`）：`codex exec resume [SESSION_ID] [PROMPT]`——"Resume a previous session by id or pick the most recent with `--last`"；选项表确认 resume 子命令完整继承 `--json`（"Print events to stdout as JSONL"）与 `-o/--output-last-message`；另有 `fork` 子命令、`--ephemeral`（不落盘）。`--json` 事件流中 `thread.started` 携带 thread id。
