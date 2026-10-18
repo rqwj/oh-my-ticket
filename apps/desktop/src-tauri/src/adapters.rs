@@ -41,6 +41,28 @@ pub fn parse_line(provider: &str, line: &str) -> Vec<serde_json::Value> {
     }
 }
 
+/// U11：从一行事件流提取 harness session id（首跑捕获 → exec 记录）。
+/// opencode：每个事件顶层 `sessionID`；pi/omp：`session` 事件的 `id`。
+/// 返回 None = 该行无 id 信息。
+pub fn extract_session_id(provider: &str, line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    let ev = serde_json::from_str::<serde_json::Value>(trimmed).ok()?;
+    match provider {
+        "opencode" => ev["sessionID"].as_str().map(str::to_string),
+        "pi" | "omp" => {
+            if ev["type"] == "session" {
+                ev["id"].as_str().map(str::to_string)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 fn raw_event(text: &str) -> serde_json::Value {
     serde_json::json!({ "kind": "raw", "stream": "stdout", "text": text })
 }
@@ -345,6 +367,31 @@ mod tests {
                 serde_json::json!({ "kind": "raw", "stream": "stdout", "text": r#"{"type":"anything"}"# })
             ]
         );
+    }
+
+    /// U11：session id 提取（opencode 任意事件 / pi·omp session 事件）
+    #[test]
+    fn extract_session_id_per_provider() {
+        assert_eq!(
+            extract_session_id(
+                "opencode",
+                r#"{"type":"text","sessionID":"ses_abc","part":{"type":"text","text":"hi"}}"#
+            )
+            .as_deref(),
+            Some("ses_abc")
+        );
+        assert_eq!(
+            extract_session_id(
+                "pi",
+                r#"{"type":"session","version":3,"id":"01a14f01-d40b"}"#
+            )
+            .as_deref(),
+            Some("01a14f01-d40b")
+        );
+        // pi 非 session 事件无 id；未知 provider / 非 JSON → None
+        assert_eq!(extract_session_id("pi", r#"{"type":"turn_start"}"#), None);
+        assert_eq!(extract_session_id("dsh", r#"{"sessionID":"x"}"#), None);
+        assert_eq!(extract_session_id("opencode", "plain"), None);
     }
 
     /// 历史回载嗅探：opencode（part 键）/ pi 族（专有 type）/ 其它 raw

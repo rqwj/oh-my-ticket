@@ -260,6 +260,55 @@ pub fn register_agent(
         .ok_or_else(|| "register_agent: record vanished".to_string())
 }
 
+/// U11：向**既有** agent 追加一次 exec（会话续接派发）。守卫：agent 必须存在、
+/// harness 与 provider 一致、状态非 starting/running（弹窗只列空闲 agent，
+/// 这里是服务端硬校验——renderer 不可信）。成功返回更新后的 agent 记录。
+pub fn append_exec(
+    runtime_dir: &Path,
+    home_id: &str,
+    agent_id: &str,
+    harness: &str,
+    new_exec: NewExec,
+) -> Result<AgentRecord, String> {
+    let path = agents_path(runtime_dir, home_id)?;
+    let record = update_json(&path, |file: &mut AgentsFile| {
+        let Some(agent) = file.agents.iter_mut().find(|a| a.id == agent_id) else {
+            return false;
+        };
+        if agent.harness != harness {
+            return false; // 调用方前置校验给出可读错误；此处兜底不写
+        }
+        if matches!(
+            agent.status,
+            AgentRecordStatus::Starting | AgentRecordStatus::Running
+        ) {
+            return false;
+        }
+        agent.execs.push(ExecRecord {
+            exec_id: new_exec.exec_id.clone(),
+            node_id: new_exec.node_id.clone(),
+            run_id: new_exec.run_id.clone(),
+            started_at: now_epoch_ms(),
+            binary_path: new_exec.binary_path.clone(),
+            binary_args: new_exec.binary_args.clone(),
+            ..Default::default()
+        });
+        agent.status = AgentRecordStatus::Starting;
+        agent.attachment = AgentAttachment::Live;
+        agent.last_exec_id = Some(new_exec.exec_id.clone());
+        true
+    })?
+    .0;
+    record
+        .agents
+        .iter()
+        .find(|a| a.id == agent_id)
+        .cloned()
+        .ok_or_else(|| {
+            format!("append_exec: agent {agent_id} 不存在或不可追加（harness 不一致/运行中）")
+        })
+}
+
 /// 按持久化身份读取单个 agent。Orphan 管理命令用此函数在 Rust 侧完成
 /// home/agent/exec 归属校验，避免 renderer 直接提供可被滥用的 pid。
 pub fn get_agent(

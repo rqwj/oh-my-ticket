@@ -131,6 +131,9 @@ pub struct ExecSession {
     /// F-U12-4：规范化事件日志（`<execId>.jsonl`，首行 session_header，
     /// 随后统一事件逐行）——U10 reconcile 与成本承接的持久层。
     pub events_log: PathBuf,
+    /// U11：捕获的 harness session id（首跑从事件流提取；终态归档
+    /// exec.harness_session_id → agent.last_session_id 镜像）。
+    pub harness_session_id: std::sync::Mutex<Option<String>>,
     /// 事件出口（waiter 与 kill_all 路径共用；U4 接 Tauri Channel）
     sink: EventSink,
     /// 事件序号（F-U2-6：三类事件统一 §5.3 envelope——`{execId, seq, ts,
@@ -489,6 +492,7 @@ impl ExecutionManager {
                 .clone(),
             started,
             last_usage: std::sync::Mutex::new(None),
+            harness_session_id: std::sync::Mutex::new(None),
             events_log,
             sink: on_event.clone(),
             seq: AtomicU64::new(0),
@@ -707,7 +711,12 @@ fn append_event_line(session: &ExecSession, event: &serde_json::Value) {
     else {
         return; // 事件日志尽力而为：失败不影响实时流
     };
-    let _ = writeln!(f, "{event}");
+    // 整行单缓冲 write_all：writeln! 对大事件（数十 KB）是分段 write，
+    // 两个读线程的 O_APPEND 追加会互相撕裂行（F-U11-2 实测）。单次
+    // write 的 append 在常规文件上原子定位，不交错。
+    let mut line = event.to_string();
+    line.push('\n');
+    let _ = f.write_all(line.as_bytes());
 }
 
 /// usage 事件的去重键（tokens + cost；None 字段以 0/无值参与比较）。
@@ -734,6 +743,13 @@ fn spawn_reader(
         for line in reader.lines() {
             let Ok(line) = line else { break };
             session.first_event_seen.store(true, Ordering::Relaxed);
+            // U11：首见 session id 即记（幂等——后续同 id 覆盖无差）
+            if let Some(id) = crate::adapters::extract_session_id(&harness, &line) {
+                *session
+                    .harness_session_id
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(id);
+            }
             // U12：JSON 事件流 → 统一事件（adapters.rs；解析失败/未知
             // harness 一律回落 raw——契约是降级保证可用）
             let mut parts = crate::adapters::parse_line(&harness, &line);
@@ -876,6 +892,23 @@ fn finish_terminal(session: &ExecSession, terminal: &Terminal) {
             }
         },
     );
+    // U11：捕获的 session id 归档（update_exec 内部镜像 agent.last_session_id）
+    let captured_session = session
+        .harness_session_id
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(id) = captured_session {
+        let _ = agents::update_exec(
+            runtime_dir,
+            &session.home_id,
+            &session.agent_id,
+            &session.exec_id,
+            |exec| {
+                exec.harness_session_id = Some(id.clone());
+            },
+        );
+    }
     if let (Some(release), Some(run_id)) = (&session.lease_release, &session.run_id) {
         release(&session.home_id, run_id, &session.exec_id);
     }
@@ -1132,6 +1165,8 @@ fn dispatch_chain(
     provider_id: &str,
     unattended: bool,
     model: Option<&str>,
+    resume_session: Option<&str>,
+    target_agent_id: Option<&str>,
     sink: EventSink,
 ) -> Result<ExecStartOutcome, String> {
     let dispatch_id = format!(
@@ -1234,27 +1269,61 @@ fn dispatch_chain(
     // （失败走补偿表）。
     let prompt_file =
         harness::prompt_file_path(runtime_dir, home_id, &exec_id, plan.prompt_channel);
-    let args =
-        harness::compose_launch_args(&plan, unattended, &prompt, prompt_file.as_deref(), model);
+    let args = harness::compose_launch_args(
+        &plan,
+        unattended,
+        &prompt,
+        prompt_file.as_deref(),
+        model,
+        resume_session,
+    );
     // 保存时 validate_env 已拒保留键；这里防御性再滤一次（手工改写的
     // config.json 不得炸 spawn 入口的硬校验）。
     let env_additions = plan.sanitized_env();
 
     // ⑤ register Agent (U4a)。失败按补偿表 cancel 本次新建 run（不留记录）。
-    let agent = match agents::register_agent(
-        runtime_dir,
-        home_id,
-        provider_id,
-        crate::agents::NewExec {
-            exec_id: exec_id.clone(),
-            node_id: Some(node_id.to_string()),
-            run_id: Some(run_id.clone()),
-            binary_path: Some(plan.program.display().to_string()),
-            // 与 transcript header 的 session_start args 镜像（含 prompt——
-            // desktop 模板 + run_id，非敏感；secrets 见 sanitize_args 纪律）
-            binary_args: sanitize_args(&args),
-        },
-    ) {
+    // U11：target_agent_id 命中既有 agent（会话续接）——服务端硬校验
+    //（存在 / harness 一致 / 非存活），追加 exec 而非新建 agent。
+    if let Some(target) = target_agent_id {
+        match agents::get_agent(runtime_dir, home_id, target) {
+            Ok(Some(agent)) if agent.harness != provider_id => {
+                return Err(format!(
+                    "目标 agent 属于 {}，不能以 {} 续跑",
+                    agent.harness, provider_id
+                ));
+            }
+            Ok(Some(agent))
+                if matches!(
+                    agent.status,
+                    agents::AgentRecordStatus::Starting | agents::AgentRecordStatus::Running
+                ) =>
+            {
+                return Err(format!("目标 agent {target} 仍在运行，拒绝并发派发"));
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Err(format!("目标 agent {target} 不存在（可能已被清理）"));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    let register = |new_exec: crate::agents::NewExec| -> Result<agents::AgentRecord, String> {
+        match target_agent_id {
+            Some(target) => {
+                agents::append_exec(runtime_dir, home_id, target, provider_id, new_exec)
+            }
+            None => agents::register_agent(runtime_dir, home_id, provider_id, new_exec),
+        }
+    };
+    let agent = match register(crate::agents::NewExec {
+        exec_id: exec_id.clone(),
+        node_id: Some(node_id.to_string()),
+        run_id: Some(run_id.clone()),
+        binary_path: Some(plan.program.display().to_string()),
+        // 与 transcript header 的 session_start args 镜像（含 prompt——
+        // desktop 模板 + run_id，非敏感；secrets 见 sanitize_args 纪律）
+        binary_args: sanitize_args(&args),
+    }) {
         Ok(agent) => agent,
         Err(err) => {
             compensate_new_run(rpc, home_id, &run_id, run_was_newly_created);
@@ -1356,11 +1425,16 @@ pub fn exec_start_impl(
     provider_id: &str,
     unattended: bool,
     model: Option<&str>,
+    resume_session: Option<&str>,
+    target_agent_id: Option<&str>,
     sink: EventSink,
 ) -> Result<ExecStartOutcome, String> {
-    // model 入参先校验（argv 注入面），非法即拒——不进 dispatch_chain
+    // model/session id 入参先校验（argv 注入面），非法即拒——不进 dispatch_chain
     if let Some(model) = model {
         harness::validate_model_id(model)?;
+    }
+    if let Some(session) = resume_session {
+        harness::validate_model_id(session)?;
     }
     // SharedSession 的 clone 共享同一个内部 mutex；终态线程由此获得 daemon
     // RPC 通道，而不会另建连接或持有 tauri::State 生命周期。
@@ -1381,6 +1455,8 @@ pub fn exec_start_impl(
         provider_id,
         unattended,
         model,
+        resume_session,
+        target_agent_id,
         sink,
     )
 }
@@ -1400,6 +1476,10 @@ pub fn exec_start(
     harness: String,
     unattended: bool,
     model: Option<String>,
+    // U11：续跑的 harness session id（None = 新开会话）
+    resume_session: Option<String>,
+    // U11：派发到既有 agent（会话续接；None = 新 agent）
+    agent_id: Option<String>,
     channel: tauri::ipc::Channel<serde_json::Value>,
 ) -> Result<ExecStartOutcome, String> {
     let sink: EventSink = Arc::new(move |value| {
@@ -1416,6 +1496,8 @@ pub fn exec_start(
         &harness,
         unattended,
         model.as_deref(),
+        resume_session.as_deref(),
+        agent_id.as_deref(),
         sink,
     )
 }
@@ -1890,6 +1972,7 @@ mod tests {
             mcp: McpInjection::None,
             lease_release: None,
             last_usage: std::sync::Mutex::new(None),
+            harness_session_id: std::sync::Mutex::new(None),
             events_log: runtime
                 .join("transcripts")
                 .join("h_test")
@@ -1955,6 +2038,7 @@ mod tests {
             lease_release: None,
             started: Instant::now(),
             last_usage: std::sync::Mutex::new(None),
+            harness_session_id: std::sync::Mutex::new(None),
             events_log: runtime
                 .join("transcripts")
                 .join("h_test")
@@ -2919,7 +3003,8 @@ mod tests {
         let sink: EventSink = Arc::new(|_| {});
 
         let result = dispatch_chain(
-            &rpc, &manager, &runtime, "h_test", &home_path, "t1", "omp", false, None, sink,
+            &rpc, &manager, &runtime, "h_test", &home_path, "t1", "omp", false, None, None, None,
+            sink,
         );
         let err = result.expect_err("register_agent 写失败应使 dispatch_chain 失败");
 
@@ -2981,7 +3066,8 @@ mod tests {
         let sink: EventSink = Arc::new(|_| {});
 
         let result = dispatch_chain(
-            &rpc, &manager, &runtime, "h_test", &home_path, "t1", "omp", false, None, sink,
+            &rpc, &manager, &runtime, "h_test", &home_path, "t1", "omp", false, None, None, None,
+            sink,
         );
         let err = result.expect_err("MCP prepare 失败应使 dispatch_chain 失败");
 
@@ -3030,7 +3116,8 @@ mod tests {
         let sink: EventSink = Arc::new(|_| {});
 
         let result = dispatch_chain(
-            &rpc, &manager, &runtime, "h_test", &home_path, "t1", "opencode", false, None, sink,
+            &rpc, &manager, &runtime, "h_test", &home_path, "t1", "opencode", false, None, None,
+            None, sink,
         );
         let err = result.expect_err("spawn 失败应使 dispatch_chain 失败");
         assert!(
@@ -3082,7 +3169,8 @@ mod tests {
         let sink: EventSink = Arc::new(|_| {});
 
         let result = dispatch_chain(
-            &rpc, &manager, &runtime, "h_test", &home_path, "t1", "omp", false, None, sink,
+            &rpc, &manager, &runtime, "h_test", &home_path, "t1", "omp", false, None, None, None,
+            sink,
         );
         assert!(result.is_err(), "prepare 失败应使 dispatch_chain 失败");
 
@@ -3125,7 +3213,8 @@ mod tests {
         let sink: EventSink = Arc::new(|_| {});
 
         let outcome = dispatch_chain(
-            &rpc, &manager, &runtime, "h_test", &home_path, "t1", "opencode", false, None, sink,
+            &rpc, &manager, &runtime, "h_test", &home_path, "t1", "opencode", false, None, None,
+            None, sink,
         )
         .expect("全链应成功");
 
@@ -3314,6 +3403,152 @@ mod tests {
         assert_eq!(usages[1]["tokens"], 14210);
         // delta 帧（thinking_delta）本体不产生 thinking 事件（只 *_end 产生）
         assert!(events.iter().all(|e| e["kind"] != "assistant_thinking"));
+    }
+
+    /// U11：端到端——opencode 假 binary 输出带 sessionID 的 JSON 行 →
+    /// 终态归档 exec.harness_session_id 并镜像 agent.last_session_id。
+    #[test]
+    fn dispatch_captures_harness_session_id_end_to_end() {
+        ensure_fake_sidecar();
+        let dir = tempfile::tempdir().unwrap();
+        let program = write_script(
+            dir.path(),
+            "ses-echo",
+            r#"printf '%s
+' '{"type":"step_start","sessionID":"ses_fake123","part":{"type":"step-start"}}'
+exit 0"#,
+        );
+        let (runtime, home_path) = setup_dispatch_env(dir.path(), "opencode", &program);
+        let fake = FakeDaemon::new(
+            dispatch_node_get(serde_json::json!([])),
+            dispatch_run_get("pending"),
+            "run-ses",
+        );
+        let rpc = |m: &str, p: serde_json::Value| fake.rpc(m, p);
+        let manager = ExecutionManager::with_limits(STARTUP_WINDOW, DEFAULT_MAX_DURATION);
+        let outcome = dispatch_chain(
+            &rpc,
+            &manager,
+            &runtime,
+            "h_test",
+            &home_path,
+            "t1",
+            "opencode",
+            false,
+            None,
+            None,
+            None,
+            Arc::new(|_| {}),
+        )
+        .expect("全链应成功");
+        let session = manager.get(&outcome.exec_id).unwrap();
+        let terminal = wait_for(|| session.terminal(), Duration::from_secs(5));
+        assert!(terminal.is_some());
+        let file = read_agents_file(&runtime);
+        let exec = file.agents[0]
+            .execs
+            .iter()
+            .find(|e| e.exec_id == outcome.exec_id)
+            .unwrap();
+        assert_eq!(exec.harness_session_id.as_deref(), Some("ses_fake123"));
+        assert_eq!(
+            file.agents[0].last_session_id.as_deref(),
+            Some("ses_fake123"),
+            "update_exec 应镜像 agent.last_session_id"
+        );
+    }
+
+    /// U11：定向派发到既有 agent（追加 exec 不新建）+ 运行中守卫拒绝。
+    #[test]
+    fn dispatch_targets_existing_agent_and_guards_running() {
+        ensure_fake_sidecar();
+        let dir = tempfile::tempdir().unwrap();
+        let program = write_script(dir.path(), "target-e", "exit 0");
+        let (runtime, home_path) = setup_dispatch_env(dir.path(), "opencode", &program);
+        let agent = agents::register_agent(
+            &runtime,
+            "h_test",
+            "opencode",
+            agents::NewExec {
+                exec_id: "exec-old".into(),
+                node_id: None,
+                run_id: None,
+                binary_path: None,
+                binary_args: vec![],
+            },
+        )
+        .unwrap();
+        agents::update_agent_status(
+            &runtime,
+            "h_test",
+            &agent.id,
+            agents::AgentRecordStatus::Exited,
+            agents::AgentAttachment::None,
+        )
+        .unwrap();
+
+        let fake = FakeDaemon::new(
+            dispatch_node_get(serde_json::json!([])),
+            dispatch_run_get("pending"),
+            "run-target",
+        );
+        let rpc = |m: &str, p: serde_json::Value| fake.rpc(m, p);
+        let manager = ExecutionManager::with_limits(STARTUP_WINDOW, DEFAULT_MAX_DURATION);
+
+        agents::update_agent_status(
+            &runtime,
+            "h_test",
+            &agent.id,
+            agents::AgentRecordStatus::Running,
+            agents::AgentAttachment::Live,
+        )
+        .unwrap();
+        let err = dispatch_chain(
+            &rpc,
+            &manager,
+            &runtime,
+            "h_test",
+            &home_path,
+            "t1",
+            "opencode",
+            false,
+            None,
+            None,
+            Some(&agent.id),
+            Arc::new(|_| {}),
+        )
+        .unwrap_err();
+        assert!(err.contains("仍在运行"), "{err}");
+
+        agents::update_agent_status(
+            &runtime,
+            "h_test",
+            &agent.id,
+            agents::AgentRecordStatus::Exited,
+            agents::AgentAttachment::None,
+        )
+        .unwrap();
+        let outcome = dispatch_chain(
+            &rpc,
+            &manager,
+            &runtime,
+            "h_test",
+            &home_path,
+            "t1",
+            "opencode",
+            false,
+            None,
+            None,
+            Some(&agent.id),
+            Arc::new(|_| {}),
+        )
+        .expect("定向派发应成功");
+        assert_eq!(outcome.agent_id, agent.id, "不新建 agent");
+        let file = read_agents_file(&runtime);
+        assert_eq!(file.agents.len(), 1);
+        assert_eq!(file.agents[0].execs.len(), 2, "历史 + 新 exec");
+        let session = manager.get(&outcome.exec_id).unwrap();
+        let _ = wait_for(|| session.terminal(), Duration::from_secs(5));
     }
 
     /// 验收回归同源第三处：run/get item 的执行器字段是 `executorActor`

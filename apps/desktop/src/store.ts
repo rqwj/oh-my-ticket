@@ -609,6 +609,8 @@ export function useTreeStore() {
       harness: string
       unattended: boolean
       model?: string | null
+      resumeSession?: string | null
+      agentId?: string | null
       onEvent?: (ev: TranscriptEvent) => void
     }): Promise<ExecStartOutcome> => {
       const channel = new Channel<TranscriptEvent>()
@@ -623,6 +625,8 @@ export function useTreeStore() {
         harness: options.harness,
         unattended: options.unattended,
         model: options.model ?? null,
+        resumeSession: options.resumeSession ?? null,
+        agentId: options.agentId ?? null,
         channel,
       })
       // pull 契约：派发后拉 agents_list（防抖等 Rust 侧 ⑤ 落盘收敛）；

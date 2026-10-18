@@ -58,6 +58,8 @@ interface Props {
     harness: string
     unattended: boolean
     model?: string | null
+    resumeSession?: string | null
+    agentId?: string | null
   }) => Promise<ExecStartOutcome>
   onClose: () => void
   /** 派发成功：App 关弹窗、切 Agents 内层 tab 并选中返回的 agentId */
@@ -116,6 +118,15 @@ export function ExecutionDialog({
   // 后校验存在才预选（列表漂移/换机不留悬空选择）。ref 镜像避免进拉取 deps。
   const [bagModels, setBagModels] = useState<Record<string, string>>({})
   const bagModelsRef = useRef(bagModels)
+  // U11：定向派发的目标 agent（选择器 agent:<id>）；新开开关默认续跑
+  const [targetAgentId, setTargetAgentId] = useState<string | null>(null)
+  const [freshSession, setFreshSession] = useState(false)
+  const targetAgent = useMemo(
+    () => agents.find(a => a.id === targetAgentId) ?? null,
+    [agents, targetAgentId],
+  )
+  /** 定向时 harness 锁定为目标 agent 的 harness；确认/模型下拉按它走 */
+  const effectiveHarness = targetAgent?.harness ?? selected
   const [preview, setPreview] = useState<HarnessLaunchPreview | null>(null)
   const [previewError, setPreviewError] = useState<string | null>(null)
   const [conflict, setConflict] = useState<ConflictInfo | null>(null)
@@ -125,8 +136,8 @@ export function ExecutionDialog({
   const [error, setError] = useState<string | null>(null)
 
   const enabledHarnesses = useMemo(() => (harnesses ?? []).filter(h => h.enabled), [harnesses])
-  const selectedEntry = enabledHarnesses.find(h => h.id === selected) ?? null
-  const needsAck = selected !== '' && !ackMap[selected]
+  const selectedEntry = enabledHarnesses.find(h => h.id === effectiveHarness) ?? null
+  const needsAck = effectiveHarness !== '' && !ackMap[effectiveHarness]
   const members = useMemo(() => collectRunMembers(nodes, nodeId), [nodes, nodeId])
   // 「追加」门控（daemon run-status-gate + DUPLICATE_MEMBER）：仅
   // pending 且存在未入 run 的新成员时可用；否则禁用并给出可读原因。
@@ -222,17 +233,17 @@ export function ExecutionDialog({
 
   bagModelsRef.current = bagModels
 
-  // 模型列表（selected 变化即拉；失败/超时降级为不显示下拉——不阻断派发）
+  // 模型列表（生效 harness 变化即拉；失败/超时降级为不显示下拉——不阻断派发）
   useEffect(() => {
-    if (!selected) return
+    if (!effectiveHarness) return
     let disposed = false
     setModels(null)
     setModelSel('')
-    harnessListModels(selected)
+    harnessListModels(effectiveHarness)
       .then(list => {
         if (disposed) return
         setModels(list)
-        const remembered = bagModelsRef.current[selected]
+        const remembered = bagModelsRef.current[effectiveHarness]
         if (remembered && list.some(m => m.id === remembered)) {
           setModelSel(remembered)
         }
@@ -243,7 +254,7 @@ export function ExecutionDialog({
     return () => {
       disposed = true
     }
-  }, [selected])
+  }, [effectiveHarness])
 
   // 详情展开（或选择变化）：只读启动预览（env 只回键名——secrets 纪律 §3.1）
   useEffect(() => {
@@ -268,7 +279,7 @@ export function ExecutionDialog({
   const memberTitle = (id: string) => titleById.get(id) ?? id
 
   const dispatch = async () => {
-    if (!selected || submitting) return
+    if ((!selected && !targetAgent) || submitting) return
     setSubmitting(true)
     setSlow(false)
     setError(null)
@@ -277,9 +288,13 @@ export function ExecutionDialog({
       const outcome = await startDispatch({
         home,
         nodeId,
-        harness: selected,
+        harness: effectiveHarness,
         unattended: true,
         model: modelSel || null,
+        // U11：定向 agent + 续跑（无历史会话或勾「新开」时 null）
+        agentId: targetAgent?.id ?? null,
+        resumeSession:
+          targetAgent && !freshSession ? targetAgent.lastSessionId : null,
       })
       clearTimeout(slowTimer)
       // 偏好记忆（bag v2，只动 v2 字段）：defaultHarness 随成功派发记为
@@ -389,10 +404,19 @@ export function ExecutionDialog({
             <div className="dispatch-row">
               <select
                 className="detail-select"
-                value={selected}
+                value={targetAgent ? `agent:${targetAgent.id}` : selected}
                 onChange={e => {
                   const value = e.target.value
-                  if (!value.startsWith('agent:')) {
+                  if (value.startsWith('agent:')) {
+                    setTargetAgentId(value.slice('agent:'.length))
+                    setFreshSession(false)
+                    // 知情确认按目标 agent 的 harness 走；跨 harness 切换
+                    // 同样重置（§九-10）
+                    setConfirmChecked(false)
+                    setRememberChecked(false)
+                  } else {
+                    setTargetAgentId(null)
+                    setFreshSession(false)
                     setSelected(value)
                     // 知情确认的对象是「这个 provider 将无人值守执行」——跨
                     // harness 切换必须重置（含「记住」勾选态），A 的放行不
@@ -413,18 +437,49 @@ export function ExecutionDialog({
                   </optgroup>
                 )}
                 {idleAgents.length > 0 && (
-                  // 空闲 Agent 渲染但禁用：会话续接 v1 未接入（U11）
-                  <optgroup label="空闲 Agent">
-                    {idleAgents.map(a => (
-                      <option key={a.id} value={`agent:${a.id}`} disabled title="会话续接 v1 未接入（U11）">
-                        {agentDisplayName(a)}
-                      </option>
-                    ))}
+                  // U11：空闲 Agent 可选——定向派发（默认续跑其上次会话）
+                  <optgroup label="空闲 Agent（续跑）">
+                    {idleAgents.map(a => {
+                      const harnessEnabled = enabledHarnesses.some(h => h.id === a.harness)
+                      const hasSession = a.lastSessionId !== null
+                      return (
+                        <option
+                          key={a.id}
+                          value={`agent:${a.id}`}
+                          disabled={!harnessEnabled}
+                          title={
+                            !harnessEnabled
+                              ? `该 agent 的 harness（${a.harness}）未启用`
+                              : hasSession
+                                ? '继续该 agent 上次会话（保留上下文）'
+                                : '该 agent 无历史会话——将新开会话'
+                          }
+                        >
+                          {agentDisplayName(a)}（{a.harness}
+                          {hasSession ? '·续跑' : '·新开'}）
+                        </option>
+                      )
+                    })}
                   </optgroup>
                 )}
               </select>
               <button className="chip" onClick={() => setDetailOpen(v => !v)}>{detailOpen ? '收起详情' : '详情'}</button>
             </div>
+
+            {targetAgent && (
+              // U11 续跑控制：目标 agent 有历史会话时默认续跑（保留上下文），
+              // 勾选则新开
+              <label className="hm-hint dispatch-resume-row">
+                <input
+                  type="checkbox"
+                  checked={freshSession}
+                  onChange={e => setFreshSession(e.target.checked)}
+                />
+                {targetAgent.lastSessionId
+                  ? `新开会话（默认继续 ${agentDisplayName(targetAgent)} 的上次会话）`
+                  : `该 Agent 无历史会话，将新开会话`}
+              </label>
+            )}
 
             {models !== null && models.length > 0 && (
               // 模型下拉（F-ACC-14）：默认不指定（用 harness 自身默认模型）；

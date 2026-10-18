@@ -258,6 +258,10 @@ export async function execStart(options: {
   unattended: boolean
   /** 指定模型（Rust 侧校验字符集；null = 不指定，用 harness 默认） */
   model?: string | null
+  /** U11：续跑的 harness session id（null = 新开会话） */
+  resumeSession?: string | null
+  /** U11：派发到既有 agent（null = 新 agent） */
+  agentId?: string | null
   channel: Channel<TranscriptEvent>
 }): Promise<ExecStartOutcome> {
   return invoke<ExecStartOutcome>('exec_start', {
@@ -267,6 +271,8 @@ export async function execStart(options: {
     harness: options.harness,
     unattended: options.unattended,
     model: options.model ?? null,
+    resumeSession: options.resumeSession ?? null,
+    agentId: options.agentId ?? null,
     channel: options.channel,
   })
 }

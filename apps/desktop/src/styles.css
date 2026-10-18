@@ -451,6 +451,9 @@ body {
 .t-usage { color: #56d364; font-size: 11px; }
 .t-exit { color: var(--muted); border-top: 1px dashed var(--border); }
 .t-exit.t-failed { color: var(--danger); }
+/* U11：定向 agent 的新开/续跑勾选行 */
+.dispatch-resume-row { display: flex; align-items: center; gap: 8px; margin: 4px 0 0; cursor: pointer; }
+
 .follow-pill {
   position: absolute; right: 16px; bottom: 12px; z-index: 2;
   padding: 4px 12px; border-radius: 999px; border: 1px solid var(--accent);

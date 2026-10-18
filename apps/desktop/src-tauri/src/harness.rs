@@ -183,6 +183,9 @@ pub struct HarnessDescriptor {
     /// 结构化输出 flag（U12：开 JSON 事件流；空 = raw 透传，未知 harness
     /// 永远 raw）。实测：opencode `--format json`、pi/omp `--mode json`。
     pub json_args: &'static [&'static str],
+    /// 续跑 flag（U11，值接一个 session id；空 = 该 harness 不支持续跑，
+    /// UI 隐藏「继续会话」）。实测：opencode `-s`、pi `--session`、omp `--resume`。
+    pub resume_args: &'static [&'static str],
 }
 
 /// dispatch prompt 的传递渠道（provider 适配差异，注册表静态声明）。
@@ -208,6 +211,7 @@ pub const REGISTRY: &[HarnessDescriptor] = &[
         model_args: &["--model"],
         model_list_args: &["models"],
         json_args: &["--format", "json"],
+        resume_args: &["-s"],
     },
     HarnessDescriptor {
         id: "omp",
@@ -224,6 +228,7 @@ pub const REGISTRY: &[HarnessDescriptor] = &[
         model_args: &["--model"],
         model_list_args: &["models"],
         json_args: &["--mode", "json"],
+        resume_args: &["--resume"],
     },
     HarnessDescriptor {
         id: "pi",
@@ -242,6 +247,7 @@ pub const REGISTRY: &[HarnessDescriptor] = &[
         model_args: &["--model"],
         model_list_args: &["--list-models"],
         json_args: &["--mode", "json"],
+        resume_args: &["--session"],
     },
 ];
 
@@ -395,6 +401,8 @@ pub struct LaunchPlan {
     pub model_args: Vec<String>,
     /// 结构化输出 flag（descriptor 静态值；空 = raw）
     pub json_args: Vec<String>,
+    /// 续跑 flag（descriptor 静态值；空 = 不支持）
+    pub resume_args: Vec<String>,
 }
 
 impl LaunchPlan {
@@ -455,6 +463,11 @@ pub fn resolve_launch(runtime_dir: &Path, provider_id: &str) -> Result<LaunchPla
             .iter()
             .map(|s| (*s).to_string())
             .collect(),
+        resume_args: descriptor
+            .resume_args
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
     })
 }
 
@@ -499,6 +512,7 @@ pub fn compose_launch_args(
     prompt: &str,
     prompt_file: Option<&Path>,
     model: Option<&str>,
+    resume_session: Option<&str>,
 ) -> Vec<String> {
     let mut args = plan.argv_prefix.clone();
     args.extend(plan.headless_flags.iter().cloned());
@@ -512,6 +526,12 @@ pub fn compose_launch_args(
     if let Some(model) = model {
         args.extend(plan.model_args.iter().map(|s| (*s).to_string()));
         args.push(model.to_string());
+    }
+    // U11：续跑 flag + session id（opencode `-s <id>` / pi `--session <id>` /
+    // omp `--resume <id>`）——id 经 validate_model_id 同款字符集校验
+    if let Some(session) = resume_session {
+        args.extend(plan.resume_args.iter().map(|s| (*s).to_string()));
+        args.push(session.to_string());
     }
     match (plan.prompt_channel, prompt_file) {
         (PromptChannel::FileAttach, Some(file)) => {
@@ -767,8 +787,11 @@ pub fn harness_open_login(harness: String) -> Result<serde_json::Value, String> 
 fn probe_descriptor(detected: Option<&Path>, d: &HarnessDescriptor) -> Option<String> {
     detected.and_then(|path| {
         // 多线程进程里 fork→exec 偶发子进程卡死（exec 前的库锁），全量测试
-        // 并行时会放大 2s 窗口误判——超时重试一次兜底。
-        probe_version(path, d.probe_args, 2).or_else(|| probe_version(path, d.probe_args, 2))
+        // 并行（子进程型测试增多）会放大 2s 窗口误判——超时重试兜底
+        //（三次：满并行负载下两次仍偶发饿死，实测三投稳定）。
+        probe_version(path, d.probe_args, 2)
+            .or_else(|| probe_version(path, d.probe_args, 2))
+            .or_else(|| probe_version(path, d.probe_args, 2))
     })
 }
 
@@ -1101,17 +1124,18 @@ mod tests {
             headless_flags: vec!["-p".to_string()],
             model_args: vec!["--model".to_string()],
             json_args: vec![],
+            resume_args: vec![],
         };
         // SpawnRequest doc 契约：用户 extra_args 在前、desktop 注入 flag 在后
         //（覆盖用户同名 flag）、prompt 收尾
-        let args = compose_launch_args(&plan, true, "PROMPT", None, None);
+        let args = compose_launch_args(&plan, true, "PROMPT", None, None, None);
         assert_eq!(
             args,
             vec!["-p", "--model", "k3", "--approval-mode=yolo", "PROMPT"],
             "unattended=true 时 args 必须含 headless 与放行 flag 且顺序正确"
         );
         assert_eq!(
-            compose_launch_args(&plan, false, "PROMPT", None, None),
+            compose_launch_args(&plan, false, "PROMPT", None, None, None),
             vec!["-p", "--model", "k3", "PROMPT"],
             "unattended=false 不得追加放行 flag（headless 始终在）"
         );
@@ -1186,9 +1210,10 @@ mod tests {
             headless_flags: vec!["-p".to_string()],
             model_args: vec!["--model".to_string()],
             json_args: vec![],
+            resume_args: vec![],
         };
         assert_eq!(
-            compose_launch_args(&plan, true, "PROMPT", None, Some("k3")),
+            compose_launch_args(&plan, true, "PROMPT", None, Some("k3"), None),
             vec!["-p", "--approval-mode=yolo", "--model", "k3", "PROMPT"],
         );
     }
@@ -1207,14 +1232,28 @@ mod tests {
             headless_flags: vec!["-p".to_string(), "--approve".to_string()],
             model_args: vec!["--model".to_string()],
             json_args: vec!["--mode".to_string(), "json".to_string()],
+            resume_args: vec!["--session".to_string()],
         };
         assert_eq!(
-            compose_launch_args(&plan, true, "LONG PROMPT", None, None),
+            compose_launch_args(&plan, true, "LONG PROMPT", None, None, None),
             vec!["-p", "--approve", "--mode", "json", "LONG PROMPT"],
             "无放行 flag 时 unattended=true 不追加任何项"
         );
+        // U11：续跑 session 紧随其后（payload 之前）
         assert_eq!(
-            compose_launch_args(&plan, true, "P", None, Some("kimi-coding/k3")),
+            compose_launch_args(&plan, true, "P", None, None, Some("ses_pi1")),
+            vec![
+                "-p",
+                "--approve",
+                "--mode",
+                "json",
+                "--session",
+                "ses_pi1",
+                "P"
+            ],
+        );
+        assert_eq!(
+            compose_launch_args(&plan, true, "P", None, Some("kimi-coding/k3"), None),
             vec![
                 "-p",
                 "--approve",
@@ -1342,6 +1381,7 @@ mod tests {
             headless_flags: vec![],
             model_args: vec!["--model".to_string()],
             json_args: vec![],
+            resume_args: vec![],
         };
         let long_prompt = "You are executing tickets…\nrule 1\nrule 2";
         let args = compose_launch_args(
@@ -1349,6 +1389,7 @@ mod tests {
             true,
             long_prompt,
             Some(Path::new("/rt/transcripts/h/exec-1.prompt.md")),
+            None,
             None,
         );
         assert_eq!(
@@ -1366,7 +1407,7 @@ mod tests {
             "argv 不得再含多行 prompt: {args:?}"
         );
         // 渠道为 FileAttach 但文件缺失 → 防御性回落 argv prompt
-        let fallback = compose_launch_args(&plan, true, long_prompt, None, None);
+        let fallback = compose_launch_args(&plan, true, long_prompt, None, None, None);
         assert_eq!(fallback.last().map(String::as_str), Some(long_prompt));
     }
 
@@ -1439,6 +1480,7 @@ mod tests {
             headless_flags: vec![],
             model_args: vec!["--model".to_string()],
             json_args: vec![],
+            resume_args: vec![],
         };
         let filtered = plan.sanitized_env();
         assert_eq!(filtered.len(), 1, "{filtered:?}");
@@ -1460,6 +1502,7 @@ mod tests {
             headless_flags: vec![],
             model_args: vec!["--model".to_string()],
             json_args: vec![],
+            resume_args: vec![],
         };
         let value = launch_preview_value(&plan);
         let keys: Vec<&str> = value["envKeys"]

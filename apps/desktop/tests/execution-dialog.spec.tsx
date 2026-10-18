@@ -294,6 +294,88 @@ describe('执行弹窗 模型下拉 (F-ACC-14)', () => {
   })
 })
 
+// ── U11：空闲 Agent 定向派发（续跑/新开）─────────────────────────────────
+
+describe('执行弹窗 Agent 定向派发 (U11)', () => {
+  const agentRoutes = (agentOver: Record<string, unknown> = {}) =>
+    async (cmd: string, args: Record<string, unknown>) => {
+      if (cmd === 'harness_list')
+        return {
+          harnesses: [
+            harnessWire({}),
+            harnessWire({ id: 'opencode', label: 'OpenCode' }),
+          ],
+        }
+      if (cmd === 'harness_list_models') return { models: [] }
+      if (cmd === 'omt_call' && args.method === 'ui/filters-get')
+        return { filters: { approvalAck: { omp: true, opencode: true } } }
+      if (cmd === 'omt_call' && args.method === 'node/get')
+        return { node: {}, children: [], runs: [] }
+      throw new Error(`unexpected: ${cmd}`)
+    }
+  const agentWireU11 = (over: Record<string, unknown> = {}) => ({
+    id: 'agent-1',
+    displayName: 'Agent 1',
+    title: null,
+    harness: 'omp',
+    status: 'exited',
+    attachment: 'none',
+    lastExecId: 'exec-1',
+    lastSessionId: 'ses_prev',
+    execs: [],
+    ...over,
+  })
+
+  it('选中空闲 Agent → 派发携带 agentId + resumeSession（默认续跑）', async () => {
+    const props = await renderDialog(
+      { agents: [agentWireU11()] as never[] },
+      agentRoutes(),
+    )
+    await waitFor(() => expect(screen.getByRole('button', { name: '派发' })).toBeTruthy())
+    fireEvent.change(screen.getAllByRole('combobox')[0], { target: { value: 'agent:agent-1' } })
+    await waitFor(() => expect(screen.getByText(/默认继续 Agent 1 的上次会话/)).toBeTruthy())
+    fireEvent.click(screen.getByRole('button', { name: '派发' }))
+    await waitFor(() =>
+      expect(props.startDispatch).toHaveBeenCalledWith(
+        expect.objectContaining({ agentId: 'agent-1', resumeSession: 'ses_prev', harness: 'omp' }),
+      ),
+    )
+  })
+
+  it('勾「新开会话」→ resumeSession 置 null', async () => {
+    const props = await renderDialog(
+      { agents: [agentWireU11()] as never[] },
+      agentRoutes(),
+    )
+    await waitFor(() => expect(screen.getByRole('button', { name: '派发' })).toBeTruthy())
+    fireEvent.change(screen.getAllByRole('combobox')[0], { target: { value: 'agent:agent-1' } })
+    await waitFor(() => expect(screen.getByText(/默认继续/)).toBeTruthy())
+    fireEvent.click(screen.getByText(/新开会话/))
+    fireEvent.click(screen.getByRole('button', { name: '派发' }))
+    await waitFor(() =>
+      expect(props.startDispatch).toHaveBeenCalledWith(
+        expect.objectContaining({ agentId: 'agent-1', resumeSession: null }),
+      ),
+    )
+  })
+
+  it('无历史会话的 Agent → resumeSession null（文案如实）', async () => {
+    const props = await renderDialog(
+      { agents: [agentWireU11({ lastSessionId: null })] as never[] },
+      agentRoutes(),
+    )
+    await waitFor(() => expect(screen.getByRole('button', { name: '派发' })).toBeTruthy())
+    fireEvent.change(screen.getAllByRole('combobox')[0], { target: { value: 'agent:agent-1' } })
+    await waitFor(() => expect(screen.getByText(/无历史会话，将新开会话/)).toBeTruthy())
+    fireEvent.click(screen.getByRole('button', { name: '派发' }))
+    await waitFor(() =>
+      expect(props.startDispatch).toHaveBeenCalledWith(
+        expect.objectContaining({ agentId: 'agent-1', resumeSession: null }),
+      ),
+    )
+  })
+})
+
 // ── F-DEFAULT-MODEL：per-provider 记忆模型，拉取列表后校验预选 ────────────
 
 describe('执行弹窗 模型记忆 (F-DEFAULT-MODEL)', () => {
