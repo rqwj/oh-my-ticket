@@ -10,11 +10,14 @@
 //! never on stderr, never in logs. stderr carries lifecycle log lines
 //! only; every protocol error maps onto an MCP structured error.
 //!
-//! Transport: JSON-RPC 2.0 over stdio with `Content-Length` framed
-//! messages (the MCP stdio transport contract). Tools are generated from
-//! the SAME parity matrix the coverage suite enforces (agent_available ∩
-//! non-human_administrative), so tools/list can never drift from the
-//! protocol contract.
+//! Transport: JSON-RPC 2.0 over stdio, **newline-delimited JSON** (the MCP
+//! stdio transport contract — one message per line; F-ACC-9: the earlier
+//! LSP-style `Content-Length` framing parsed nothing from real SDK
+//! clients). Tools are generated from the SAME parity matrix the coverage
+//! suite enforces (agent_available ∩ non-human_administrative), and each
+//! tool's `inputSchema` is projected from `schema/commands.schema.json`
+//! (F-ACC-10: an empty schema once left the model with no way to pass
+//! `runId`), so tools/list can never drift from the protocol contract.
 
 use std::io::{BufRead, BufReader, Write};
 
@@ -191,19 +194,95 @@ pub fn serve(globals: &GlobalArgs) -> Result<i32, Problem> {
 /// pass through to the daemon verbatim — the daemon's own schema
 /// validation remains the authority).
 fn tool_descriptors() -> Vec<serde_json::Value> {
+    let (commands, common) = schemas();
     MCP_TOOLS
         .iter()
         .map(|action| {
+            let params = params_def_of(action)
+                .and_then(|name| commands.pointer(&format!("/$defs/{name}")))
+                .cloned()
+                .map(|def| resolve_refs(def, common))
+                .unwrap_or_else(|| serde_json::json!({ "type": "object" }));
+            let description = params
+                .get("description")
+                .and_then(|d| d.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    format!("OMT daemon action {action} (agent-available subset, parity-matrix governed)")
+                });
             serde_json::json!({
                 "name": wire_name(action),
-                "description": format!("OMT daemon action {action} (agent-available subset, parity-matrix governed)"),
-                "inputSchema": {
-                    "type": "object",
-                    "additionalProperties": true,
-                },
+                "description": description,
+                "inputSchema": params,
             })
         })
         .collect()
+}
+
+/// action → `commands.schema.json` `$defs` 中的 params 定义名。
+/// schema 文件本身没有机器可读的 method→def 映射（描述前缀只有部分带
+/// `Method` 标记），映射表与 MCP_TOOLS 同级维护——单元测试强制每个
+/// MCP 工具都解析出定义，缺项即红（防漂移）。
+fn params_def_of(action: &str) -> Option<&'static str> {
+    Some(match action {
+        "node/create" => "CreateNodeParams",
+        "node/get" => "GetNodeParams",
+        "node/list" => "ListNodeParams",
+        "node/tree" => "TreeParams",
+        "node/search" => "SearchNodesParams",
+        "node/update" => "UpdateNodeParams",
+        "node/move" => "MoveNodeParams",
+        "node/archive" => "ArchiveNodeParams",
+        "run/create" => "RunCreateParams",
+        "run/get" => "RunGetParams",
+        "run/list" => "RunListParams",
+        "run/control" => "RunControlParams",
+        "run/claim" => "ClaimRunParams",
+        "run/report" => "ReportRunParams",
+        "run/add-members" => "RunAddMembersParams",
+        "run/nudge-record" => "RunNudgeRecordParams",
+        "run/interrupt" => "RunInterruptParams",
+        "events/resume" => "EventsResumeParams",
+        _ => return None,
+    })
+}
+
+const COMMANDS_SCHEMA: &str = include_str!("../../../schema/commands.schema.json");
+const COMMON_SCHEMA: &str = include_str!("../../../schema/common.schema.json");
+
+fn schemas() -> &'static (serde_json::Value, serde_json::Value) {
+    static SCHEMAS: std::sync::OnceLock<(serde_json::Value, serde_json::Value)> =
+        std::sync::OnceLock::new();
+    SCHEMAS.get_or_init(|| {
+        (
+            serde_json::from_str(COMMANDS_SCHEMA).expect("commands.schema.json parses"),
+            serde_json::from_str(COMMON_SCHEMA).expect("common.schema.json parses"),
+        )
+    })
+}
+
+/// 递归内联 `$ref`（跨文件引用只指向 common.schema.json 的 `$defs`；
+/// 解析失败原样保留——仍是合法 JSON Schema，但单元测试会拦住新增引用形状）。
+fn resolve_refs(value: serde_json::Value, common: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(mut map) => {
+            if let Some(reference) = map.get("$ref").and_then(|v| v.as_str()) {
+                let name = reference.rsplit('/').next().unwrap_or(reference);
+                if let Some(def) = common.pointer(&format!("/$defs/{name}")) {
+                    return resolve_refs(def.clone(), common);
+                }
+                return serde_json::Value::Object(map);
+            }
+            for v in map.values_mut() {
+                *v = resolve_refs(v.take(), common);
+            }
+            serde_json::Value::Object(map)
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(|v| resolve_refs(v, common)).collect())
+        }
+        other => other,
+    }
 }
 
 /// One tool invocation → one daemon call; the daemon Problem maps onto an
@@ -257,42 +336,34 @@ fn log_line(text: &str) {
     eprintln!("[omt-mcp] {text}");
 }
 
-/// Read one Content-Length framed message; None at clean EOF.
+/// Read one newline-delimited JSON message; None at clean EOF.
+///
+/// **F-ACC-9**: MCP stdio transport is newline-delimited JSON (one message
+/// per line, no embedded newlines) — NOT LSP-style `Content-Length` framing.
+/// The previous framing parsed nothing from real MCP clients (opencode/omp
+/// SDKs), so their `initialize` timed out and the server was silently
+/// dropped from the session toolset.
 fn read_frame(reader: &mut impl BufRead) -> Result<Option<String>, Problem> {
-    let mut content_length: Option<usize> = None;
     loop {
-        let mut header = String::new();
+        let mut line = String::new();
         let read = reader
-            .read_line(&mut header)
+            .read_line(&mut line)
             .map_err(|err| Problem::new("IO", format!("stdin read: {err}")))?;
         if read == 0 {
             return Ok(None); // EOF
         }
-        let trimmed = header.trim();
+        let trimmed = line.trim();
         if trimmed.is_empty() {
-            if content_length.is_some() {
-                break;
-            }
-            continue; // tolerate stray blank lines between frames
+            continue; // tolerate stray blank lines
         }
-        if let Some(value) = trimmed.strip_prefix("Content-Length:") {
-            content_length = value.trim().parse::<usize>().ok();
-        }
-        // Content-Type and unknown headers are ignored per the spec.
+        return Ok(Some(trimmed.to_string()));
     }
-    let length = content_length
-        .ok_or_else(|| Problem::new("INVALID_INPUT", "frame without Content-Length"))?;
-    let mut body = vec![0u8; length];
-    reader
-        .read_exact(&mut body)
-        .map_err(|err| Problem::new("IO", format!("stdin body read: {err}")))?;
-    String::from_utf8(body)
-        .map(Some)
-        .map_err(|err| Problem::new("INVALID_INPUT", format!("frame not utf-8: {err}")))
 }
 
 fn write_frame(writer: &mut impl Write, body: &str) -> std::io::Result<()> {
-    write!(writer, "Content-Length: {}\r\n\r\n{}", body.len(), body)?;
+    // Responses are compact single-line JSON (serde_json::to_string) —
+    // writeln supplies the delimiter the client reads on.
+    writeln!(writer, "{body}")?;
     writer.flush()
 }
 
@@ -372,5 +443,56 @@ mod tests {
         assert!(!identity_downgraded("mcp:1/exec:e1", Some("mcp:1/exec:e1")));
         assert!(identity_downgraded("mcp:1/exec:e1", Some("mcp:1")));
         assert!(identity_downgraded("mcp:1/exec:e1", None));
+    }
+
+    /// F-ACC-10 回归：每个 MCP 工具的 inputSchema 必须从
+    /// commands.schema.json 解析出定义（映射缺项或 def 消失即红），
+    /// 且 properties 非空——空 schema 曾让模型无从传 runId。
+    #[test]
+    fn every_mcp_tool_resolves_a_params_schema() {
+        let (commands, common) = schemas();
+        for action in MCP_TOOLS {
+            let def_name =
+                params_def_of(action).unwrap_or_else(|| panic!("{action} 缺 Params 映射"));
+            let def = commands
+                .pointer(&format!("/$defs/{def_name}"))
+                .unwrap_or_else(|| panic!("{def_name} 不在 commands.schema.json"));
+            let resolved = resolve_refs(def.clone(), common);
+            assert_eq!(resolved["type"], "object", "{action}");
+            let props = resolved["properties"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{action} 无 properties: {resolved}"));
+            assert!(!props.is_empty(), "{action} properties 为空");
+        }
+    }
+
+    /// F-ACC-10 回归：run__claim 必须声明 homeId/runId（required）且
+    /// $ref 已内联（runId 解析出 type:string——客户端 SDK 拿不到
+    /// 跨文件 $ref 的形状）。
+    #[test]
+    fn claim_tool_schema_requires_home_and_run_inlined() {
+        let tools = tool_descriptors();
+        let claim = tools
+            .iter()
+            .find(|t| t["name"] == "run__claim")
+            .expect("run__claim 在 tools/list");
+        let required: Vec<&str> = claim["inputSchema"]["required"]
+            .as_array()
+            .expect("required 数组")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(required.contains(&"homeId"), "{claim}");
+        assert!(required.contains(&"runId"), "{claim}");
+        assert_eq!(
+            claim["inputSchema"]["properties"]["runId"]["type"],
+            "string"
+        );
+        assert!(
+            claim["inputSchema"]["properties"]["runId"]
+                .get("$ref")
+                .is_none(),
+            "$ref 必须已内联: {claim}"
+        );
     }
 }
