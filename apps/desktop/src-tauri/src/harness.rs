@@ -175,8 +175,11 @@ pub struct HarnessDescriptor {
     /// 无法在无头进程内完成）。omp 裸跑进 TUI /login；opencode 走
     /// `auth login` 子命令。
     pub login_args: &'static [&'static str],
-    /// 指定模型的 flag（值接一个 model id；两家同为 `--model`）。
+    /// 指定模型的 flag（值接一个 model id；三家同为 `--model`）。
     pub model_args: &'static [&'static str],
+    /// 模型列表命令参数（F-PI-2：opencode/omp 是 `models` 子命令，pi 是
+    /// `--list-models` flag——`pi models` 会被当消息起 TUI 超时失败）。
+    pub model_list_args: &'static [&'static str],
 }
 
 /// dispatch prompt 的传递渠道（provider 适配差异，注册表静态声明）。
@@ -200,6 +203,7 @@ pub const REGISTRY: &[HarnessDescriptor] = &[
         headless_flags: &[],
         login_args: &["auth", "login"],
         model_args: &["--model"],
+        model_list_args: &["models"],
     },
     HarnessDescriptor {
         id: "omp",
@@ -214,6 +218,7 @@ pub const REGISTRY: &[HarnessDescriptor] = &[
         headless_flags: &["-p"],
         login_args: &[],
         model_args: &["--model"],
+        model_list_args: &["models"],
     },
     HarnessDescriptor {
         id: "pi",
@@ -230,6 +235,7 @@ pub const REGISTRY: &[HarnessDescriptor] = &[
         headless_flags: &["-p", "--approve"],
         login_args: &[],
         model_args: &["--model"],
+        model_list_args: &["--list-models"],
     },
 ];
 
@@ -693,12 +699,16 @@ fn parse_models_output(provider_id: &str, output: &str) -> Vec<ModelEntry> {
 pub fn harness_list_models(harness: String) -> Result<serde_json::Value, String> {
     let runtime_dir = daemon::runtime_dir();
     let program = resolve_login_program(&runtime_dir, &harness)?;
-    let output = capture_with_timeout(&program, &["models"], 8).ok_or_else(|| {
-        format!(
-            "运行 {} models 失败（未安装/超时）——模型下拉不可用",
-            program.display()
-        )
-    })?;
+    let descriptor =
+        descriptor_of(&harness).ok_or_else(|| format!("unsupported harness type: {harness}"))?;
+    let output =
+        capture_with_timeout(&program, descriptor.model_list_args, 8).ok_or_else(|| {
+            format!(
+                "运行 {} {} 失败（未安装/超时）——模型下拉不可用",
+                program.display(),
+                descriptor.model_list_args.join(" ")
+            )
+        })?;
     let models = parse_models_output(&harness, &output);
     Ok(serde_json::json!({ "models": models }))
 }
@@ -1236,6 +1246,15 @@ mod tests {
 
         // registry：omp 裸跑（TUI /login），opencode 走 auth login
         assert_eq!(descriptor_of("omp").unwrap().login_args, &[] as &[&str]);
+        // F-PI-2：pi 的模型列表是 flag 不是子命令
+        assert_eq!(
+            descriptor_of("pi").unwrap().model_list_args,
+            &["--list-models"] as &[&str]
+        );
+        assert_eq!(
+            descriptor_of("omp").unwrap().model_list_args,
+            &["models"] as &[&str]
+        );
         assert_eq!(
             descriptor_of("opencode").unwrap().login_args,
             &["auth", "login"] as &[&str]
