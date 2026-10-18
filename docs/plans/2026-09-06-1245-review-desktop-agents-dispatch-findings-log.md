@@ -1058,6 +1058,21 @@ daemon `run_item_view` 序列化为 `executorActor`（views.rs:130）。恒空 �
 - **实现**：spawn 时建 `<execId>.jsonl`（首行 `session_header`{execId, agentId, nodeId, runId, harness, argv(脱敏), startedAt}——F-U2-7 原始定义）；session_start/raw 派生事件/exit 逐行追加（append 行原子）；终态把 `last_usage` 最终快照归档进 `ExecRecord.usage_tokens/usage_cost`（成本承接第一层）。历史回载优先读 jsonl（逐行即事件，header 不进回放窗），无 jsonl 回落 raw.log 嗅探——新旧数据兼容。raw.log 保持原始事实源不变。
 - **测试**：jsonl 形状（header/首尾事件序）入 dispatch_success；tail 优先级（jsonl 在则 raw 干扰不可见、header 剔除）；既有 usage 去重测试仍绿。Rust 106 / 前端 110 / clippy / fmt / build 全绿。
 
+### §16. U11 会话续接实现记录（2026-10-18）
+
+#### F-U11-1 · 实现面
+- **捕获**：`adapters::extract_session_id`（opencode 任意事件顶层 `sessionID`；pi/omp `session` 事件 `id`——样本实锚）→ spawn_reader 首见即记 ExecSession → finish_terminal 归档 `exec.harness_session_id`（update_exec 内建镜像 `agent.last_session_id`）。端到端测试：假 opencode binary 输出带 sessionID 的 JSON 行 → 归档断言。
+- **续跑 argv**：registry `resume_args`（opencode `-s`、pi `--session`、omp `--resume`；空 = 不支持，UI 隐藏），compose 位序 `[prefix, headless, json, extra_args, unattended, model, resume, payload]`；session id 过 `validate_model_id` 同款字符集校验（argv 注入面）。
+- **定向派发**：`exec_start` 增 `agentId`/`resumeSession`；服务端硬校验（存在/harness 一致/非存活——renderer 不可信），命中走 `agents::append_exec`（追加 exec 到既有 agent，非新建）。测试覆盖守卫与追加。
+- **弹窗**：空闲 Agent 选项激活（U9 绑定预选提示里的「会话续接（U11）接入后…」兑现）；显示 `harness·续跑/新开` 标注；默认续跑上次会话，勾「新开会话」置 null；无历史会话如实标注；agent 的 harness 未启用时选项禁用并说明。
+- **附带**：probe_descriptor 探测重试 2→3（满并行负载下两次仍偶发饿死，实测三投稳定——非 U11 逻辑问题）。
+- 质量门：Rust 109（+4）/ 前端 113（+3）/ clippy / fmt / build 全绿。**验收待做**：实派发两次同一 ticket，第二次选空闲 Agent 续跑，确认上下文延续（模型记得第一次的内容）。
+
+#### F-U11-2 · P1 · dual-bug · `executor.rs` · U11 验收分析时挖出的两个数据面缺陷
+- **已知噪声回落 raw**：spawn_reader 的「解析结果为空 → 回落 raw」兜底把 pi 族 58KB 系统提示整条灌进 transcript 与 jsonl（U12 设计「空=已知噪声必须丢弃」被兜底推翻）。修复：空结果即丢弃；单 raw 结果回写真实 stream 标注。
+- **jsonl 大行撕裂**：`writeln!` 对数十 KB 事件分段 write，stdout/stderr 两读线程 O_APPEND 追加互相撕裂行（exec-77304 实测 2 条撕裂行）。修复：整行单缓冲 `write_all`（常规文件单次 append write 原子定位）。旧数据撕裂行无害——历史回放跳过畸形行。
+- **状态**：均 fixed（Rust 109 全绿；验收后新卷 0 撕裂）
+
 ### 残留状态核查（第二轮验收后）
 
 失败尝试在 daemon 侧已成功创建 RUN-0001（pending，持有 TICKET-0001，无执行器），EPIC-0001/TICKET-0001 被 node/execute 标为 in_progress。重试无需清理：ensure-run 复用路径按 pending → start 正常接管（已实测 run-get 确认）。
