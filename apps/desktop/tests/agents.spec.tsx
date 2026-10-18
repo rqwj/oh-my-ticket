@@ -314,6 +314,46 @@ describe('U9/U5 store 动作：gcBindings / stopAgent / killOrphan', () => {
     expect(callsAfter).toBe(callsBefore)
   })
 
+  it('U10 resumeAgent：未做过知情确认 → 拒绝并引导；已确认 → 定向续跑参数齐备', async () => {
+    let bag: Record<string, unknown> = { models: { omp: 'k3' } } // 无 approvalAck
+    const execStartCalls: Array<Record<string, unknown>> = []
+    invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === 'omt_call' && args?.method === 'ui/filters-get')
+        return { filters: (args.params as { key: string }).key === 'tauri:harness' ? bag : {} }
+      if (cmd === 'omt_call') return { node: {}, children: [], runs: [] }
+      if (cmd === 'exec_start') {
+        execStartCalls.push(args ?? {})
+        return { execId: 'exec-new', agentId: 'agent-1', runId: 'run-1', warnings: [] }
+      }
+      return {}
+    })
+    const agent = makeAgent('agent-1', 'exec-old', {
+      status: 'exited',
+      attachment: 'none',
+      lastSessionId: 'ses_prev',
+    })
+    // execs[0] 带 nodeId——makeAgent 的 makeExec 无 nodeId，手工补
+    agent.execs[0].nodeId = 'T-9'
+    const { result } = await setupStore()
+    await act(async () => { await result.current.selectHome(home) })
+
+    // 门 1：未确认 → 拒绝且不发 exec_start
+    await expect(result.current.resumeAgent(agent)).rejects.toThrow(/知情确认/)
+    expect(execStartCalls.length).toBe(0)
+
+    // 门 2：已确认 → 定向续跑（agentId/resumeSession/记忆模型齐备）
+    bag = { approvalAck: { omp: true }, models: { omp: 'k3' } }
+    await act(async () => { await result.current.resumeAgent(agent) })
+    expect(execStartCalls.length).toBe(1)
+    expect(execStartCalls[0]).toMatchObject({
+      agentId: 'agent-1',
+      resumeSession: 'ses_prev',
+      model: 'k3',
+      harness: 'omp',
+      nodeId: 'T-9',
+    })
+  })
+
   it('stopAgent：exec_stop reject → 错误经 presentError 进全局 error', async () => {
     invokeMock.mockImplementation(async (cmd: string) => {
       if (cmd === 'exec_stop') return Promise.reject(new Error('CONFLICT: revision mismatch expected 3 got 5'))
@@ -478,6 +518,20 @@ describe('U5 TranscriptView 自动跟随', () => {
     fireEvent.click(screen.getByText(/回到最新/))
     expect(scrollTop).toBe(1000)
     expect(screen.queryByText(/回到最新/)).toBeNull()
+  })
+
+  it('U10 一键续跑：空闲 agent 渲染「继续执行」，点击回调；live 不渲染', async () => {
+    const { TranscriptView } = await import('../src/TranscriptView')
+    const idle = makeAgent('agent-r', 'exec-r', { status: 'exited', attachment: 'none', lastSessionId: 'ses_x' })
+    const { rerender } = render(
+      <TranscriptView agent={idle} events={[]} onResumeAgent={() => Promise.resolve()} />,
+    )
+    const btn = screen.getByRole('button', { name: '继续执行' })
+    expect(btn.getAttribute('title')).toContain('续跑上次会话')
+    fireEvent.click(btn) // 回调型 prop——不抛错即通过（行为断言在面板层）
+    const live = makeAgent('agent-r2', 'exec-r2', { status: 'running' })
+    rerender(<TranscriptView agent={live} events={[]} onResumeAgent={() => Promise.resolve()} />)
+    expect(screen.queryByRole('button', { name: '继续执行' })).toBeNull()
   })
 
   it('行渲染：stdout/stderr 区分、session_start/exit 结构化呈现', async () => {

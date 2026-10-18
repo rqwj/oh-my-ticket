@@ -196,7 +196,23 @@ fn with_session<R>(
         .lock()
         .map_err(|_| "session lock poisoned".to_string())?;
     if guard.is_none() {
-        *guard = Some(DaemonSession::establish()?);
+        let session = DaemonSession::establish()?;
+        *guard = Some(session);
+        {
+            // U10：首个会话建立（所有 RPC 的咽喉点——daemon_ensure 只是其一
+            /// 且未必被前端调用）→ 一次性后台对账（幂等 swap 守卫）
+            static RECONCILED_ONCE: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !RECONCILED_ONCE.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let reconciler = crate::state::SharedSession(shared.0.clone());
+                std::thread::spawn(move || {
+                    crate::executor::reconcile_interrupted_execs(
+                        &reconciler,
+                        &daemon::runtime_dir(),
+                    );
+                });
+            }
+        }
     }
     f(guard.as_mut().expect("session just established"))
 }

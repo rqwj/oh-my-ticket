@@ -646,6 +646,34 @@ export function useTreeStore() {
     }))
   }, [])
 
+  /** U10：空闲 agent 一键续跑——定向派发其关联 ticket（U11 续跑语义：
+   *  有 lastSessionId 则续会话），走与弹窗同款的知情确认门（bag v2 ack
+   *  未确认 → 拒绝并引导先走一次弹窗）与记忆模型。 */
+  const resumeAgent = useCallback(
+    async (agent: AgentRecord) => {
+      const exec = agent.execs[agent.execs.length - 1]
+      const home = activeHomeRef.current
+      if (!exec?.nodeId) throw new Error('该 agent 无关联 ticket，无法续跑')
+      if (!home) throw new Error('无活动 workspace')
+      const bag = await readHarnessBag(home.homeId)
+      if (!bag.approvalAck?.[agent.harness]) {
+        throw new Error(
+          `请先对 ${agent.harness} 完成一次无人值守知情确认（任意 ticket 派发弹窗勾选）后再使用一键续跑`,
+        )
+      }
+      await startDispatch({
+        home,
+        nodeId: exec.nodeId,
+        harness: agent.harness,
+        unattended: true,
+        model: bag.models?.[agent.harness] ?? null,
+        resumeSession: agent.lastSessionId,
+        agentId: agent.id,
+      })
+    },
+    [startDispatch],
+  )
+
   const stopAgent = useCallback(async (execId: string) => {
     try {
       await execStop(execId)
@@ -957,6 +985,7 @@ export function useTreeStore() {
     killOrphan,
     ingestTranscriptEvent,
     loadHistoryTail,
+    resumeAgent,
     // ── U9：绑定切片（R-C）───────────────────────────────────────────────
     refreshBindings,
     gcBindings,

@@ -183,6 +183,7 @@ export function App() {
                     loadHistoryTail={store.loadHistoryTail}
                     onSelectAgent={store.selectAgent}
                     onStopAgent={execId => void store.stopAgent(execId)}
+                    onResumeAgent={store.resumeAgent}
                     onKillOrphan={(agentId, execId) => void store.killOrphan(agentId, execId)}
                     onGcBindings={() => void store.gcBindings()}
                     onOpenHarnessSettings={() => setView('settings')}

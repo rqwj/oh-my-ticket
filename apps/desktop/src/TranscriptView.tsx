@@ -149,9 +149,17 @@ interface Props {
   /** 本 exec 已认领项数（两段式确认文案的 N；未知为 null） */
   claimed?: number | null
   onStopAgent?: () => void
+  /** U10：空闲 agent 一键续跑（Agents 面板入口；live 时不渲染） */
+  onResumeAgent?: () => void
 }
 
-export function TranscriptView({ agent, events, claimed = null, onStopAgent }: Props) {
+export function TranscriptView({
+  agent,
+  events,
+  claimed = null,
+  onStopAgent,
+  onResumeAgent,
+}: Props) {
   const scrollRef = useRef<HTMLDivElement | null>(null)
   const [follow, setFollow] = useState(true)
   const [unseen, setUnseen] = useState(0)
@@ -226,6 +234,19 @@ export function TranscriptView({ agent, events, claimed = null, onStopAgent }: P
         <span className="agent-name">{agentDisplayName(agent)}</span>
         <span className={`chip agent-status st-${agent.status}`}>{agent.status}</span>
         <span className="row-spacer" />
+        {!live && onResumeAgent && (
+          <button
+            className="chip"
+            onClick={onResumeAgent}
+            title={
+              agent.lastSessionId
+                ? `续跑上次会话（${agent.lastSessionId.slice(0, 8)}…）——保留该 agent 的模型上下文`
+                : '该 Agent 无历史会话——将新开会话执行其关联 ticket'
+            }
+          >
+            继续执行
+          </button>
+        )}
         {live && onStopAgent && <ConfirmStopButton claimed={claimed} onConfirm={onStopAgent} />}
       </div>
       {events.length === 0 ? (

@@ -68,6 +68,8 @@ interface Props {
   loadHistoryTail: (execId: string, homeId: string) => void
   onSelectAgent: (id: string) => void
   onStopAgent: (execId: string) => void
+  /** U10：空闲 agent 一键续跑（App → store.resumeAgent） */
+  onResumeAgent: (agent: AgentRecord) => Promise<void>
   onKillOrphan: (agentId: string, execId: string) => void
   onOpenHarnessSettings: () => void
   /** U9：一键清理悬空绑定（bindings_gc，成功后 App/store 侧重拉绑定表） */
@@ -87,11 +89,14 @@ export function AgentsPanel({
   loadHistoryTail,
   onSelectAgent,
   onStopAgent,
+  onResumeAgent,
   onKillOrphan,
   onOpenHarnessSettings,
   onGcBindings,
 }: Props) {
   const [stats, setStats] = useState<Record<string, RunStat>>({})
+  /** U10：一键续跑失败的就地报错（成功无需提示——事件流自己会出现） */
+  const [resumeError, setResumeError] = useState<string | null>(null)
   const statsRef = useRef<Record<string, RunStat>>({})
   // 当前节点标题一次建表（行渲染 O(1) 查询；免每行全树 DFS）
   const titleById = useMemo(() => nodeTitlesById(nodes), [nodes])
@@ -243,6 +248,7 @@ export function AgentsPanel({
         {groups.finished.map(renderRow)}
       </div>
       <div className="agents-transcript">
+        {resumeError && <p className="error-banner">{resumeError}</p>}
         {selected && selectedExec ? (
           <TranscriptView
             key={selectedExec.execId}
@@ -250,6 +256,22 @@ export function AgentsPanel({
             events={eventsOf(selectedExec.execId)}
             claimed={selectedClaimed}
             onStopAgent={() => onStopAgent(selectedExec.execId)}
+            onResumeAgent={
+              // U10：空闲（非 running/starting）且最新 exec 带 ticket 才可续跑；
+              // 结果就地报错（harness 未启用/未做知情确认/守卫拒绝等）
+              selected.status !== 'running' &&
+              selected.status !== 'starting' &&
+              selectedExec.nodeId
+                ? async () => {
+                    setResumeError(null)
+                    try {
+                      await onResumeAgent(selected)
+                    } catch (err) {
+                      setResumeError(String(err))
+                    }
+                  }
+                : undefined
+            }
           />
         ) : (
           <TranscriptView agent={null} events={[]} />

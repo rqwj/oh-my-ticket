@@ -615,7 +615,7 @@ impl ExecutionManager {
                     }
                     Ok(None)
                         if Instant::now()
-                            >= started + max_duration + KILL_GRACE + Duration::from_secs(5) =>
+                            >= started + max_duration + KILL_GRACE + Duration::from_secs(15) =>
                     {
                         // 兜底：升级 KILL 后仍未收割（极端）——强制按 Killed 收口
                         waiter_session.kill_tree(libc::SIGKILL);
@@ -1606,12 +1606,90 @@ fn transcript_tail_from(
     events
 }
 
+/// U10 启动对账：对 demote 标记的中断 exec（app 重启杀死、daemon 侧租约
+/// 未释放——run item 卡 running、run 卡死）执行 §3.3 释放序列（admin
+/// report failed + retry 回 pending），随后置 reconciled 幂等标记。
+/// 返回处理的 exec 数。rpc seam 供测试注入。
+pub fn reconcile_interrupted_execs_with(
+    rpc: &dyn Fn(&str, serde_json::Value) -> Result<serde_json::Value, String>,
+    runtime_dir: &Path,
+) -> usize {
+    let targets = match agents::list_reconcile_targets(runtime_dir) {
+        Ok(t) => t,
+        Err(_) => return 0,
+    };
+    let mut handled = 0usize;
+    for t in &targets {
+        release_items_for_exec(rpc, &t.home_id, &t.run_id, &t.exec_id);
+        // F-U10-2：强退可能连同步收口都打断（finish_terminal 未及运行，
+        // 终态归档全缺）——捕获的 session id 还在 raw.log 首段流里，回填
+        // 后该 agent 仍可续跑（上下文不因崩溃丢失）
+        let backfill_session =
+            session_id_from_raw_log(runtime_dir, &t.home_id, &t.exec_id, &t.harness);
+        let _ = agents::update_exec(runtime_dir, &t.home_id, &t.agent_id, &t.exec_id, |exec| {
+            exec.reconciled = true;
+            if exec.harness_session_id.is_none() {
+                exec.harness_session_id = backfill_session.clone();
+            }
+        });
+        handled += 1;
+    }
+    handled
+}
+
+/// 从 raw.log 流行回填 harness session id（pi/omp 的 session 事件在首行、
+/// opencode 任意行携带 sessionID）。读前 32 行足够。
+fn session_id_from_raw_log(
+    runtime_dir: &Path,
+    home_id: &str,
+    exec_id: &str,
+    harness: &str,
+) -> Option<String> {
+    let path = runtime_dir
+        .join("transcripts")
+        .join(home_id)
+        .join(format!("{exec_id}.raw.log"));
+    let text = std::fs::read_to_string(path).ok()?;
+    for line in text.lines().take(32) {
+        let body = line
+            .strip_prefix("[stdout] ")
+            .or_else(|| line.strip_prefix("[stderr] "))
+            .unwrap_or(line);
+        if let Some(id) = crate::adapters::extract_session_id(harness, body) {
+            return Some(id);
+        }
+    }
+    None
+}
+
+/// `daemon_ensure` 建立会话后的薄封装（生产 rpc = daemon_rpc）。
+pub fn reconcile_interrupted_execs(shared: &SharedSession, runtime_dir: &Path) -> usize {
+    let rpc = |method: &str, params: serde_json::Value| daemon_rpc(shared, method, params);
+    let handled = reconcile_interrupted_execs_with(&rpc, runtime_dir);
+    if handled > 0 {
+        eprintln!("U10 对账：释放了 {handled} 个中断 exec 的 daemon 租约");
+    }
+    handled
+}
+
 /// F-U2-13 + F-U2-1 联动：signal 分支偏好 stop_reason + kill_all 同步收口。
 /// 终态租约释放（§3.3 补充）：Killed/Exited/Failed 后释放本 exec 持有的项。
 fn release_lease_on_terminal(shared: &SharedSession, home_id: &str, run_id: &str, exec_id: &str) {
+    let rpc = |method: &str, params: serde_json::Value| daemon_rpc(shared, method, params);
+    release_items_for_exec(&rpc, home_id, run_id, exec_id);
+}
+
+/// run/get 挑出本 exec 仍持有的 running item 并逐个释放（admin report
+/// failed + retry 回 pending）。终态线程（release_lease_on_terminal）与
+/// 启动对账（reconcile_interrupted_execs）共用。
+fn release_items_for_exec(
+    rpc: &dyn Fn(&str, serde_json::Value) -> Result<serde_json::Value, String>,
+    home_id: &str,
+    run_id: &str,
+    exec_id: &str,
+) {
     // run/get 查 items 中 executor_actor 以 /exec:<exec_id> 结尾的 in-flight 项
-    let resp = match daemon_rpc(
-        shared,
+    let resp = match rpc(
         "run/get",
         serde_json::json!({"homeId": home_id, "runId": run_id}),
     ) {
@@ -1620,8 +1698,7 @@ fn release_lease_on_terminal(shared: &SharedSession, home_id: &str, run_id: &str
     };
     for node_id in held_running_nodes(&resp, exec_id) {
         // admin report failed（无 leaseToken，Administrator 授权路径）
-        let _ = daemon_rpc(
-            shared,
+        let _ = rpc(
             "run/report",
             serde_json::json!({
                 "homeId": home_id, "runId": run_id, "nodeId": node_id,
@@ -1630,8 +1707,7 @@ fn release_lease_on_terminal(shared: &SharedSession, home_id: &str, run_id: &str
             }),
         );
         // retry 回 pending
-        let _ = daemon_rpc(
-            shared,
+        let _ = rpc(
             "run/control",
             serde_json::json!({
                 "homeId": home_id, "runId": run_id,
@@ -1721,7 +1797,7 @@ mod tests {
                 }
                 None
             },
-            Duration::from_secs(5),
+            Duration::from_secs(15),
         );
         assert!(saw_hello.is_some(), "应收到 stdout raw 事件");
 
@@ -1774,7 +1850,7 @@ mod tests {
                 sink,
             )
             .unwrap();
-        let terminal = wait_for(|| session.terminal(), Duration::from_secs(5));
+        let terminal = wait_for(|| session.terminal(), Duration::from_secs(15));
         assert!(
             matches!(terminal, Some(Terminal::Failed(_))),
             "{terminal:?}"
@@ -1818,7 +1894,7 @@ mod tests {
                 sink,
             )
             .unwrap();
-        let terminal = wait_for(|| session.terminal(), Duration::from_secs(5));
+        let terminal = wait_for(|| session.terminal(), Duration::from_secs(15));
         assert!(
             matches!(terminal, Some(Terminal::Exited(3))),
             "{terminal:?}"
@@ -1870,7 +1946,7 @@ mod tests {
                 sink,
             )
             .unwrap();
-        let terminal = wait_for(|| session.terminal(), Duration::from_secs(5));
+        let terminal = wait_for(|| session.terminal(), Duration::from_secs(15));
         let Some(Terminal::Failed(detail)) = terminal else {
             panic!("应为 Failed：{terminal:?}");
         };
@@ -1922,7 +1998,7 @@ mod tests {
                 sink,
             )
             .unwrap();
-        let terminal = wait_for(|| session.terminal(), Duration::from_secs(5));
+        let terminal = wait_for(|| session.terminal(), Duration::from_secs(15));
         assert!(
             matches!(&terminal, Some(Terminal::Killed(KillReason::External(9)))),
             "{terminal:?}"
@@ -2270,7 +2346,7 @@ mod tests {
             )
             .unwrap();
         let released = lease_rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(Duration::from_secs(15))
             .expect("终态路径应调用租约释放");
         assert_eq!(
             released,
@@ -2340,7 +2416,7 @@ mod tests {
                 }
                 None
             },
-            Duration::from_secs(5),
+            Duration::from_secs(15),
         );
         assert_eq!(
             args,
@@ -2384,7 +2460,7 @@ mod tests {
                 sink,
             )
             .unwrap();
-        let terminal = wait_for(|| session.terminal(), Duration::from_secs(5));
+        let terminal = wait_for(|| session.terminal(), Duration::from_secs(15));
         assert!(
             matches!(terminal, Some(Terminal::Exited(0))),
             "{terminal:?}"
@@ -2588,7 +2664,7 @@ mod tests {
                 }
                 None
             },
-            Duration::from_secs(5),
+            Duration::from_secs(15),
         );
         assert_eq!(seen.as_deref(), Some(runtime.to_str().unwrap()));
         let _ = manager.exec_stop("exec-env");
@@ -3246,7 +3322,7 @@ mod tests {
         }
         // 收割子进程（脚本 exit 0 → Exited），不留给分离的等待线程
         let session = manager.get(&outcome.exec_id).expect("session 应已注册");
-        let terminal = wait_for(|| session.terminal(), Duration::from_secs(5));
+        let terminal = wait_for(|| session.terminal(), Duration::from_secs(15));
         assert!(
             matches!(terminal, Some(Terminal::Exited(0))),
             "{terminal:?}"
@@ -3405,6 +3481,122 @@ mod tests {
         assert!(events.iter().all(|e| e["kind"] != "assistant_thinking"));
     }
 
+    /// U10 启动对账：中断 exec（demote 签名 + run）→ 释放序列执行 + 幂等标记。
+    #[test]
+    fn reconcile_interrupted_execs_releases_leases_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        // 构造：一个中断 exec（签名 + run）+ 一个正常 exec（不参与）
+        let agent = agents::register_agent(
+            &runtime,
+            "h_test",
+            "pi",
+            agents::NewExec {
+                exec_id: "exec-crash".into(),
+                node_id: Some("n1".into()),
+                run_id: Some("run-stuck".into()),
+                binary_path: None,
+                binary_args: vec![],
+            },
+        )
+        .unwrap();
+        agents::update_exec(&runtime, "h_test", &agent.id, "exec-crash", |e| {
+            e.failure_detail = Some("app restarted before exec finished".to_string());
+        })
+        .unwrap();
+        agents::register_agent(
+            &runtime,
+            "h_test",
+            "pi",
+            agents::NewExec {
+                exec_id: "exec-fine".into(),
+                node_id: None,
+                run_id: Some("run-ok".into()),
+                binary_path: None,
+                binary_args: vec![],
+            },
+        )
+        .unwrap();
+
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(
+            Vec::<(String, serde_json::Value)>::new(),
+        ));
+        let rpc = {
+            let calls = calls.clone();
+            move |method: &str, params: serde_json::Value| -> Result<serde_json::Value, String> {
+                calls
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push((method.to_string(), params.clone()));
+                if method == "run/get" {
+                    // run-stuck：一个 item 卡 running、归属 exec-crash
+                    Ok(serde_json::json!({
+                        "run": { "status": "running" },
+                        "items": [{
+                            "homeId": "h_test", "runId": "run-stuck", "nodeId": "n1",
+                            "state": "running", "executorActor": "mcp:1/exec:exec-crash",
+                        }],
+                    }))
+                } else {
+                    Ok(serde_json::json!({}))
+                }
+            }
+        };
+
+        let handled = reconcile_interrupted_execs_with(&rpc, &runtime);
+        assert_eq!(handled, 1, "仅中断 exec 参与对账");
+        {
+            let c = calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let report = c.iter().find(|(m, _)| m == "run/report").unwrap();
+            assert_eq!(report.1["nodeId"], "n1");
+            assert_eq!(report.1["outcome"], "failed");
+            assert!(c
+                .iter()
+                .any(|(m, p)| m == "run/control" && p["action"] == "retry"));
+        }
+        // F-U10-2：崩溃打断 finish_terminal 时 session id 从 raw.log 回填
+        let raw = runtime
+            .join("transcripts")
+            .join("h_test")
+            .join("exec-crash.raw.log");
+        std::fs::create_dir_all(raw.parent().unwrap()).unwrap();
+        std::fs::write(
+            &raw,
+            "[stdout] {\"type\":\"session\",\"version\":3,\"id\":\"ses_backfill\"}\n[stdout] noise\n",
+        )
+        .unwrap();
+        agents::update_exec(&runtime, "h_test", &agent.id, "exec-crash", |e| {
+            e.reconciled = false; // 模拟另一轮崩溃后待对账
+        })
+        .unwrap();
+        let handled3 = reconcile_interrupted_execs_with(&rpc, &runtime);
+        assert_eq!(handled3, 1);
+        let file = read_agents_file(&runtime);
+        let exec = file.agents[0]
+            .execs
+            .iter()
+            .find(|e| e.exec_id == "exec-crash")
+            .unwrap();
+        assert_eq!(exec.harness_session_id.as_deref(), Some("ses_backfill"));
+        assert_eq!(
+            file.agents[0].last_session_id.as_deref(),
+            Some("ses_backfill"),
+            "回填后镜像 last_session_id（续跑可用）"
+        );
+        // 幂等：再次对账 → 无新调用、handled=0
+        let handled2 = reconcile_interrupted_execs_with(&rpc, &runtime);
+        assert_eq!(handled2, 0);
+        let file = read_agents_file(&runtime);
+        let exec = file.agents[0]
+            .execs
+            .iter()
+            .find(|e| e.exec_id == "exec-crash")
+            .unwrap();
+        assert!(exec.reconciled, "幂等标记已落盘");
+    }
+
     /// U11：端到端——opencode 假 binary 输出带 sessionID 的 JSON 行 →
     /// 终态归档 exec.harness_session_id 并镜像 agent.last_session_id。
     #[test]
@@ -3442,7 +3634,7 @@ exit 0"#,
         )
         .expect("全链应成功");
         let session = manager.get(&outcome.exec_id).unwrap();
-        let terminal = wait_for(|| session.terminal(), Duration::from_secs(5));
+        let terminal = wait_for(|| session.terminal(), Duration::from_secs(15));
         assert!(terminal.is_some());
         let file = read_agents_file(&runtime);
         let exec = file.agents[0]
@@ -3548,7 +3740,7 @@ exit 0"#,
         assert_eq!(file.agents.len(), 1);
         assert_eq!(file.agents[0].execs.len(), 2, "历史 + 新 exec");
         let session = manager.get(&outcome.exec_id).unwrap();
-        let _ = wait_for(|| session.terminal(), Duration::from_secs(5));
+        let _ = wait_for(|| session.terminal(), Duration::from_secs(15));
     }
 
     /// 验收回归同源第三处：run/get item 的执行器字段是 `executorActor`

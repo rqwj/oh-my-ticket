@@ -84,6 +84,10 @@ pub struct ExecRecord {
     /// 最终快照）——成本承接的第一层落盘。
     pub usage_tokens: Option<u64>,
     pub usage_cost: Option<f64>,
+    /// U10：启动对账已处理（幂等标记——demote 的「app restarted」签名
+    /// exec 释放过 daemon 租约后置 true，避免重复对账）。
+    #[serde(default)]
+    pub reconciled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -307,6 +311,57 @@ pub fn append_exec(
         .ok_or_else(|| {
             format!("append_exec: agent {agent_id} 不存在或不可追加（harness 不一致/运行中）")
         })
+}
+
+/// U10 启动对账目标：demote 标记的中断 exec（app 重启杀死、租约未释放）。
+pub struct ReconcileTarget {
+    pub home_id: String,
+    pub agent_id: String,
+    pub exec_id: String,
+    pub run_id: String,
+    pub harness: String,
+}
+
+/// demote 签名（与 demote_live_agents 写入的 failure_detail 字面量一致）。
+const RESTART_MARKER: &str = "app restarted before exec finished";
+
+/// 枚举待对账 exec：failure_detail 命中重启签名且未 reconciled、带 run_id。
+pub fn list_reconcile_targets(runtime_dir: &Path) -> Result<Vec<ReconcileTarget>, String> {
+    let root = runtime_dir.join("agents");
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return Ok(Vec::new());
+    };
+    let mut targets = Vec::new();
+    for entry in entries.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let Some(home_id) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let file = entry.path().join("agents.json");
+        let (agents_file, _) = match read_json::<AgentsFile>(&file) {
+            Ok(v) => v,
+            Err(_) => continue, // 损坏/缺失 → 该 home 跳过（回放面另行降级）
+        };
+        for agent in &agents_file.agents {
+            for exec in &agent.execs {
+                if !exec.reconciled
+                    && exec.run_id.is_some()
+                    && exec.failure_detail.as_deref() == Some(RESTART_MARKER)
+                {
+                    targets.push(ReconcileTarget {
+                        home_id: home_id.clone(),
+                        agent_id: agent.id.clone(),
+                        exec_id: exec.exec_id.clone(),
+                        run_id: exec.run_id.clone().unwrap_or_default(),
+                        harness: agent.harness.clone(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(targets)
 }
 
 /// 按持久化身份读取单个 agent。Orphan 管理命令用此函数在 Rust 侧完成
