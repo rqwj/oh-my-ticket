@@ -12,8 +12,28 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { AgentRecord, OmtNode, SavedFilters } from './types'
 import { STATUS_COLORS } from './types'
-import { bindingViewsForNodes, type NodeBindingView } from './store'
+import { bindingViewsForNodes, nodesById, type NodeBindingView } from './store'
 import { agentDisplayName } from './agentUi'
+
+/** 层级规则（daemon 契约镜像）：根=epic；epic→story；story/substory→
+ * substory|ticket（ticket 只能挂 story 系下，不能直接挂 epic）；ticket/
+ * subticket→subticket。纯函数供测试钉住。 */
+export function allowedChildTypes(parentType: string | null): string[] {
+  switch (parentType) {
+    case null:
+      return ['epic']
+    case 'epic':
+      return ['story']
+    case 'story':
+    case 'substory':
+      return ['substory', 'ticket']
+    case 'ticket':
+    case 'subticket':
+      return ['subticket']
+    default:
+      return []
+  }
+}
 
 interface Props {
   nodes: OmtNode[]
@@ -27,6 +47,8 @@ interface Props {
   bindingsDegraded?: boolean
   onSelect: (id: string) => void
   onFilters: (patch: SavedFilters) => void
+  /** 新建子节点（返回新节点 id；store 侧负责刷新树并选中新节点） */
+  onCreateNode: (input: { type: string; title: string; body?: string; parentId: string | null }) => Promise<string>
 }
 
 const TYPE_META: Record<string, { badge: string; color: string }> = {
@@ -162,8 +184,22 @@ function toggleInList<T>(list: T[] | undefined, value: T, all: readonly T[]): T[
   return next.length === all.length ? [] : next
 }
 
-export function TreePanel({ nodes, filters, recentIds, selectedId, bindings = {}, agents = [], bindingsDegraded = false, onSelect, onFilters }: Props) {
+export function TreePanel({ nodes, filters, recentIds, selectedId, bindings = {}, agents = [], bindingsDegraded = false, onSelect, onFilters, onCreateNode }: Props) {
   const [query, setQuery] = useState(filters.query ?? '')
+  // 新建子节点表单（U14 验收诉求）：父节点 = 当前选中（无选中 = 根 → epic）
+  const [createOpen, setCreateOpen] = useState(false)
+  const [createType, setCreateType] = useState('')
+  const [createTitle, setCreateTitle] = useState('')
+  const [createBody, setCreateBody] = useState('')
+  const [creating, setCreating] = useState(false)
+  const [createError, setCreateError] = useState<string | null>(null)
+  // 深索引查找：树是嵌套结构（story 在 epic 的 children 里），顶层 find
+  // 永远找不到子节点（F-U14-3——曾致选中 story 按钮仍显示「新建 Epic」）
+  const selectedNode = useMemo(
+    () => (selectedId ? nodesById(nodes).get(selectedId) ?? null : null),
+    [nodes, selectedId],
+  )
+  const allowedTypes = useMemo(() => allowedChildTypes(selectedNode?.type ?? null), [selectedNode?.type])
   // Persisted bag loads asynchronously after mount — adopt its query.
   useEffect(() => setQuery(filters.query ?? ''), [filters.query])
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set())
@@ -253,6 +289,80 @@ export function TreePanel({ nodes, filters, recentIds, selectedId, bindings = {}
             🗃 Archived
           </button>
         </div>
+        <div className="chip-row">
+          <button
+            className="chip"
+            title={selectedNode ? `在 ${selectedNode.id} 下新建子节点` : '新建顶层 Epic'}
+            onClick={() => {
+              setCreateOpen(v => !v)
+              setCreateType(allowedTypes[0] ?? '')
+              setCreateError(null)
+            }}
+          >
+            ＋ 新建{selectedNode ? `（${selectedNode.type} 下）` : ' Epic'}
+          </button>
+        </div>
+        {createOpen && (
+          <div className="create-node-form">
+            <p className="hm-hint">
+              父节点：{selectedNode ? `${selectedNode.id} ${selectedNode.title}` : '（根）'}
+            </p>
+            <div className="chip-row">
+              {allowedTypes.map(t => (
+                <button
+                  key={t}
+                  className={`chip${createType === t ? ' active' : ''}`}
+                  onClick={() => setCreateType(t)}
+                >
+                  {t}
+                </button>
+              ))}
+              {allowedTypes.length === 0 && <span className="hm-hint">该节点类型不支持子节点</span>}
+            </div>
+            <input
+              className="hm-input"
+              aria-label="节点标题"
+              placeholder="标题（必填）"
+              value={createTitle}
+              onChange={e => setCreateTitle(e.target.value)}
+            />
+            <textarea
+              className="hm-textarea"
+              rows={3}
+              aria-label="节点正文（可选）"
+              placeholder="正文（可选）——如 ticket 的任务说明"
+              value={createBody}
+              onChange={e => setCreateBody(e.target.value)}
+            />
+            {createError && <p className="error-banner">{createError}</p>}
+            <div className="chip-row">
+              <button
+                className="chip active"
+                disabled={creating || !createType || createTitle.trim() === ''}
+                onClick={() => {
+                  setCreating(true)
+                  setCreateError(null)
+                  onCreateNode({
+                    type: createType,
+                    title: createTitle.trim(),
+                    body: createBody.trim() === '' ? undefined : createBody,
+                    parentId: selectedNode?.id ?? null,
+                  })
+                    .then(() => {
+                      setCreateOpen(false)
+                      setCreateTitle('')
+                      setCreateBody('')
+                    })
+                    .catch(err => setCreateError(String(err)))
+                    .finally(() => setCreating(false))
+                }}
+              >
+                {creating ? '创建中…' : '创建'}
+              </button>
+              <button className="chip" onClick={() => setCreateOpen(false)}>取消</button>
+            </div>
+          </div>
+        )}
         <div className="chip-row sort-row">
           <button
             className={`chip sort-anchor${filters.showId ? ' active' : ''}`}

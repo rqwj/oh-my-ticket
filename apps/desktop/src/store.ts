@@ -878,6 +878,26 @@ export function useTreeStore() {
     [refreshNodes, refreshRuns, loadFilters, refreshAgents, refreshBindings, migrateHarnessBag],
   )
 
+  /** 新建节点（树面板入口）：node/create → 刷新树 → 选中新节点。 */
+  const createNode = useCallback(
+    async (input: { type: string; title: string; body?: string; parentId: string | null }) => {
+      const home = activeHomeRef.current
+      if (!home) throw new Error('无活动 workspace')
+      const result = await omtCall<{ node?: { nodeId?: string } }>('node/create', {
+        homeId: home.homeId,
+        type: input.type,
+        title: input.title,
+        ...(input.parentId ? { parentId: input.parentId } : {}),
+        ...(input.body !== undefined ? { body: input.body } : {}),
+      })
+      await refreshNodes(home)
+      const newId = result.node?.nodeId
+      if (newId) selectNode(newId)
+      return newId ?? ''
+    },
+    [refreshNodes],
+  )
+
   // Declare flow (U5 consumer): register an unregistered home directory,
   // then re-pull the home list. Pre-U5 daemons surface the feature gap
   // as a readable fallback message.
@@ -986,6 +1006,7 @@ export function useTreeStore() {
     ingestTranscriptEvent,
     loadHistoryTail,
     resumeAgent,
+    createNode,
     // ── U9：绑定切片（R-C）───────────────────────────────────────────────
     refreshBindings,
     gcBindings,

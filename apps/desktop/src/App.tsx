@@ -122,6 +122,7 @@ export function App() {
             bindingsDegraded={state.bindingsParseFailed}
             onSelect={id => { store.selectNode(id); setView('detail'); setTicketTab('detail') }}
             onFilters={patch => state.activeHome && void store.saveFilters(state.activeHome, patch)}
+            onCreateNode={store.createNode}
           />
           </div>
         )}
