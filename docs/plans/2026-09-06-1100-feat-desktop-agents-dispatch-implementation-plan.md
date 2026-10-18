@@ -455,6 +455,8 @@ stateDiagram-v2
 
 ### U12. 结构化 adapter
 
+> **2026-10-18 插入需求**：新增 **pi** provider 支持（v1 已随验收轮实装——registry 条目/`.pi/mcp.json` 项目注入（ProjectSpec 泛化，omp 布局字节兼容）/`--approve` 信任 flag/`--list-models` 解析；见 base_design A.3b）。U12 的 pi 结构化数据面走 `--mode json`。
+
 - **Goal**: transcript 从 raw 升级为结构化（KD-D4）。
 - **Requirements**: R-E。
 - **Dependencies**: U2。

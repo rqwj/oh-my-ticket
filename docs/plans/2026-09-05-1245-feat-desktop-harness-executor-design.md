@@ -396,6 +396,17 @@ desktop 若以非默认 runtime dir 运行 daemon，spawn harness 时必须把 `
 - **MCP 配置**（docs/mcp-config.md）：OMP-native 文件为项目 `.omp/mcp.json` / 用户 `~/.omp/agent/mcp.json`（named profile 下 `~/.omp/profiles/<name>/agent/mcp.json`），结构 `{"mcpServers": {"name": {type:"stdio", command, args, env…}}, "disabledServers": [], "enabledServers": []}`；另自动翻译 `.claude/`、`.codex/config.toml`、`opencode.json` 等 8 类来源。运行期覆盖可用 `--config <file>`（可重复，config.yml-style overlay）。
 - **会话/其他**：`--session-dir` / `--no-session` / `-r resume` / `--export`；profile 隔离（`--profile`）；`--max-time` 进程级超时；`--cwd` 指定目录；模型 `--model`、思考档 `--thinking`。本机 `~/.omp/run/daemons` 显示其有 IDE daemon 机制（headless 不依赖）。
 
+### A.3b pi（badlogic/pi-mono，本机 nvm 全局安装，v1.0.0，2026-10-18 实测）
+
+- **无头调用**：`pi -p "<task>"`（`--print, -p`：Non-interactive mode: process prompt and exit）；位置参数即消息（`@file` 前缀为附件），**无 opencode 式位置参数 lstat 行为**，长 prompt 可直传（PromptChannel::Argv）。
+- **项目信任是 MCP 注入的硬前提**：`pi mcp add <s> -l -- <cmd>` 写 `.pi/mcp.json`（实测形状 `{"mcpServers": {s: {"command": "<str>", "args": []}}}`，无 type 字段），且 pi 明确提示「项目未受信则 .pi/mcp.json 被忽略」——派发 argv 必须带 `--approve`（Trust project-local files for this run），否则重演 F-ACC-9 式静默无工具。
+- **无审批层**：pi 基础无 omp 的 approval-mode 机制，`-p` 模式工具自动执行 → `unattended_flag: []`。
+- **结构化输出**：`--mode text|json|rpc`——U12 结构化 adapter 的 pi 数据面走 `--mode json`。
+- **会话**：`--session <path|id>` / `--session-id <id>`（精确、缺失即建，天然适配 U11 预指派）/ `-c` / `-r` / `--fork`。
+- **模型**：`--model provider/id`（fuzzy）；`pi --list-models` 空白对齐表格（provider/model 两列）零成本解析。
+- **认证**：`pi auth check/print-api-key`（api key env 或 `~/.pi/agent/auth.json`）；登录经 TUI（终端登录按钮裸跑 `pi`）。
+- **实测记录**：`pi -p --approve --model kimi-coding/k3 "Reply with exactly: PI-OK"` → `PI-OK`（2026-10-18，无头 + 信任 flag + 模型选择 + 认证全链通过）。
+
 ### A.4 对设计结论的影响汇总
 
 1. 四家全有可用的 headless 路径，设计的三层 adapter（结构化/raw 兜底）成立且已具体化；**omp 应升级为 RPC 集成**（增量流式 + steer 能力），其余 JSONL 一次性流。

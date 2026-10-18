@@ -1016,6 +1016,10 @@ daemon `run_item_view` 序列化为 `executorActor`（views.rs:130）。恒空 �
 
 **omp 与 opencode 双 harness 冒烟通过**——派发 → run 创建/复用 → harness 无头启动 → MCP 注入（omt 工具全参数 schema）→ `run__claim` 认领 → 执行 → `run__report` → run 状态流转 completed 全链路闭环（opencode：RUN-0003/RUN-0008 双轮验证；omp：登录后通过）。期间暴露并修复 14 项（F-ACC-1~14），三类系统性教训已沉淀：daemon 视图字段/线协议/CLI argv 三处的「测试镜像实现而非镜像规范」、provider 适配必须实测定稿（headless flag/放行 flag/prompt 渠道/模型面）、真实对端接入是唯一可靠的暴露手段。附带产出：终端登录入口（订阅/OAuth）、模型下拉、transcript 行高不变量与 ANSI 处理。P1 待办不变（U10/11/12/14/16、U15 余项）。
 
+#### F-PI-1 · feat · pi provider 支持（U12 插入需求，2026-10-18）
+用户要求在 U12 增加对 pi 的支持。全部按「实测定稿」纪律先行探明（pi 1.0.0 本机）：`-p` 无头、位置参数无 lstat（Argv 渠道）、**`.pi/mcp.json` 项目未受信即被静默忽略 → argv 必须 `--approve`**（防 F-ACC-9 复发）、条目形状无 type 字段、无审批层（unattended_flag 空）、`--mode json`（U12 数据面）、`--list-models` 表格解析、`--session-id` 精确续接（U11）。
+- **状态**：done（REGISTRY pi 条目；mcp_injection 泛化为 ProjectSpec 双命名空间——**omp 目录/条目形状字节级兼容**（19 个既有注入测试原样通过），pi 独立 `harness/pi-injection`/`pi-launchers` + `.pi/mcp.json`；sweep 双 spec；模型解析 + compose/注入/sweep 测试 ×4；弹窗详情对空放行 flag 的文案适配。实烟测：`pi -p --approve --model kimi-coding/k3` → PI-OK。Rust 99 / 前端 105 / clippy / fmt / build 全绿）
+
 ### 残留状态核查（第二轮验收后）
 
 失败尝试在 daemon 侧已成功创建 RUN-0001（pending，持有 TICKET-0001，无执行器），EPIC-0001/TICKET-0001 被 node/execute 标为 in_progress。重试无需清理：ensure-run 复用路径按 pending → start 正常接管（已实测 run-get 确认）。
