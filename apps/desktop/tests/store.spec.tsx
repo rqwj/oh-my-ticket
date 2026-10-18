@@ -449,6 +449,28 @@ describe('bag v2 迁移（U1b：旧 tauri:harness 条目，home 加载路径顺�
     unmount()
   })
 
+  it('F-DEFAULT-MODEL：writeHarnessBag models 合并——新值覆盖、空串清除、空对象收键', async () => {
+    let bag: Record<string, unknown> = {
+      defaultHarness: 'omp',
+      models: { opencode: 'glm-5.3', omp: 'k3' },
+    }
+    const setCalls: Array<Record<string, unknown>> = []
+    bagDaemon(
+      () => bag,
+      next => { bag = next },
+    )
+    const { writeHarnessBag, readHarnessBag } = await import('../src/store')
+    // 空串清除 omp 条目、新增 pi 条目、opencode 保留
+    await writeHarnessBag('h1', { models: { omp: '', pi: 'kimi-coding/k3' } })
+    const read = await readHarnessBag('h1')
+    expect(read.models).toEqual({ opencode: 'glm-5.3', pi: 'kimi-coding/k3' })
+    // 全清 → models 键整体移除
+    await writeHarnessBag('h1', { models: { opencode: '', pi: '' } })
+    const read2 = await readHarnessBag('h1')
+    expect(read2.models).toBeUndefined()
+    expect(read2.defaultHarness).toBe('omp')
+  })
+
   it('旧 dsh 条目 → 不写不删（旧字段原样）+ legacyDshByHome 提示态出现', async () => {
     let bag: Record<string, unknown> = { harness: { type: 'dsh', mode: 'dev', devPath: '/code/dsh' } }
     bagDaemon(() => bag, () => {}) // set 不落盘 → 若误写，读侧 legacy 不会消失

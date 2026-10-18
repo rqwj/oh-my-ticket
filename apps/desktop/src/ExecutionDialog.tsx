@@ -17,7 +17,7 @@
  * （优先级：绑定 agent.harness > bag defaultHarness > 首个 enabled）。
  * 悬空绑定（agent 不在列表）与数据降级（parseFailed）不提示、不覆盖默认。
  */
-import { useEffect, useMemo, useState } from 'react'
+import { useRef, useEffect, useMemo, useState } from 'react'
 import { omtCall, harnessLaunchPreview, harnessListModels, bindingsGet, type ExecStartOutcome, type HarnessLaunchPreview, type HarnessModelEntry } from './bridge'
 import { readHarnessBag, writeHarnessBag, harnessList, resolveBindingForNode, nodesById, nodeTitlesById, type HarnessEntry, type ResolvedBinding } from './store'
 import { agentDisplayName } from './agentUi'
@@ -112,6 +112,10 @@ export function ExecutionDialog({
   // 模型下拉（F-ACC-14）：selected harness 变化时拉取；失败置 null 降级隐藏
   const [models, setModels] = useState<HarnessModelEntry[] | null>(null)
   const [modelSel, setModelSel] = useState('')
+  // F-DEFAULT-MODEL：per-provider 上次派发选用的模型（bag v2）——列表拉到
+  // 后校验存在才预选（列表漂移/换机不留悬空选择）。ref 镜像避免进拉取 deps。
+  const [bagModels, setBagModels] = useState<Record<string, string>>({})
+  const bagModelsRef = useRef(bagModels)
   const [preview, setPreview] = useState<HarnessLaunchPreview | null>(null)
   const [previewError, setPreviewError] = useState<string | null>(null)
   const [conflict, setConflict] = useState<ConflictInfo | null>(null)
@@ -154,6 +158,7 @@ export function ExecutionDialog({
         if (disposed) return
         setHarnesses(list)
         setAckMap(bag.approvalAck ?? {})
+        setBagModels(bag.models ?? {})
         // 默认选中（U9 优先级）：绑定 agent.harness > bag defaultHarness >
         // 首个 enabled。绑定悬空（agent 不在列表）或数据降级（parseFailed）
         // 时按无绑定处理——不做悬空判定、不覆盖默认链路。
@@ -215,6 +220,8 @@ export function ExecutionDialog({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [home.homeId, nodeId])
 
+  bagModelsRef.current = bagModels
+
   // 模型列表（selected 变化即拉；失败/超时降级为不显示下拉——不阻断派发）
   useEffect(() => {
     if (!selected) return
@@ -223,7 +230,12 @@ export function ExecutionDialog({
     setModelSel('')
     harnessListModels(selected)
       .then(list => {
-        if (!disposed) setModels(list)
+        if (disposed) return
+        setModels(list)
+        const remembered = bagModelsRef.current[selected]
+        if (remembered && list.some(m => m.id === remembered)) {
+          setModelSel(remembered)
+        }
       })
       .catch(() => {
         if (!disposed) setModels(null)
@@ -271,10 +283,12 @@ export function ExecutionDialog({
       })
       clearTimeout(slowTimer)
       // 偏好记忆（bag v2，只动 v2 字段）：defaultHarness 随成功派发记为
-      // 本次选择；勾「记住」时再写 approvalAck（另一 workspace 仍要求确认）
+      // 本次选择；勾「记住」时再写 approvalAck（另一 workspace 仍要求确认）；
+      // F-DEFAULT-MODEL：models 记本次选择（空选择 = 清除该 provider 记忆）
       void writeHarnessBag(home.homeId, {
         defaultHarness: selected,
         ...(rememberChecked ? { approvalAck: { [selected]: true } } : {}),
+        models: { [selected]: modelSel },
       })
       onDispatched(outcome)
       onClose()

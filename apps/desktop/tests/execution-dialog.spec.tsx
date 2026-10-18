@@ -294,6 +294,91 @@ describe('执行弹窗 模型下拉 (F-ACC-14)', () => {
   })
 })
 
+// ── F-DEFAULT-MODEL：per-provider 记忆模型，拉取列表后校验预选 ────────────
+
+describe('执行弹窗 模型记忆 (F-DEFAULT-MODEL)', () => {
+  const modelMemoryRoutes = (
+    bag: Record<string, unknown>,
+    models: Array<{ id: string; group: string | null }>,
+    setCalls: unknown[] = [],
+  ) =>
+    async (cmd: string, args: Record<string, unknown>) => {
+      if (cmd === 'harness_list') return { harnesses: [harnessWire({})] }
+      if (cmd === 'harness_list_models') return { models }
+      if (cmd === 'omt_call' && args.method === 'ui/filters-get')
+        return { filters: params_of(args).key === 'tauri:harness' ? bag : {} }
+      if (cmd === 'omt_call' && args.method === 'ui/filters-set') {
+        setCalls.push(params_of(args).filters)
+        return {}
+      }
+      if (cmd === 'omt_call' && args.method === 'node/get')
+        return { node: {}, children: [], runs: [] }
+      throw new Error(`unexpected: ${cmd}`)
+    }
+  const params_of = (args: Record<string, unknown>) => args.params as Record<string, unknown>
+
+  it('bag 记忆的模型在列表中 → 拉取后自动预选，派发直接带上', async () => {
+    const props = await renderDialog(
+      {},
+      modelMemoryRoutes(
+        { approvalAck: { omp: true }, models: { omp: 'k3' } },
+        [
+          { id: 'k3', group: 'kimi-code' },
+          { id: 'kimi-k2.5', group: 'kimi-code' },
+        ],
+      ),
+    )
+    await waitFor(() => expect(screen.getByRole('button', { name: '派发' })).toBeTruthy())
+    const select = (await waitFor(() =>
+      screen.getByRole('combobox', { name: '执行模型' }),
+    )) as HTMLSelectElement
+    await waitFor(() => expect(select.value).toBe('k3'))
+    fireEvent.click(screen.getByRole('button', { name: '派发' }))
+    await waitFor(() =>
+      expect(props.startDispatch).toHaveBeenCalledWith(expect.objectContaining({ model: 'k3' })),
+    )
+  })
+
+  it('记忆模型不在列表中 → 回退「默认（不指定）」', async () => {
+    await renderDialog(
+      {},
+      modelMemoryRoutes(
+        { approvalAck: { omp: true }, models: { omp: 'gone-model' } },
+        [{ id: 'k3', group: 'kimi-code' }],
+      ),
+    )
+    await waitFor(() => expect(screen.getByRole('button', { name: '派发' })).toBeTruthy())
+    const select = (await waitFor(() =>
+      screen.getByRole('combobox', { name: '执行模型' }),
+    )) as HTMLSelectElement
+    await waitFor(() => expect(select.value).toBe(''))
+  })
+
+  it('派发成功 → models 记忆写入 bag；空选择清除该 provider 条目', async () => {
+    const setCalls: unknown[] = []
+    const props = await renderDialog(
+      {},
+      modelMemoryRoutes(
+        { approvalAck: { omp: true }, defaultHarness: 'omp', models: { opencode: 'glm-5.3' } },
+        [{ id: 'k3', group: 'kimi-code' }],
+        setCalls,
+      ),
+    )
+    await waitFor(() => expect(screen.getByRole('button', { name: '派发' })).toBeTruthy())
+    const select = (await waitFor(() =>
+      screen.getByRole('combobox', { name: '执行模型' }),
+    )) as HTMLSelectElement
+    await waitFor(() => expect(select.value).toBe('')) // omp 无记忆
+    fireEvent.change(select, { target: { value: 'k3' } })
+    fireEvent.click(screen.getByRole('button', { name: '派发' }))
+    await waitFor(() => expect(props.onDispatched).toHaveBeenCalled())
+    await waitFor(() => expect(setCalls.length).toBeGreaterThan(0))
+    const written = setCalls[setCalls.length - 1] as Record<string, unknown>
+    expect(written.models).toEqual({ opencode: 'glm-5.3', omp: 'k3' })
+    expect(written.defaultHarness).toBe('omp')
+  })
+})
+
 // ── 权限知情确认（§九-10：显式放行 + per-workspace 记住）──────────────────
 
 describe('U6 权限知情确认', () => {

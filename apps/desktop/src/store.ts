@@ -225,11 +225,14 @@ const HARNESS_BAG_KEY = 'tauri:harness'
 export interface HarnessBagV2 {
   defaultHarness?: string
   approvalAck?: Record<string, boolean>
+  /** per-provider 上次派发选用的模型（F-DEFAULT-MODEL；值 '' = 清除记忆） */
+  models?: Record<string, string>
 }
 
 interface RawHarnessBag {
   defaultHarness?: unknown
   approvalAck?: unknown
+  models?: unknown
   harness?: unknown
   [k: string]: unknown
 }
@@ -259,6 +262,13 @@ function projectHarnessBag(bag: RawHarnessBag): HarnessBagRead {
   if (typeof bag.defaultHarness === 'string' && bag.defaultHarness) {
     read.defaultHarness = bag.defaultHarness
   }
+  if (bag.models && typeof bag.models === 'object' && !Array.isArray(bag.models)) {
+    const models: Record<string, string> = {}
+    for (const [k, v] of Object.entries(bag.models as Record<string, unknown>)) {
+      if (typeof v === 'string' && v) models[k] = v
+    }
+    if (Object.keys(models).length > 0) read.models = models
+  }
   if (bag.approvalAck && typeof bag.approvalAck === 'object' && !Array.isArray(bag.approvalAck)) {
     const ack: Record<string, boolean> = {}
     for (const [provider, flag] of Object.entries(bag.approvalAck as Record<string, unknown>)) {
@@ -287,6 +297,22 @@ export async function writeHarnessBag(homeId: string, patch: HarnessBagV2): Prom
         ? (current.approvalAck as Record<string, unknown>)
         : {}
     next.approvalAck = { ...existing, ...patch.approvalAck }
+  }
+  if (patch.models !== undefined) {
+    const existing =
+      current.models && typeof current.models === 'object' && !Array.isArray(current.models)
+        ? (current.models as Record<string, unknown>)
+        : {}
+    const merged: Record<string, string> = {}
+    for (const [k, v] of Object.entries(existing)) {
+      if (typeof v === 'string' && v) merged[k] = v
+    }
+    for (const [provider, model] of Object.entries(patch.models)) {
+      if (model === '') delete merged[provider]
+      else merged[provider] = model
+    }
+    if (Object.keys(merged).length > 0) next.models = merged
+    else delete next.models
   }
   await omtCall('ui/filters-set', { homeId, key: HARNESS_BAG_KEY, filters: next }).catch(() => {})
 }
