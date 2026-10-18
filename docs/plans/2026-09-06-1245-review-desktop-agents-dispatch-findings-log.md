@@ -942,3 +942,86 @@ kill_all 半已随 12e4d91 完成（finish_terminal 含 mcp release），行与�
 
 - F-U2-17（测试模块拆分）：设计/人工项，排期 U4 后 simplify。
 - F-U2-13 的残余：外部 SIGTERM 落在请求窗口内仍会归因模糊——已按 §12-#5 决策接受并文档化。
+
+---
+
+## 14. 本地验收发现 · daemon 视图字段 mock 漂移（真实派发恒报「无未完成可执行成员」）
+
+- **日期**：2026-10-18
+- **发现方式**：本地验收（真实 daemon + desktop UI 派发 TICKET-0001），预检 fail-fast 报「无未完成可执行成员」。
+- **根因**：executor.rs 对 daemon `node/get` / `run/get` 响应的字段读取与 `crates/omt-runtime/src/views.rs` 真实序列化不一致，且**单测 mock 抄了同一个错误形状**（`kind`/`id`/`executorSessionId`），mock 与实现同源漂移——全部质量门绿灯，真实 daemon 一接入即现形。
+
+#### F-ACC-1 · P0 · mock-drift · `executor.rs:1003` · 成员收集读 `node["kind"]`
+daemon `node_view` 序列化为 `type`（views.rs:18/30）。`kind` 恒空 → 任何节点派发成员恒为 0 → 预检直接报错。**验收报错的直接原因。**
+- **状态**：fixed（改读 `node["type"]`；`dispatch_node_get` 夹具重写为真实形状，含 `archived`；新增 `collect_members_walks_subtree_in_daemon_view_shape` 契约测试：epic→story→ticket 子树遍历 + done/archived 过滤 + 回边防环）
+
+#### F-ACC-2 · P0 · mock-drift · `executor.rs:1017` · 子树遍历读 `child["id"]`
+daemon `node_summary` 序列化为 `nodeId`。即使修了 F-ACC-1，epic/story 派发也看不到子节点（子树遍历断链），只有直接派发 ticket 可用。
+- **状态**：fixed（改读 `child["nodeId"]`，由 F-ACC-1 的契约测试同覆盖）
+
+#### F-ACC-4 · P0 · mock-drift · `executor.rs:1087` · run/create 后读 `resp["id"]`
+daemon `run/create` 返回 `run_view_full`（`{"run": {"runId": ...}, "items": [...]}`，dispatch.rs run_create 尾部），run id 在 `run.runId` 而非顶层 `id`。`unwrap_or_default` 吞掉缺失 → 空 runId → 后续 `run/get` 报 `unknown run: (NOT_FOUND)`（空 id，截图实锤）。**第二轮验收报错的直接原因。**
+- **状态**：fixed（改读 `resp["run"]["runId"]`，缺失时显式报错「run/create 响应缺少 run.runId」而非静默置空；FakeDaemon 的 run/create mock 镜像 run_view_full 形状，`dispatch_success_builds_exec_start_outcome` 的 `outcome.run_id` 断言即守卫）
+
+#### F-ACC-3 · P1 · mock-drift · `executor.rs:1307` · 终态释放读 `item["executorSessionId"]`
+daemon `run_item_view` 序列化为 `executorActor`（views.rs:130）。恒空 → `release_lease_on_terminal` 匹配不到任何持有项，exec 终止（kill/退出）后 daemon 侧 run item 卡 running。
+- **状态**：fixed（解析提取为纯函数 `held_running_nodes`，新增 `held_running_nodes_matches_executor_actor_suffix` 契约测试：后缀匹配 + 非 running 排除）
+
+### 验证
+
+- 真实 daemon `show TICKET-0001 --json` 复核键名：`nodeId/type/status/archived` 与修复后读取一致；TICKET-0001（open、未归档）现可被正常收集。
+- desktop Rust：89 passed（+2 守卫）；`cargo fmt --check` exit 0；clippy `--all-targets -D warnings` 通过。
+- 注：本轮全量跑曾现 2 例并行负载 flake（harness probe / lease 释放），单测与整体重跑均绿——与 §12 记录的 CI 负载敏感性同类。
+
+#### F-ACC-5 · P1 · ui-bug · `TranscriptView.tsx` · 虚拟化行高被多行文本撑破 → 绝对定位行互相叠印
+验收截图：transcript 区红字（stderr）压蓝字（prompt）、规则文本多份叠影。机制：行是 22px 固定高 + 绝对定位，`white-space: pre` 下 `\r` 渲染为换行、session_start 行内联完整 DISPATCH_PROMPT（argv 内嵌 `\n`）——任一行实际高度超 22px 即盖住后续行（DOM 靠后者叠上）。ANSI 转义（`[91m`）与裸 ESC 同时被字面渲染。
+- **状态**：fixed（渲染层新增 `flattenEvents` 纯函数：事件→单条 22px 渲染行，多行拆行、`\r\n`/`\n`/`\r` 切分、`stripAnsi` 剥 CSI/OSC 与控制符；虚拟化改按行切片。前端 101 passed（+4 守卫），build 过）
+
+#### F-ACC-6 · P0 · provider-bug · `harness.rs`/`executor.rs` · opencode 位置参数 lstat → ENAMETOOLONG 启动即炸
+验收 exec-1667 exit 1（"Unexpected error"）：raw.log 实锤 `ENAMETOOLONG: name too long, lstat '…/apps/desktop/You are executing tickets…'`——opencode 对位置参数 lstat 判文件附件，多行长 prompt 被当路径。
+- **状态**：fixed（REGISTRY 新增 `PromptChannel`：opencode=FileAttach（prompt 落 `<runtime>/transcripts/<home>/<exec>.prompt.md`，argv 只留 `-f <path>` + 短指令）、omp=Argv 不变。路径先定（compose/Agent 记录共用），写盘在 ⑦ MCP prepare 后、spawn 前，失败走补偿表。Rust 90 passed，dispatch_success 断言 prompt 文件存在且含 run id）
+
+#### F-ACC-7 · P0 · provider-bug · `harness.rs` · argv 缺 `run` 子命令 → opencode 打印帮助退出 1
+验收截图（第三轮）：transcript 输出整屏 opencode banner+help 后 exit 1。根因：`--auto`/`-f` 均为 `opencode run` 子命令的 flag，compose 出的 argv 没有 `run` 前缀，根命令不识别 → 打印帮助退出（已本机复现：`opencode --auto -f /tmp/x "msg"` → banner+help）。F-ACC-6 只修了参数长度，命令形态本身一直是错的——单测用假脚本不校验 argv 语义，三轮才现形。
+- **状态**：fixed（HarnessDescriptor 新增 `argv_prefix`：opencode=`["run"]`、omp=`[]`；compose 契约更新为 `[argv_prefix..., extra_args..., unattended_flag, prompt位]`。Rust 90 passed，compose 测试断言 `run` 前缀在首位）
+
+#### F-ACC-8 · P0 · provider-bug · `harness.rs` · yargs 数组 flag 贪心吞噬：`-f <file> <msg>` 的 msg 被当第二个文件
+验收第四轮：`Error: File not found: Execute the task in the attached file.…`。根因：opencode（yargs）的 `-f` 是数组型 flag，会吞掉其后所有位置参数——F-ACC-6 修出的 argv 形态 `-f <file> <message>` 里 message 被归入文件列表，按路径检查报 File not found。本机双盲测复现：`run -f /real "msg"` → `File not found: msg`；`run "msg" -f /nope` → `File not found: /nope`（顺序正确）。
+- **状态**：fixed（FileAttach 分支顺序改为 message 在前：`[run, --auto, ATTACH_MESSAGE, -f, <file>]`；终态 argv 形态已用真实 opencode 无副作用验证（指向不存在文件确认解析分离）。Rust 90 passed）
+
+#### F-ACC-9 · P0 · wire-protocol · `omt-runtime/src/mcp.rs` · MCP stdio 用了 LSP 的 Content-Length 分帧，真实客户端全灭
+验收第五轮：模型诚实报告「toolset has no such MCP tool」（prompt 规则 5 的拒止纪律反而验证了注入失败被如实暴露）。链路定位：spawn env 注入正确（`OPENCODE_CONFIG_CONTENT` 已应用、`build · glm-5.2` 证明用户配置生效）→ 直接探 server：`omt mcp` 对标准换行 JSON 的 initialize **零响应**。根因：`read_frame`/`write_frame` 实现的是 LSP 风格 `Content-Length` 分帧，而 **MCP stdio 规范是换行分隔 JSON**（每行一条）——opencode/omp 的 SDK 客户端按规范发换行 JSON，server 永远等不到 Content-Length 头 → initialize 超时 → opencode 静默丢弃 omt server。`mcp_spec.rs` 的测试客户端抄了同一套错误分帧，测试与服务端自洽全绿——F-ACC-1/4 的「测试镜像实现而非规范」第三次现身。
+- **状态**：fixed（`read_frame` 改逐行读、`write_frame` 改 `writeln!`+flush；`mcp_spec.rs` harness 改镜像 MCP 规范的换行分帧并注释封堵回归。真实握手探针通过（initialize 返回完整 capabilities/serverInfo），workspace 257 passed 0 failed，`target/debug/omt` sidecar 已重建——每次派发现起进程，无需重启 tauri:dev）
+
+#### F-ACC-10 · P0 · mcp-surface · `omt-runtime/src/mcp.rs` · tools/list 发布空 inputSchema，模型无从传参
+验收第六轮：`run__claim` 被拒两次 `INVALID_INPUT: runId: must be a string`——模型声明「tool 暴露的 properties: {}，无法传 runId」。根因：`tool_descriptors` 硬编码 `{type: object, additionalProperties: true}`，没有投影参数契约；daemon 侧校验真实存在，模型侧却拿不到形状。
+- **状态**：fixed（inputSchema 从 `schema/commands.schema.json` `$defs` 投影：显式 action→ParamsDef 映射表 + `include_str!` 编译期内嵌 + 跨文件 `$ref`（common.schema.json）递归内联（SDK 客户端解不了跨文件 $ref）；description 优先取 schema 里的 `Method …` 说明。单元测试 ×2（映射完整性 + run__claim required/内联）+ mcp_spec 扩展断言。实探 tools/list：18 工具全部非空 properties，run__claim required=[homeId,runId]）
+
+#### F-ACC-11 · P2 · open · `omt-runtime/tests/election_race.rs` · election 竞争测试 ~20% 概率双存活
+验收期间全量门偶发：`exactly one daemon must survive` 断言 left=2（5 次单跑 1 败；单线程亦偶发）。与本分支改动无关（election 路径未动，带改动的全量此前连绿两轮）。**open**：需判别是测试时序敏感还是 election 真实缺陷（输家未退），排期独立分析。
+
+#### F-ACC-12 · P0 · provider-bug · `harness.rs` · omp 缺无头 flag + 放行 flag 记错
+验收第七轮（opencode 已全链路闭环）：omp 派发后无输出且尾部出现终端能力查询序列（`>[<u[>4;0m`）——根因 ①：omp 不加 `-p/--print` 会起 TUI，向无终端的管道发 Kitty 键盘协议等查询后挂起；根因 ②：registry 记的裸 `--yolo` 在 omp v18.0.9 不存在，真实放行 flag 是 `--approval-mode=yolo`（always-ask|write|yolo）——即 F-U1-4 悬置的实测回填项。
+- **状态**：fixed（REGISTRY 新增 `headless_flags`（omp=`["-p"]`、opencode 空——`run` 子命令本身一次性）；omp `unattended_flag` 改 `["--approval-mode=yolo"]`；compose 契约 `[argv_prefix, headless_flags, extra_args, unattended_flag, payload位]`。本机实测 `omp -p --approval-mode=yolo --no-session` 正确进入无头模式，仅报未登录（环境前提：需先 omp 内 /login 或配 API key env）。Rust 90 passed，clippy/fmt 干净）
+
+#### F-ACC-13 · P1 · feature · `harness.rs`/`HarnessManagerTab.tsx` · 订阅/OAuth 登录无入口
+验收第八轮：omp 报 `No API key found for kimi-code`——订阅类认证无法在无头派发进程内完成，用户只能手工开终端。API key 类已可经设置页 Env 配置；订阅/OAuth 缺 UI 入口。
+- **状态**：fixed（设置页 Harnesses 详情新增「终端登录」按钮：`harness_open_login` 命令经 osascript 在 Terminal.app 新窗口运行 harness 的交互登录命令——registry 新增 `login_args`（omp 裸跑 TUI /login、opencode `auth login`）；登录 binary 解析不要求 enabled（先登录后启用）；两级转义纯函数（shell 单引号 + AppleScript 字面量）带敌意路径测试；凭据落 harness 自身全局存储，OMT 不经手。Rust 92 passed（+2）、前端 103 passed（+2）、build 过）
+
+#### F-ACC-14 · P2 · feature · 执行弹窗 · 派发前可选模型
+验收反馈：派发选 provider 后希望能拉出模型列表、选定后再执行。两家 `models` 命令均零成本可解析（opencode 纯 `provider/model` 行；omp 分组表格）。
+- **状态**：done（`harness_list_models` 命令：`<binary> models` 超时捕获 + per-provider 纯函数解析（真实输出 fixture 钉测试）；registry `model_args`（两家 `--model`）+ compose 注入位序 `[prefix, headless, extra_args, unattended, model, payload]`；`validate_model_id` 拒 argv 注入形状（空白/换行/`-` 开头/超长）。弹窗：模型下拉（分组 optgroup，「默认（不指定）」置顶），拉取失败降级隐藏不阻断派发；选择为 per-dispatch（持久默认走设置页 extraArgs `--model xxx`）。Rust 95 passed（+3）、前端 105 passed（+2）、build 过）
+
+### 验收结论（2026-10-18 收口）
+
+**omp 与 opencode 双 harness 冒烟通过**——派发 → run 创建/复用 → harness 无头启动 → MCP 注入（omt 工具全参数 schema）→ `run__claim` 认领 → 执行 → `run__report` → run 状态流转 completed 全链路闭环（opencode：RUN-0003/RUN-0008 双轮验证；omp：登录后通过）。期间暴露并修复 14 项（F-ACC-1~14），三类系统性教训已沉淀：daemon 视图字段/线协议/CLI argv 三处的「测试镜像实现而非镜像规范」、provider 适配必须实测定稿（headless flag/放行 flag/prompt 渠道/模型面）、真实对端接入是唯一可靠的暴露手段。附带产出：终端登录入口（订阅/OAuth）、模型下拉、transcript 行高不变量与 ANSI 处理。P1 待办不变（U10/11/12/14/16、U15 余项）。
+
+### 残留状态核查（第二轮验收后）
+
+失败尝试在 daemon 侧已成功创建 RUN-0001（pending，持有 TICKET-0001，无执行器），EPIC-0001/TICKET-0001 被 node/execute 标为 in_progress。重试无需清理：ensure-run 复用路径按 pending → start 正常接管（已实测 run-get 确认）。
+
+### 教训（制度化建议）
+
+**凡 mock 对端（daemon 响应形状 / MCP 测试客户端 / 任何协议测试替身），必须从规范或真实对端反推，不得从自己的实现反推**——本日志同类问题三次：F-ACC-1/4（字段名 mock 漂移）、F-ACC-9（分帧协议漂移）。真实对端接入（本地验收）是唯一能稳定暴露这类自洽错误的手段，应尽早纳入每个 provider 的 U 单元出口。
+
+**凡 mock daemon 响应形状，必须从 `views.rs` 序列化反推，不得从实现代码的读取端反推**——读取端错则 mock 跟着错，测试形同虚设。两个新契约测试把形状钉死在测试体里，后续字段变更会先红在这里。
