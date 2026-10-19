@@ -1142,6 +1142,15 @@ daemon `run_item_view` 序列化为 `executorActor`（views.rs:130）。恒空 �
 Agent 28 验收失败（3s exit 0 但零输出零工具）：`exposure: direct` 把工具 schema 原样送进 kimi-coding API 请求 → `400: tools.function.parameters is not a valid moonshot flavored json schema — At path 'properties.filter.$ref': $defs not found for reference: #/$defs/NodeFilter`。根因：F-ACC-10 的内联只处理**跨文件**引用（common.schema.json），同文件 `$defs` 引用原样保留——codemode 模式 schema 不进请求所以无恙，direct 模式即炸。
 - **修复**：`resolve_refs_in` 多定义源递归（common + commands 文档自身，按序查 `/$defs/{name}`）+ 引用环守卫（展开链同名即停）。新增回归：全工具序列化后**零 `$ref`/零 `$defs`** + node__list 的 filter（原 NodeFilter 引用点）为内联对象。实探 tools/list：18 工具零残留。workspace 283 passed。
 
+### §21. 效率优化收官验证（2026-10-19）
+
+**pi / omp / opencode 三家 hello 冒烟均以 3 次工具调用完成**（claim → 执行 → report；无探索轮、无 homeId 挖掘）。对照基线 Agent 26：15 轮思考、158s、16.8k tokens——优化链生效：
+1. F-PROMPT-1：prompt 带 homeId + per-harness 调用提示（三家通吃）
+2. F-EXPOSE-1：pi 注入 `exposure: direct`（工具直接声明进模型工具表，根因消灭发现开销）
+3. F-EXPOSE-2：schema 全量内联（direct 模式兼容严格校验器——moonshot 400 修复）
+
+opencode 本就无发现开销（工具直声明），homeId 修复后同样 3 调用；omp 无 exposure 体系，靠 tool_hint 达成同效。**三家的冒烟成本从此一致且接近理论上限**。
+
 ### 残留状态核查（第二轮验收后）
 
 失败尝试在 daemon 侧已成功创建 RUN-0001（pending，持有 TICKET-0001，无执行器），EPIC-0001/TICKET-0001 被 node/execute 标为 in_progress。重试无需清理：ensure-run 复用路径按 pending → start 正常接管（已实测 run-get 确认）。
