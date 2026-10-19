@@ -19,6 +19,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import type { TranscriptEvent } from './bridge'
 import type { AgentRecord } from './types'
 import { agentDisplayName, ConfirmStopButton } from './agentUi'
+import { MarkdownText } from './MarkdownText'
 
 export const ROW_HEIGHT_PX = 22
 export const OVERSCAN_ROWS = 10
@@ -143,6 +144,153 @@ export function flattenEvents(events: TranscriptEvent[]): TranscriptLine[] {
   return lines
 }
 
+/** 普通视图的消息分组（U-VIEW）：统一事件 → 聊天式消息块。
+ * tool_call 与其后的 tool_result 配对一个条目；thinking 块独立可折叠；
+ * start/exit 保持单行。纯函数供测试。 */
+export type MessageGroup =
+  | { kind: 'start'; text: string }
+  | { kind: 'exit'; text: string; failed: boolean }
+  | { kind: 'thinking'; text: string }
+  | { kind: 'text'; text: string }
+  | { kind: 'tool'; name: string; input: string; summary: string; isError: boolean; pendingResult?: boolean }
+  | { kind: 'error'; text: string }
+  | { kind: 'raw'; stream: string; text: string }
+
+
+/** 普通视图的轮次结构（U-VIEW2，对齐 dsh Turn 语义）：一轮 = 一段过程
+ *（思考/工具/原始输出）+ 轮末回答（assistant_text）+ 可选用量。完成的轮
+ * 折叠为摘要头（已思考 · N 次工具调用 · 用时——数据有就显示）；运行中
+ * 轮平铺。session_start/exit 是轮外的顶层分隔行。纯函数供测试。 */
+export interface Turn {
+  /** 轮内过程与回答条目（MessageGroup 同构，含 text 终答） */
+  entries: MessageGroup[]
+  /** 过程行计数（thinking + tool） */
+  thinkingCount: number
+  toolCount: number
+  /** 首尾事件 ts 差（毫秒；事件缺 ts 时为 null——有就显示没有就空着） */
+  durationMs: number | null
+  /** 轮末用量（事件携带时） */
+  usage: { tokens?: number | null; cost?: number | null } | null
+  /** 已收到 assistant_text（轮完成）——之后的事件开新轮 */
+  answered: boolean
+}
+
+export function groupTurns(events: TranscriptEvent[]): Turn[] {
+  const turns: Turn[] = []
+  let current: Turn = { entries: [], thinkingCount: 0, toolCount: 0, durationMs: null, usage: null, answered: false }
+  let firstTs: number | null = null
+  let lastTs: number | null = null
+  // raw JSON 行收纳（轮内聚合，折叠展示）
+  let rawBucket: MessageGroup[] = []
+  const sealTurn = () => {
+    if (current.entries.length === 0 && rawBucket.length === 0) {
+      return // 空轮不产出
+    }
+    current.entries.push(...rawBucket)
+    current.durationMs =
+      firstTs !== null && lastTs !== null && lastTs >= firstTs ? lastTs - firstTs : null
+    turns.push(current)
+    current = { entries: [], thinkingCount: 0, toolCount: 0, durationMs: null, usage: null, answered: false }
+    firstTs = null
+    lastTs = null
+    rawBucket = []
+  }
+  for (const event of events) {
+    // 已答轮的延后封口（dsh 时序：usage 在回答之后到达，须归入本轮）——
+    // 新过程/新回答事件才真正开新轮。先于 ts 记账：新轮首事件的时间戳
+    // 不得污染上一轮时长。
+    if (
+      current.answered &&
+      (event.kind === 'assistant_thinking' ||
+        event.kind === 'tool_call' ||
+        (event.kind === 'assistant_text' && current.entries.some(e => e.kind === 'text')))
+    ) {
+      sealTurn()
+    }
+    const ts = Number(event.ts)
+    if (Number.isFinite(ts) && ts > 0) {
+      if (firstTs === null) firstTs = ts
+      lastTs = ts
+    }
+    // start/exit 是顶层分隔：封当前轮后单独成块（不进 Turn）
+    if (event.kind === 'session_start' || event.kind === 'exit') {
+      sealTurn()
+      current.entries.push(
+        event.kind === 'session_start'
+          ? { kind: 'start', text: `▶ ${event.program} ${event.args.join(' ')} · pid ${event.pid}` }
+          : {
+              kind: 'exit',
+              text: `■ ${event.status}${event.code !== null ? ` · code ${event.code}` : ''}${event.killReason ? ` · ${event.killReason}` : ''} · ${(event.durationMs / 1000).toFixed(1)}s`,
+              failed: event.status === 'failed',
+            },
+      )
+      current.answered = true // 分隔块独立成「轮」展示（不折叠）
+      sealTurn()
+      continue
+    }
+    switch (event.kind) {
+      case 'assistant_text':
+        current.entries.push({ kind: 'text', text: event.text })
+        current.answered = true
+        break
+      case 'assistant_thinking':
+        current.thinkingCount += 1
+        current.entries.push({ kind: 'thinking', text: event.text })
+        break
+      case 'tool_call': {
+        current.toolCount += 1
+        const input = JSON.stringify(event.input ?? {})
+        current.entries.push({
+          kind: 'tool',
+          name: event.name,
+          input,
+          summary: '',
+          isError: false,
+          pendingResult: true,
+        })
+        break
+      }
+      case 'tool_result': {
+        // 配对到本轮最后一个待结果工具；配不上则独立 raw 呈现
+        const pending = [...current.entries].reverse().find(
+          g => g.kind === 'tool' && g.pendingResult,
+        ) as { kind: 'tool'; pendingResult?: boolean } | undefined
+        if (pending) {
+          const tool = pending as Extract<MessageGroup, { kind: 'tool' }>
+          tool.summary = event.summary
+          tool.isError = event.isError
+          tool.pendingResult = false
+        } else {
+          rawBucket.push({ kind: 'raw', stream: 'stdout', text: `↳ ${event.summary}` })
+        }
+        break
+      }
+      case 'usage':
+        current.usage = { tokens: event.tokens ?? null, cost: event.cost ?? null }
+        break
+      case 'error':
+        current.entries.push({ kind: 'error', text: `⚠ ${event.message}` })
+        break
+      default: {
+        // raw 行：JSON 形状（旧数据/未解析流）收进折叠桶；纯文本正常显示
+        const line = (event as { text: string }).text ?? ''
+        if (line.trimStart().startsWith('{')) {
+          rawBucket.push({ kind: 'raw', stream: 'stdout', text: line })
+        } else {
+          current.entries.push({
+            kind: 'raw',
+            stream: (event as { stream: string }).stream ?? 'stdout',
+            text: line,
+          })
+        }
+        break
+      }
+    }
+  }
+  sealTurn()
+  return turns
+}
+
 interface Props {
   agent: AgentRecord | null
   events: TranscriptEvent[]
@@ -167,6 +315,8 @@ export function TranscriptView({
   const [follow, setFollow] = useState(true)
   const [unseen, setUnseen] = useState(0)
   const [range, setRange] = useState({ start: 0, end: 0 })
+  /** U-VIEW：普通（消息分组）/ Raw（行式）双视图；默认普通 */
+  const [viewMode, setViewMode] = useState<'normal' | 'raw'>('normal')
   const followRef = useRef(true)
   const lastSeenRef = useRef(0)
   // idle 求值用的时钟 tick：事件静默时不发生重渲染，Date.now() 只在渲染期
@@ -195,8 +345,9 @@ export function TranscriptView({
       setUnseen(lines.length - lastSeenRef.current)
     }
     if (el) setRange(visibleRange(el.scrollTop, el.clientHeight, lines.length))
+    // viewMode 参与：切回 Raw 时 range 需重算（否则初始 {0,0} 切片为空）
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [events, events.length])
+  }, [events, events.length, viewMode])
 
   const handleScroll = () => {
     const el = scrollRef.current
@@ -236,6 +387,20 @@ export function TranscriptView({
       <div className="t-header">
         <span className="agent-name">{agentDisplayName(agent)}</span>
         <span className={`chip agent-status st-${agent.status}`}>{agent.status}</span>
+        <button
+          className={`chip${viewMode === 'normal' ? ' active' : ''}`}
+          title="按消息类型分组呈现（思考/工具块折叠，对齐 dsh 交互）"
+          onClick={() => setViewMode('normal')}
+        >
+          普通
+        </button>
+        <button
+          className={`chip${viewMode === 'raw' ? ' active' : ''}`}
+          title="原始行式视图（逐行，含未解析输出）"
+          onClick={() => setViewMode('raw')}
+        >
+          Raw
+        </button>
         <span className="row-spacer" />
         {!live && onResumeAgent && (
           <button
@@ -258,6 +423,8 @@ export function TranscriptView({
             ? '尚无输出——等待 agent 产生事件…'
             : '该执行已结束，无输出记录（历史尾部已尝试回载）'}
         </p>
+      ) : viewMode === 'normal' ? (
+        <NormalTranscriptView events={events} live={live} />
       ) : (
         <div className="t-scroll-wrap">
           <div className="t-scroll" ref={scrollRef} onScroll={handleScroll}>
@@ -287,6 +454,147 @@ export function TranscriptView({
       )}
     </div>
   )
+}
+
+/** 普通视图（U-VIEW）：消息分组呈现。不做行级虚拟化——尾窗事件有界
+ *（2000 条），分组后 DOM 规模可控；折叠交互对齐 dsh（thinking 与工具
+ * 执行默认折叠、点击展开）。 */
+function NormalTranscriptView({ events, live }: { events: TranscriptEvent[]; live: boolean }) {
+  const turns = useMemo(() => groupTurns(events), [events])
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({})
+  const scrollRef = useRef<HTMLDivElement | null>(null)
+  const stickRef = useRef(true)
+  useEffect(() => {
+    const el = scrollRef.current
+    if (el && stickRef.current) el.scrollTop = el.scrollHeight
+  }, [turns])
+  return (
+    <div className="t-scroll-wrap">
+      <div
+        className="t-scroll normal-scroll"
+        ref={scrollRef}
+        onScroll={() => {
+          const el = scrollRef.current
+          if (!el) return
+          stickRef.current = shouldFollow(el.scrollTop, el.scrollHeight, el.clientHeight)
+        }}
+      >
+        <div className="msg-list">
+          {turns.map((turn, i) => {
+            const first = turn.entries[0]
+            const isSeparator =
+              turn.entries.length === 1 && (first.kind === 'start' || first.kind === 'exit')
+            if (isSeparator) {
+              const entry = first as Extract<MessageGroup, { kind: 'start' | 'exit' }>
+              return entry.kind === 'start' ? (
+                <div key={i} className="msg-row msg-start">{entry.text}</div>
+              ) : (
+                <div key={i} className={`msg-row msg-exit${entry.failed ? ' msg-failed' : ''}`}>
+                  {entry.failed ? '❎' : '✅'} {entry.text}
+                </div>
+              )
+            }
+            const textEntries = turn.entries.filter(e => e.kind === 'text')
+            const open = expanded[String(i)] === true
+            const running = live && !turn.answered && i === turns.length - 1
+            return (
+              <div key={i} className="msg-turn">
+                {/* 轮头：完成轮折叠过程行（dsh Turn 语义）；运行中平铺 */}
+                {turn.answered ? (
+                  <button className="msg-fold turn-head" onClick={() => setExpanded(s => ({ ...s, [String(i)]: !open }))} aria-expanded={open}>
+                    {turn.thinkingCount > 0 ? '思考 · ' : ''}
+                    {turn.toolCount > 0 ? `${turn.toolCount} 次工具调用` : ''}
+                    {turn.thinkingCount === 0 && turn.toolCount === 0 ? '处理' : ''}
+                    {turn.durationMs != null ? ` · ${(turn.durationMs / 1000).toFixed(1)}s` : ''}
+                    {open ? ' ▾' : ' ▸'}
+                  </button>
+                ) : null}
+                {(open || running || !turn.answered) && turn.entries.some(e => e.kind !== 'text') ? (
+                  <div className="turn-detail">
+                    {turn.entries.map((group, j) => {
+                      const entryOpen = expanded[`${i}-${j}`] === true
+                      const toggle = () => setExpanded(s => ({ ...s, [`${i}-${j}`]: !entryOpen }))
+                      switch (group.kind) {
+                        case 'thinking':
+                          return (
+                            <div key={j} className="msg-row msg-thinking">
+                              <button className="msg-fold" onClick={toggle} aria-expanded={entryOpen}>
+                                思考 {entryOpen ? '▾' : '▸'}
+                              </button>
+                              {entryOpen ? (
+                                <pre className="msg-body">{group.text}</pre>
+                              ) : (
+                                <span className="msg-summary">{firstLine(group.text)}</span>
+                              )}
+                            </div>
+                          )
+                        case 'tool':
+                          return (
+                            <div key={j} className={`msg-row msg-tool${group.isError ? ' msg-tool-error' : ''}`}>
+                              <button className="msg-fold" onClick={toggle} aria-expanded={entryOpen}>
+                                ⚙ {group.name}{group.summary ? ` · ${firstLine(group.summary)}` : group.pendingResult ? ' · …' : ''} {entryOpen ? '▾' : '▸'}
+                              </button>
+                              {entryOpen ? (
+                                <>
+                                  <pre className="msg-body">{prettyJson(group.input)}</pre>
+                                  {group.summary ? (
+                                    <pre className={`msg-body${group.isError ? ' msg-body-error' : ''}`}>{group.summary}</pre>
+                                  ) : null}
+                                </>
+                              ) : null}
+                            </div>
+                          )
+                        case 'error':
+                          return <div key={j} className="msg-row msg-error">{group.text}</div>
+                        case 'raw':
+                          return (
+                            <div key={j} className={`msg-row${group.stream === 'stderr' ? ' msg-stderr' : ''}`}>
+                              {group.text}
+                            </div>
+                          )
+                        default:
+                          return null
+                      }
+                    })}
+                  </div>
+                ) : null}
+                {/* 轮末回答：markdown 正文 */}
+                {textEntries.map((group, j) =>
+                  group.kind === 'text' ? (
+                    <div key={`t${j}`} className="msg-row msg-text">
+                      <MarkdownText text={group.text} />
+                    </div>
+                  ) : null,
+                )}
+                {/* 本轮用量（数据有就显示） */}
+                {turn.usage ? (
+                  <div className="msg-row msg-usage">
+                    本轮用量
+                    {turn.usage.tokens != null ? ` · ${turn.usage.tokens.toLocaleString()} tok` : ''}
+                    {turn.usage.cost != null ? ` · $${turn.usage.cost.toFixed(4)}` : ''}
+                  </div>
+                ) : null}
+              </div>
+            )
+          })}
+          {live && <div className="msg-row msg-running">● 运行中…</div>}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function prettyJson(input: string): string {
+  try {
+    return JSON.stringify(JSON.parse(input), null, 2)
+  } catch {
+    return input
+  }
+}
+
+function firstLine(text: string): string {
+  const line = text.split('\n')[0] ?? ''
+  return line.length > 80 ? `${line.slice(0, 80)}…` : line
 }
 
 function TranscriptRow({ line, top }: { line: TranscriptLine; top: number }) {

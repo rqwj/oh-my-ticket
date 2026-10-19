@@ -465,6 +465,48 @@ body {
 .trust-gate-popup-row { display: flex; align-items: center; gap: 8px; }
 .trust-gate-popup-title-text { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+/* U-VIEW2：普通视图（轮次结构，对齐 dsh Turn） */
+.msg-turn { display: flex; flex-direction: column; gap: 4px; padding: 6px 0; }
+.turn-head {
+  background: none; border: none; cursor: pointer; font: inherit;
+  color: var(--muted); font-size: 11px; text-align: left; padding: 0;
+  width: 100%;
+}
+.turn-head:hover { color: var(--fg, #e6edf3); }
+.turn-detail { display: flex; flex-direction: column; gap: 4px; }
+.msg-text { font-family: -apple-system, 'Segoe UI', sans-serif; font-size: 13px; line-height: 1.6; }
+.msg-text .md-code { background: rgba(110, 118, 129, 0.2); border-radius: 3px; padding: 1px 4px; }
+
+/* U-VIEW：普通视图（消息分组，旧结构保留色板） */
+.normal-scroll { padding: 4px 0; }
+.msg-list { display: flex; flex-direction: column; gap: 6px; padding: 0 8px 8px; }
+.msg-row {
+  font-family: ui-monospace, monospace; font-size: 12px; line-height: 1.5;
+  border-left: 2px solid var(--border); padding: 2px 8px;
+}
+.msg-start { color: var(--accent); border-left-color: var(--accent); }
+.msg-exit { color: var(--muted); border-left-color: var(--border); }
+.msg-exit.msg-failed { color: var(--danger); border-left-color: var(--danger); }
+.msg-thinking { color: var(--muted); border-left-color: #8b949e; }
+.msg-text { border-left-color: var(--accent); }
+.msg-tool { border-left-color: #79c0ff; }
+.msg-tool.msg-tool-error { border-left-color: var(--danger); }
+.msg-usage { color: #56d364; border-left-color: #56d364; font-size: 11px; }
+.msg-error { color: var(--danger); border-left-color: var(--danger); }
+.msg-stderr { color: #ffa198; }
+.msg-running { color: #56d364; animation: pulse 1.5s infinite; }
+@keyframes pulse { 50% { opacity: 0.4; } }
+.msg-fold {
+  background: none; border: none; color: inherit; cursor: pointer;
+  font: inherit; padding: 0; text-align: left; width: 100%;
+}
+.msg-summary { color: var(--muted); display: block; white-space: pre-wrap; }
+.msg-body {
+  margin: 4px 0 0; white-space: pre-wrap; word-break: break-word;
+  font-family: inherit; font-size: 11px; color: var(--fg, #e6edf3);
+}
+.msg-body-error { color: var(--danger); }
+
 /* U14：信任门（awaiting_confirmation）单元格与流尾提示 */
 .trust-gate-cell { display: inline-flex; align-items: center; gap: 6px; }
 .chip.trust-gate { color: #d29922; border-color: #d29922; }

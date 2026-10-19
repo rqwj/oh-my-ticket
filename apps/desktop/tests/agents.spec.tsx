@@ -525,6 +525,7 @@ describe('U5 TranscriptView 自动跟随', () => {
     const events0 = Array.from({ length: 50 }, (_, i) => raw('exec-a', i, `line-${i}`))
     const agent = makeAgent('agent-a', 'exec-a')
     const { rerender } = render(<TranscriptView agent={agent} events={events0} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Raw' }))
     const scrollEl = document.querySelector('.t-scroll') as HTMLElement
     expect(scrollEl).toBeTruthy()
     // jsdom 无布局：覆写该实例的滚动度量（getter/setter 捕获赋值）
@@ -631,6 +632,62 @@ describe('U5 TranscriptView 自动跟随', () => {
     expect(dialog.textContent).toContain('T-EXT')
   })
 
+  it('U-VIEW groupTurns：轮次边界/摘要计数/用量挂轮尾/raw JSON 收纳', async () => {
+    const { groupTurns } = await import('../src/TranscriptView')
+    const base = { execId: 'e', ts: '1000' }
+    const turns = groupTurns([
+      { ...base, seq: 1, ts: '1000', kind: 'assistant_thinking' as const, text: 'plan' },
+      { ...base, seq: 2, ts: '1500', kind: 'tool_call' as const, name: 'bash', input: { command: 'echo hi' } },
+      { ...base, seq: 3, ts: '2000', kind: 'tool_result' as const, summary: 'hi', isError: false },
+      { ...base, seq: 4, ts: '2500', kind: 'assistant_text' as const, text: 'answer-1' },
+      { ...base, seq: 5, ts: '3000', kind: 'usage' as const, tokens: 100, cost: 0.01 },
+      { ...base, seq: 6, ts: '3500', kind: 'assistant_text' as const, text: 'answer-2' },
+    ])
+    // 轮边界：answer-1 结束第一轮（usage 归第一轮），answer-2 独立一轮
+    expect(turns.length).toBe(2)
+    expect(turns[0].thinkingCount).toBe(1)
+    expect(turns[0].toolCount).toBe(1)
+    expect(turns[0].durationMs).toBe(2000) // 1000 → 3000（usage 在回答后到达，归本轮）
+    expect(turns[0].usage).toEqual({ tokens: 100, cost: 0.01 })
+    expect(turns[0].answered).toBe(true)
+    // 工具配对
+    const tool = turns[0].entries.find(e => e.kind === 'tool') as { kind: 'string' } as never as { summary: string }
+    expect(tool.summary).toBe('hi')
+    // 第二轮：无过程无用量
+    expect(turns[1].toolCount).toBe(0)
+    expect(turns[1].usage).toBeNull()
+    expect(turns[1].durationMs).toBe(0)
+  })
+
+  it('U-VIEW 普通视图（轮次）：完成轮折叠摘要可展开、markdown 正文、用量轮尾', async () => {
+    const { TranscriptView } = await import('../src/TranscriptView')
+    const agent = makeAgent('agent-t', 'exec-t', { status: 'exited' })
+    const events = [
+      raw('exec-t', 1, '{"type":"legacy_json"}'),
+      { execId: 'exec-t', seq: 2, ts: '2', kind: 'assistant_thinking' as const, text: 'first-line-only\nsecret-thought-detail' },
+      { execId: 'exec-t', seq: 3, ts: '3', kind: 'tool_call' as const, name: 'bash', input: { command: 'echo TOOLPROBE' } },
+      { execId: 'exec-t', seq: 4, ts: '4', kind: 'tool_result' as const, summary: 'TOOLPROBE', isError: false },
+      { execId: 'exec-t', seq: 5, ts: '5', kind: 'assistant_text' as const, text: '**bold answer**' },
+      { execId: 'exec-t', seq: 6, ts: '6', kind: 'usage' as const, tokens: 42, cost: 0.001 },
+      exitEvent('exec-t', 'exited'),
+    ]
+    render(<TranscriptView agent={agent} events={events} />)
+    // 完成轮折叠：思考/工具正文不可见，轮头摘要可见
+    expect(screen.queryByText(/secret-thought-detail/)).toBeNull()
+    expect(screen.getByText(/1 次工具调用/)).toBeTruthy()
+    // markdown 正文渲染（粗体成 strong）
+    expect(screen.getByText('bold answer')).toBeTruthy()
+    // 用量挂轮尾
+    expect(screen.getByText(/本轮用量 · 42 tok/)).toBeTruthy()
+    // 旧 JSON raw 行不直接糊屏（收纳，不在主列表逐行展示）
+    expect(screen.queryByText('{"type":"legacy_json"}')).toBeNull()
+    // 展开轮 → 思考/工具明细出现
+    fireEvent.click(screen.getByRole('button', { name: /1 次工具调用/ }))
+    expect(screen.getByText('first-line-only')).toBeTruthy() // 思考条目折叠摘要可见
+    // 终态分隔行
+    expect(screen.getByText(/■ exited/)).toBeTruthy()
+  })
+
   it('U14：awaitingCount > 0 渲染信任门提示条；0/null 不渲染', async () => {
     const { TranscriptView } = await import('../src/TranscriptView')
     const agent = makeAgent('agent-a9', 'exec-a9', { status: 'exited' })
@@ -649,6 +706,8 @@ describe('U5 TranscriptView 自动跟随', () => {
       exitEvent('exec-a', 'exited'),
     ]
     const { container } = render(<TranscriptView agent={makeAgent('agent-a', 'exec-a', { status: 'exited' })} events={events} />)
+    // 行式断言面在 Raw 视图（默认普通视图不再渲染 .t-row 行）
+    fireEvent.click(screen.getByRole('button', { name: 'Raw' }))
     expect(container.querySelector('.t-start')?.textContent).toContain('pid 4242')
     expect(container.querySelector('.t-stderr')?.textContent).toBe('err-line')
     const stderrCount = container.querySelectorAll('.t-stderr').length
