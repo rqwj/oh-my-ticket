@@ -70,18 +70,22 @@ pub(crate) struct ProjectSpec {
     pub rel: &'static str,
     /// 条目是否带 `"type": "stdio"`（omp 历史形状；pi 形状无此字段）
     entry_type_stdio: bool,
+    /// 注入条目是否带 `exposure: direct`（pi ≥1.0；omp 未同步该体系）
+    expose_direct: bool,
 }
 
 const OMP_SPEC: ProjectSpec = ProjectSpec {
     ns: "omp",
     rel: ".omp/mcp.json",
     entry_type_stdio: true,
+    expose_direct: false,
 };
 
 const PI_SPEC: ProjectSpec = ProjectSpec {
     ns: "pi",
     rel: ".pi/mcp.json",
     entry_type_stdio: false,
+    expose_direct: true,
 };
 
 impl ProjectSpec {
@@ -99,7 +103,7 @@ impl ProjectSpec {
         workspace_root.join(self.rel)
     }
     fn entry(self, launcher: &Path) -> serde_json::Value {
-        if self.entry_type_stdio {
+        let mut entry = if self.entry_type_stdio {
             serde_json::json!({
                 "type": "stdio",
                 "command": launcher.display().to_string(),
@@ -110,7 +114,16 @@ impl ProjectSpec {
                 "command": launcher.display().to_string(),
                 "args": [],
             })
+        };
+        if self.expose_direct {
+            // pi ≥1.0 exposure 体系（实测 1.3.0 确认）：direct = 工具像内置
+            // 工具一样声明给模型——消除 codemode 发现开销（F-EXPOSE）。
+            // description 进系统提示的 mcp_servers 清单。
+            entry["exposure"] = serde_json::json!("direct");
+            entry["description"] =
+                serde_json::json!("OMT ticket run discipline: run__claim / run__report");
         }
+        entry
     }
 }
 
@@ -1311,6 +1324,17 @@ mod tests {
             root["mcpServers"]["omt"].get("type").is_none(),
             "pi 条目不得带 type 字段: {merged}"
         );
+        // F-EXPOSE：pi ≥1.0 的 exposure 体系——direct 声明 + description
+        assert_eq!(
+            root["mcpServers"]["omt"]["exposure"], "direct",
+            "pi 注入条目应带 exposure:direct: {merged}"
+        );
+        assert!(
+            root["mcpServers"]["omt"]["description"]
+                .as_str()
+                .is_some_and(|d| d.contains("run__claim")),
+            "pi 注入条目应带 description: {merged}"
+        );
         assert!(omt_command(&merged).is_some());
         // omp 的文件/目录不受影响
         assert!(!OMP_SPEC.workspace_file(&rig.workspace).exists());
@@ -1329,6 +1353,13 @@ mod tests {
         )
         .expect("omp prepare");
         assert!(OMP_SPEC.workspace_file(&rig.workspace).exists());
+        // F-EXPOSE：omp 未同步 pi 的 exposure 体系——条目不得带该键
+        let omp_merged = std::fs::read_to_string(OMP_SPEC.workspace_file(&rig.workspace)).unwrap();
+        let omp_root: serde_json::Value = serde_json::from_str(&omp_merged).unwrap();
+        assert!(
+            omp_root["mcpServers"]["omt"].get("exposure").is_none(),
+            "omp 条目不应带 exposure: {omp_merged}"
+        );
         let omp_state = std::fs::read_to_string(
             OMP_SPEC
                 .injection_root(&rig.runtime)

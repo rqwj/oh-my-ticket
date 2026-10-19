@@ -254,7 +254,9 @@ pub const REGISTRY: &[HarnessDescriptor] = &[
         model_list_args: &["--list-models"],
         json_args: &["--mode", "json"],
         resume_args: &["--session"],
-        tool_hint: "MCP tools are callable via the codemode tool, e.g. `await tools.mcp__omt__run__claim({homeId, runId})`; use run__list / run__get to inspect, mcp__omt__ prefixed names for all omt tools.",
+        // F-EXPOSE：注入的 omt server 带 exposure:direct（pi ≥1.0）——工具
+        // 已像内置工具一样声明给模型，直接调用即可
+        tool_hint: "The omt tools (run__claim, run__report, ...) are declared directly in your toolset (named mcp__omt__run__claim etc.) — call them directly as tools.",
     },
 ];
 
