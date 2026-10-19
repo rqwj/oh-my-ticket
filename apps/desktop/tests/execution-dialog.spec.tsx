@@ -322,7 +322,7 @@ describe('执行弹窗 Agent 定向派发 (U11)', () => {
     attachment: 'none',
     lastExecId: 'exec-1',
     lastSessionId: 'ses_prev',
-    execs: [],
+    execs: [{ execId: 'exec-1', model: 'kimi-coding/k3' }],
     ...over,
   })
 
@@ -334,6 +334,7 @@ describe('执行弹窗 Agent 定向派发 (U11)', () => {
     await waitFor(() => expect(screen.getByRole('button', { name: '派发' })).toBeTruthy())
     fireEvent.change(screen.getAllByRole('combobox')[0], { target: { value: 'agent:agent-1' } })
     await waitFor(() => expect(screen.getByText(/默认继续 Agent 1 的上次会话/)).toBeTruthy())
+    expect(screen.getByText(/Agent 1（omp·kimi-coding\/k3·续跑）/)).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: '派发' }))
     await waitFor(() =>
       expect(props.startDispatch).toHaveBeenCalledWith(

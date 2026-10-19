@@ -465,47 +465,76 @@ body {
 .trust-gate-popup-row { display: flex; align-items: center; gap: 8px; }
 .trust-gate-popup-title-text { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-/* U-VIEW2：普通视图（轮次结构，对齐 dsh Turn） */
-.msg-turn { display: flex; flex-direction: column; gap: 4px; padding: 6px 0; }
-.turn-head {
-  background: none; border: none; cursor: pointer; font: inherit;
-  color: var(--muted); font-size: 11px; text-align: left; padding: 0;
-  width: 100%;
+/* U-VIEW2：普通视图（轮次结构）——无竖线、icon 前置、颜色区分；
+   轮尾细灰下划线分隔；嵌套展开块用 icon + 左细竖线包裹 */
+.msg-turn {
+  display: flex; flex-direction: column; gap: 4px;
+  padding: 8px 0 6px;
+  border-bottom: 1px solid rgba(110, 118, 129, 0.25); /* 轮间细分隔线 */
 }
-.turn-head:hover { color: var(--fg, #e6edf3); }
-.turn-detail { display: flex; flex-direction: column; gap: 4px; }
-.msg-text { font-family: -apple-system, 'Segoe UI', sans-serif; font-size: 13px; line-height: 1.6; }
-.msg-text .md-code { background: rgba(110, 118, 129, 0.2); border-radius: 3px; padding: 1px 4px; }
-
-/* U-VIEW：普通视图（消息分组，旧结构保留色板） */
-.normal-scroll { padding: 4px 0; }
-.msg-list { display: flex; flex-direction: column; gap: 6px; padding: 0 8px 8px; }
+.msg-turn:last-child { border-bottom: none; }
+.msg-row, .msg-block {
+  font-family: -apple-system, 'Segoe UI', 'PingFang SC', sans-serif;
+  font-size: 13px; line-height: 1.6; padding: 1px 0;
+}
+/* 可折叠块：icon 与文字在同一 inline 基线流（天然底部对齐），
+   摘要/全文另起一行并对齐标题文字起点 */
+.msg-block .msg-fold {
+  display: flex; align-items: baseline; gap: 8px; width: 100%;
+}
+.msg-summary, .msg-body { margin-left: 26px; } /* icon 18 + gap 8 */
 .msg-row {
-  font-family: ui-monospace, monospace; font-size: 12px; line-height: 1.5;
-  border-left: 2px solid var(--border); padding: 2px 8px;
+  display: flex; align-items: baseline; gap: 8px;
 }
-.msg-start { color: var(--accent); border-left-color: var(--accent); }
-.msg-exit { color: var(--muted); border-left-color: var(--border); }
-.msg-exit.msg-failed { color: var(--danger); border-left-color: var(--danger); }
-.msg-thinking { color: var(--muted); border-left-color: #8b949e; }
-.msg-text { border-left-color: var(--accent); }
-.msg-tool { border-left-color: #79c0ff; }
-.msg-tool.msg-tool-error { border-left-color: var(--danger); }
-.msg-usage { color: #56d364; border-left-color: #56d364; font-size: 11px; }
-.msg-error { color: var(--danger); border-left-color: var(--danger); }
-.msg-stderr { color: #ffa198; }
-.msg-running { color: #56d364; animation: pulse 1.5s infinite; }
-@keyframes pulse { 50% { opacity: 0.4; } }
+.msg-icon {
+  flex-shrink: 0; width: 18px; display: inline-flex;
+  align-items: center; justify-content: center;
+}
+.msg-text-body { min-width: 0; color: #e6edf3; }
+.msg-row .msg-text-body { flex: 1; }
 .msg-fold {
-  background: none; border: none; color: inherit; cursor: pointer;
-  font: inherit; padding: 0; text-align: left; width: 100%;
+  display: flex; align-items: flex-start; gap: 8px;
+  background: none; border: none; cursor: pointer; font: inherit;
+  text-align: left; padding: 1px 0; width: 100%; color: #e6edf3;
 }
-.msg-summary { color: var(--muted); display: block; white-space: pre-wrap; }
+.msg-fold:hover .msg-text-body { text-decoration: underline; text-underline-offset: 3px; }
+
+/* 轮头摘要：白色 13px（与正文同级，弱化感靠行距与分隔线） */
+.turn-head .msg-text-body { color: #e6edf3; font-size: 13px; }
+.turn-head:hover .msg-text-body { text-decoration: underline; text-underline-offset: 3px; }
+
+/* 嵌套过程明细：平铺（无竖线），思考/工具的摘要与正文对齐在标题下方 */
+.turn-detail { display: flex; flex-direction: column; gap: 4px; }
+.msg-thinking, .msg-tool { flex-direction: column; align-items: stretch; }
+.msg-thinking .msg-fold, .msg-tool .msg-fold { flex-direction: row; }
+.msg-summary { margin-left: 26px; } /* 对齐标题文字起点（icon 18 + gap 8） */
+.msg-thinking .msg-body, .msg-tool .msg-body { margin-left: 26px; }
+.msg-thinking .msg-icon, .msg-tool .msg-icon { color: var(--muted); }
+.msg-tool .msg-icon { color: #79c0ff; }
+/* 过程行的次级颜色 */
+.msg-thinking .msg-text-body, .msg-thinking .msg-summary { color: var(--muted); }
+.msg-tool .msg-text-body { color: #79c0ff; }
+.msg-tool-error .msg-text-body { color: var(--danger); }
+.msg-usage .msg-text-body { color: #56d364; font-size: 12px; }
+.msg-error .msg-text-body { color: var(--danger); }
+.msg-stderr .msg-text-body { color: #ffa198; }
+.msg-start .msg-text-body { color: var(--accent); }
+.msg-exit .msg-text-body { color: var(--muted); }
+.msg-failed .msg-text-body { color: var(--danger); }
+
+/* markdown 正文区 */
+.md-prose { font-size: 13px; }
+.md-prose .md-code {
+  background: rgba(110, 118, 129, 0.2); border-radius: 3px; padding: 1px 4px;
+  font-family: ui-monospace, monospace; font-size: 12px;
+}
 .msg-body {
-  margin: 4px 0 0; white-space: pre-wrap; word-break: break-word;
-  font-family: inherit; font-size: 11px; color: var(--fg, #e6edf3);
+  margin: 4px 0 0 0; white-space: pre-wrap; word-break: break-word;
+  font-family: ui-monospace, monospace; font-size: 11px; color: #c9d1d9;
 }
 .msg-body-error { color: var(--danger); }
+.msg-summary { color: var(--muted); font-size: 12px; white-space: pre-wrap; word-break: break-word; }
+.msg-running { color: #56d364; animation: pulse 1.5s infinite; }
 
 /* U14：信任门（awaiting_confirmation）单元格与流尾提示 */
 .trust-gate-cell { display: inline-flex; align-items: center; gap: 6px; }

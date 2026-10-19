@@ -659,6 +659,20 @@ describe('U5 TranscriptView 自动跟随', () => {
     expect(turns[1].durationMs).toBe(0)
   })
 
+  it('U-VIEW 回归：store 尾窗同引用原地追加事件 → 普通视图实时更新（运行中不动 bug）', async () => {
+    const { TranscriptView } = await import('../src/TranscriptView')
+    const agent = makeAgent('agent-live', 'exec-live', { status: 'running' })
+    // 镜像 store 尾窗语义：稳定数组引用 + 原地 push
+    const window: TranscriptEvent[] = [raw('exec-live', 1, 'boot-line')]
+    const { rerender } = render(<TranscriptView agent={agent} events={window} />)
+    expect(screen.getByText('boot-line')).toBeTruthy()
+    act(() => {
+      window.push({ execId: 'exec-live', seq: 2, ts: '2', kind: 'assistant_text', text: 'live-answer' })
+    })
+    rerender(<TranscriptView agent={agent} events={window} />)
+    expect(screen.getByText('live-answer')).toBeTruthy()
+  })
+
   it('U-VIEW 普通视图（轮次）：完成轮折叠摘要可展开、markdown 正文、用量轮尾', async () => {
     const { TranscriptView } = await import('../src/TranscriptView')
     const agent = makeAgent('agent-t', 'exec-t', { status: 'exited' })

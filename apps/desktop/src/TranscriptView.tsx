@@ -20,6 +20,16 @@ import type { TranscriptEvent } from './bridge'
 import type { AgentRecord } from './types'
 import { agentDisplayName, ConfirmStopButton } from './agentUi'
 import { MarkdownText } from './MarkdownText'
+import {
+  IconBolt,
+  IconChat,
+  IconDoc,
+  IconPlay,
+  IconStopSquare,
+  IconThink,
+  IconTool,
+  IconWarn,
+} from './icons'
 
 export const ROW_HEIGHT_PX = 22
 export const OVERSCAN_ROWS = 10
@@ -180,20 +190,16 @@ export function groupTurns(events: TranscriptEvent[]): Turn[] {
   let current: Turn = { entries: [], thinkingCount: 0, toolCount: 0, durationMs: null, usage: null, answered: false }
   let firstTs: number | null = null
   let lastTs: number | null = null
-  // raw JSON 行收纳（轮内聚合，折叠展示）
-  let rawBucket: MessageGroup[] = []
   const sealTurn = () => {
-    if (current.entries.length === 0 && rawBucket.length === 0) {
+    if (current.entries.length === 0) {
       return // 空轮不产出
     }
-    current.entries.push(...rawBucket)
     current.durationMs =
       firstTs !== null && lastTs !== null && lastTs >= firstTs ? lastTs - firstTs : null
     turns.push(current)
     current = { entries: [], thinkingCount: 0, toolCount: 0, durationMs: null, usage: null, answered: false }
     firstTs = null
     lastTs = null
-    rawBucket = []
   }
   for (const event of events) {
     // 已答轮的延后封口（dsh 时序：usage 在回答之后到达，须归入本轮）——
@@ -261,7 +267,7 @@ export function groupTurns(events: TranscriptEvent[]): Turn[] {
           tool.isError = event.isError
           tool.pendingResult = false
         } else {
-          rawBucket.push({ kind: 'raw', stream: 'stdout', text: `↳ ${event.summary}` })
+          current.entries.push({ kind: 'raw', stream: 'stdout', text: `↳ ${event.summary}` })
         }
         break
       }
@@ -272,11 +278,10 @@ export function groupTurns(events: TranscriptEvent[]): Turn[] {
         current.entries.push({ kind: 'error', text: `⚠ ${event.message}` })
         break
       default: {
-        // raw 行：JSON 形状（旧数据/未解析流）收进折叠桶；纯文本正常显示
+        // raw 行：JSON 形状（旧数据/未解析流）不进普通视图——Raw 视图
+        // 才是它的归属地；纯文本（echo 输出等）正常显示
         const line = (event as { text: string }).text ?? ''
-        if (line.trimStart().startsWith('{')) {
-          rawBucket.push({ kind: 'raw', stream: 'stdout', text: line })
-        } else {
+        if (!line.trimStart().startsWith('{')) {
           current.entries.push({
             kind: 'raw',
             stream: (event as { stream: string }).stream ?? 'stdout',
@@ -460,7 +465,10 @@ export function TranscriptView({
  *（2000 条），分组后 DOM 规模可控；折叠交互对齐 dsh（thinking 与工具
  * 执行默认折叠、点击展开）。 */
 function NormalTranscriptView({ events, live }: { events: TranscriptEvent[]; live: boolean }) {
-  const turns = useMemo(() => groupTurns(events), [events])
+  // events 是 store 尾窗的稳定数组引用（原地追加）——memo 依赖必须含
+  // length 才能感知实时事件（raw 视图 effect 同款；首版漏了 → 运行中
+  // 永不更新、结束后也不显示，实测抓到）
+  const turns = useMemo(() => groupTurns(events), [events, events.length])
   const [expanded, setExpanded] = useState<Record<string, boolean>>({})
   const scrollRef = useRef<HTMLDivElement | null>(null)
   const stickRef = useRef(true)
@@ -487,10 +495,14 @@ function NormalTranscriptView({ events, live }: { events: TranscriptEvent[]; liv
             if (isSeparator) {
               const entry = first as Extract<MessageGroup, { kind: 'start' | 'exit' }>
               return entry.kind === 'start' ? (
-                <div key={i} className="msg-row msg-start">{entry.text}</div>
+                <div key={i} className="msg-row msg-start">
+                  <span className="msg-icon"><IconPlay /></span>
+                  <span className="msg-text-body">{entry.text}</span>
+                </div>
               ) : (
                 <div key={i} className={`msg-row msg-exit${entry.failed ? ' msg-failed' : ''}`}>
-                  {entry.failed ? '❎' : '✅'} {entry.text}
+                  <span className="msg-icon">{entry.failed ? <IconWarn /> : <IconStopSquare />}</span>
+                  <span className="msg-text-body">{entry.text}</span>
                 </div>
               )
             }
@@ -499,16 +511,20 @@ function NormalTranscriptView({ events, live }: { events: TranscriptEvent[]; liv
             const running = live && !turn.answered && i === turns.length - 1
             return (
               <div key={i} className="msg-turn">
-                {/* 轮头：完成轮折叠过程行（dsh Turn 语义）；运行中平铺 */}
+                {/* 轮头摘要：icon 前置 + 颜色（无竖线） */}
                 {turn.answered ? (
                   <button className="msg-fold turn-head" onClick={() => setExpanded(s => ({ ...s, [String(i)]: !open }))} aria-expanded={open}>
-                    {turn.thinkingCount > 0 ? '思考 · ' : ''}
-                    {turn.toolCount > 0 ? `${turn.toolCount} 次工具调用` : ''}
-                    {turn.thinkingCount === 0 && turn.toolCount === 0 ? '处理' : ''}
-                    {turn.durationMs != null ? ` · ${(turn.durationMs / 1000).toFixed(1)}s` : ''}
-                    {open ? ' ▾' : ' ▸'}
+                    <span className="msg-icon"><IconDoc /></span>
+                    <span className="msg-text-body">
+                      {turn.thinkingCount > 0 ? `思考 · ` : ''}
+                      {turn.toolCount > 0 ? `${turn.toolCount} 次工具调用` : ''}
+                      {turn.thinkingCount === 0 && turn.toolCount === 0 ? '处理' : ''}
+                      {turn.durationMs != null ? ` · ${(turn.durationMs / 1000).toFixed(1)}s` : ''}
+                      {open ? ' ▾' : ' ▸'}
+                    </span>
                   </button>
                 ) : null}
+                {/* 展开后的过程明细：icon + 左侧细竖线包裹（嵌套层级） */}
                 {(open || running || !turn.answered) && turn.entries.some(e => e.kind !== 'text') ? (
                   <div className="turn-detail">
                     {turn.entries.map((group, j) => {
@@ -517,39 +533,52 @@ function NormalTranscriptView({ events, live }: { events: TranscriptEvent[]; liv
                       switch (group.kind) {
                         case 'thinking':
                           return (
-                            <div key={j} className="msg-row msg-thinking">
+                            <div key={j} className="msg-block msg-thinking">
                               <button className="msg-fold" onClick={toggle} aria-expanded={entryOpen}>
-                                思考 {entryOpen ? '▾' : '▸'}
+                                <span className="msg-icon"><IconThink /></span>
+                                <span className="msg-text-body">思考 {entryOpen ? '▾' : '▸'}</span>
                               </button>
                               {entryOpen ? (
                                 <pre className="msg-body">{group.text}</pre>
                               ) : (
-                                <span className="msg-summary">{firstLine(group.text)}</span>
+                                <div className="msg-summary">{firstLine(group.text)}</div>
                               )}
                             </div>
                           )
                         case 'tool':
                           return (
-                            <div key={j} className={`msg-row msg-tool${group.isError ? ' msg-tool-error' : ''}`}>
+                            <div key={j} className={`msg-block msg-tool${group.isError ? ' msg-tool-error' : ''}`}>
                               <button className="msg-fold" onClick={toggle} aria-expanded={entryOpen}>
-                                ⚙ {group.name}{group.summary ? ` · ${firstLine(group.summary)}` : group.pendingResult ? ' · …' : ''} {entryOpen ? '▾' : '▸'}
+                                <span className="msg-icon"><IconTool /></span>
+                                <span className="msg-text-body">
+                                  {group.name}
+                                  {group.summary ? ` · ${firstLine(group.summary)}` : group.pendingResult ? ' · …' : ''} {entryOpen ? '▾' : '▸'}
+                                </span>
                               </button>
                               {entryOpen ? (
                                 <>
                                   <pre className="msg-body">{prettyJson(group.input)}</pre>
                                   {group.summary ? (
-                                    <pre className={`msg-body${group.isError ? ' msg-body-error' : ''}`}>{group.summary}</pre>
+                                    <pre className={`msg-body${group.isError ? ' msg-body-error' : ''}`}>
+                                      {group.summary.length > 600 ? `${group.summary.slice(0, 600)}\n…（截断，完整内容见 Raw 视图 / raw.log）` : group.summary}
+                                    </pre>
                                   ) : null}
                                 </>
                               ) : null}
                             </div>
                           )
                         case 'error':
-                          return <div key={j} className="msg-row msg-error">{group.text}</div>
+                          return (
+                            <div key={j} className="msg-row msg-error">
+                              <span className="msg-icon"><IconWarn /></span>
+                              <span className="msg-text-body">{group.text}</span>
+                            </div>
+                          )
                         case 'raw':
                           return (
                             <div key={j} className={`msg-row${group.stream === 'stderr' ? ' msg-stderr' : ''}`}>
-                              {group.text}
+                              <span className="msg-icon"><IconDoc /></span>
+                              <span className="msg-text-body">{group.text}</span>
                             </div>
                           )
                         default:
@@ -558,20 +587,26 @@ function NormalTranscriptView({ events, live }: { events: TranscriptEvent[]; liv
                     })}
                   </div>
                 ) : null}
-                {/* 轮末回答：markdown 正文 */}
+                {/* 轮末回答：markdown 正文（icon 前置 💬） */}
                 {textEntries.map((group, j) =>
                   group.kind === 'text' ? (
                     <div key={`t${j}`} className="msg-row msg-text">
-                      <MarkdownText text={group.text} />
+                      <span className="msg-icon"><IconChat /></span>
+                      <div className="msg-text-body md-prose">
+                        <MarkdownText text={group.text} />
+                      </div>
                     </div>
                   ) : null,
                 )}
-                {/* 本轮用量（数据有就显示） */}
+                {/* 本轮用量（icon ⚡ + 颜色，数据有就显示） */}
                 {turn.usage ? (
                   <div className="msg-row msg-usage">
-                    本轮用量
-                    {turn.usage.tokens != null ? ` · ${turn.usage.tokens.toLocaleString()} tok` : ''}
-                    {turn.usage.cost != null ? ` · $${turn.usage.cost.toFixed(4)}` : ''}
+                    <span className="msg-icon"><IconBolt /></span>
+                    <span className="msg-text-body">
+                      本轮用量
+                      {turn.usage.tokens != null ? ` · ${turn.usage.tokens.toLocaleString()} tok` : ''}
+                      {turn.usage.cost != null ? ` · $${turn.usage.cost.toFixed(4)}` : ''}
+                    </span>
                   </div>
                 ) : null}
               </div>
