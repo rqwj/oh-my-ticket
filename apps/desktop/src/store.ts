@@ -39,6 +39,7 @@ import {
   execStart,
   execStop,
   execTranscriptTail,
+  agentsDelete,
   omtCall,
   subscribeEvents,
   type EventEnvelope,
@@ -716,6 +717,22 @@ export function useTreeStore() {
     [startDispatch],
   )
 
+  /** F-DEL：删除 agent（终态守卫在服务端）；成功后清选中态并重拉列表。 */
+  const deleteAgent = useCallback(
+    async (agentId: string) => {
+      const home = activeHomeRef.current
+      if (!home) throw new Error('无活动 workspace')
+      await agentsDelete(home.homeId, agentId)
+      setState(s => ({
+        ...s,
+        selectedAgentId: s.selectedAgentId === agentId ? null : s.selectedAgentId,
+        unviewedFailedIds: s.unviewedFailedIds.filter(id => id !== agentId),
+      }))
+      await refreshAgents()
+    },
+    [refreshAgents],
+  )
+
   const stopAgent = useCallback(async (execId: string) => {
     try {
       await execStop(execId)
@@ -1049,6 +1066,7 @@ export function useTreeStore() {
     loadHistoryTail,
     resumeAgent,
     createNode,
+    deleteAgent,
     // ── U9：绑定切片（R-C）───────────────────────────────────────────────
     refreshBindings,
     gcBindings,

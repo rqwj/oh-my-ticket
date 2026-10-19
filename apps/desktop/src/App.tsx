@@ -185,6 +185,7 @@ export function App() {
                     onSelectAgent={store.selectAgent}
                     onStopAgent={execId => void store.stopAgent(execId)}
                     onResumeAgent={store.resumeAgent}
+                    onDeleteAgent={agent => store.deleteAgent(agent.id)}
                     onKillOrphan={(agentId, execId) => void store.killOrphan(agentId, execId)}
                     onGcBindings={() => void store.gcBindings()}
                     onOpenHarnessSettings={() => setView('settings')}

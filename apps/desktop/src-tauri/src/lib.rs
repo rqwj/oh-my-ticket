@@ -68,6 +68,7 @@ pub fn run() {
             harness::harness_open_login,
             harness::harness_list_models,
             agents::agents_list,
+            agents::agents_delete,
             agents::bindings_get,
             agents::bindings_gc,
             executor::exec_start,

@@ -292,6 +292,11 @@ export async function harnessLaunchPreview(harness: string): Promise<HarnessLaun
   return invoke<HarnessLaunchPreview>('harness_launch_preview', { harness })
 }
 
+/** F-DEL：删除 agent（终态；运行中/不受控会被服务端拒绝并给可读理由） */
+export async function agentsDelete(homeId: string, agentId: string): Promise<void> {
+  await invoke<void>('agents_delete', { homeId, agentId })
+}
+
 /** 历史 transcript 尾部（F-PI-3）：raw.log 尾部重建的展示事件——
  * app 重启后选中历史 agent 时惰性加载；无日志返回空数组。 */
 export async function execTranscriptTail(

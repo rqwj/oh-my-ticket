@@ -373,6 +373,55 @@ pub fn list_reconcile_targets(runtime_dir: &Path) -> Result<Vec<ReconcileTarget>
 
 /// 按持久化身份读取单个 agent。Orphan 管理命令用此函数在 Rust 侧完成
 /// home/agent/exec 归属校验，避免 renderer 直接提供可被滥用的 pid。
+/// F-DEL：删除一个 agent（列表项右上角删除入口）。守卫：starting/running
+/// 拒绝（先停止再删）；attachment=orphan 拒绝（pid 仍存活，先强制终止）。
+pub fn delete_agent(runtime_dir: &Path, home_id: &str, agent_id: &str) -> Result<(), String> {
+    let path = agents_path(runtime_dir, home_id)?;
+    let (_, changed) = update_json(&path, |file: &mut AgentsFile| {
+        let Some(agent) = file.agents.iter().find(|a| a.id == agent_id) else {
+            return false;
+        };
+        if matches!(
+            agent.status,
+            AgentRecordStatus::Starting | AgentRecordStatus::Running
+        ) {
+            return false;
+        }
+        if agent.attachment == AgentAttachment::Orphan {
+            return false;
+        }
+        file.agents.retain(|a| a.id != agent_id);
+        true
+    })
+    .map_err(|e| format!("删除失败：{e}"))?;
+    if !changed.changed {
+        let (file, _) = read_json::<AgentsFile>(&path)?;
+        match file.agents.iter().find(|a| a.id == agent_id) {
+            None => Err(format!("agent {agent_id} 不存在")),
+            Some(agent)
+                if matches!(
+                    agent.status,
+                    AgentRecordStatus::Starting | AgentRecordStatus::Running
+                ) =>
+            {
+                Err(format!("agent {agent_id} 仍在运行——请先停止再删除"))
+            }
+            Some(agent) if agent.attachment == AgentAttachment::Orphan => Err(format!(
+                "agent {agent_id} 处于不受控态（pid 存活）——请先强制终止再删除"
+            )),
+            Some(_) => Err("删除未生效（未知原因）".to_string()),
+        }
+    } else {
+        Ok(())
+    }
+}
+
+#[tauri::command(async)]
+pub fn agents_delete(home_id: String, agent_id: String) -> Result<serde_json::Value, String> {
+    delete_agent(&daemon::runtime_dir(), &home_id, &agent_id)?;
+    Ok(serde_json::json!({ "deleted": agent_id }))
+}
+
 pub fn get_agent(
     runtime_dir: &Path,
     home_id: &str,
@@ -561,6 +610,38 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let runtime = dir.path().to_path_buf();
         (dir, runtime, "h_1a2b3c4d5e6f".to_string())
+    }
+
+    #[test]
+    fn delete_agent_guards_and_removes() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        let agent = register_agent(&runtime, "h_test", "pi", new_exec("exec-del")).unwrap();
+        // 运行中 → 拒绝（可读理由）
+        update_agent_status(
+            &runtime,
+            "h_test",
+            &agent.id,
+            AgentRecordStatus::Running,
+            AgentAttachment::Live,
+        )
+        .unwrap();
+        let err = delete_agent(&runtime, "h_test", &agent.id).unwrap_err();
+        assert!(err.contains("仍在运行"), "{err}");
+        // 终态 → 删除成功；再删 → 不存在
+        update_agent_status(
+            &runtime,
+            "h_test",
+            &agent.id,
+            AgentRecordStatus::Exited,
+            AgentAttachment::None,
+        )
+        .unwrap();
+        delete_agent(&runtime, "h_test", &agent.id).unwrap();
+        let err2 = delete_agent(&runtime, "h_test", &agent.id).unwrap_err();
+        assert!(err2.contains("不存在"), "{err2}");
+        let (file, _) = read_json::<AgentsFile>(&agents_path(&runtime, "h_test").unwrap()).unwrap();
+        assert!(file.agents.is_empty());
     }
 
     fn new_exec(exec_id: &str) -> NewExec {

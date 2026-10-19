@@ -306,6 +306,8 @@ interface Props {
   onResumeAgent?: () => void
   /** U14：该 agent 的 run 中待人工确认（信任门）的 item 数——流尾提示指路 */
   awaitingCount?: number | null
+  /** F-DEL：删除 agent（继续执行右侧红色按钮；确认弹窗由 AgentsPanel 呈现） */
+  onDeleteAgent?: () => void
 }
 
 export function TranscriptView({
@@ -315,6 +317,7 @@ export function TranscriptView({
   onStopAgent,
   onResumeAgent,
   awaitingCount = null,
+  onDeleteAgent,
 }: Props) {
   const scrollRef = useRef<HTMLDivElement | null>(null)
   const [follow, setFollow] = useState(true)
@@ -418,6 +421,15 @@ export function TranscriptView({
             }
           >
             继续执行
+          </button>
+        )}
+        {!live && onDeleteAgent && (
+          <button
+            className="chip danger-chip"
+            title="删除该 agent（不可恢复）"
+            onClick={onDeleteAgent}
+          >
+            删除
           </button>
         )}
         {live && onStopAgent && <ConfirmStopButton claimed={claimed} onConfirm={onStopAgent} />}

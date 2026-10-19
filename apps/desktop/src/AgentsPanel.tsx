@@ -14,6 +14,7 @@ import type { AgentRecord, ExecRecord, OmtNode, RunDetail, RunItemView } from '.
 import { claimedCountForExec, danglingBindingsOf, nodeTitlesById } from './store'
 import { agentDisplayName, ConfirmStopButton } from './agentUi'
 import { TranscriptView } from './TranscriptView'
+import { DeleteIcon } from './icons'
 
 /** 最新 exec：lastExecId 指针优先，缺失时回退 execs[] 末位。 */
 function latestExecOf(agent: AgentRecord): ExecRecord | null {
@@ -70,6 +71,8 @@ interface Props {
   onStopAgent: (execId: string) => void
   /** U10：空闲 agent 一键续跑（App → store.resumeAgent） */
   onResumeAgent: (agent: AgentRecord) => Promise<void>
+  /** F-DEL：删除 agent（确认弹窗在面板内；终态守卫在服务端） */
+  onDeleteAgent: (agent: AgentRecord) => Promise<void>
   onKillOrphan: (agentId: string, execId: string) => void
   onOpenHarnessSettings: () => void
   /** U9：一键清理悬空绑定（bindings_gc，成功后 App/store 侧重拉绑定表） */
@@ -90,6 +93,7 @@ export function AgentsPanel({
   onSelectAgent,
   onStopAgent,
   onResumeAgent,
+  onDeleteAgent,
   onKillOrphan,
   onOpenHarnessSettings,
   onGcBindings,
@@ -99,6 +103,10 @@ export function AgentsPanel({
   const [resumeError, setResumeError] = useState<string | null>(null)
   /** U14：信任门弹窗动作报错 */
   const [gateError, setGateError] = useState<string | null>(null)
+  /** F-DEL：待确认删除的 agent（弹窗）；删除中/失败就地呈现 */
+  const [deleteTarget, setDeleteTarget] = useState<AgentRecord | null>(null)
+  const [deleting, setDeleting] = useState(false)
+  const [deleteError, setDeleteError] = useState<string | null>(null)
   // U14：全面板待裁决项（底部弹窗）——跨所有已拉取的 run 聚合。普通计算
   //（不得用 useMemo——须位于提前 return 之前且避免 hooks 位点抖动；stats 规模小）
   const awaitingItems: Array<{ runId: string; nodeId: string; title?: string }> = []
@@ -308,6 +316,21 @@ export function AgentsPanel({
           {stoppable && exec && (
             <ConfirmStopButton claimed={claimed} onConfirm={() => onStopAgent(exec.execId)} />
           )}
+          {/* F-DEL：右上角小删除 icon（运行中/不受控隐藏——先处理存活态） */}
+          {!stoppable && agent.attachment !== 'orphan' && (
+            <button
+              className="agent-delete-icon"
+              title="删除该 agent"
+              aria-label={`删除 ${agentDisplayName(agent)}`}
+              onClick={event => {
+                event.stopPropagation()
+                setDeleteError(null)
+                setDeleteTarget(agent)
+              }}
+            >
+              <DeleteIcon />
+            </button>
+          )}
           {agent.attachment === 'orphan' && exec && (
             <button
               className="chip agent-kill-btn"
@@ -356,6 +379,16 @@ export function AgentsPanel({
             claimed={selectedClaimed}
             onStopAgent={() => onStopAgent(selectedExec.execId)}
             awaitingCount={selectedAwaiting}
+            onDeleteAgent={
+              selected.status !== 'running' &&
+              selected.status !== 'starting' &&
+              selected.attachment !== 'orphan'
+                ? () => {
+                    setDeleteError(null)
+                    setDeleteTarget(selected)
+                  }
+                : undefined
+            }
             onResumeAgent={
               // U10：空闲（非 running/starting）且最新 exec 带 ticket 才可续跑；
               // 结果就地报错（harness 未启用/未做知情确认/守卫拒绝等）
@@ -377,6 +410,36 @@ export function AgentsPanel({
           <TranscriptView agent={null} events={[]} />
         )}
         {gatePopup}
+        {deleteTarget && (
+          // F-DEL：删除确认弹窗——红色危险态，明确不可恢复与影响面
+          <div className="trust-gate-popup delete-confirm" role="alertdialog" aria-label="确认删除 agent">
+            <p className="trust-gate-popup-title">
+              删除 {agentDisplayName(deleteTarget)}（{deleteTarget.harness}）？
+            </p>
+            <p className="hm-hint">
+              将移除该 agent 的记录与执行历史（transcript 文件保留在磁盘）。此操作不可恢复。
+            </p>
+            {deleteError && <p className="error-banner">{deleteError}</p>}
+            <div className="chip-row">
+              <button
+                className="chip active"
+                disabled={deleting}
+                onClick={() => {
+                  setDeleting(true)
+                  onDeleteAgent(deleteTarget)
+                    .then(() => setDeleteTarget(null))
+                    .catch(err => setDeleteError(String(err)))
+                    .finally(() => setDeleting(false))
+                }}
+              >
+                {deleting ? '删除中…' : '确认删除'}
+              </button>
+              <button className="chip" disabled={deleting} onClick={() => setDeleteTarget(null)}>
+                取消
+              </button>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   )

@@ -108,6 +108,8 @@ interface PanelProps {
   eventsOf: (execId: string) => TranscriptEvent[]
   onSelectAgent: (id: string) => void
   onStopAgent: (execId: string) => void
+  onResumeAgent?: (agent: AgentRecord) => Promise<void>
+  onDeleteAgent?: (agent: AgentRecord) => Promise<void>
   onKillOrphan: (agentId: string, execId: string) => void
   onOpenHarnessSettings: () => void
 }
@@ -764,6 +766,36 @@ describe('U5 TranscriptView 自动跟随', () => {
 // ── AgentsPanel：列表呈现 / 两段式终止 / Orphan / 空态 ────────────────────
 
 describe('U5 AgentsPanel 列表', () => {
+  it('F-DEL：终态 agent 行右上角删除 icon → 确认弹窗 → 确认调用 onDeleteAgent；取消不调用；运行中隐藏', async () => {
+    const onDeleteAgent = vi.fn().mockResolvedValue(undefined)
+    const idle = makeAgent('agent-d1', 'exec-d1', { status: 'exited', attachment: 'none' })
+    const running = makeAgent('agent-d2', 'exec-d2', { status: 'running' })
+    await renderPanel({ agents: [idle, running], onDeleteAgent })
+    // 运行中无删除 icon；终态有
+    expect(screen.queryByRole('button', { name: '删除 Agent 2' })).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: '删除 Agent agent-d1' }))
+    // 确认弹窗出现（危险态文案）
+    expect(screen.getByRole('alertdialog', { name: '确认删除 agent' })).toBeTruthy()
+    expect(screen.getByText(/此操作不可恢复/)).toBeTruthy()
+    // 取消 → 不调用
+    fireEvent.click(screen.getByRole('button', { name: '取消' }))
+    expect(onDeleteAgent).not.toHaveBeenCalled()
+    // 再删 → 确认 → 调用并关闭
+    fireEvent.click(screen.getByRole('button', { name: '删除 Agent agent-d1' }))
+    fireEvent.click(screen.getByRole('button', { name: '确认删除' }))
+    await waitFor(() => expect(onDeleteAgent).toHaveBeenCalledWith(idle))
+  })
+
+  it('F-DEL：删除失败（运行守卫）→ 弹窗内就地报错不关闭', async () => {
+    const onDeleteAgent = vi.fn().mockRejectedValue(new Error('agent 仍在运行——请先停止再删除'))
+    const idle = makeAgent('agent-d3', 'exec-d3', { status: 'exited', attachment: 'none' })
+    await renderPanel({ agents: [idle], onDeleteAgent })
+    fireEvent.click(screen.getByRole('button', { name: '删除 Agent agent-d3' }))
+    fireEvent.click(screen.getByRole('button', { name: '确认删除' }))
+    await waitFor(() => expect(screen.getByText(/仍在运行/)).toBeTruthy())
+    expect(screen.getByRole('alertdialog', { name: '确认删除 agent' })).toBeTruthy()
+  })
+
   beforeEach(() => invokeMock.mockReset())
 
   it('条目渲染 display_name：title 优先，回退记录 displayName', async () => {
