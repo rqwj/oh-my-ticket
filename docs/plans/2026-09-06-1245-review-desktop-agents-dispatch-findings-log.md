@@ -1138,6 +1138,10 @@ daemon `run_item_view` 序列化为 `executorActor`（views.rs:130）。恒空 �
 调研确认（本机 pi 1.3.0 文档 + omp 18.12.2 二进制复查）：pi ≥1.0 有完整 exposure 体系（codemode 默认/deferred/**direct**/hidden + per-tool toolExposure），`direct` = 工具像内置工具一样声明给模型（文档推荐场景即「小而常用工具集」——omt 18 工具命中）；omp 18.12.2 仍未同步（无 toolExposure 面）。omp 新增 `--restore`（恢复会话并接着跑未完成轮次）——记为 U10/U11 后续选项。
 - **实现**：ProjectSpec 增 `expose_direct`（pi=true/omp=false），注入条目带 `exposure: direct` + `description: "OMT ticket run discipline: run__claim / run__report"`（进系统提示 mcp_servers 清单）；pi 的 tool_hint 改为「工具已直接声明在工具表，直接调用」。omp 条目明确不带该键（未知键行为未定义）。测试：pi 条目 exposure/description 断言 + omp 无 exposure 断言。Rust 113（1 次 kill_all_timeout 负载 flake，重跑绿）。
 
+#### F-EXPOSE-2 · P0 · schema-bug · `omt-runtime/src/mcp.rs` · 同文件 `$ref` 未内联——direct 模式被 moonshot 校验器 400
+Agent 28 验收失败（3s exit 0 但零输出零工具）：`exposure: direct` 把工具 schema 原样送进 kimi-coding API 请求 → `400: tools.function.parameters is not a valid moonshot flavored json schema — At path 'properties.filter.$ref': $defs not found for reference: #/$defs/NodeFilter`。根因：F-ACC-10 的内联只处理**跨文件**引用（common.schema.json），同文件 `$defs` 引用原样保留——codemode 模式 schema 不进请求所以无恙，direct 模式即炸。
+- **修复**：`resolve_refs_in` 多定义源递归（common + commands 文档自身，按序查 `/$defs/{name}`）+ 引用环守卫（展开链同名即停）。新增回归：全工具序列化后**零 `$ref`/零 `$defs`** + node__list 的 filter（原 NodeFilter 引用点）为内联对象。实探 tools/list：18 工具零残留。workspace 283 passed。
+
 ### 残留状态核查（第二轮验收后）
 
 失败尝试在 daemon 侧已成功创建 RUN-0001（pending，持有 TICKET-0001，无执行器），EPIC-0001/TICKET-0001 被 node/execute 标为 in_progress。重试无需清理：ensure-run 复用路径按 pending → start 正常接管（已实测 run-get 确认）。
