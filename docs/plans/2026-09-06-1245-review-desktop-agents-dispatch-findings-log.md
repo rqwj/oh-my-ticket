@@ -1118,6 +1118,11 @@ daemon `run_item_view` 序列化为 `executorActor`（views.rs:130）。恒空 �
 - 思考块标题「思考」+ 折叠首行预览（settledReasoningPreview 语义）；工具折叠态 `⚙ name · 摘要`（结果首行），展开 pretty JSON + 结果；assistant 正文经 MarkdownText 渲染（正文字体）；raw JSON 行收纳（不再糊屏）；start/exit 弱化为分隔行。
 - 分档：普通（≈dsh standard）+ Raw；compact/verbose 后续按需。测试：轮次边界/计数/时长/usage 归属/工具配对 + 渲染折叠展开。前端 128 passed。
 
+#### F-VIEW-3 · feat · 续跑列表展示模型 + 视图打磨收官（2026-10-19）
+- **模型展示**：ExecRecord/NewExec 增 `model` 字段（dispatch_chain 落档），弹窗空闲 Agent 选项显示 `Agent N（pi·kimi-coding/k3·续跑）`。注：仅新派发起生效（历史 exec 无此字段，显示省略）。
+- **视图打磨**（多轮验收反馈逐条修）：线框 SVG 图标替换 emoji（icons.tsx，对齐 dsh stroke 风格）；折叠块结构重排——icon 与标题同 inline 基线流（结构性修复跨元素基线错位）、摘要/全文对齐标题文字起点；旧版样式块残留导致的竖线复现（同优先级后来居上）已删除；JSON raw 行普通视图硬过滤；工具结果 600 字符截断指路 Raw；轮头白字 13px；审计确认 jsonl 零坏行零截断（显示截断均为设计行为）。
+- 质量门：Rust 112 / 前端 128 / build 全绿。
+
 ### 残留状态核查（第二轮验收后）
 
 失败尝试在 daemon 侧已成功创建 RUN-0001（pending，持有 TICKET-0001，无执行器），EPIC-0001/TICKET-0001 被 node/execute 标为 in_progress。重试无需清理：ensure-run 复用路径按 pending → start 正常接管（已实测 run-get 确认）。
