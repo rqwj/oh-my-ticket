@@ -25,6 +25,16 @@ branch: feat/desktop-agents-dispatch
 
 | ID | 级别 | 类型 | 单元 | 位置 | 摘要 | 状态 | 负责人 |
 |---|---|---|---|---|---|---|---|
+| F-BENCH-3 | P1 | gated_auto | BENCH | `bench.rs::analyze_jsonl` | omp 经 `write xd://mcp__omt_*` 调 MCP，`is_omt` 只看名字 → omp 的 discovery_overhead 恒等于全部调用，硬门永久红（§27） | open | — |
+| F-BENCH-4 | P1 | manual | BENCH | fixture 回放测试 | 语料未对 `parse_line` / `parse_models_output` 回放；事件词汇测试 grep 冻结的 adapter 产物，测不出漂移（§27） | open | — |
+| F-BENCH-5 | P1 | manual | BENCH | `harness_probe.rs` / `harness-capture.rs` | 探针硬编码 binary 路径与 model_list_args，测的是自己的 registry 副本（违反 R-1，F-PI-2 类漂移测不出）（§27） | open | — |
+| F-BENCH-6 | P2 | gated_auto | BENCH | `harness-capture.rs` | omp `--version` 为 `omp/18.12.2` → 落到 `omp/omp/18.12.2/` | open | — |
+| F-BENCH-7 | P2 | gated_auto | BENCH | `harness-capture.rs` | 重跑 capture 覆盖手写 meta.json 出处 | open | — |
+| F-BENCH-8 | P2 | gated_auto | BENCH | `fixtures_are_normalized` / `normalize` | 归一测试不含 omp 卷与 help/models；raw 内嵌时间戳未归一；未过 sanitize_line | open | — |
+| F-BENCH-9 | P2 | gated_auto | BENCH | `bench.rs` opencode 测试 | 注释过时（实为 3 次）且未断言 tool_calls==3 | open | — |
+| F-BENCH-10 | P3 | gated_auto | BENCH | 探针 / capture | 裸 `.output()` 无超时（F1 教训） | open | — |
+| F-BENCH-11 | P3 | advisory | BENCH | omp 卷 | 无 usage 事件 → omp tokens/cost 恒 None | open | — |
+| F-BENCH-12 | P3 | advisory | BENCH | 注释 / §26 | 「MCP 握手」未实现、adapter-lines 文件名不符、「上两级」应为三级 | open | — |
 | F-U3-15 | P1 | manual | U3 | `mcp_injection.rs::prepare_omp_with` :279→:283 | **merge 先于 state.json 写入**：二者之间崩溃 → 首个 exec 无 `workspace` 记录，sweep 跳过该目录且删光 launcher → 用户文件留悬空 `omt`；下次 prepare 把污染后的文件当"原件"备份，永远恢复不干净（556c1d2 引入，§8 漏检） | fixed(d53b191) | — |
 | F-U3-16 | P1 | manual | U3 | `mcp_injection.rs` :281/:304 | **writtenSha 每次 prepare 都重置基线**：两 exec 重叠期间用户改了文件 → 第二次 prepare 把改动吸进 S2 → 最后 release 比对 S2 相等 → 整体恢复到第一次 prepare 时的 backup，用户改动静默丢失（556c1d2 引入，§8 漏检） | fixed(d53b191) | — |
 | F-U3-11 | P2 | gated_auto | U3 | `mcp_injection.rs::finalize_release` :310/:323 | **b3500cb 回归**：user_modified 分支打印「备份保留于 …」后无条件 `remove_dir_all(state_dir)` 删掉 backup；外科手术 no-op（command 不匹配/文件不可解析）时用户文件仍被污染且唯一原件已毁 | fixed(d53b191) | — |
@@ -1192,6 +1202,40 @@ opencode 本就无发现开销（工具直声明），homeId 修复后同样 3 �
 - **§6.1 分析器**：`bench.rs`（desktop crate）——jsonl → ExecMetrics 纯函数（tool_calls / discovery_overhead / turns / duration / tokens / cost / errors / outcome），`analyze_dir` 批量。4 个回放测试进普通 cargo test（CI 可跑）：pi 3-call + discovery=0 永久契约、opencode 零发现开销、结构完备、**归一化不变量**（语料不得含本机路径/真实 session/验收环境名）。思考块期望按 provider（opencode 无 reasoning 是正常形态）。
 - **§6.2 探针**：`#[ignore]` 集成测试（`harness_probe.rs`——flag 面可执行验证 + 模型列表执行 + 事件词汇 fixture 回放）+ `harness-capture` cargo example（零成本面采样：version/help/models + 归一落盘；事件流留给 runner 层）。实跑验证：probe --ignored 2 过、capture pi 端到端产出目录。
 - 工作树门：Rust 117+workspace 全绿、clippy/fmt 干净。crate 搬迁（§6.3）与 runner（§6.4+Harbor spike）为下一步。
+
+### §27. `f6eeaed` · 评测 §6.1–6.2 · code review（2026-10-20）
+
+**评审方式**：单上下文内联；对照设计 §3.1/§3.3/§3.5/§4.2 与 `adapters.rs` / `harness.rs` 现有代码，并用 python 逐卷统计 fixture 的事件 kind 与工具名。复跑：`cargo test -p oh-my-ticket-desktop bench::` 4 过、`--test harness_probe` 1 过 2 ignored、clippy `-D warnings` 干净。
+
+**结论**：工程纪律到位（example + `#[ignore]` 形态、分析器纯函数、真实卷入语料），但**语料库的核心价值尚未兑现**，且分析器对 omp 判错：
+
+| ID | 级别 | 类型 | 位置 | 发现 |
+|---|---|---|---|---|
+| F-BENCH-3 | P1 | gated_auto | `bench.rs::analyze_jsonl` :70 | **omp 的 omt 调用全部被判为发现开销**：omp 经 `write` 工具写虚拟路径调 MCP（`input.path = "xd://mcp__omt_run_claim"`），工具名是 `write`；`is_omt` 只看名字 → omp 卷 tool_calls=3、discovery_overhead=3、零 omt 调用。runner 接入后 omp 的 `discovery_overhead = 0` 硬门**永久红**。模块注释称「或任何含 run__claim 的调用」但代码未实现。无 omp 分析器测试，故未被发现。修法：`is_omt` 同时检查 `input.path` 以 `xd://mcp__omt` 开头（或任一字符串参数含 `mcp__omt`）+ 补 omp 卷断言 3/0 |
+| F-BENCH-4 | P1 | manual | `bench.rs` tests / `harness_probe.rs::probe_event_vocabulary_from_fixtures` | **语料库未对 adapter / 模型解析器做回放**（设计 §3.5 的核心）：无任何测试对 fixture 调 `adapters::parse_line` 或 `parse_models_output`；`stream-synthetic-lines.jsonl`、`models.txt`、`help.txt` 均无消费者。事件词汇测试只在**已经过 adapter 的** jsonl 里 grep `"tool_call"` —— 存的是采集时冻结的 adapter 产物，与当前 adapter 代码无关，**永远测不出漂移**（同义反复）。修法：jsonl 里 `kind:"raw"` 的 `text` 就是 harness 原始 stdout 行——逐行喂当前 `parse_line`，断言重放产出的 tool_call 数/名与卷内记录一致 + 按 provider 的 §3.3 核心集；`models.txt` 过 `parse_models_output` 非空；`help.txt` 对 REGISTRY flag 做 yellow 级 grep |
+| F-BENCH-5 | P1 | manual | `harness_probe.rs` / `examples/harness-capture.rs` | **探针自带第二份 registry**：binary 路径（`~/.opencode/bin/opencode`、`/opt/homebrew/bin/omp`）与 `model_list_args` 均硬编码，未读 `REGISTRY` —— 违反 R-1「CLI 复写 registry 必漂移」否决项；更关键的是探针测的是**自己的副本**，F-PI-2 这类「registry 写错 flag」永远测不出（registry 若写回 `models`，探针照样用 `--list-models` 通过）。硬编码 Homebrew 路径在非 Homebrew/Intel 机上静默 skip，探针「全绿」实则零检查。根因：`lib.rs` 无 `pub` 导出，tests/examples 拿不到 `harness`。修法：`lib.rs` 开一个窄导出（如 `#[doc(hidden)] pub mod bench_support { pub use crate::harness::{REGISTRY, descriptor_of, which_binary, probe_version}; }`），探针与 capture 按 descriptor 驱动 |
+| F-BENCH-6 | P2 | gated_auto | `harness-capture.rs` :24-29 | **omp 采集落错目录**：`omp --version` 输出 `omp/18.12.2` → 目录 `fixtures/harness/omp/omp/18.12.2/`（现有 omp 目录是手工建的）。修法：从输出提取 semver（取末段 / 正则），与 `probe_version` 的处理对齐 |
+| F-BENCH-7 | P2 | gated_auto | `harness-capture.rs` :38-43 | **采集覆盖手写 meta.json**：对已有事件流的版本重跑 capture，会把 model/task/source/normalization 出处抹成 4 字段（pi 的 meta 已是此形态，丢了 stream 出处）。修法：读取-合并后写（serde），或 capture 元数据单独成 `capture.json` |
+| F-BENCH-8 | P2 | gated_auto | `bench.rs::fixtures_are_normalized` / `harness-capture.rs::normalize` | **归一不变量覆盖不全**：测试只扫 pi/opencode 两卷，**不含最大的 omp 卷（491 行）**与任何 help/models；raw `text` 内嵌 JSON 的时间戳未归一（omp 卷 `"timestamp":"2026-10-19T12:17:20.244Z"`）；capture 的 `normalize` 只换 `$HOME`，未过 `sanitize_line`（设计 B）；哨兵 `01a1` 是随手值。修法：测试遍历 `fixtures/harness/**` 全部文件，用正则断言无 `/Users/`、`/home/`、ISO 时间戳；capture 先 `sanitize_line` 再归一 |
+| F-BENCH-9 | P2 | gated_auto | `bench.rs` :190 | **opencode 3-call 契约未锁 + 注释过时**：注释称该卷是「Agent 24 信任门轮、tool_calls 高于 3」，实际卷为 `omt_run__claim` / `bash` / `omt_run__report` 恰 3 次；测试不断言 `tool_calls == 3`，opencode 的 3-call 收官未成为回归门。修法：改注释 + 加断言 |
+| F-BENCH-10 | P3 | gated_auto | `harness_probe.rs` / `harness-capture.rs::capture` | 探针与采集用裸 `.output()` 无超时——F1 教训（flag 错时 omp 进 TUI 挂起，正是 F-ACC-12 的失败形态），探针本身会永久挂住。复用 `probe_version` 式超时 |
+| F-BENCH-11 | P3 | advisory | omp 卷 | omp 卷**无 usage 事件**（444 行 message_update 未产出任何 usage）→ tokens/cost 对 omp 恒为 None，§4.2 的基线偏移对 omp 不可用。需确认是 omp 不发 usage 还是 adapter 漏取 |
+| F-BENCH-12 | P3 | advisory | `harness_probe.rs` 模块注释 / §26 | 文档与实现不符：模块注释列「MCP 握手」检查面但未实现；§26 称 omp 留 `adapter-lines.jsonl` 供 parse_line 回放，实际文件名为 `stream-synthetic-lines.jsonl` 且无消费者（并入 F-BENCH-4）；`bench.rs` :163 注释「上两级」实为三级 |
+
+**建议顺序**：F-BENCH-3（一行级修复 + omp 测试）→ F-BENCH-5（窄导出，F-BENCH-4 的回放也要用到 `adapters`）→ F-BENCH-4 → P2 批量。
+
+### §27. 评测机制实施复核修复（F-BENCH-3~12，2026-10-20）
+
+- **F-BENCH-3**（P1）：is_omt 补 input.path 检查——omp 经 write 工具写虚拟路径 `xd://mcp__omt_run_claim` 调 MCP（omt 与动词间是**单下划线**，首版查 `omt__` 不命中，实测三跑才抓到）；omp 卷断言 3 调用/0 开销入测。
+- **F-BENCH-4**（P1）：语料库核心价值落地——raw JSON 行重放进**当前** adapters::parse_line（pi/omp 卷；opencode 卷 raw 恰全为 step_start 噪声，其重放面由事件词汇测试覆盖）；models.txt 形状按 provider 校验（行式/列名表格/分组表格三种）；深度比对待 §6.3 暴露 parse_models_output。
+- **F-BENCH-5**（P1）：探针改由 REGISTRY 驱动（lib.rs 暴露最小 pub 面：REGISTRY/which_binary/probe_version）；消除探针自带副本（R-1 否决项）与静默跳过（找不到 binary 时显式 fail）。
+- **F-BENCH-6/7**（P2）：omp 版本串去 `omp/` 前缀再建目录；capture 合并 meta.json（保留既有字段，只补缺）。
+- **F-BENCH-8**（P2）：归一化检查扩到全部 jsonl + help/models（walk 全目录，≥9 文件下限）；capture 输出过 sanitize_line。
+- **F-BENCH-9**（P2）：opencode 断言改 3 调用双契约。
+- **F-BENCH-10**（P3）：探针/capture 加 timeout（防 TUI 挂起）。
+- **F-BENCH-11**（P3）：溯源——omp 18.12.2 的 usage 挂 turn_end 的 message.usage（1.3 在 message_update）；adapter 补 end 族提取 + 分析器 raw 重放兜底（语料是采集时 adapter 输出，当前代码重放补齐——正是语料库价值）；omp 卷 tokens/cost 断言入测。
+- **F-BENCH-12**（P3）：注释/文档与实现对齐（`omt__`→`omt_`、模块注释与代码一致）。
+- 质量：workspace 292 全绿（探针超时负载 flake 1 次，重跑绿）。
 
 ### 残留状态核查（第二轮验收后）
 

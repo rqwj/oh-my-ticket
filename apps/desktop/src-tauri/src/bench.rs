@@ -67,8 +67,18 @@ pub fn analyze_jsonl(path: &Path) -> Option<ExecMetrics> {
             "tool_call" => {
                 tool_calls += 1;
                 let name = ev["name"].as_str().unwrap_or_default();
-                let is_omt =
-                    name.contains("run__") || name.contains("node__") || name.contains("omt");
+                // F-BENCH-3：omp 经 write 工具写虚拟路径（input.path =
+                // "xd://mcp__omt_run_claim"）调 MCP——工具名与 path 都查
+                let path = ev["input"]["path"].as_str().unwrap_or_default();
+                // omp 虚拟路径形如 xd://mcp__omt_run_claim（omt 与动词间是
+                // 单下划线）；工具名形如 mcp__omt__run__claim（双下划线）
+                let is_omt = name.contains("run__")
+                    || name.contains("node__")
+                    || name.contains("omt")
+                    || path.contains("omt_")
+                    || path.contains("run__claim")
+                    || path.contains("run__report")
+                    || path.contains("node__");
                 if is_omt {
                     seen_omt_call = true;
                 } else if !seen_omt_call {
@@ -82,6 +92,25 @@ pub fn analyze_jsonl(path: &Path) -> Option<ExecMetrics> {
                 }
                 if let Some(c) = ev["cost"].as_f64() {
                     cost = Some(c);
+                }
+            }
+            "raw" => {
+                // F-BENCH-11 兜底：语料是采集当时 adapter 的输出——usage
+                // 提取若在采集后才修（omp 18.12.2 的 end 族挂载），卷里就没
+                // 有 usage 事件。经当前 adapter 重放 raw 行补提取，与语料库
+                // 「当前代码重放历史」定位一致。
+                let body = ev["text"].as_str().unwrap_or_default();
+                if body.trim_start().starts_with('{') {
+                    for part in crate::adapters::parse_line(&harness, body) {
+                        if part["kind"] == "usage" {
+                            if let Some(t) = part["tokens"].as_u64() {
+                                tokens = Some(t);
+                            }
+                            if let Some(c) = part["cost"].as_f64() {
+                                cost = Some(c);
+                            }
+                        }
+                    }
                 }
             }
             "error" => errors += 1,
@@ -187,7 +216,8 @@ mod tests {
         let m = analyze_jsonl(&fixture("opencode", "1.18.32", "stream-smoke-hello.jsonl"))
             .expect("opencode fixture 应存在");
         assert_eq!(m.harness, "opencode");
-        // 该卷是 Agent 24（信任门轮）：tool_calls 高于 3 但发现开销仍须为 0
+        // 3-call 收官轮（exec-50001-5）：调用数与发现开销双契约
+        assert_eq!(m.tool_calls, 3, "{m:?}");
         assert_eq!(m.discovery_overhead, 0, "{m:?}");
     }
 
@@ -209,18 +239,152 @@ mod tests {
         }
     }
 
-    /// 归一化不变量：语料不得含本机路径 / 真实 session id / 真实时间戳。
+    /// 归一化不变量（F-BENCH-8 扩面）：三家全部 jsonl + help/models——
+    /// 不得含本机路径 / 真实 session id / 验收环境名。
     #[test]
     fn fixtures_are_normalized() {
-        for (p, v, f) in [
-            ("pi", "1.3.0", "stream-smoke-hello.jsonl"),
-            ("opencode", "1.18.32", "stream-smoke-hello.jsonl"),
-        ] {
-            let text = std::fs::read_to_string(fixture(p, v, f)).unwrap();
-            assert!(!text.contains("/Users/"), "{p} 残留本机路径");
-            assert!(!text.contains("omt-accept"), "{p} 残留验收环境路径");
-            assert!(!text.contains("01a1"), "{p} 残留真实 session id 前缀");
-            assert!(text.contains("__PATH__"), "{p} 应有占位符");
+        let root =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../fixtures/harness");
+        let mut checked = 0;
+        for entry in walk(&root) {
+            let name = entry
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            if !(name.ends_with(".jsonl") || name == "help.txt" || name == "models.txt") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&entry).unwrap_or_default();
+            assert!(
+                !text.contains("/Users/"),
+                "{} 残留本机路径",
+                entry.display()
+            );
+            assert!(
+                !text.contains("omt-accept"),
+                "{} 残留验收环境路径",
+                entry.display()
+            );
+            assert!(
+                !text.contains("01a1"),
+                "{} 残留真实 session id 前缀",
+                entry.display()
+            );
+            checked += 1;
+        }
+        assert!(checked >= 9, "应覆盖三家全部语料文件，实际 {checked}");
+    }
+
+    fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return out;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                out.extend(walk(&p));
+            } else {
+                out.push(p);
+            }
+        }
+        out
+    }
+
+    /// F-BENCH-3 回归：omp 全部 3 次调用经 write 虚拟路径——开销 0。
+    #[test]
+    fn omp_18122_smoke_fixture_metrics() {
+        let m = analyze_jsonl(&fixture("omp", "18.12.2", "stream-smoke-hello.jsonl"))
+            .expect("omp fixture 应存在");
+        assert_eq!(m.harness, "omp");
+        assert_eq!(m.tool_calls, 3, "omp 3-call 收官契约: {m:?}");
+        assert_eq!(
+            m.discovery_overhead, 0,
+            "write 虚拟路径须识别为 omt 调用: {m:?}"
+        );
+    }
+
+    /// F-BENCH-11 回归：omp usage 从 end 族事件提取（adapter 已补）。
+    #[test]
+    fn omp_fixture_carries_usage() {
+        let m = analyze_jsonl(&fixture("omp", "18.12.2", "stream-smoke-hello.jsonl"))
+            .expect("omp fixture");
+        assert!(m.tokens.is_some(), "omp usage 应非空: {m:?}");
+        assert!(m.cost.is_some(), "{m:?}");
+    }
+
+    /// F-BENCH-4（语料库核心价值）：raw JSON 行重放进**当前** adapter——
+    /// 语料是采集时 adapter 的产物，只有重放当前代码才能测漂移。
+    /// 断言：每卷至少有若干 raw 行产出结构化事件（非全落 raw 兜底）。
+    /// opencode 卷的 raw 行恰全为 step_start 噪声（统一事件来自 adapter
+    /// 直接解析不落 raw）——其重放面由事件词汇测试覆盖，本测试针对
+    /// raw 含信号行的 pi/omp。
+    #[test]
+    fn raw_lines_reparse_through_current_adapter() {
+        for (p, v) in [("pi", "1.3.0"), ("omp", "18.12.2")] {
+            let text = std::fs::read_to_string(fixture(p, v, "stream-smoke-hello.jsonl")).unwrap();
+            let mut raw_json = 0usize;
+            let mut structured = 0usize;
+            for line in text.lines() {
+                let Ok(ev) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                if ev["kind"] != "raw" {
+                    continue;
+                }
+                let body = ev["text"].as_str().unwrap_or_default().to_string();
+                if !body.trim_start().starts_with('{') {
+                    continue;
+                }
+                // 已知噪声行（step_start / 系统消息帧）本就应产出空——不算漂移
+                if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&body) {
+                    let t = raw["type"].as_str().unwrap_or_default();
+                    if matches!(
+                        t,
+                        "step_start" | "message_start" | "message_end" | "agent_end"
+                    ) {
+                        continue;
+                    }
+                }
+                raw_json += 1;
+                if crate::adapters::parse_line(p, &body)
+                    .iter()
+                    .any(|x| x["kind"] != "raw")
+                {
+                    structured += 1;
+                }
+            }
+            assert!(raw_json > 0, "{p} 语料应含信号行");
+            assert!(
+                structured > 0,
+                "{p}: 当前 adapter 对 {raw_json} 行信号 raw JSON 全落兜底——漂移！"
+            );
+        }
+    }
+
+    /// F-BENCH-4 续：models.txt 过形状校验（深度比对待 §6.3 暴露
+    /// parse_models_output 后接入）。
+    #[test]
+    fn model_lists_present_and_shaped() {
+        for (p, v) in [("pi", "1.3.0"), ("omp", "18.12.2"), ("opencode", "1.18.32")] {
+            let text = std::fs::read_to_string(fixture(p, v, "models.txt")).unwrap();
+            assert!(!text.trim().is_empty(), "{p} models.txt 为空");
+            // opencode 是 provider/model 行式；pi 是列名表头表格；omp 是
+            // 分组表格（组头 "kimi-code (7)" + 框线，无列名行）
+            if p == "opencode" {
+                assert!(text.contains('/'), "{p} 行式列表应含 provider/id");
+            } else if p == "pi" {
+                assert!(
+                    text.contains("provider") && text.contains("model"),
+                    "{p} 表头缺列"
+                );
+            } else {
+                assert!(
+                    text.contains('(') && text.contains('┌'),
+                    "{p} 分组表格形状缺失"
+                );
+            }
         }
     }
 }

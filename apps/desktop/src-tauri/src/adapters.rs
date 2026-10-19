@@ -247,6 +247,25 @@ fn parse_pi_family(ev: &serde_json::Value) -> Vec<serde_json::Value> {
                 "isError": ev["isError"].as_bool().unwrap_or(false),
             })]
         }
+        // F-BENCH-11：omp 18.12.2 的 usage 帧不再挂 message_update（1.3 位置），
+        // 而在 message_end / turn_end / agent_end（实测：4 帧均匀分布）。
+        // message_update 里的 usage 是流中快照（F-U12-3 去重已处理），
+        // end 族的是最终值——这里提取后同样经 reader 去重。
+        "message_end" | "turn_end" | "agent_end" => {
+            let usage = ev.pointer("/message/usage").or(Some(&ev["usage"]));
+            let Some(usage) = usage.filter(|u| u.is_object()) else {
+                return Vec::new();
+            };
+            match (
+                usage["totalTokens"].as_u64(),
+                usage["cost"]["total"].as_f64(),
+            ) {
+                (Some(tokens), cost) => {
+                    vec![serde_json::json!({ "kind": "usage", "tokens": tokens, "cost": cost })]
+                }
+                (None, _) => Vec::new(),
+            }
+        }
         "error" => {
             let message = ev["error"]
                 .as_str()
