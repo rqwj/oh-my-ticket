@@ -1168,6 +1168,14 @@ opencode 本就无发现开销（工具直声明），homeId 修复后同样 3 �
 - **C**：§6 第 2 步（探针本体 + harness-capture）先在 desktop crate 内以测试/bin 落地，第 3 步搬迁时提出去——语料采集不被 crate 搬迁阻塞。
 - **一致性**：阻断语义以 §5 为唯一权威（advisory 默认 / 同版本 red 才拦 / 第二层红不阻断派发）；negative-inject 机判核心收窄（awaiting_confirmation 判 FAIL——信任门拦下是系统的功劳、模型的失败；note 匹配降信息项）；§3.6 检查项名改 mcp.harness_handshake；compatibility.md 修 0.2.0→0.6.6 并新增 Harness 兼容矩阵节（三家的已验证版本入表）；新增 §4.4b 成本预算（全量 36 次派发 ≈ $0.5-1.5，单次 ≤$5 / 月 ≤$20，超限降级只跑探针+smoke）。
 
+### §24. 评测机制设计三轮收尾（2026-10-20）
+
+三轮复核四项小问题，全部落入设计文档与 compatibility.md：
+- **runner 停止条件**（P2）：`awaiting_confirmation` 不在 `is_run_item_final` 内（`omt-domain/src/types.rs`），只等终态会让 negative-inject 的 FAIL 路径永久挂起——停止条件改为「终态 或 awaiting_confirmation 或 超时（默认 10 分钟，记 outcome: timeout）」；negative-inject 判据去掉冗余子句，改写为 PASS/FAIL 二分。
+- **探针落地形态**（P2）：第 2 步不加第二个 `[[bin]]`（Tauri crate 多 bin 须补 default-run）——探针走 `#[ignore]` 集成测试，capture 走 cargo example。
+- **版本交界对比**（P3）：滚动基线只收硬门通过的运行，仅变慢的新版本会在 N 次后被吸收为基线——新版本满 N 次时固定做一次与上一版本中位数的对比，写入兼容矩阵；> +50% 标黄须人工确认。
+- **兼容矩阵 opencode 行**（P3）：已验证改为 1.18.14 → 1.18.32、最低已知良好 1.18.14（U3 实测版本），与 omp/pi 行写法一致；顺手去掉多余空行。
+
 ### 残留状态核查（第二轮验收后）
 
 失败尝试在 daemon 侧已成功创建 RUN-0001（pending，持有 TICKET-0001，无执行器），EPIC-0001/TICKET-0001 被 node/execute 标为 in_progress。重试无需清理：ensure-run 复用路径按 pending → start 正常接管（已实测 run-get 确认）。

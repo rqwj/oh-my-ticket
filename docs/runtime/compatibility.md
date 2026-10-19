@@ -37,7 +37,6 @@
 自 U7a 删除 TS core 后退役——按上游 U10b 决策：记录结论为「Rust leg
 晋升规范执行者，TS leg 已退役」，不再双跑。
 
-
 ## Harness 兼容矩阵（R-5；版本变更钩子的比对锚点）
 
 每 provider 记录已验证版本与最低已知良好版本；探针 verdict 变化或新版本
@@ -45,6 +44,6 @@
 
 | Provider | 已验证版本 | 最低已知良好 | 备注 |
 |---|---|---|---|
-| opencode | 1.18.32 | 1.18.32 | 工具直声明（等价全 direct） |
+| opencode | 1.18.14 → 1.18.32 | 1.18.14 | 工具直声明（等价全 direct）；1.18.14 为 U3 注入实测版本（`mcp_injection.rs` 模块注释） |
 | omp | 18.0.9 → 18.12.2 | 18.0.9 | 18.12.2 无 exposure 体系；新增 `--restore`（backlog） |
 | pi | 1.0.0 → 1.3.0 | 1.0.0 | exposure:direct 自 1.0 可用；1.3 出现 chunk 事件（adapters 优雅忽略） |
