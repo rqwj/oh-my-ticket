@@ -7,6 +7,7 @@
 mod adapters;
 mod agents;
 mod atomic_json;
+mod bench;
 mod daemon;
 // U2 内核先于 U4 exec_start 接线落地——spawn 侧 API 在 U4 前是死代码
 #[allow(dead_code)]

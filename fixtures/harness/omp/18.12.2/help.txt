@@ -1,0 +1,233 @@
+omp v18.12.2
+
+USAGE
+  $ omp [COMMAND]
+
+ARGUMENTS
+  MESSAGES   Messages to send (prefix files with @)
+
+FLAGS
+      --model=<value>                   Model to use (fuzzy match: "opus", "gpt-5.2", or "openai/gpt-5.2")
+      --smol=<value>                    Smol/fast model for lightweight tasks (or PI_SMOL_MODEL env)
+      --slow=<value>                    Slow/reasoning model for thorough analysis (or PI_SLOW_MODEL env)
+      --plan=<value>                    Plan model for architectural planning (or PI_PLAN_MODEL env)
+      --goal=<value>                    Start fresh in goal mode (interactive only; bypasses autoResume; no positional prompt, startup plan mode, or explicit resume)
+      --prewalk                         Switch from the active model to a fast/cheap model at the first edit/write after the plan's todo list exists (default off; see prewalk.enabled)
+      --no-prewalk                      Disable prewalk, including prewalk.auto, even if prewalk.enabled is set
+      --prewalk-into=<value>            Target model for prewalk (default the "smol" role)
+      --plan-yolo                       Force read-only plan mode at start, auto-approve the plan on the model's first resolve call, then switch to --plan-yolo-into to implement it
+      --plan-yolo-into=<value>          Target model for plan-yolo execution (default the "smol" role)
+      --provider=<value>                Provider to use (legacy; prefer --model)
+      --api-key=<value>                 API key (defaults to env vars)
+      --system-prompt=<value>           System prompt (default: coding assistant prompt)
+      --system-prompt-template=<value>  Handlebars system prompt template (mutually exclusive with --system-prompt)
+      --append-system-prompt=<value>    Append text or file contents to the system prompt
+      --allow-home                      Allow starting in ~ without auto-switching to a temp dir
+      --profile=<value>                 Use an isolated profile for auth, sessions, settings, and caches
+      --alias=<value>                   Create a shell shortcut for the selected profile and exit
+      --cwd=<value>                     Directory to start in (overrides the launch cwd)
+      --mode=<value>                    Output mode: text (default), json, rpc, or rpc-ui
+      --config=<value>                  Load an extra config.yml-style overlay for this run (repeatable)
+      --add-dir=<value>                 Add a workspace directory beyond the working directory (repeatable)
+  -p, --print                           Non-interactive mode: process prompt and exit
+  -c, --continue                        Continue previous session
+  -r, --resume=<value>                  Resume a session (by ID prefix, path, or picker if omitted)
+      --restore=<value>                 Resume a session as --resume does, then go on with what its last process left unfinished (the interrupted turn and the subagents it was running)
+      --from-claude                     Import a Claude Code session into OMP
+      --from-codex                      Import a Codex session into OMP
+      --session-dir=<value>             Directory for session storage and lookup
+      --no-session                      Don't save session (ephemeral)
+      --models=<value>                  Comma-separated model patterns for Ctrl+P cycling
+      --no-tools                        Disable all built-in tools
+      --no-lsp                          Disable LSP tools, formatting, and diagnostics
+      --no-pty                          Disable PTY-based interactive bash execution
+      --tools=<value>                   Comma-separated list of tools to enable (default: all)
+      --thinking=<value>                Set thinking level: off, minimal, low, medium, high, xhigh, max, auto
+      --service-tier=<value>            OpenAI service tier for this session (none omits service_tier)
+      --hide-thinking                   Hide thinking blocks in TUI output (display only, does not disable model thinking)
+      --advisor                         Enable the advisor runtime (passively reviews each turn and injects notes)
+      --external-thinking               Use a private scratchpad while disabling supported GPT, Claude, and Gemini reasoning (at your own risk: providers have flagged this request shape as abuse)
+      --hook=<value>                    Load a hook/extension file (can be used multiple times)
+  -e, --extension=<value>               Load an extension file (can be used multiple times)
+      --no-extensions                   Disable extension discovery (explicit -e paths still work)
+      --no-skills                       Disable skills discovery and loading
+      --skills=<value>                  Comma-separated glob patterns to filter skills (e.g., git-*,docker)
+      --no-rules                        Disable rules discovery and loading
+      --export=<value>                  Export session file to HTML and exit
+      --no-title                        Disable title auto-generation
+      --no-ui                           With --mode rpc or rpc-ui: run extensions headless (rpc-ui tool UI remains enabled)
+      --print-thoughts                  Include thinking blocks in print mode text output
+      --max-time=<value>                Stop the session after this duration (e.g., 600, 10m, 1h)
+      --auto-approve                    Auto-approve all tool calls (skip approval prompts)
+      --approval-mode=<value>           Override tools.approvalMode for this session (always-ask|write|yolo)
+
+EXAMPLES
+  # Interactive mode
+    omp
+  # Interactive mode with initial prompt
+    omp "List all .ts files in src/"
+  # Start working on a goal immediately
+    omp --goal "Investigate the importer"
+  # Include files in initial message
+    omp @prompt.md @image.png "What color is the sky?"
+  # Non-interactive mode (process and exit)
+    omp -p "List all .ts files in src/"
+  # Continue previous session
+    omp --continue "What did we discuss?"
+  # Pick a session back up after a crash, subagents included
+    omp --restore ~/.omp/agent/sessions/--path--/session.jsonl
+  # Create a shell shortcut for a work profile
+    omp --profile work --alias omp-work
+  # Use different model (fuzzy matching)
+    omp --model opus "Help me refactor this code"
+  # Limit model cycling to specific models
+    omp --models claude-sonnet,claude-haiku,gpt-4o
+  # Export a session file to HTML
+    omp --export ~/.omp/agent/sessions/--path--/session.jsonl
+
+COMMANDS
+  acp            Run omp as an ACP (Agent Client Protocol) server over stdio
+  agents         Manage bundled task agents
+  anonymize      Write a shareable copy of a session and its subagents: turn contents redacted, metadata kept, paths and literals replaced by consistent mock tokens
+  auth           Export or import stored provider credentials (API keys and OAuth logins) as JSON
+  auth-broker    Manage the omp auth-broker (credential vault)
+  auth-gateway   Run an auth-gateway: an HTTP forward proxy backed by the configured broker, or JSON lines on stdio with your own credentials
+  bench          Benchmark models: TTFT/prefill vs decode throughput with p50/p95, across chat, prefill, generation, and prompt-cache workloads, or single-user vs parallel load (--detailed)
+  browser-relay  Run the local CDP relay that lets the browser prelude drive your own Chrome tabs
+  cleanse        Detect and fix project diagnostics with weighted parallel subagents
+  clip           Upload a /record recording to live.omp.sh as a public clip and print its URL
+  collab         List active local Collab host metadata without URLs; use collab link <instanceId|pid> to retrieve a control link (--view for view-only)
+  commit         Generate a commit message and update changelogs
+  completions    Print a shell completion script (bash, zsh, or fish)
+  compress       Rewrite a text file into the dense prompt register, reporting what it drops
+  config         Manage configuration settings
+  dry-balance    Dry-run OAuth account balancing across random session ids
+  find           Semantic search: describe a behavior, get the files and line ranges that implement it
+  gallery        Preview tool, composer, and status-line renderers in a deterministic visual gallery
+  gc             Run storage garbage collection
+  git            Interactive fullscreen git UI: split diff viewer, staging sidebar, and commit composer
+  grep           Test grep tool
+  grievances     View, clean, or push reported tool issues (auto-QA grievances)
+  if-bench       Benchmark instruction following and working memory: one cached thread of glyph array actions with a moving cat-sound directive
+  images         Inspect, diagnose, probe, and purge image publication backends
+  install        Install or link an extension package (alias of `plugin install`/`plugin link`)
+  join           Join a shared collab session (same as /join)
+  login          Log in to a model provider (terminal counterpart of /login)
+  models         List, search, and refresh available models
+  play           Replay a /record session recording in the terminal (space pauses, q quits)
+  plugin         Manage plugins (install, uninstall, list, etc.)
+  predict        Type a prompt and compare every word-completion engine's ghost text live
+  ps             List and control daemon-supervised background processes (logs, stop, kill, restart)
+  read           Show what the read tool will return for a path, URL, or internal URI
+  render         Draw a session's entire thread through the production transcript pipeline (with repaint timing)
+  say            Synthesize text with the local TTS engine and play it through the speakers
+  search         Test web search providers
+  session        Hand a session to another machine: pack it, unpack it, or mark the local copy moved
+  setup          Run onboarding setup or install dependencies for optional features
+  share          Share a saved session via an encrypted link (same as /share)
+  shell          Interactive shell console
+  skill          Install, search, publish, and manage skills on the Skillshare registry (skills.omp.sh)
+  ssh            Manage SSH host configurations
+  stats          View usage statistics
+  stream         Broadcast local omp session screens and chat to your public live channel
+  tiny-models    Download tiny local models (session titles, memory, word completion)
+  token          Get the API key or OAuth token for a provider
+  toks           Count a file or text with every embedded offline tokenizer (OpenAI, Claude, Qwen, …)
+  ttsr           Inspect and test Time-Traveling Stream Rules (TTSR)
+  update         Check for and install updates
+  usage          Show provider usage limits for every authenticated account
+  worktree       Add, list, or clear git worktrees (clone-first when enabled)
+
+Environment Variables:
+  # Core Providers
+  ANTHROPIC_API_KEY          - Anthropic Claude models
+  ANTHROPIC_OAUTH_TOKEN      - Anthropic OAuth (takes precedence over API key)
+  CLAUDE_CODE_USE_FOUNDRY    - Enable Anthropic Foundry mode (uses Foundry endpoint + mTLS)
+  FOUNDRY_BASE_URL           - Anthropic Foundry base URL (e.g., https://<foundry-host>)
+  ANTHROPIC_FOUNDRY_API_KEY  - Anthropic token used as Authorization: Bearer <token> in Foundry mode
+  ANTHROPIC_CUSTOM_HEADERS   - Extra headers for Foundry or any custom ANTHROPIC_BASE_URL gateway (e.g., "user-id: USERNAME")
+  CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS - Omit pre-release Anthropic fields (context_management, beta tool fields, task budgets, thinking.block_binding) for gateways that reject them
+  CLAUDE_CODE_CLIENT_CERT    - Client certificate (PEM path or inline PEM) for mTLS
+  CLAUDE_CODE_CLIENT_KEY     - Client private key (PEM path or inline PEM) for mTLS
+  NODE_EXTRA_CA_CERTS        - CA bundle path (or inline PEM) for server certificate validation
+  OPENAI_API_KEY             - OpenAI GPT models
+  GEMINI_API_KEY             - Google Gemini models
+  COPILOT_GITHUB_TOKEN      - GitHub Copilot
+
+  # Additional LLM Providers
+  AZURE_OPENAI_API_KEY       - Azure OpenAI models
+  GROQ_API_KEY               - Groq models
+  CEREBRAS_API_KEY           - Cerebras models
+  XAI_API_KEY                - xAI Grok models
+  OPENROUTER_API_KEY         - OpenRouter aggregated models
+  KILO_API_KEY               - Kilo Gateway models
+  MISTRAL_API_KEY            - Mistral models
+  ZAI_API_KEY                - z.ai models (ZhipuAI/GLM)
+  UMANS_AI_CODING_PLAN_API_KEY - Umans AI Coding Plan models
+  ABLITERATION_API_KEY       - Abliteration uncensored GLM models
+  UMANS_WEBSEARCH_PROVIDER    - Umans gateway web search backend (native or exa)
+  MINIMAX_API_KEY            - MiniMax models
+  OPENCODE_API_KEY           - OpenCode Zen/OpenCode Go models
+  CURSOR_ACCESS_TOKEN        - Cursor AI models
+  CLINE_API_KEY              - ClinePass subscription models
+  COMMAND_CODE_API_KEY       - Command Code Provider API models
+  CHARM_HYPER_API_KEY        - Charm Hyper inference gateway models
+  AI_GATEWAY_API_KEY         - Vercel AI Gateway
+  STEPFUN_API_KEY            - StepFun Step models
+  HELMCODE_API_KEY           - Helmcode private EU inference
+  WAFER_SERVERLESS_API_KEY   - Wafer Serverless (pay-as-you-go)
+  YOLO_AUTO_API_KEY          - Yolo-Auto flat-rate Qwen models
+  SINGULARITYAPI_DEV_API_KEY - SingularityAPI universal gateway (300+ models)
+  SINGULARITYAPI_TECH_API_KEY - SingularityAPI reserved DeepSeek lanes
+
+  # Cloud Providers
+  AWS_PROFILE                - AWS Bedrock (or AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY)
+  GOOGLE_CLOUD_PROJECT       - Google Vertex AI (requires GOOGLE_CLOUD_LOCATION)
+  GOOGLE_APPLICATION_CREDENTIALS - Service account for Vertex AI
+
+  # Search & Tools
+  EXA_API_KEY                - Exa web search
+  BRAVE_API_KEY              - Brave web search
+  PERPLEXITY_API_KEY         - Perplexity web search API key (optional; anonymous fallback)
+  PERPLEXITY_COOKIES         - Perplexity web search (session cookie)
+  TAVILY_API_KEY             - Tavily web search
+  TINYFISH_API_KEY           - TinyFish web search
+  FIRECRAWL_API_KEY          - Firecrawl web search + fetch reader backend
+  ANTHROPIC_SEARCH_API_KEY   - Anthropic web search (override; isolates search from main ANTHROPIC_API_KEY)
+  ANTHROPIC_SEARCH_BASE_URL  - Anthropic web search base URL (override; pairs with ANTHROPIC_SEARCH_API_KEY)
+  TYPESAFE_API_KEY           - TypeSafe System One judgments (auto thinking, unexpected-stop, AI staging, eval judge())
+
+  # Configuration
+  OMP_PROFILE                 - Named profile for isolated agent state (same as --profile)
+  Use `omp --profile <name> --alias <command>` to create a shell shortcut for a profile
+  PI_CODING_AGENT_DIR        - Session storage directory (default: ~/.omp/agent)
+  PI_PACKAGE_DIR             - Override package directory (for Nix/Guix store paths)
+  PI_SMOL_MODEL              - Override smol/fast model (see --smol)
+  PI_SLOW_MODEL              - Override slow/reasoning model (see --slow)
+  PI_PLAN_MODEL              - Override planning model (see --plan)
+  PI_NO_PTY                  - Disable PTY-based interactive bash execution
+  For complete environment variable reference, see:
+  docs/environment-variables.md
+Available Tools (default-enabled unless noted):
+  read          - Read file contents
+  bash          - Execute bash commands
+  edit          - Edit files with find/replace
+  write         - Write files (creates/overwrites)
+  grep          - Search file contents
+  glob          - Find files by glob pattern
+  lsp           - Language server protocol (code intelligence)
+  python        - Execute Python code (requires: omp setup python)
+  notebook      - Edit Jupyter notebooks
+  browser       - Browser automation (Puppeteer)
+  computer      - Native host desktop capture and input (disabled by default)
+  task          - Launch sub-agents for parallel tasks
+  todo          - Manage todo/task lists
+  web_search    - Search the web
+  ask           - Ask user questions (interactive mode only)
+
+Plugin Options:
+  --plugin-dir <path>        Load plugin from directory (repeatable)
+
+Useful Commands:
+  omp agents unpack           - Export bundled subagents to ~/.omp/agent/agents (default)
+  omp agents unpack --project - Export bundled subagents to ./.omp/agents

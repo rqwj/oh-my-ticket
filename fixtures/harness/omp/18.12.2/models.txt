@@ -1,0 +1,44 @@
+kimi-code (7)
+┌───────────────────────────┬─────────┬─────────┬─────────────────────────┬────────┐
+│ model                     │ context │ max-out │ thinking                │ images │
+├───────────────────────────┼─────────┼─────────┼─────────────────────────┼────────┤
+│ k3                        │      1M │    131K │ low,high,max            │ yes    │
+│ k3-256k                   │    262K │    131K │ low,high,max            │ yes    │
+│ kimi-for-coding           │      1M │     33K │ low,high,max            │ yes    │
+│ kimi-for-coding-highspeed │    262K │     33K │ minimal,low,medium,high │ yes    │
+│ kimi-k2                   │    262K │    262K │ -                       │ no     │
+│ kimi-k2-turbo-preview     │    262K │     32K │ -                       │ no     │
+│ kimi-k2.5                 │    262K │     66K │ minimal,low,medium,high │ yes    │
+└───────────────────────────┴─────────┴─────────┴─────────────────────────┴────────┘
+
+ollama (2)
+┌───────────────────────┬─────────┬─────────┬──────────┬────────┐
+│ model                 │ context │ max-out │ thinking │ images │
+├───────────────────────┼─────────┼─────────┼──────────┼────────┤
+│ bge-m3:latest         │    8.2K │    8.2K │ -        │ no     │
+│ qwen2.5:0.5b-instruct │     33K │     33K │ -        │ no     │
+└───────────────────────┴─────────┴─────────┴──────────┴────────┘
+
+zai (18)
+┌────────────────┬─────────┬─────────┬───────────────────────────────┬────────┐
+│ model          │ context │ max-out │ thinking                      │ images │
+├────────────────┼─────────┼─────────┼───────────────────────────────┼────────┤
+│ glm-4.5        │    131K │     98K │ minimal,low,medium,high,xhigh │ no     │
+│ glm-4.5-air    │    131K │     98K │ minimal,low,medium,high,xhigh │ no     │
+│ glm-4.5-flash  │    131K │     98K │ minimal,low,medium,high,xhigh │ no     │
+│ glm-4.5v       │     64K │     16K │ minimal,low,medium,high,xhigh │ yes    │
+│ glm-4.6        │    205K │    131K │ minimal,low,medium,high,xhigh │ no     │
+│ glm-4.6v       │    128K │     33K │ minimal,low,medium,high,xhigh │ yes    │
+│ glm-4.6v-flash │    128K │     33K │ minimal,low,medium,high,xhigh │ yes    │
+│ glm-4.7        │    205K │    131K │ minimal,low,medium,high,xhigh │ no     │
+│ glm-4.7-flash  │    200K │    131K │ minimal,low,medium,high,xhigh │ no     │
+│ glm-4.7-flashx │    200K │    131K │ minimal,low,medium,high,xhigh │ no     │
+│ glm-5          │    205K │    131K │ minimal,low,medium,high,xhigh │ no     │
+│ glm-5-turbo    │    200K │    131K │ minimal,low,medium,high,xhigh │ no     │
+│ glm-5.1        │    200K │    131K │ minimal,low,medium,high,xhigh │ no     │
+│ glm-5.2        │      1M │    131K │ high,max                      │ no     │
+│ glm-5.3        │      1M │    131K │ low,high,max                  │ no     │
+│ glm-5.3-flash  │      1M │    131K │ low,high,max                  │ yes    │
+│ glm-5.3-flashx │      1M │    131K │ low,high,max                  │ yes    │
+│ glm-5v-turbo   │    200K │    131K │ minimal,low,medium,high,xhigh │ yes    │
+└────────────────┴─────────┴─────────┴───────────────────────────────┴────────┘

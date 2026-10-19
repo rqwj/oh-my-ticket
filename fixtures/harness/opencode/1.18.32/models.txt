@@ -1,0 +1,17 @@
+opencode/beam-free
+opencode/big-pickle
+opencode/deepseek-v4.1-flash-free
+opencode/glm-5.3-flash-free
+opencode/longcat-2.5-preview-free
+opencode/mimo-v2.6-flash-free
+opencode/nemotron-3-ultra-free
+opencode/nemotron-3.5-lightning-free
+opencode/nemotron-3.5-super-vl-free
+opencode/space-bunny-free
+zai-coding-plan/glm-4.7
+zai-coding-plan/glm-5-turbo
+zai-coding-plan/glm-5.2
+zai-coding-plan/glm-5.2-highspeed
+zai-coding-plan/glm-5.3
+zai-coding-plan/glm-5.3-flash
+zai-coding-plan/glm-5.3-highspeed

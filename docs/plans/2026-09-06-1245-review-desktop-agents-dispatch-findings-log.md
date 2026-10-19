@@ -1186,6 +1186,13 @@ opencode 本就无发现开销（工具直声明），homeId 修复后同样 3 �
 
 **五轮补遗（2026-10-20）**：§4.4 停止条件原按单 item 措辞，多 item 任务有歧义——补 run 级语义三条：①全部 item 均入停止态才停（否则 subtree-multi 首项进信任门即提前收工，第二次 claim 测不到）；②run 进入终态（canceled 等）也停（agent 异常取消时 item 永久 pending 的兜底）；③超时计整个 run 总时长而非逐 item。措辞歧义当场修入文档而非留到实现——语义决策属设计管辖面，且按字面实现会测漏。
 
+### §26. 评测机制实施 §6.1–6.2（feat/harness-benchmark 分支，2026-10-20）
+
+- **§6.1 语料库**：`fixtures/harness/<provider>/<version>/`（opencode 1.18.32 / omp 18.12.2 / pi 1.3.0）——三家各含 version/help/models + `stream-smoke-hello.jsonl`（**三家 3-tool-call 收官轮的真实事件流**，exec-50001 系列）+ meta.json。采样经对象级归一（路径/sessionId/execId/pid/时间戳 → 固定占位）；omp 另留 adapter-lines.jsonl（合成行，供 parse_line 回放）。首采踩坑一次：误采 Agent 26 的旧轮（13 调用）——按 tool_calls 挑卷的检查本身就成了流程的一部分。
+- **§6.1 分析器**：`bench.rs`（desktop crate）——jsonl → ExecMetrics 纯函数（tool_calls / discovery_overhead / turns / duration / tokens / cost / errors / outcome），`analyze_dir` 批量。4 个回放测试进普通 cargo test（CI 可跑）：pi 3-call + discovery=0 永久契约、opencode 零发现开销、结构完备、**归一化不变量**（语料不得含本机路径/真实 session/验收环境名）。思考块期望按 provider（opencode 无 reasoning 是正常形态）。
+- **§6.2 探针**：`#[ignore]` 集成测试（`harness_probe.rs`——flag 面可执行验证 + 模型列表执行 + 事件词汇 fixture 回放）+ `harness-capture` cargo example（零成本面采样：version/help/models + 归一落盘；事件流留给 runner 层）。实跑验证：probe --ignored 2 过、capture pi 端到端产出目录。
+- 工作树门：Rust 117+workspace 全绿、clippy/fmt 干净。crate 搬迁（§6.3）与 runner（§6.4+Harbor spike）为下一步。
+
 ### 残留状态核查（第二轮验收后）
 
 失败尝试在 daemon 侧已成功创建 RUN-0001（pending，持有 TICKET-0001，无执行器），EPIC-0001/TICKET-0001 被 node/execute 标为 in_progress。重试无需清理：ensure-run 复用路径按 pending → start 正常接管（已实测 run-get 确认）。
