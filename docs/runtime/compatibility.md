@@ -4,7 +4,7 @@
 
 | 版本 | 位置 | 语义 |
 |------|------|------|
-| **产品版本** | 根 `Cargo.toml` `[workspace.package] version`（当前 0.2.0） | 唯一事实源。`omt`/`omt-daemon` 二进制、release tag（`v<X.Y.Z>`）、桌面包、npm 平台包全部由此派生（release workflow 校验 tag==版本，不一致 fail）。 |
+| **产品版本** | 根 `Cargo.toml` `[workspace.package] version`（当前 0.6.6） | 唯一事实源。`omt`/`omt-daemon` 二进制、release tag（`v<X.Y.Z>`）、桌面包、npm 平台包全部由此派生（release workflow 校验 tag==版本，不一致 fail）。 |
 | **npm 根包 SemVer** | 根 `package.json` `version` | DSH 插件分发节奏独立演进；声明 runtime 兼容下限而非锁步。 |
 | **协议版本** | 握手 `protocolVersion`（当前 1.0） | MAJOR 断裂才升级；MINOR/特性以 `features` 开放映射追加（如 `homeDeclare`）。 |
 
@@ -36,3 +36,15 @@
 执行者**（`crates/omt-domain` corpus 测试）。TS leg（`corpus/runner/ts`）
 自 U7a 删除 TS core 后退役——按上游 U10b 决策：记录结论为「Rust leg
 晋升规范执行者，TS leg 已退役」，不再双跑。
+
+
+## Harness 兼容矩阵（R-5；版本变更钩子的比对锚点）
+
+每 provider 记录已验证版本与最低已知良好版本；探针 verdict 变化或新版本
+验证后更新本表。fixture 语料见 `fixtures/harness/<provider>/<version>/`。
+
+| Provider | 已验证版本 | 最低已知良好 | 备注 |
+|---|---|---|---|
+| opencode | 1.18.32 | 1.18.32 | 工具直声明（等价全 direct） |
+| omp | 18.0.9 → 18.12.2 | 18.0.9 | 18.12.2 无 exposure 体系；新增 `--restore`（backlog） |
+| pi | 1.0.0 → 1.3.0 | 1.0.0 | exposure:direct 自 1.0 可用；1.3 出现 chunk 事件（adapters 优雅忽略） |

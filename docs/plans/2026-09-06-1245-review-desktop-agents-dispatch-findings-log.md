@@ -1160,6 +1160,14 @@ opencode 本就无发现开销（工具直声明），homeId 修复后同样 3 �
 - **R-4/R-5/R-6**：finding→具名检查项纪律、兼容矩阵（`docs/runtime/compatibility.md`）作版本钩子锚点、taskVersion 分桶。
 - **Harbor**：定位第二层 runner 前置 spike（两家支持性 + daemon 容器化待确认），不作门禁；第一/三层无现成替代自研。
 
+### §23. 评测机制设计二轮修订（2026-10-19）
+
+二轮评审三项实质问题 + 五项一致性修正，全部采纳并落入设计文档：
+- **A**：基线分桶去掉 harnessVersion（一轮 R-7 转录时自加的——含版本则新版本空基线起步，跨版本回归告警永不触发）；版本号保留在结果记录做归因。
+- **B**：语料库采样即脱敏（sanitize_line 随 omt-harness 搬迁）+ 路径/时间戳/sessionID 固定占位归一——否则与 §4.4 冲突且跨版本 diff 不可读。
+- **C**：§6 第 2 步（探针本体 + harness-capture）先在 desktop crate 内以测试/bin 落地，第 3 步搬迁时提出去——语料采集不被 crate 搬迁阻塞。
+- **一致性**：阻断语义以 §5 为唯一权威（advisory 默认 / 同版本 red 才拦 / 第二层红不阻断派发）；negative-inject 机判核心收窄（awaiting_confirmation 判 FAIL——信任门拦下是系统的功劳、模型的失败；note 匹配降信息项）；§3.6 检查项名改 mcp.harness_handshake；compatibility.md 修 0.2.0→0.6.6 并新增 Harness 兼容矩阵节（三家的已验证版本入表）；新增 §4.4b 成本预算（全量 36 次派发 ≈ $0.5-1.5，单次 ≤$5 / 月 ≤$20，超限降级只跑探针+smoke）。
+
 ### 残留状态核查（第二轮验收后）
 
 失败尝试在 daemon 侧已成功创建 RUN-0001（pending，持有 TICKET-0001，无执行器），EPIC-0001/TICKET-0001 被 node/execute 标为 in_progress。重试无需清理：ensure-run 复用路径按 pending → start 正常接管（已实测 run-get 确认）。
