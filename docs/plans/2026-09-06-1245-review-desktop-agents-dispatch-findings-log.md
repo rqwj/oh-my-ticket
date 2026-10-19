@@ -1129,6 +1129,11 @@ daemon `run_item_view` 序列化为 `executorActor`（views.rs:130）。恒空 �
 - **服务端守卫**（renderer 不可信）：starting/running 拒绝（先停止）、orphan 拒绝（先强制终止）、不存在可读报错；store 侧删除后清选中态与 failed badge 并重拉列表。
 - **测试**：Rust 守卫三分支 + 删除落盘；前端 icon→弹窗→确认/取消→调用、失败就地报错、运行中隐藏。Rust 113 / 前端 131 全绿。
 
+#### F-PROMPT-1 · P1 · perf · `executor.rs`/`harness.rs` · 派发 prompt 缺 homeId 与调用方式——Agent 26 分析（158s 输出一个 hello）
+**归因**（事件时间线）：15 个模型轮 × ~10-12s（kimi-coding/k3 推理延迟）中，6 轮探索 pi 里怎么调 omt MCP 工具（codemode 里 searchTools/describeNamespace/dump ALL_TOOLS）、3 轮挖 homeId（猜路径被 schema 拒 → sqlite3 直查 omt.db）——**2/3 耗在发现，实际工作仅 4 轮 ~40s**。
+- **修复**：①DISPATCH_PROMPT 增 `{home_id}` 占位符（头部声明 + 规则 1/4 的参数列表）；②registry 新增 per-harness `tool_hint` 拼接模板尾部——pi/omp：「MCP tools via codemode: `await tools.mcp__omt__run__claim({homeId, runId})`」；opencode：直接作为工具调用。dispatch_success 断言 prompt 文件含 homeId 与提示。
+- **预期**：15 轮 → ~5 轮、~50-60s、token 减半。Rust 113（kill_all_timeout 仍偶发负载 flake，3 跑 2 绿）。
+
 ### 残留状态核查（第二轮验收后）
 
 失败尝试在 daemon 侧已成功创建 RUN-0001（pending，持有 TICKET-0001，无执行器），EPIC-0001/TICKET-0001 被 node/execute 标为 in_progress。重试无需清理：ensure-run 复用路径按 pending → start 正常接管（已实测 run-get 确认）。
