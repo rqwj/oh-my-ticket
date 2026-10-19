@@ -1151,6 +1151,15 @@ Agent 28 验收失败（3s exit 0 但零输出零工具）：`exposure: direct` 
 
 opencode 本就无发现开销（工具直声明），homeId 修复后同样 3 调用；omp 无 exposure 体系，靠 tool_hint 达成同效。**三家的冒烟成本从此一致且接近理论上限**。
 
+### §22. 评测机制设计评审采纳（2026-10-19）
+
+`2026-10-19-2110-review-harness-benchmark-design.md`（R-1~R-11）**全盘采纳**，设计文档已按修订清单更新：
+- **R-3（最重要）**：新增「版本 fixture 语料库」——`fixtures/harness/<provider>/<version>/` 沉淀采样，adapters/flag 面对全部历史版本离线回放进普通 cargo test，测试面随版本单调增长（原设计只有单点比对，升级跑完即丢）。
+- **R-1**：定案抽 `crates/omt-harness`（REGISTRY/探测原语/adapters/分析器共用层）；实施后置到 feature 分支合入后（第一步语料库零搬迁依赖）。
+- **R-2/R-7/R-8/R-9/R-10/R-11**：事件词汇按 provider（opencode 无终止事件）、N=3 门 + 滚动中位数基线、runner 显式隔离 + crash recovery、发布门 advisory 默认 + 同版本 red 才拦、CI/本机边界写清、工具数从 parity 推导（不硬编码）+ 不重复 mcp_spec 覆盖 + negative-inject 机判 + help-grep 降 yellow + 结果不存 transcript。
+- **R-4/R-5/R-6**：finding→具名检查项纪律、兼容矩阵（`docs/runtime/compatibility.md`）作版本钩子锚点、taskVersion 分桶。
+- **Harbor**：定位第二层 runner 前置 spike（两家支持性 + daemon 容器化待确认），不作门禁；第一/三层无现成替代自研。
+
 ### 残留状态核查（第二轮验收后）
 
 失败尝试在 daemon 侧已成功创建 RUN-0001（pending，持有 TICKET-0001，无执行器），EPIC-0001/TICKET-0001 被 node/execute 标为 in_progress。重试无需清理：ensure-run 复用路径按 pending → start 正常接管（已实测 run-get 确认）。
