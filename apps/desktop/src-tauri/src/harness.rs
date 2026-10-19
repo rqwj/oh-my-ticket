@@ -186,6 +186,10 @@ pub struct HarnessDescriptor {
     /// 续跑 flag（U11，值接一个 session id；空 = 该 harness 不支持续跑，
     /// UI 隐藏「继续会话」）。实测：opencode `-s`、pi `--session`、omp `--resume`。
     pub resume_args: &'static [&'static str],
+    /// MCP 工具调用方式提示（F-PROMPT：Agent 26 分析——模型曾花 6 轮探索
+    /// pi 里怎么调 omt 工具、3 轮挖 homeId，158s 里 2/3 耗在发现上）。
+    /// 拼进 DISPATCH_PROMPT 尾部，按各 harness 实测调用形态书写。
+    pub tool_hint: &'static str,
 }
 
 /// dispatch prompt 的传递渠道（provider 适配差异，注册表静态声明）。
@@ -212,6 +216,7 @@ pub const REGISTRY: &[HarnessDescriptor] = &[
         model_list_args: &["models"],
         json_args: &["--format", "json"],
         resume_args: &["-s"],
+        tool_hint: "MCP tools appear as `omt_run__claim`-style tools in your toolset — call them directly as tools.",
     },
     HarnessDescriptor {
         id: "omp",
@@ -229,6 +234,7 @@ pub const REGISTRY: &[HarnessDescriptor] = &[
         model_list_args: &["models"],
         json_args: &["--mode", "json"],
         resume_args: &["--resume"],
+        tool_hint: "MCP tools are callable via the codemode tool, e.g. `await tools.mcp__omt__run__claim({homeId, runId})`; use run__list / run__get to inspect, mcp__omt__ prefixed names for all omt tools.",
     },
     HarnessDescriptor {
         id: "pi",
@@ -248,6 +254,7 @@ pub const REGISTRY: &[HarnessDescriptor] = &[
         model_list_args: &["--list-models"],
         json_args: &["--mode", "json"],
         resume_args: &["--session"],
+        tool_hint: "MCP tools are callable via the codemode tool, e.g. `await tools.mcp__omt__run__claim({homeId, runId})`; use run__list / run__get to inspect, mcp__omt__ prefixed names for all omt tools.",
     },
 ];
 
