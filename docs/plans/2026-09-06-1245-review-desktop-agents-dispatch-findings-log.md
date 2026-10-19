@@ -1108,6 +1108,16 @@ daemon `run_item_view` 序列化为 `executorActor`（views.rs:130）。恒空 �
 - 质量门：Rust 112（+2）/ 前端 126 / clippy / fmt / build 全绿。single-instance 半此前已交付。
 - **验收待做**：切换 workspace 若干次后 `ps -M <app-pid> | grep -c ^` 稳定（线程数不随切换增长）。
 
+#### F-VIEW-1 · feat · transcript 双视图（普通/Raw，2026-10-19 验收反馈）
+「界面显示原始内容」→ 增加聊天式**普通视图**（默认）：统一事件经 `groupMessages` 纯函数分组——类型图标（🚀 启动 / 💭 思考 / ⚙ 工具 / ⚡ 用量 / ⚠ 错误 / ✅❎ 终态）；**thinking 与工具执行默认折叠**（折叠态显示首行/结果摘要，点击展开——对齐 dsh 的折叠交互）；tool_call 与其后 tool_result 配对单条目；raw 行按普通行显示。原行式视图保留为 **Raw**（头部 chips 切换）。普通视图不做行级虚拟化（尾窗事件有界），自带贴底跟随。附带修复：切回 Raw 时行窗口 range 未重算会白屏（视图切换加入重算 deps）。测试：分组配对/孤儿 tool 兜底、折叠展开、双视图切换。前端 128 passed。
+
+#### F-VIEW-2 · feat · 普通视图重构为轮次结构（对齐 dsh Turn，2026-10-19 二轮验收反馈）
+首版普通视图是「事件换行排列」，JSON 糊屏。对照 dsh 客户端源码（`dsh-client-ui-chat`：presentation-policy/chat-settings）核实其真实约定后重构：
+- **轮次（Turn）为顶层结构**：一轮 = 过程（思考+工具）+ 轮末 markdown 回答 + 轮尾「本轮用量」；完成轮的过程行**整轮折叠**为摘要头（`思考 · N 次工具调用 · Xs`——时长从事件时间戳计算，**有就显示没有空着**，用户定夺）；运行中轮平铺。
+- **延后封口**（dsh 时序）：usage 在回答之后到达须归本轮——封轮延迟到下一个新轮事件，且先于时间戳记账（否则新轮首事件污染上轮时长，实测抓住）。
+- 思考块标题「思考」+ 折叠首行预览（settledReasoningPreview 语义）；工具折叠态 `⚙ name · 摘要`（结果首行），展开 pretty JSON + 结果；assistant 正文经 MarkdownText 渲染（正文字体）；raw JSON 行收纳（不再糊屏）；start/exit 弱化为分隔行。
+- 分档：普通（≈dsh standard）+ Raw；compact/verbose 后续按需。测试：轮次边界/计数/时长/usage 归属/工具配对 + 渲染折叠展开。前端 128 passed。
+
 ### 残留状态核查（第二轮验收后）
 
 失败尝试在 daemon 侧已成功创建 RUN-0001（pending，持有 TICKET-0001，无执行器），EPIC-0001/TICKET-0001 被 node/execute 标为 in_progress。重试无需清理：ensure-run 复用路径按 pending → start 正常接管（已实测 run-get 确认）。
