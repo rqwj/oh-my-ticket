@@ -10,11 +10,14 @@
 //! never on stderr, never in logs. stderr carries lifecycle log lines
 //! only; every protocol error maps onto an MCP structured error.
 //!
-//! Transport: JSON-RPC 2.0 over stdio with `Content-Length` framed
-//! messages (the MCP stdio transport contract). Tools are generated from
-//! the SAME parity matrix the coverage suite enforces (agent_available ∩
-//! non-human_administrative), so tools/list can never drift from the
-//! protocol contract.
+//! Transport: JSON-RPC 2.0 over stdio, **newline-delimited JSON** (the MCP
+//! stdio transport contract — one message per line; F-ACC-9: the earlier
+//! LSP-style `Content-Length` framing parsed nothing from real SDK
+//! clients). Tools are generated from the SAME parity matrix the coverage
+//! suite enforces (agent_available ∩ non-human_administrative), and each
+//! tool's `inputSchema` is projected from `schema/commands.schema.json`
+//! (F-ACC-10: an empty schema once left the model with no way to pass
+//! `runId`), so tools/list can never drift from the protocol contract.
 
 use std::io::{BufRead, BufReader, Write};
 
@@ -91,10 +94,12 @@ pub fn serve(globals: &GlobalArgs) -> Result<i32, Problem> {
 
     // Restricted enrollment: node/run/events only — home administration
     // and adapter UI bags stay outside the agent surface (R7).
+    let (actor, name) = enroll_identity(globals);
+    let requested_actor = actor.clone();
     let options = omt_client::EnrollOptions {
         kind: "mcp".into(),
-        name: Some("omt-mcp".into()),
-        actor_namespace: Some(format!("mcp:{}", std::process::id())),
+        name: Some(name),
+        actor_namespace: Some(actor),
         operations: None,
         credential_path: None,
     };
@@ -103,6 +108,17 @@ pub fn serve(globals: &GlobalArgs) -> Result<i32, Problem> {
         &options,
         &["node", "run", "events"],
     )?;
+
+    // F-U3-14: `Registry::issue` (auth.rs) downgrades an out-of-policy
+    // actorNamespace request SILENTLY (never errors) — a length overflow
+    // past its 64-char cap looks identical to a successful enroll from
+    // here. Detect the mismatch so it is at least visible in the log
+    // instead of only manifesting later as an unmatchable
+    // executor_session_id.
+    let granted = enrollment.handshake["credential"]["actorNamespace"].as_str();
+    if identity_downgraded(&requested_actor, granted) {
+        log_line("warning: daemon granted a narrower actor namespace than requested (see auth.rs Registry::issue)");
+    }
 
     log_line("mcp server ready (scoped grant: node/run/events)");
 
@@ -178,19 +194,117 @@ pub fn serve(globals: &GlobalArgs) -> Result<i32, Problem> {
 /// pass through to the daemon verbatim — the daemon's own schema
 /// validation remains the authority).
 fn tool_descriptors() -> Vec<serde_json::Value> {
+    let (commands, common) = schemas();
     MCP_TOOLS
         .iter()
         .map(|action| {
+            let params = params_def_of(action)
+                .and_then(|name| commands.pointer(&format!("/$defs/{name}")))
+                .cloned()
+                // 双定义源（F-EXPOSE-2）：common（跨文件引用）+ commands
+                // 文档自身（同文件 $defs 引用）一次递归扫净
+                .map(|def| resolve_refs_in(def, &[common, commands], &[]))
+                .unwrap_or_else(|| serde_json::json!({ "type": "object" }));
+            let description = params
+                .get("description")
+                .and_then(|d| d.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    format!("OMT daemon action {action} (agent-available subset, parity-matrix governed)")
+                });
             serde_json::json!({
                 "name": wire_name(action),
-                "description": format!("OMT daemon action {action} (agent-available subset, parity-matrix governed)"),
-                "inputSchema": {
-                    "type": "object",
-                    "additionalProperties": true,
-                },
+                "description": description,
+                "inputSchema": params,
             })
         })
         .collect()
+}
+
+/// action → `commands.schema.json` `$defs` 中的 params 定义名。
+/// schema 文件本身没有机器可读的 method→def 映射（描述前缀只有部分带
+/// `Method` 标记），映射表与 MCP_TOOLS 同级维护——单元测试强制每个
+/// MCP 工具都解析出定义，缺项即红（防漂移）。
+fn params_def_of(action: &str) -> Option<&'static str> {
+    Some(match action {
+        "node/create" => "CreateNodeParams",
+        "node/get" => "GetNodeParams",
+        "node/list" => "ListNodeParams",
+        "node/tree" => "TreeParams",
+        "node/search" => "SearchNodesParams",
+        "node/update" => "UpdateNodeParams",
+        "node/move" => "MoveNodeParams",
+        "node/archive" => "ArchiveNodeParams",
+        "run/create" => "RunCreateParams",
+        "run/get" => "RunGetParams",
+        "run/list" => "RunListParams",
+        "run/control" => "RunControlParams",
+        "run/claim" => "ClaimRunParams",
+        "run/report" => "ReportRunParams",
+        "run/add-members" => "RunAddMembersParams",
+        "run/nudge-record" => "RunNudgeRecordParams",
+        "run/interrupt" => "RunInterruptParams",
+        "events/resume" => "EventsResumeParams",
+        _ => return None,
+    })
+}
+
+const COMMANDS_SCHEMA: &str = include_str!("../../../schema/commands.schema.json");
+const COMMON_SCHEMA: &str = include_str!("../../../schema/common.schema.json");
+
+fn schemas() -> &'static (serde_json::Value, serde_json::Value) {
+    static SCHEMAS: std::sync::OnceLock<(serde_json::Value, serde_json::Value)> =
+        std::sync::OnceLock::new();
+    SCHEMAS.get_or_init(|| {
+        (
+            serde_json::from_str(COMMANDS_SCHEMA).expect("commands.schema.json parses"),
+            serde_json::from_str(COMMON_SCHEMA).expect("common.schema.json parses"),
+        )
+    })
+}
+
+/// 递归内联 `$ref`（跨文件引用只指向 common.schema.json 的 `$defs`；
+/// 解析失败原样保留——仍是合法 JSON Schema，但单元测试会拦住新增引用形状）。
+/// 递归内联**全部** `$ref`（F-EXPOSE-2）：跨文件（common.schema.json）与
+/// 同文件 `$defs` 一视同仁——`exposure: direct` 会把工具 schema 原样送进
+/// 模型 API 请求，moonshot 等严格校验器不认保留 `$ref/$defs` 的形状
+/// （Agent 28 实测 400：`$defs not found for reference: #/$defs/NodeFilter`）。
+/// `defs_sources` 按序查找 `/$defs/{name}`（前查前得）；引用环守卫——
+/// 展开链上出现同名定义即原样保留（病态 schema 不死循环）。
+fn resolve_refs_in(
+    value: serde_json::Value,
+    defs_sources: &[&serde_json::Value],
+    expanding: &[String],
+) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(mut map) => {
+            if let Some(reference) = map.get("$ref").and_then(|v| v.as_str()) {
+                let name = reference.rsplit('/').next().unwrap_or(reference);
+                if expanding.iter().any(|n| n == name) {
+                    return serde_json::Value::Object(map); // 引用环
+                }
+                for source in defs_sources {
+                    if let Some(def) = source.pointer(&format!("/$defs/{name}")) {
+                        let mut next = expanding.to_vec();
+                        next.push(name.to_string());
+                        return resolve_refs_in(def.clone(), defs_sources, &next);
+                    }
+                }
+                return serde_json::Value::Object(map);
+            }
+            for v in map.values_mut() {
+                *v = resolve_refs_in(v.take(), defs_sources, expanding);
+            }
+            serde_json::Value::Object(map)
+        }
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items
+                .into_iter()
+                .map(|v| resolve_refs_in(v, defs_sources, expanding))
+                .collect(),
+        ),
+        other => other,
+    }
 }
 
 /// One tool invocation → one daemon call; the daemon Problem maps onto an
@@ -244,41 +358,189 @@ fn log_line(text: &str) {
     eprintln!("[omt-mcp] {text}");
 }
 
-/// Read one Content-Length framed message; None at clean EOF.
+/// Read one newline-delimited JSON message; None at clean EOF.
+///
+/// **F-ACC-9**: MCP stdio transport is newline-delimited JSON (one message
+/// per line, no embedded newlines) — NOT LSP-style `Content-Length` framing.
+/// The previous framing parsed nothing from real MCP clients (opencode/omp
+/// SDKs), so their `initialize` timed out and the server was silently
+/// dropped from the session toolset.
 fn read_frame(reader: &mut impl BufRead) -> Result<Option<String>, Problem> {
-    let mut content_length: Option<usize> = None;
     loop {
-        let mut header = String::new();
+        let mut line = String::new();
         let read = reader
-            .read_line(&mut header)
+            .read_line(&mut line)
             .map_err(|err| Problem::new("IO", format!("stdin read: {err}")))?;
         if read == 0 {
             return Ok(None); // EOF
         }
-        let trimmed = header.trim();
+        let trimmed = line.trim();
         if trimmed.is_empty() {
-            if content_length.is_some() {
-                break;
-            }
-            continue; // tolerate stray blank lines between frames
+            continue; // tolerate stray blank lines
         }
-        if let Some(value) = trimmed.strip_prefix("Content-Length:") {
-            content_length = value.trim().parse::<usize>().ok();
-        }
-        // Content-Type and unknown headers are ignored per the spec.
+        return Ok(Some(trimmed.to_string()));
     }
-    let length = content_length
-        .ok_or_else(|| Problem::new("INVALID_INPUT", "frame without Content-Length"))?;
-    let mut body = vec![0u8; length];
-    reader
-        .read_exact(&mut body)
-        .map_err(|err| Problem::new("IO", format!("stdin body read: {err}")))?;
-    String::from_utf8(body)
-        .map(Some)
-        .map_err(|err| Problem::new("INVALID_INPUT", format!("frame not utf-8: {err}")))
 }
 
 fn write_frame(writer: &mut impl Write, body: &str) -> std::io::Result<()> {
-    write!(writer, "Content-Length: {}\r\n\r\n{}", body.len(), body)?;
+    // Responses are compact single-line JSON (serde_json::to_string) —
+    // writeln supplies the delimiter the client reads on.
+    writeln!(writer, "{body}")?;
     writer.flush()
+}
+
+/// U3: enrollment 身份——desktop 派发时经 `--actor exec:<execId>` 指定执行者
+/// 身份，使 `run_items.executor_session_id` 可精确定位派发方（§3.3 身份纪律）。
+///
+/// **F-U3-2**：`Registry::issue`（auth.rs）只授予等于 base（`mcp:<pid>`）或以
+/// `base/` 为前缀的 actor namespace——一个裸的 `exec:<execId>` 既不等于 base
+/// 也不以其为前缀，会被**静默**降级回 `mcp:<pid>`，且不报错。因此这里把请求
+/// 的 actor 规整成 `mcp:<pid>/exec:<execId>` 这一嵌套形式再送去 enroll，才能
+/// 被 daemon 实际采纳；未指定时保持 `mcp:<pid>` 兼容（F18/F19：原为硬编码）。
+///
+/// **F-U3-14（决策，二次评审 §10）**：嵌套形式把 pid 重新绑进了身份——如果
+/// harness 中途重启 `omt mcp`（新 pid），新连接的 actor 变成
+/// `mcp:<新pid>/exec:<execId>`，与旧连接持有的租约 actor 不再字符串相等，
+/// `authorize_report` 会拒绝用旧租约 report。**这是刻意接受的 v1 权衡**，
+/// 而非需要在 daemon 侧放行裸 `exec:` 前缀的理由——后者需要修改
+/// `Registry::issue` 的授权策略，属于独立安全评审范畴，不在本单元做。MCP
+/// 中途重启视为罕见事件，交给既有的 15 分钟租约 TTL（interrupted → retry）
+/// 兜底恢复，与 desktop/执行器崩溃走的是同一条路径。desktop 侧按
+/// `executor_session_id.ends_with("/exec:<execId>")` 匹配，不做精确相等。
+///
+/// 64 字符上限（`Registry::issue`）留给 execId 的预算：`mcp:` + pid（最多
+/// 7 位）+ `/exec:` 已占约 17 字符，execId 建议控制在 40 字符以内；超限会
+/// 被静默降级（见 `serve()` 里 enroll 后的 `identity_downgraded` 检测）。
+///
+/// 返回 (actor, name)。
+fn enroll_identity(globals: &GlobalArgs) -> (String, String) {
+    let base = format!("mcp:{}", std::process::id());
+    let actor = match globals.actor.as_deref() {
+        Some(requested) if !requested.is_empty() => format!("{base}/{requested}"),
+        _ => base,
+    };
+    let name = format!("omt-mcp-{actor}");
+    (actor, name)
+}
+
+/// F-U3-14: 真代表 daemon 实际授予的 actorNamespace 与我们请求的不同——
+/// `Registry::issue` 对策略外的请求是**静默**降级（从不报错），这是唯一能
+/// 探知它发生过的方式。纯函数，不依赖真实 daemon 连接，便于单测覆盖。
+fn identity_downgraded(requested: &str, granted: Option<&str>) -> bool {
+    granted != Some(requested)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn globals(actor: Option<&str>) -> GlobalArgs {
+        GlobalArgs {
+            runtime_dir: None,
+            homes: Vec::new(),
+            json: false,
+            actor: actor.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn enroll_identity_nests_explicit_actor_under_mcp_pid_base() {
+        // F-U3-2: must be base or base/nested (auth.rs Registry::issue) —
+        // a bare "exec:e1" would be silently downgraded by the daemon.
+        let (actor, name) = enroll_identity(&globals(Some("exec:e1")));
+        assert!(actor.starts_with("mcp:"), "{actor}");
+        assert!(actor.ends_with("/exec:e1"), "{actor}");
+        assert_eq!(name, format!("omt-mcp-{actor}"));
+    }
+
+    #[test]
+    fn enroll_identity_defaults_to_bare_mcp_pid_namespace() {
+        let (actor, _name) = enroll_identity(&globals(None));
+        assert!(actor.starts_with("mcp:"), "{actor}");
+        assert!(!actor.contains('/'), "{actor}");
+    }
+
+    #[test]
+    fn identity_downgraded_detects_daemon_mismatch() {
+        assert!(!identity_downgraded("mcp:1/exec:e1", Some("mcp:1/exec:e1")));
+        assert!(identity_downgraded("mcp:1/exec:e1", Some("mcp:1")));
+        assert!(identity_downgraded("mcp:1/exec:e1", None));
+    }
+
+    /// F-ACC-10 回归：每个 MCP 工具的 inputSchema 必须从
+    /// commands.schema.json 解析出定义（映射缺项或 def 消失即红），
+    /// 且 properties 非空——空 schema 曾让模型无从传 runId。
+    #[test]
+    fn every_mcp_tool_resolves_a_params_schema() {
+        let (commands, common) = schemas();
+        for action in MCP_TOOLS {
+            let def_name =
+                params_def_of(action).unwrap_or_else(|| panic!("{action} 缺 Params 映射"));
+            let def = commands
+                .pointer(&format!("/$defs/{def_name}"))
+                .unwrap_or_else(|| panic!("{def_name} 不在 commands.schema.json"));
+            let resolved = resolve_refs_in(def.clone(), &[common, commands], &[]);
+            assert_eq!(resolved["type"], "object", "{action}");
+            let props = resolved["properties"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{action} 无 properties: {resolved}"));
+            assert!(!props.is_empty(), "{action} properties 为空");
+        }
+    }
+
+    /// F-EXPOSE-2 回归：direct 模式下工具 schema 进 API 请求——任何
+    /// `$ref`（含同文件 $defs）都不得残留（moonshot 校验器拒绝）。
+    #[test]
+    fn tool_schemas_fully_inlined_no_refs_remain() {
+        let tools = tool_descriptors();
+        let raw = serde_json::to_string(&tools).unwrap();
+        assert!(
+            !raw.contains("$ref"),
+            "schema 残留 $ref: {}",
+            &raw[..raw.len().min(400)]
+        );
+        assert!(!raw.contains("$defs"), "schema 残留 $defs");
+        // 具体抽查：node__list 的 filter（原 #/$defs/NodeFilter）已内联成对象
+        let list = tools
+            .iter()
+            .find(|t| t["name"] == "node__list")
+            .expect("node__list");
+        let filter = list
+            .pointer("/inputSchema/properties/filter")
+            .expect("filter 属性存在");
+        assert!(
+            filter.get("type").is_some() || filter.get("properties").is_some(),
+            "filter 应为内联对象: {filter}"
+        );
+    }
+
+    /// F-ACC-10 回归：run__claim 必须声明 homeId/runId（required）且
+    /// $ref 已内联（runId 解析出 type:string——客户端 SDK 拿不到
+    /// 跨文件 $ref 的形状）。
+    #[test]
+    fn claim_tool_schema_requires_home_and_run_inlined() {
+        let tools = tool_descriptors();
+        let claim = tools
+            .iter()
+            .find(|t| t["name"] == "run__claim")
+            .expect("run__claim 在 tools/list");
+        let required: Vec<&str> = claim["inputSchema"]["required"]
+            .as_array()
+            .expect("required 数组")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(required.contains(&"homeId"), "{claim}");
+        assert!(required.contains(&"runId"), "{claim}");
+        assert_eq!(
+            claim["inputSchema"]["properties"]["runId"]["type"],
+            "string"
+        );
+        assert!(
+            claim["inputSchema"]["properties"]["runId"]
+                .get("$ref")
+                .is_none(),
+            "$ref 必须已内联: {claim}"
+        );
+    }
 }

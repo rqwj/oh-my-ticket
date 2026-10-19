@@ -31,20 +31,26 @@ pub struct DaemonStatus {
     pub spawned_by_us: bool,
 }
 
-/// Resolve the sidecar binary: sibling of the running executable
+/// Resolve a sidecar binary by name: sibling of the running executable
 /// (bundled .app AND dev target dir — current_exe().parent(), never
-/// resource_dir, per the U8 research contract).
-pub fn sidecar_path() -> Result<PathBuf, String> {
+/// resource_dir, per the U8 research contract). U3 泛化：`omt` CLI 作为
+/// 第二 sidecar（MCP 桥）共用同一解析约定。
+pub fn sidecar_path(name: &str) -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|err| format!("current_exe: {err}"))?;
     let dir = exe
         .parent()
         .ok_or_else(|| "current_exe has no parent dir".to_string())?;
-    let candidate = dir.join("omt-daemon");
+    let candidate = dir.join(name);
     if candidate.exists() {
         Ok(candidate)
     } else {
-        Err(format!("no sidecar omt-daemon next to {}", exe.display()))
+        Err(format!("no sidecar {name} next to {}", exe.display()))
     }
+}
+
+/// `omt mcp` sidecar 的绝对路径（MCP config 的 command 指向它）。
+pub fn omt_sidecar_path() -> Result<PathBuf, String> {
+    sidecar_path("omt")
 }
 
 /// The shared per-user runtime dir (same resolution rule as every other
@@ -73,7 +79,7 @@ pub fn live_descriptor(dir: &Path) -> Option<Descriptor> {
 #[cfg(unix)]
 pub fn spawn_sidecar(dir: &Path) -> Result<Descriptor, String> {
     use std::os::unix::process::CommandExt;
-    let binary = sidecar_path()?;
+    let binary = sidecar_path("omt-daemon")?;
     let mut command = Command::new(binary);
     command
         .arg("--runtime-dir")

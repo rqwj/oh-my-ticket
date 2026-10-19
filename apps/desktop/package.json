@@ -1,7 +1,7 @@
 {
   "name": "oh-my-ticket-desktop",
   "private": true,
-  "version": "0.6.4",
+  "version": "0.6.6",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -13,21 +13,22 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-dialog": "^2",
+    "@tauri-apps/plugin-notification": "^2.7.0",
     "@tauri-apps/plugin-shell": "^2",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1",
-    "@tauri-apps/plugin-dialog": "^2"
+    "react-dom": "^18.3.1"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2",
+    "@testing-library/jest-dom": "^6",
+    "@testing-library/react": "^16",
     "@types/react": "^18.3.0",
     "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^4.3.4",
+    "jsdom": "^25",
     "typescript": "^5.6.3",
     "vite": "^6.0.0",
-    "vitest": "^3",
-    "jsdom": "^25",
-    "@testing-library/react": "^16",
-    "@testing-library/jest-dom": "^6"
+    "vitest": "^3"
   }
 }

@@ -321,3 +321,51 @@ pub fn expires_iso(expires_at_ms: i64) -> String {
 pub fn ttl() -> Duration {
     Duration::from_millis(CREDENTIAL_TTL_MS.max(0) as u64)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use omt_storage::clock::FixedClock;
+    use std::sync::Arc;
+
+    fn clock() -> Arc<dyn MillisClock> {
+        Arc::new(FixedClock::at_ms(0))
+    }
+
+    /// F-U3-2: this is the daemon-side half of the mcp.rs `enroll_identity`
+    /// fix — a nested actor namespace under the server-assigned base is
+    /// accepted verbatim, so `omt --actor exec:<id> mcp` (which sends
+    /// `mcp:<pid>/exec:<id>`) actually gets that identity, not a silent
+    /// downgrade.
+    #[test]
+    fn issue_accepts_nested_actor_namespace_under_base() {
+        let registry = Registry::new();
+        let peer = PeerId {
+            pid: 4242,
+            uid: None,
+        };
+        let requested = json!({ "actorNamespace": "mcp:4242/exec:e1" });
+        let (_, credential) = registry
+            .issue(peer, ClientKind::Mcp, &requested, &[], &clock())
+            .unwrap();
+        assert_eq!(credential.actor_namespace, "mcp:4242/exec:e1");
+        assert_eq!(credential.principal_id, "mcp:4242");
+    }
+
+    /// A foreign top-level namespace (not equal to base, not nested under
+    /// it) is silently downgraded to base — the daemon never errors, it
+    /// just doesn't grant what was asked. Callers must nest, not replace.
+    #[test]
+    fn issue_downgrades_foreign_actor_namespace_to_base() {
+        let registry = Registry::new();
+        let peer = PeerId {
+            pid: 4242,
+            uid: None,
+        };
+        let requested = json!({ "actorNamespace": "exec:e1" });
+        let (_, credential) = registry
+            .issue(peer, ClientKind::Mcp, &requested, &[], &clock())
+            .unwrap();
+        assert_eq!(credential.actor_namespace, "mcp:4242");
+    }
+}

@@ -16,7 +16,7 @@ mod common;
 
 use common::{DaemonProcess, TestCtx};
 use serde_json::json;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
 
 struct McpProcess {
@@ -52,31 +52,27 @@ impl McpProcess {
         }
     }
 
+    /// F-ACC-9 harness rule: the test client mirrors the **MCP stdio spec**
+    /// (newline-delimited JSON), never the server's implementation — the
+    /// previous Content-Length harness silently agreed with a wrong server.
     fn request(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
         self.next_id += 1;
         let body =
             json!({ "jsonrpc": "2.0", "id": self.next_id, "method": method, "params": params })
                 .to_string();
-        write!(self.stdin, "Content-Length: {}\r\n\r\n{}", body.len(), body).expect("write frame");
-        self.stdin.flush().expect("flush frame");
-        // Read frames until the response with OUR id (skip notifications).
+        writeln!(self.stdin, "{body}").expect("write line");
+        self.stdin.flush().expect("flush line");
+        // Read lines until the response with OUR id (skip notifications).
         loop {
-            let mut content_length = 0usize;
-            loop {
-                let mut header = String::new();
-                let read = self.stdout.read_line(&mut header).expect("read header");
-                assert!(read > 0, "mcp stdout closed while waiting for {method}");
-                let trimmed = header.trim();
-                if trimmed.is_empty() {
-                    break;
-                }
-                if let Some(value) = trimmed.strip_prefix("Content-Length:") {
-                    content_length = value.trim().parse().expect("content-length");
-                }
+            let mut line = String::new();
+            let read = self.stdout.read_line(&mut line).expect("read line");
+            assert!(read > 0, "mcp stdout closed while waiting for {method}");
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
             }
-            let mut body = vec![0u8; content_length];
-            self.stdout.read_exact(&mut body).expect("read body");
-            let value: serde_json::Value = serde_json::from_slice(&body).expect("frame json");
+            let value: serde_json::Value = serde_json::from_str(trimmed)
+                .unwrap_or_else(|err| panic!("line is not JSON ({err}): {trimmed}"));
             if value["id"].as_u64() == Some(self.next_id) {
                 return value;
             }
@@ -85,7 +81,7 @@ impl McpProcess {
 
     fn notify(&mut self, method: &str) {
         let body = json!({ "jsonrpc": "2.0", "method": method }).to_string();
-        write!(self.stdin, "Content-Length: {}\r\n\r\n{}", body.len(), body).expect("write notify");
+        writeln!(self.stdin, "{body}").expect("write notify");
         self.stdin.flush().expect("flush notify");
     }
 
@@ -214,6 +210,35 @@ fn mcp_tools_list_matches_parity_matrix_minus_home_family() {
     assert!(
         !names.iter().any(|n| n.contains("declare")),
         "no declare tool despite features.homeDeclare: {names:?}"
+    );
+
+    // F-ACC-10: inputSchema must be projected from commands.schema.json —
+    // an empty schema once left the model unable to pass `runId`.
+    let tools_resp = mcp.request("tools/list", json!({}));
+    let tools_arr = tools_resp
+        .pointer("/result/tools")
+        .and_then(|v| v.as_array())
+        .expect("tools array");
+    for tool in tools_arr {
+        assert_eq!(tool["inputSchema"]["type"], "object", "{tool}");
+        let props = tool["inputSchema"]["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{} 无 properties: {tool}", tool["name"]));
+        assert!(!props.is_empty(), "{} properties 为空", tool["name"]);
+    }
+    let claim = tools_arr
+        .iter()
+        .find(|t| t["name"] == "run__claim")
+        .expect("claim tool");
+    let required: Vec<&str> = claim["inputSchema"]["required"]
+        .as_array()
+        .expect("required")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(
+        required.contains(&"homeId") && required.contains(&"runId"),
+        "claim 声明 homeId+runId: {claim}"
     );
 
     let stderr = mcp.shutdown();

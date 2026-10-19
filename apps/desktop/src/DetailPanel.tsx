@@ -18,6 +18,8 @@ interface Props {
   onUpdated: (id: string, patch: Record<string, unknown>, revision?: number) => Promise<string | null>
   onSelect: (id: string) => void
   onChanged: () => void
+  /** U6 (R-B)：运行按钮改开执行弹窗（node/execute 由派发链步骤 ② 承接） */
+  onDispatch: (title: string) => void
 }
 
 interface NodeSummaryWire {
@@ -67,7 +69,7 @@ async function copyText(text: string): Promise<boolean> {
   }
 }
 
-export function DetailPanel({ home, nodeId, onUpdated, onSelect, onChanged }: Props) {
+export function DetailPanel({ home, nodeId, onUpdated, onSelect, onChanged, onDispatch }: Props) {
   const [wire, setWire] = useState<NodeDetailWire | null>(null)
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState('')
@@ -110,17 +112,6 @@ export function DetailPanel({ home, nodeId, onUpdated, onSelect, onChanged }: Pr
 
   const saveBody = async () => {
     if (await applyPatch({ body: draft })) setEditing(false)
-  }
-
-  const execute = async () => {
-    try {
-      await omtCall('node/execute', { homeId: home.homeId, nodeId: detail.id })
-      setMessage(null)
-      await load()
-      onChanged()
-    } catch (error) {
-      setMessage(String(error))
-    }
   }
 
   const addToRun = async () => {
@@ -203,7 +194,7 @@ export function DetailPanel({ home, nodeId, onUpdated, onSelect, onChanged }: Pr
       )}
 
       <div className="detail-actions">
-        <button className="chip primary" onClick={() => void execute()}>Execute</button>
+        <button className="chip primary" onClick={() => onDispatch(detail.title)}>Execute</button>
         <button className="chip" onClick={() => void addToRun()}>Add to run</button>
         {confirmArchive ? (
           <span className="confirm-group">

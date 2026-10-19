@@ -150,12 +150,14 @@ fn usage_err(message: impl Into<String>) -> CliError {
 
 pub struct GlobalArgs {
     pub(crate) runtime_dir: Option<String>,
-    homes: Vec<String>,
-    json: bool,
+    pub(crate) homes: Vec<String>,
+    pub(crate) json: bool,
     /// Stable cross-invocation actor namespace (leases fence to it).
     /// Defaults to "cli:<pid>"; set when separate invocations must share
     /// executor identity (e.g. claim in one call, report in another).
-    actor: Option<String>,
+    /// U3: `omt mcp` consumes it so desktop dispatches can pin
+    /// `exec:<execId>` (plan §3.3 identity discipline).
+    pub(crate) actor: Option<String>,
 }
 
 struct Split {
