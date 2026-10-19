@@ -442,6 +442,7 @@ export function ExecutionDialog({
                     {idleAgents.map(a => {
                       const harnessEnabled = enabledHarnesses.some(h => h.id === a.harness)
                       const hasSession = a.lastSessionId !== null
+                      const lastModel = a.execs[a.execs.length - 1]?.model ?? null
                       return (
                         <option
                           key={a.id}
@@ -456,6 +457,7 @@ export function ExecutionDialog({
                           }
                         >
                           {agentDisplayName(a)}（{a.harness}
+                          {lastModel ? `·${lastModel}` : ''}
                           {hasSession ? '·续跑' : '·新开'}）
                         </option>
                       )

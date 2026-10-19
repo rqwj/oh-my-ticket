@@ -84,6 +84,9 @@ pub struct ExecRecord {
     /// 最终快照）——成本承接的第一层落盘。
     pub usage_tokens: Option<u64>,
     pub usage_cost: Option<f64>,
+    /// 本次派发选用的模型（F-VIEW3：续跑列表展示）。
+    #[serde(default)]
+    pub model: Option<String>,
     /// U10：启动对账已处理（幂等标记——demote 的「app restarted」签名
     /// exec 释放过 daemon 租约后置 true，避免重复对账）。
     #[serde(default)]
@@ -219,6 +222,8 @@ pub struct NewExec {
     pub run_id: Option<String>,
     pub binary_path: Option<String>,
     pub binary_args: Vec<String>,
+    /// 本次派发选用的模型（F-VIEW3：续跑列表展示；未指定 None）
+    pub model: Option<String>,
 }
 
 /// 注册新 Agent：分配持久单调序号（display_name = `Agent N`），以
@@ -250,6 +255,7 @@ pub fn register_agent(
                 started_at: now_epoch_ms(),
                 binary_path: new_exec.binary_path.clone(),
                 binary_args: new_exec.binary_args.clone(),
+                model: new_exec.model.clone(),
                 ..Default::default()
             }],
         };
@@ -295,6 +301,7 @@ pub fn append_exec(
             started_at: now_epoch_ms(),
             binary_path: new_exec.binary_path.clone(),
             binary_args: new_exec.binary_args.clone(),
+            model: new_exec.model.clone(),
             ..Default::default()
         });
         agent.status = AgentRecordStatus::Starting;
@@ -563,6 +570,7 @@ mod tests {
             run_id: None,
             binary_path: None,
             binary_args: vec![],
+            model: None,
         }
     }
 

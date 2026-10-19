@@ -1323,6 +1323,8 @@ fn dispatch_chain(
         // 与 transcript header 的 session_start args 镜像（含 prompt——
         // desktop 模板 + run_id，非敏感；secrets 见 sanitize_args 纪律）
         binary_args: sanitize_args(&args),
+        // F-VIEW3：续跑列表展示本次模型
+        model: model.map(str::to_string),
     }) {
         Ok(agent) => agent,
         Err(err) => {
@@ -1920,6 +1922,7 @@ mod tests {
                 run_id: None,
                 binary_path: None,
                 binary_args: vec![],
+                model: None,
             },
         )
         .unwrap();
@@ -2024,6 +2027,7 @@ mod tests {
                 run_id: None,
                 binary_path: None,
                 binary_args: vec![],
+                model: None,
             },
         )
         .unwrap();
@@ -2092,6 +2096,7 @@ mod tests {
                 run_id: None,
                 binary_path: None,
                 binary_args: vec![],
+                model: None,
             },
         )
         .unwrap();
@@ -2166,6 +2171,7 @@ mod tests {
                 run_id: None,
                 binary_path: None,
                 binary_args: vec![],
+                model: None,
             },
         )
         .unwrap();
@@ -2241,6 +2247,7 @@ mod tests {
                 run_id: None,
                 binary_path: None,
                 binary_args: vec![],
+                model: None,
             },
         )
         .unwrap();
@@ -2322,6 +2329,7 @@ mod tests {
                 run_id: Some("run-1".into()),
                 binary_path: None,
                 binary_args: vec![],
+                model: None,
             },
         )
         .unwrap();
@@ -2514,6 +2522,7 @@ mod tests {
                 run_id: None,
                 binary_path: None,
                 binary_args: vec![],
+                model: None,
             },
         )
         .unwrap();
@@ -2563,6 +2572,7 @@ mod tests {
                 run_id: None,
                 binary_path: None,
                 binary_args: vec![],
+                model: None,
             },
         )
         .unwrap();
@@ -2732,6 +2742,7 @@ mod tests {
                 run_id: None,
                 binary_path: None,
                 binary_args: vec![],
+                model: None,
             },
         )
         .unwrap();
@@ -3497,6 +3508,7 @@ mod tests {
                 run_id: Some("run-stuck".into()),
                 binary_path: None,
                 binary_args: vec![],
+                model: None,
             },
         )
         .unwrap();
@@ -3514,6 +3526,7 @@ mod tests {
                 run_id: Some("run-ok".into()),
                 binary_path: None,
                 binary_args: vec![],
+                model: None,
             },
         )
         .unwrap();
@@ -3667,6 +3680,7 @@ exit 0"#,
                 run_id: None,
                 binary_path: None,
                 binary_args: vec![],
+                model: None,
             },
         )
         .unwrap();

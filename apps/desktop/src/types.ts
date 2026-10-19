@@ -126,6 +126,8 @@ export interface ExecRecord {
   /** F-U12-4：终态归档的会话累计用量（无 usage 事件为 null） */
   usageTokens?: number | null
   usageCost?: number | null
+  /** 本次派发选用的模型（F-VIEW3：弹窗空闲 Agent 列表展示；未指定为 null） */
+  model?: string | null
   /** Rust-captured process identity; never accepted from the renderer for kill authorization. */
   pid: number | null
   processStartId: string | null
