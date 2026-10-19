@@ -201,7 +201,9 @@ fn tool_descriptors() -> Vec<serde_json::Value> {
             let params = params_def_of(action)
                 .and_then(|name| commands.pointer(&format!("/$defs/{name}")))
                 .cloned()
-                .map(|def| resolve_refs(def, common))
+                // 双定义源（F-EXPOSE-2）：common（跨文件引用）+ commands
+                // 文档自身（同文件 $defs 引用）一次递归扫净
+                .map(|def| resolve_refs_in(def, &[common, commands], &[]))
                 .unwrap_or_else(|| serde_json::json!({ "type": "object" }));
             let description = params
                 .get("description")
@@ -263,24 +265,44 @@ fn schemas() -> &'static (serde_json::Value, serde_json::Value) {
 
 /// 递归内联 `$ref`（跨文件引用只指向 common.schema.json 的 `$defs`；
 /// 解析失败原样保留——仍是合法 JSON Schema，但单元测试会拦住新增引用形状）。
-fn resolve_refs(value: serde_json::Value, common: &serde_json::Value) -> serde_json::Value {
+/// 递归内联**全部** `$ref`（F-EXPOSE-2）：跨文件（common.schema.json）与
+/// 同文件 `$defs` 一视同仁——`exposure: direct` 会把工具 schema 原样送进
+/// 模型 API 请求，moonshot 等严格校验器不认保留 `$ref/$defs` 的形状
+/// （Agent 28 实测 400：`$defs not found for reference: #/$defs/NodeFilter`）。
+/// `defs_sources` 按序查找 `/$defs/{name}`（前查前得）；引用环守卫——
+/// 展开链上出现同名定义即原样保留（病态 schema 不死循环）。
+fn resolve_refs_in(
+    value: serde_json::Value,
+    defs_sources: &[&serde_json::Value],
+    expanding: &[String],
+) -> serde_json::Value {
     match value {
         serde_json::Value::Object(mut map) => {
             if let Some(reference) = map.get("$ref").and_then(|v| v.as_str()) {
                 let name = reference.rsplit('/').next().unwrap_or(reference);
-                if let Some(def) = common.pointer(&format!("/$defs/{name}")) {
-                    return resolve_refs(def.clone(), common);
+                if expanding.iter().any(|n| n == name) {
+                    return serde_json::Value::Object(map); // 引用环
+                }
+                for source in defs_sources {
+                    if let Some(def) = source.pointer(&format!("/$defs/{name}")) {
+                        let mut next = expanding.to_vec();
+                        next.push(name.to_string());
+                        return resolve_refs_in(def.clone(), defs_sources, &next);
+                    }
                 }
                 return serde_json::Value::Object(map);
             }
             for v in map.values_mut() {
-                *v = resolve_refs(v.take(), common);
+                *v = resolve_refs_in(v.take(), defs_sources, expanding);
             }
             serde_json::Value::Object(map)
         }
-        serde_json::Value::Array(items) => {
-            serde_json::Value::Array(items.into_iter().map(|v| resolve_refs(v, common)).collect())
-        }
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items
+                .into_iter()
+                .map(|v| resolve_refs_in(v, defs_sources, expanding))
+                .collect(),
+        ),
         other => other,
     }
 }
@@ -457,13 +479,39 @@ mod tests {
             let def = commands
                 .pointer(&format!("/$defs/{def_name}"))
                 .unwrap_or_else(|| panic!("{def_name} 不在 commands.schema.json"));
-            let resolved = resolve_refs(def.clone(), common);
+            let resolved = resolve_refs_in(def.clone(), &[common, commands], &[]);
             assert_eq!(resolved["type"], "object", "{action}");
             let props = resolved["properties"]
                 .as_object()
                 .unwrap_or_else(|| panic!("{action} 无 properties: {resolved}"));
             assert!(!props.is_empty(), "{action} properties 为空");
         }
+    }
+
+    /// F-EXPOSE-2 回归：direct 模式下工具 schema 进 API 请求——任何
+    /// `$ref`（含同文件 $defs）都不得残留（moonshot 校验器拒绝）。
+    #[test]
+    fn tool_schemas_fully_inlined_no_refs_remain() {
+        let tools = tool_descriptors();
+        let raw = serde_json::to_string(&tools).unwrap();
+        assert!(
+            !raw.contains("$ref"),
+            "schema 残留 $ref: {}",
+            &raw[..raw.len().min(400)]
+        );
+        assert!(!raw.contains("$defs"), "schema 残留 $defs");
+        // 具体抽查：node__list 的 filter（原 #/$defs/NodeFilter）已内联成对象
+        let list = tools
+            .iter()
+            .find(|t| t["name"] == "node__list")
+            .expect("node__list");
+        let filter = list
+            .pointer("/inputSchema/properties/filter")
+            .expect("filter 属性存在");
+        assert!(
+            filter.get("type").is_some() || filter.get("properties").is_some(),
+            "filter 应为内联对象: {filter}"
+        );
     }
 
     /// F-ACC-10 回归：run__claim 必须声明 homeId/runId（required）且
