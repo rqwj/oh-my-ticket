@@ -1184,6 +1184,8 @@ opencode 本就无发现开销（工具直声明），homeId 修复后同样 3 �
 
 状态改为「四轮修订定稿·可实施」。设计经一轮评审（R-1~R-11）+ 二轮（A/B/C）+ 三轮（4 项）+ 四轮（2 注）收敛。
 
+**五轮补遗（2026-10-20）**：§4.4 停止条件原按单 item 措辞，多 item 任务有歧义——补 run 级语义三条：①全部 item 均入停止态才停（否则 subtree-multi 首项进信任门即提前收工，第二次 claim 测不到）；②run 进入终态（canceled 等）也停（agent 异常取消时 item 永久 pending 的兜底）；③超时计整个 run 总时长而非逐 item。措辞歧义当场修入文档而非留到实现——语义决策属设计管辖面，且按字面实现会测漏。
+
 ### 残留状态核查（第二轮验收后）
 
 失败尝试在 daemon 侧已成功创建 RUN-0001（pending，持有 TICKET-0001，无执行器），EPIC-0001/TICKET-0001 被 node/execute 标为 in_progress。重试无需清理：ensure-run 复用路径按 pending → start 正常接管（已实测 run-get 确认）。

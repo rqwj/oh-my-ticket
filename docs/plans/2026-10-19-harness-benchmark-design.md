@@ -1,6 +1,6 @@
 # Harness 调用性能评测机制设计
 
-> 状态：提案·四轮修订定稿（2026-10-20；一轮 R-1~R-11 全采纳；二轮 A/B/C 实质修正 + 五项一致性；三轮四项收尾；四轮两条复核注：subtree-multi 超时覆盖、交界确认提醒列为可选增强）。**设计收敛，可实施。**
+> 状态：提案·五轮定稿（2026-10-20；一轮 R-1~R-11 全采纳；二轮 A/B/C 实质修正 + 五项一致性；三轮四项收尾；四轮两条复核注；五轮补停止条件的 run 级语义——全停才算停 / 超时按 run 总时长 / run 终态兜底）。**设计收敛，可实施。**
 > 背景动机：desktop agents dispatch 全量落地后，harness 本身持续升级（pi 1.0.0→1.3.0、
 > omp 18.0.9→18.12.2 均在本轮验收期内发生）。本项目已被 harness 升级咬过四次
 > （见 §1），每次都靠人工验收发现。本文设计一套分层的评测机制，把「实测定稿」
@@ -192,9 +192,17 @@ fixtures/harness/<provider>/<version>/
 - `omt bench run --task smoke-hello --harness pi [--model ...]`：
   派发 → 等停止态 → 读 `.jsonl` 提取指标 → 写报告（**只存指标，不存
   transcript**——可能含路径/密钥片段，R-11）
-- **停止条件（三轮评审）**：item 进入终态（`is_run_item_final`：done /
-  failed / blocked / skipped / interrupted）**或** 进入 `awaiting_confirmation`
-  **或** 超时（默认 10 分钟，可按任务覆盖）。`awaiting_confirmation` 不是终态
+- **停止条件（三轮评审；五轮补 run 级语义——多 item 任务的措辞歧义）**：
+  满足其一即停——
+  1. **全部 item** 均进入停止态（终态 `is_run_item_final`：done / failed /
+     blocked / skipped / interrupted，**或** `awaiting_confirmation`）——
+     不是任一 item 停就停：subtree-multi 若第一个 item 进信任门、runner
+     提前收工，第二次 claim 根本没被测到（五轮指出的坑）
+  2. **run 进入终态**（completed / canceled / completed_with_failures 等）——
+     agent 侧异常把 run 取消时 item 可能永久 pending，靠此兜住而非干等超时
+  3. **超时**：默认 10 分钟、可按任务覆盖（subtree-multi 20 分钟）——计时
+     为**整个 run 的总时长**，非逐 item 各自计时
+  `awaiting_confirmation` 不是终态
   （`crates/omt-domain/src/types.rs::is_run_item_final`），需人工裁决才离开——
   只等终态会让 negative-inject 的 FAIL 路径永久挂起。超时记 `outcome: timeout`，
   计入硬门失败；runner 退出前按隔离约定清理临时 home / runtime dir
