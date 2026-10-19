@@ -1123,6 +1123,12 @@ daemon `run_item_view` 序列化为 `executorActor`（views.rs:130）。恒空 �
 - **视图打磨**（多轮验收反馈逐条修）：线框 SVG 图标替换 emoji（icons.tsx，对齐 dsh stroke 风格）；折叠块结构重排——icon 与标题同 inline 基线流（结构性修复跨元素基线错位）、摘要/全文对齐标题文字起点；旧版样式块残留导致的竖线复现（同优先级后来居上）已删除；JSON raw 行普通视图硬过滤；工具结果 600 字符截断指路 Raw；轮头白字 13px；审计确认 jsonl 零坏行零截断（显示截断均为设计行为）。
 - 质量门：Rust 112 / 前端 128 / build 全绿。
 
+#### F-DEL-1 · feat · Agents 删除功能（2026-10-19）
+- **入口**：①列表 item 右上角小删除 icon（垃圾桶线框，hover 红）——运行中/不受控 agent 隐藏（先处理存活态）；②Agent 详情头部「继续执行」右侧红色「删除」按钮（同守卫隐藏）。
+- **确认弹窗**：点击后弹危险态 alertdialog（红边框、明示「不可恢复」与影响面——记录与执行历史移除、transcript 文件保留在磁盘）；确认执行 / 取消；失败（服务端守卫）就地报错不关闭。
+- **服务端守卫**（renderer 不可信）：starting/running 拒绝（先停止）、orphan 拒绝（先强制终止）、不存在可读报错；store 侧删除后清选中态与 failed badge 并重拉列表。
+- **测试**：Rust 守卫三分支 + 删除落盘；前端 icon→弹窗→确认/取消→调用、失败就地报错、运行中隐藏。Rust 113 / 前端 131 全绿。
+
 ### 残留状态核查（第二轮验收后）
 
 失败尝试在 daemon 侧已成功创建 RUN-0001（pending，持有 TICKET-0001，无执行器），EPIC-0001/TICKET-0001 被 node/execute 标为 in_progress。重试无需清理：ensure-run 复用路径按 pending → start 正常接管（已实测 run-get 确认）。
