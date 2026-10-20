@@ -1444,6 +1444,16 @@ F-BENCH-13 查证结论：4e960a2 提交说明声称的探针/capture/lib 改动
 
 **待实测（§8）**：pi 与 omp 各一次「派发 → 结束 → 续跑」，比较续跑 exec 首条 usage 与前一 exec 末值（判定逐消息计 vs 延续累计），结论写回设计 §8。
 
+### §38. 执行面子项目 1 实现完成 + ce-work 收尾评审（2026-10-21）
+
+实现序列 `d6d07cd..e6dab22`（Task 1-12 全部落地，按 2026-10-21 评审建议拆 8a/8b/8c 与 11a/11b；F-U4a-3 测试按 deferred 项改为双侧钉死）。自动化验证：workspace 三遍全绿（345/0）、clippy/fmt/tsc 干净、`nm` daemon=0、前端 140（新增 exec-plane.spec.tsx 9 例、既有 131 未改）、四组真二进制 e2e（daemon_link / exec_shim / exec_launch / exec_survives_launcher）。
+
+**ce-work 收尾评审**（ce-code-review，depth:full，9 位评审：correctness / project-standards / security / adversarial / testing / maintainability / reliability / data-migration / agent-native；跨模型 pass 未运行——主机家族不可证，对抗视角由本地评审承担；收据 `/tmp/compound-engineering-501/ce-code-review/20261021-053122-ba8f3ae8/review.json`，run 20261021-053122-ba8f3ae8）：3 条 actionable 全部经 validator 确认并在 `10c069a` 修复——**#1** 死派发路径（exec_start_impl/dispatch_chain/DISPATCH_LOCK/set_rpc 删除，步骤①–⑥合并为 `dispatch_daemon_side` 供 launch 复用，补偿测试全部移植，两处 kill_all 测试随之删除 → workspace 343）；**#2** kill_all + KillReason::AppExit 按 KD-D7 修订删除；**#3** KD-E9 入 CI 符号门（`nm` 断言 daemon=0 / cli>0）。
+
+**anchor-50 残留**（评审裁定软桶、未修复，见 review.json residual_risks 共 58 条；高频候选供下轮）：launcher `wait_ready` Failed 分支只取消 run 未标 agent Failed（correctness+adversarial）；`stop_all` 首个失败中断循环且退出路径吞错（adversarial）；launcher shim_pid 写入 best-effort 失败后 exec 不可停且会被误判 SHIM_LOST（adversarial）；MCP 清扫在 flock 前取状态快照的竞态（agent-native）；orphan agent 可续跑覆盖 attachment（agent-native）；迁移中断时 transcript_tail 不回落旧目录（data-migration）；shim 收尾对 wedged daemon 无 RPC 超时（reliability）；migrate 单 home 硬错中断全部（data-migration）；transcript_tail 旧回退路径的 home_id/exec_id 未过 validate_segment（security，pre-existing）。另有 46 条 testing gaps。
+
+**待用户**：手工验收矩阵（14 项，见「执行面子项目 1 验收」节）+ §8 resume usage 实测。
+
 ### 残留状态核查（第二轮验收后）
 
 失败尝试在 daemon 侧已成功创建 RUN-0001（pending，持有 TICKET-0001，无执行器），EPIC-0001/TICKET-0001 被 node/execute 标为 in_progress。重试无需清理：ensure-run 复用路径按 pending → start 正常接管（已实测 run-get 确认）。
