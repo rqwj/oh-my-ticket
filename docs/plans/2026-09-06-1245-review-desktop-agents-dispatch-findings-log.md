@@ -33,6 +33,7 @@ branch: feat/desktop-agents-dispatch
 | F-BENCH-23 | P2 | gated_auto | BENCH | `bench.rs::analyze_jsonl` raw.log 回落 | **语料目录的 raw.log 被同目录所有 jsonl 共用**：找不到 `<execId>.raw.log` 时回落到 `raw.log`。omp 18.12.2 目录有两卷（smoke-hello 与 synthetic-lines），分析 synthetic-lines 时会用 smoke 那次运行的 raw.log 覆盖用量，报出另一条流的 42430 tokens。修法：语料按 executor 的命名存成 `<stem>.raw.log`，删掉回落分支（§31） | fixed(2b8e036)：改名成对 + 回退删除 + gitignore `*.raw.log` + 必需文件清单（§32） | — |
 | F-BENCH-24 | P3 | gated_auto | BENCH | `fixtures/harness/*/raw.log` / `bench.rs::fixtures_are_normalized` | 55a8e55 提交说明称「时间戳已清洗」「覆盖下限 ≥12」，实际 raw.log 仍有 170 处内嵌 ISO 时间戳（omp 100 / opencode 10 / pi 60，与 §30 计数相同），测试下限仍是 `checked >= 9`，归一化测试也不检查时间戳；另含 `mcp:93364` 这类真实 pid（§31） | fixed(2b8e036)：288 处 ISO + 87 处 pid 清洗（行级解析一致性保持）、防回退断言 + 下限 13、capture normalize() 生成侧补齐、meta.json 说明如实化（§32） | — |
 | F-BENCH-25 | P3→P2 | gated_auto | 设置页 / 探针 | `harness.rs::probe_descriptor` / `harness_list` | 探针梯子 2/6/6s 后，挂起型 binary（flag 写错起 TUI）每家最长 14s（原 6s）；`harness_list` 按 REGISTRY 串行探测，三家都挂时设置页约 42s 才出结果。注释「首试保 TUI 快否决」不成立——首试超时后仍会再等 12s。可改为各 provider 并行探测，或在 UI 先返回 pending 再回填版本（§33） | fixed(e87a99a)：probe_all 并行探测（保序，墙钟 = 最慢一家）+ 并行性测试；不实注释已改写（挂起判定 6→14s 如实记录，由并行补偿）；根配置线程上限注释改为「冗余保险」定位（§34） | — |
+| F-BENCH-26 | P2 | gated_auto | U2/U12 | `executor.rs::finish_terminal` / 等待线程 `:640-670` | **终态先于落账发布**：(a) `finish_terminal` 第一步就写 `terminal`，之后才算 usage、写 agents.json、写 session id、追加 exit 行——轮询 `terminal()` 的一方会读到半成品；(b) reader 线程在 `finish_terminal` **之后**才 join，等待线程只等「首事件」≤300ms——最后几行 stdout（通常正是最后一条 `message_end`）可能还没被解析，usage 少记最后一条、session id 丢失、exit 之后还有 raw 行。16 线程下 6 次有 3 次失败（三个不同测试，均秒级失败，不是 30s 窗口超时）；慢 sink 确定性复现 3/3：归档 100 而非 250、jsonl 末行不是 exit；4 线程上限把它掩盖了（§35） | open | — |
 | F-BENCH-13 | P1 | manual | BENCH | `4e960a2` 提交说明 / §27（修复节） | 提交说明与日志称 F-BENCH-5/6/7/10 及 8/12 部分已修，但 `harness_probe.rs`、`harness-capture.rs`、`lib.rs` 自 f6eeaed 后**未改动**（无 worktree / stash / 其他分支留存）——改动疑似未提交即丢失（§28） | fixed(3192d60)（改动已重做并核实存在） | — |
 | F-BENCH-14 | P1 | manual | BENCH/U12 | `executor.rs` usage 归档 / `bench.rs` / `adapters.rs` | **usage 是每条消息的值，不是会话累计**：pi 1.3.0 与 omp 18.12.2 语料中 cost 逐消息非单调（0.0349→0.0095→0.0078→0.0092）。F-U12-3「累计快照取末值」的口径错误——ExecRecord 的 usage 与分析器的 tokens/cost 只记最后一条消息：pi 卷报 $0.0092 实为 $0.0615（少报 6.7 倍），omp 卷报 $0.0096 实为 $0.0431（§28） | fixed(da9c376 + 55a8e55)：三家均按消息/步求和 | — |
 | F-BENCH-15 | P1 | manual | BENCH | `bench.rs::raw_lines_reparse_through_current_adapter` | 重放测不到解析漂移：语料的 raw 行只是采集时**未产出事件**的行，产出 tool_call / thinking / text 的源行没有保留，无从重放；该测试能通过只因 4e960a2 新增的 turn_end usage 提取（改动前 pi 的 raw 行重放结构化数为 0）（§28） | fixed(55a8e55)：raw.log 已入库，重放对账测试在干净树上可跑 | — |
@@ -1369,6 +1370,26 @@ F-BENCH-13 查证结论：4e960a2 提交说明声称的探针/capture/lib 改动
 **顺带（F-BENCH-22 余量收尾）**：全量验证中复现 `dispatch_captures_harness_session_id_end_to_end` 偶发红（单跑绿）——terminal 等待窗口 15/10s 对 exec 评估停顿仅 ~1.6× 余量；executor 测试全部 terminal 等待窗口统一放宽至 30s、boom 测试 startup 窗口 10→30s。桌面 crate 连续 ×6 全绿、前端 pnpm build + vitest 131 全绿。
 
 **勘误**：3568a4c 提交说明中测试名误写为 `probe_all_runs_entries_concurrency`（实名 `..._concurrently`），已在推送前的 amend（e87a99a）中修正。
+
+### §35. `e87a99a` + `a1a6890` · F-BENCH-25/20 修复 · code review（2026-10-20）
+
+**确认修好**：F-BENCH-25（`probe_all` 用 scoped threads 并行探测，输出保持 REGISTRY 顺序；线程 panic 由 join 转成 Err，不会让 scope 再 panic；并行性测试只用 sleep，不受 exec 停顿影响；注释已如实改写）；F-BENCH-20（`ExecRecord.usage_caliber`，`#[serde(default)]` 兼容旧 JSON，有旧记录反序列化测试和真实终态归档测试——两条 `message_end` 求和 250 / $0.03 + 口径标记；TS 类型同步）。`.cargo/config.toml` 注释已标明线程上限只是冗余保险。clippy、fmt、`tsc --noEmit` 干净，桌面 vitest 131 通过。
+
+**新问题：16 线程下仍然不稳定，而且不是 exec 停顿。** 仓库根目录默认配置（4 线程）跑 3 次全绿；`RUST_TEST_THREADS=16` 跑 6 次有 3 次失败，每次挂的测试都不同：
+- `event_envelope_is_uniform_across_all_kinds`（缺 raw / exit 事件）
+- `dispatch_success_builds_exec_start_outcome`（`executor.rs:3470`，jsonl 最后一行不是 `exit`）
+- `dispatch_captures_harness_session_id_end_to_end`（`:3798`，agents.json 里没有 session id）
+
+整套测试 6–9 秒就结束，说明失败都是秒级发生的，和 30 秒等待窗口、冷 exec 停顿都无关。§33 / §34 里「16 线程亦已验证全绿」在当前代码上不成立。
+
+| ID | 级别 | 说明 |
+|---|---|---|
+| F-BENCH-26 | P2 | **终态在落账完成之前就已发布**，有两处竞态。<br>(a) `finish_terminal` 的第一步是把 `terminal` 设为 Some（用作幂等 guard），之后才算 usage、写 agents.json、写 session id、追加 exit 事件和 exit 行。任何轮询 `terminal()` 的地方（测试的 `wait_for`、`kill_all` 的收口循环）都可能读到写了一半的状态。<br>(b) 等待线程在子进程退出后只等「首事件已出现」最多 300ms，然后就 classify + `finish_terminal`；reader 线程到 `:670` 才 join。管道里还没被读完的最后几行——通常正是最后一条 `message_end` 和 session 行——会在 `final_totals()` 之后才被解析：usage 少记最后一条消息，session id 没写进 agents.json，jsonl 里 exit 之后还会追加 raw 行。<br>生产上：机器有负载、或 UI 的 Channel 回调慢（reader 是在回调里串行处理的）时就会发生；评测 runner 并发跑多个 harness 正是这种场景。它会让 F-BENCH-14 / 19 刚修好的用量再次少报，而且现在这些记录还会被标上 `message-sum`。<br>修法：① 子进程退出并 `kill_tree` 之后，先对 reader 做有界 join（例如 2s，孤儿已被 SIGKILL，管道会关闭），再 classify / `finish_terminal`；② 幂等改用单独的 `finishing: AtomicBool`（compare_exchange 抢占），`terminal` 在所有写入完成之后最后发布；`kill_all` 的强制收口路径同样遵守这个顺序。确定性回归测试：sink 回调里每个事件 sleep 200ms（让 reader 落后于退出），脚本输出两条 `message_end` 后立即 exit，断言归档的是 250 而不是 100、jsonl 最后一行是 exit |
+| — | P3（nit） | `usage_caliber` 在 `final_totals()` 走 cumulative 分支时也会写 `message-sum`（目前没有 cumulative 的产生方，影响为零；可以按实际分支写入，或删掉 cumulative 分支）。字段注释写「da9c376 起」，但 da9c376 到 e87a99a 之间归档的记录已经是求和口径、却没有标记，会被当成旧口径——都是开发期数据，注明即可 |
+
+**确定性复现（评审方，干净 worktree @ a1a6890）**：在 `terminal_archives_usage_with_caliber` 的基础上只改一处——sink 回调每个事件 sleep 700ms（模拟 UI Channel 慢 / 机器负载）。终态后再等 3 秒才读文件，以排除竞态 (a)。结果 **3 次全部复现**：agents.json 归档 `usage_tokens = 100`（应为 250，第二条 `message_end` 永久漏记，记录却带着 `message-sum` 标记），jsonl 最后一行是 `usage` 而不是 `exit`（exit 之后又追加了事件）。这证明 (b) 是生产数据错误，不只是测试读早了。复现补丁可直接作为修复的回归测试。
+
+**线程上限**：这正是 §33 担心的情况——4 线程上限掩盖了一个真实的竞态。建议修完 F-BENCH-26 后在 16 线程下连跑 10 次全绿，再决定这个上限去留。
 
 ### 残留状态核查（第二轮验收后）
 
