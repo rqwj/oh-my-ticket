@@ -1,14 +1,17 @@
-//! U2 (R-B/R-E 内核) + U4 (派发链): ExecutionManager —— harness 子进程的执
-//! 行内核与 run 化派发全链。
+//! U2（R-B/R-E 内核）+ U4 的 daemon 侧派发步骤：ExecutionManager —— harness
+//! 子进程的执行内核，与派发链前段（§3.3 ①–⑥）。
 //!
 //! U2 职责：spawn（setpgid 进程组、cwd 剥 `.omt` 尾、env 合并 + OMT_RUNTIME_DIR
 //! 强制注入）、stdout/stderr 泵（TranscriptEvent + raw.log）、exec_stop
 //! （幂等 + 进程组 TERM→KILL 升级）、起动窗/最大时长兜底、终态分类与
-//! agents.json 状态回写。
+//! agents.json 状态回写。本内核只被 exec-shim（shim.rs）使用——desktop 面
+//! 经 launch::start 拉起 shim 后不再持有会话。
 //!
-//! U4 职责：dispatch chain（§3.3：锁内预检 → node/execute → ensure-run →
-//! start → Agent 落盘 → bindings → MCP prepare → spawn，per-step commandId
-//! 幂等 + 补偿表）、终态租约释放（admin report failed + retry）、prompt 模板。
+//! U4 职责（daemon 侧）：dispatch_daemon_side（§3.3：node/get 预检 →
+//! node/execute → ensure-run → run/control start → Agent 落盘 → bindings，
+//! per-step commandId 幂等 + 补偿表）、终态租约释放（admin report failed +
+//! retry）、prompt 模板。链上执行（spec 落盘 / shim / MCP 注入 / spawn）在
+//! launch.rs 与 shim.rs。
 //!
 //! 启动 reconcile（U10）仍不在本模块。
 
@@ -35,13 +38,10 @@ pub const DEFAULT_MAX_DURATION: Duration = Duration::from_secs(120 * 60);
 const READER_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 pub const KILL_GRACE: Duration = Duration::from_secs(3);
 
-/// 进程内派发互斥锁：串行化预检 + 建链，闭合读侧 TOCTOU（§3.3）。
-static DISPATCH_LOCK: Mutex<()> = Mutex::new(());
-
 /// 派发 prompt 模板（§3.6.11 不可信内容规则 + §3.3 纪律）。
-/// `{run_id}` 由 exec_start 替换；ticket/claim context 正文是不可信数据。
-/// pub(crate)：launcher（launch::start）复用同一模板（Task 9）。
-pub(crate) const DISPATCH_PROMPT: &str = "\
+/// `{run_id}` 由 `dispatch_daemon_side` 替换；ticket/claim context 正文是
+/// 不可信数据。
+const DISPATCH_PROMPT: &str = "\
 You are executing tickets from an OMT run. Follow these rules exactly.\n\
 Home: homeId \"{home_id}\" (pass it as the homeId argument to every omt tool call).\n\
 1. Call the omt tool run__claim with homeId \"{home_id}\" and runId \"{run_id}\" to claim the next pending item.\n\
@@ -60,7 +60,6 @@ and outcome \"done\" (or \"failed\" / \"blocked\" with a note explaining why).\n
 pub enum KillReason {
     User,
     MaxDuration,
-    AppExit,
     /// 非 desktop 发起的信号死亡（外部 kill -9 等，F-U2-5）。
     External(i32),
 }
@@ -71,7 +70,6 @@ impl KillReason {
         match self {
             KillReason::User => "user".to_string(),
             KillReason::MaxDuration => "maxduration".to_string(),
-            KillReason::AppExit => "appexit".to_string(),
             KillReason::External(sig) => format!("external-{sig}"),
         }
     }
@@ -186,7 +184,8 @@ pub struct ExecSession {
     /// U11：捕获的 harness session id（首跑从事件流提取；终态归档
     /// exec.harness_session_id → agent.last_session_id 镜像）。
     pub harness_session_id: std::sync::Mutex<Option<String>>,
-    /// 事件出口（waiter 与 kill_all 路径共用；U4 接 Tauri Channel）
+    /// 事件出口（读线程/等待线程共用的回调；shim 内无人消费——事件的持久
+    /// 面是 jsonl，desktop 经 follow.rs 尾随）
     sink: EventSink,
     /// 事件序号（F-U2-6：三类事件统一 §5.3 envelope——`{execId, seq, ts,
     /// kind, ...}`）。计数器随 ExecSession 创建（session_start 发出前），
@@ -196,7 +195,7 @@ pub struct ExecSession {
     /// F-BENCH-26(a)：终态收口进行中（幂等 guard）。`terminal` 要等全部
     /// 落账完成才发布，不能再用 terminal.is_some() 当 guard。
     finishing: AtomicBool,
-    /// 终止方设置的原因：exec_stop=User、kill_all=AppExit、watchdog=MaxDuration
+    /// 终止方设置的原因：exec_stop=User、watchdog=MaxDuration
     stop_reason: Mutex<Option<KillReason>>,
     terminal: Mutex<Option<Terminal>>,
 }
@@ -254,29 +253,21 @@ pub struct ExecutionManager {
     lease_release: Mutex<Option<LeaseRelease>>,
     startup_window: Option<Duration>,
     max_duration: Option<Duration>,
-    /// kill_all 的有界等待时长（SIGTERM 后给优雅退出的宽限；测试可缩短）
-    kill_grace: Option<Duration>,
 }
 
 impl ExecutionManager {
     /// 纯构造（不碰磁盘）。启动清扫见 [`startup_housekeeping`]。
     pub fn new() -> Self {
-        Self::with_kill_grace(STARTUP_WINDOW, DEFAULT_MAX_DURATION, KILL_GRACE)
+        Self::with_limits(STARTUP_WINDOW, DEFAULT_MAX_DURATION)
     }
 
     /// shim 用：每 exec 一个 manager，maxDuration 来自 launch spec。
     pub fn with_max_duration(max_duration: Duration) -> Self {
-        Self::with_kill_grace(STARTUP_WINDOW, max_duration, KILL_GRACE)
+        Self::with_limits(STARTUP_WINDOW, max_duration)
     }
 
-    /// 注入 daemon RPC（终态租约释放的通道）。
-    pub fn set_rpc(&self, rpc: RpcFn) {
-        self.set_lease_release(Arc::new(move |home_id, run_id, exec_id| {
-            let _ = release_items_for_exec(&*rpc, home_id, run_id, exec_id);
-        }));
-    }
-
-    /// 直接注入租约释放回调（shim 用：按需连接 + 临时授权，见 daemon_link）。
+    /// 注入租约释放回调（shim 用：按需连接 + 临时授权，见 daemon_link；
+    /// desktop 会话的 U10 对账不经此路径，走 reconcile_interrupted_execs）。
     pub fn set_lease_release(&self, release: LeaseRelease) {
         *self
             .lease_release
@@ -284,23 +275,13 @@ impl ExecutionManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(release);
     }
 
-    /// 测试用：默认 KILL_GRACE
-    #[cfg(test)]
+    /// 构造（不碰磁盘）。测试注入更短的起动窗/最大时长。
     fn with_limits(startup_window: Duration, max_duration: Duration) -> Self {
-        Self::with_kill_grace(startup_window, max_duration, KILL_GRACE)
-    }
-
-    fn with_kill_grace(
-        startup_window: Duration,
-        max_duration: Duration,
-        kill_grace: Duration,
-    ) -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
             lease_release: Mutex::new(None),
             startup_window: Some(startup_window),
             max_duration: Some(max_duration),
-            kill_grace: Some(kill_grace),
         }
     }
 
@@ -310,10 +291,6 @@ impl ExecutionManager {
 
     fn max_duration(&self) -> Duration {
         self.max_duration.unwrap_or(DEFAULT_MAX_DURATION)
-    }
-
-    fn kill_grace(&self) -> Duration {
-        self.kill_grace.unwrap_or(KILL_GRACE)
     }
 
     /// spawn 一个 harness 会话并接入事件泵。`runtime_dir` 用于 OMT_RUNTIME_DIR
@@ -530,7 +507,7 @@ impl ExecutionManager {
             let mut term_sig: Option<i32> = None;
             let mut kill_at: Option<Instant> = None;
             loop {
-                // 终止原因：exec_stop=User、kill_all=AppExit、watchdog=MaxDuration
+                // 终止原因：exec_stop=User、watchdog=MaxDuration
                 let kill_reason = waiter_session.stop_reason().or_else(|| {
                     (started.elapsed() >= max_duration).then_some(KillReason::MaxDuration)
                 });
@@ -622,53 +599,6 @@ impl ExecutionManager {
             }
         }
         Ok(())
-    }
-
-    /// 退出钩子：终止全部会话（KD-D7）。app 退出路径调用。
-    ///
-    /// F-U2-1：同步收口——预置 terminal 会让等待线程的 finish_terminal 早退，
-    /// agents.json 永远收不到 Killed(AppExit)（下次启动被 demote 记成
-    /// 「app restarted」的 Failed，语义错且 execs[].kill_reason 缺失）。这里
-    /// 设置原因 → SIGTERM → 有界等待等待线程收口 → 超时则本路径直接
-    /// finish_terminal（幂等 guard 保证与等待线程只写一次）。
-    pub fn kill_all(&self, reason: KillReason) {
-        let mut pending: Vec<Arc<ExecSession>> = {
-            let sessions = self
-                .sessions
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            sessions
-                .values()
-                .filter(|s| s.terminal().is_none())
-                .cloned()
-                .collect()
-        };
-        for session in &pending {
-            session.request_stop(reason);
-            session.kill_tree(libc::SIGTERM);
-        }
-        let deadline = Instant::now() + self.kill_grace() + Duration::from_secs(2);
-        loop {
-            pending.retain(|s| s.terminal().is_none());
-            if pending.is_empty() || Instant::now() >= deadline {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        // 未收口的：升级 SIGKILL 并同步落盘（finish_terminal 幂等 guard 防
-        // 与等待线程双写；MCP 注入的 workspace 释放同路径完成）
-        for session in &pending {
-            session.kill_tree(libc::SIGKILL);
-            finish_terminal(session, &Terminal::Killed(reason));
-        }
-    }
-
-    pub fn get(&self, exec_id: &str) -> Option<Arc<ExecSession>> {
-        self.sessions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(exec_id)
-            .cloned()
     }
 }
 
@@ -777,8 +707,9 @@ fn spawn_reader(
 /// 终态分类（§3.2 / F-U2-2）：desktop 发起的 kill → Killed(reason)；**外部**
 /// 信号死亡 → Killed(External)（F-U2-5）；起动窗内**未产出任何 transcript
 /// 事件**且非零退出 → Failed(stderr 尾，已脱敏)；其余 → Exited(code)。
-/// F-U2-13：signal 分支优先采用已请求的 stop_reason——kill_all 的
-/// request_stop 与 SIGTERM 之间的采样/收割窗口不得把 app 退出记成 external。
+/// F-U2-13：signal 分支优先采用已请求的 stop_reason——exec_stop 的
+/// request_stop 与 SIGTERM 之间的采样/收割窗口不得把本侧发起的终止记成
+/// external。
 #[allow(clippy::too_many_arguments)]
 fn classify(
     session: &ExecSession,
@@ -793,9 +724,9 @@ fn classify(
         return Terminal::Killed(kill_reason.unwrap_or(KillReason::User));
     }
     if let Some(sig) = signal {
-        // F-U2-13：desktop 自己发的 SIGTERM（waiter 升级或 kill_all）按已请求
-        // 的原因收口；#5 决策：其余信号（外部 SIGKILL/SEGV 等）保持 External
-        // 归因——窗口内外部 SIGTERM 的归因模糊已接受并在此文档化。
+        // F-U2-13：本侧自己发的 SIGTERM（waiter 升级）按已请求的原因收口；
+        // #5 决策：其余信号（外部 SIGKILL/SEGV 等）保持 External 归因——
+        // 窗口内外部 SIGTERM 的归因模糊已接受并在此文档化。
         let reason = if sig == libc::SIGTERM {
             session.stop_reason().unwrap_or(KillReason::External(sig))
         } else {
@@ -827,14 +758,14 @@ fn classify(
 /// F-BENCH-26(a)：幂等 guard 是独立的 `finishing` 标记——`terminal` 在
 /// 全部落账（MCP 释放 / agents.json 状态与 usage / session id / 租约
 /// 释放 / exit 事件与行）完成之后**最后**发布；轮询方（测试 wait_for、
-/// kill_all 收口、UI）在 terminal() 变 Some 的瞬间读到的就是完整数据。
+/// UI）在 terminal() 变 Some 的瞬间读到的就是完整数据。
 fn finish_terminal(session: &ExecSession, terminal: &Terminal) {
     if session
         .finishing
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
-        return; // 已收口（如 kill_all 与等待线程竞争）
+        return; // 已收口（幂等 guard 兜底，防双写）
     }
     let runtime_dir = &session.runtime_dir;
     let (status, _detail) = match terminal {
@@ -1068,8 +999,8 @@ pub fn wait_for<T>(mut check: impl FnMut() -> Option<T>, timeout: Duration) -> O
     }
 }
 
-// ── U4: dispatch chain (§3.3) ─────────────────────────────────────────────
-// DISPATCH_LOCK 定义在文件头部（line 37）。
+// ── U4: dispatch chain, daemon 侧（§3.3 ①–⑥）────────────────────────────
+// 进程内串行化（预检 + 建链）由 launch::start 的 LAUNCH_LOCK 提供。
 
 /// exec_start 的成功返回。
 #[derive(Debug, serde::Serialize)]
@@ -1082,15 +1013,15 @@ pub struct ExecStartOutcome {
     pub warnings: Vec<String>,
 }
 
-/// dispatch_chain 的 daemon RPC seam（#5）：生产侧由 `exec_start_impl` 包装
-/// 调用方注入的 `RpcFn`（行为不变），测试侧注入脚本化替身——补偿表（cancel）
-/// 才能被断言。pub(crate)：launcher 复用同一 seam（Task 9）。
+/// dispatch_daemon_side 的 daemon RPC seam（#5）：生产侧由 `launch::start`
+/// 包装调用方注入的 `RpcFn`（行为不变），测试侧注入脚本化替身——补偿表
+/// （cancel）才能被断言。
 pub(crate) type DaemonRpc<'a> =
     &'a dyn Fn(&str, serde_json::Value) -> Result<serde_json::Value, String>;
 
 /// F-U3-9 后续：收集子树内可执行的 ticket/subticket 成员（跳过 done/archived），
-/// 语义对齐 DSH 面 collectRunMembers。pub(crate)：launcher 复用（Task 9）。
-pub(crate) fn collect_members(
+/// 语义对齐 DSH 面 collectRunMembers。
+fn collect_members(
     rpc: DaemonRpc<'_>,
     home_id: &str,
     node_id: &str,
@@ -1132,33 +1063,48 @@ pub(crate) fn collect_members(
     Ok(members)
 }
 
-/// 派发链（§3.3 全量）。由 `exec_start` 在 `DISPATCH_LOCK` 内调用。
-/// 返回 `ExecStartOutcome`（#9：调用方不再解构重打包）。所有 daemon 交互
-/// （含补偿表的 cancel）经 `rpc` seam。
-#[allow(clippy::too_many_lines)]
+/// dispatch_daemon_side 的产出（§3.3 ①–⑥）：launcher（launch::start）据此
+/// 走 ⑦ spec 落盘 → ⑧ 拉起 shim → ⑨ 就绪握手。
+#[derive(Debug)]
+pub(crate) struct DispatchPlan {
+    /// ⑤ 已注册/续接的 agent 记录。
+    pub agent: agents::AgentRecord,
+    pub exec_id: String,
+    pub run_id: String,
+    /// 补偿表门：仅本次新建的 run 才允许 cancel（复用 run 绝不）。
+    pub run_was_newly_created: bool,
+    /// 非阻断警告（绑定写失败等）。
+    pub warnings: Vec<String>,
+    /// agent 目录（spec / shim 日志 / transcript 都落在这里）。
+    pub agent_dir: PathBuf,
+    /// 渲染后的派发 prompt（spec 字段；prompt 文件由 shim 落盘）。
+    pub prompt: String,
+}
+
+/// 派发链的 daemon 侧步骤（§3.3 ①–⑥）：预检 → node/execute → ensure-run →
+/// run/control start → 注册/续接 Agent → 绑定。由 launcher（launch::start）
+/// 在 `LAUNCH_LOCK` 内调用；链上执行（spec 落盘 / shim / MCP 注入 / spawn）
+/// 在 launch.rs 与 shim.rs。所有 daemon 交互（含补偿表的 cancel）经 `rpc`
+/// seam；失败同步返回，不留半链状态。
 #[allow(clippy::too_many_arguments)]
-fn dispatch_chain(
+pub(crate) fn dispatch_daemon_side(
     rpc: DaemonRpc<'_>,
-    manager: &ExecutionManager,
-    omt_path: &Path,
     runtime_dir: &Path,
     home_id: &str,
-    home_path: &Path,
     node_id: &str,
     provider_id: &str,
     unattended: bool,
     model: Option<&str>,
     resume_session: Option<&str>,
     target_agent_id: Option<&str>,
-    sink: EventSink,
-) -> Result<ExecStartOutcome, String> {
+) -> Result<DispatchPlan, String> {
     let dispatch_id = format!(
         "d-{}-{}",
         agents::now_epoch_ms(),
         omt_harness::atomic_json::unique_suffix()
     );
 
-    // ① 预检（锁内）
+    // ① 预检
     let node_resp = rpc(
         "node/get",
         serde_json::json!({"homeId": home_id, "nodeId": node_id}),
@@ -1172,15 +1118,16 @@ fn dispatch_chain(
         .cloned()
         .unwrap_or_default()
         .iter()
-        .filter_map(|r| r["runId"].as_str().map(<str as ToOwned>::to_owned))
+        .filter_map(|r| r["runId"].as_str().map(str::to_owned))
         .collect();
 
-    // ② node/execute
-    let exec_params = serde_json::json!({
-        "homeId": home_id, "nodeId": node_id,
-        "commandId": format!("{dispatch_id}:execute"),
-    });
-    rpc("node/execute", exec_params)?;
+    // ② node/execute（发起方是 desktop，adapter_only 可用；P-3）
+    rpc(
+        "node/execute",
+        serde_json::json!({
+            "homeId": home_id, "nodeId": node_id, "commandId": format!("{dispatch_id}:execute"),
+        }),
+    )?;
 
     // ③ ensure-run
     let (run_id, run_was_newly_created) = if let Some(existing) = active_runs.first() {
@@ -1189,10 +1136,8 @@ fn dispatch_chain(
         let resp = rpc(
             "run/create",
             serde_json::json!({
-                "homeId": home_id,
-                "title": format!("dispatch {node_id}"),
-                "nodeIds": members,
-                "commandId": format!("{dispatch_id}:create"),
+                "homeId": home_id, "title": format!("dispatch {node_id}"),
+                "nodeIds": members, "commandId": format!("{dispatch_id}:create"),
             }),
         )?;
         // run/create 返回 run_view_full（dispatch.rs）：run id 在 `run.runId`。
@@ -1205,17 +1150,14 @@ fn dispatch_chain(
         (created, true)
     };
 
-    // ④ run/control start（仅新建/Pending；复用 Running 跳过）
-    let run_status = {
-        let resp = rpc(
-            "run/get",
-            serde_json::json!({"homeId": home_id, "runId": run_id}),
-        )?;
-        resp["run"]["status"]
-            .as_str()
-            .unwrap_or("pending")
-            .to_string()
-    };
+    // ④ run/control start（仅 pending）
+    let run_status = rpc(
+        "run/get",
+        serde_json::json!({"homeId": home_id, "runId": run_id}),
+    )?["run"]["status"]
+        .as_str()
+        .unwrap_or("pending")
+        .to_string();
     match run_status.as_str() {
         "pending" => {
             rpc(
@@ -1232,15 +1174,12 @@ fn dispatch_chain(
                 "run {run_id} 是 {run_status}，需在弹窗中选择 resume/retry 或取消"
             ));
         }
-        other => {
-            return Err(format!("run {run_id} 状态 {other}，无法派发"));
-        }
+        other => return Err(format!("run {run_id} 状态 {other}，无法派发")),
     }
 
-    // ⑧ 前置：launch 解析（U6/R-B——接真实用户配置；无配置/未启用 → Err）。
-    // 语义上属步骤 ⑧，但提前到 ⑤ 之前执行：NewExec 要落真实 binary 路径与
-    // args（§3.1：路径与 args 可落盘，env 值绝不），且解析失败时同 ①–④ 一样
-    // 不留 Agent 记录（补偿表）。
+    // 启动参数（记录用；shim 会用同一输入重算，P-4）。语义上属步骤 ⑧，但
+    // 提前到 ⑤ 之前执行：NewExec 要落真实 binary 路径与 args（§3.1：路径与
+    // args 可落盘，env 值绝不），且解析失败时同 ①–④ 一样不留 Agent 记录。
     let plan = harness::resolve_launch(runtime_dir, provider_id)?;
     let prompt = DISPATCH_PROMPT
         .replace("{run_id}", &run_id)
@@ -1251,20 +1190,14 @@ fn dispatch_chain(
                 .map(|d| d.tool_hint)
                 .unwrap_or(""),
         );
-    // exec_id 提前生成：prompt 文件名、Agent 记录、spawn 三方共用
+    // exec_id 提前生成：Agent 记录、agent 目录三方共用（新 agent 的 id 由
+    // execId 派生；续跑用目标 agent 自己的目录——KD-E2）。
     let exec_id = format!("exec-{}", omt_harness::atomic_json::unique_suffix());
-    // KD-E2：agent 目录在链上提前确定（新 agent 的 id 由 execId 派生；续跑
-    // 用目标 agent 自己的目录）——prompt 文件与 transcript 都落在它里面。
     let agent_id_for_paths = match target_agent_id {
         Some(target) => target.to_string(),
         None => crate::layout::new_agent_id(&exec_id),
     };
     let agent_dir = crate::layout::agent_dir(runtime_dir, home_id, &agent_id_for_paths)?;
-    // F-ACC-6（验收 ENAMETOOLONG）：opencode 对位置参数 lstat 判文件附件，
-    // 多行长 prompt 被当路径启动即炸。FileAttach 渠道把 prompt 落 per-exec
-    // 文件（与 raw.log 同目录，无 secrets——desktop 模板 + run_id），argv 只
-    // 留 `-f <path>` + 短指令。路径此处确定（compose/注册用），写盘在 ⑦ 后
-    // （失败走补偿表）。
     let prompt_file = harness::prompt_file_path(&agent_dir, &exec_id, plan.prompt_channel);
     let args = harness::compose_launch_args(
         &plan,
@@ -1274,22 +1207,19 @@ fn dispatch_chain(
         model,
         resume_session,
     );
-    // 保存时 validate_env 已拒保留键；这里防御性再滤一次（手工改写的
-    // config.json 不得炸 spawn 入口的硬校验）。
-    let env_additions = plan.sanitized_env();
 
-    // ⑤ register Agent (U4a)。失败按补偿表 cancel 本次新建 run（不留记录）。
-    // U11：target_agent_id 命中既有 agent（会话续接）——服务端硬校验
-    //（存在 / harness 一致 / 非存活），追加 exec 而非新建 agent。
+    // ⑤ 注册 / 续接 agent。U11：target_agent_id 命中既有 agent（会话续接）
+    // ——服务端硬校验（存在 / harness 一致 / 非存活），追加 exec 而非新建。
+    // 失败按补偿表 cancel 本次新建 run（不留记录）。
     if let Some(target) = target_agent_id {
-        match agents::get_agent(runtime_dir, home_id, target) {
-            Ok(Some(agent)) if agent.harness != provider_id => {
+        match agents::get_agent(runtime_dir, home_id, target)? {
+            Some(agent) if agent.harness != provider_id => {
                 return Err(format!(
                     "目标 agent 属于 {}，不能以 {} 续跑",
                     agent.harness, provider_id
                 ));
             }
-            Ok(Some(agent))
+            Some(agent)
                 if matches!(
                     agent.status,
                     agents::AgentRecordStatus::Starting | agents::AgentRecordStatus::Running
@@ -1297,22 +1227,11 @@ fn dispatch_chain(
             {
                 return Err(format!("目标 agent {target} 仍在运行，拒绝并发派发"));
             }
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                return Err(format!("目标 agent {target} 不存在（可能已被清理）"));
-            }
-            Err(err) => return Err(err),
+            Some(_) => {}
+            None => return Err(format!("目标 agent {target} 不存在（可能已被清理）")),
         }
     }
-    let register = |new_exec: crate::agents::NewExec| -> Result<agents::AgentRecord, String> {
-        match target_agent_id {
-            Some(target) => {
-                agents::append_exec(runtime_dir, home_id, target, provider_id, new_exec)
-            }
-            None => agents::register_agent(runtime_dir, home_id, provider_id, new_exec),
-        }
-    };
-    let agent = match register(crate::agents::NewExec {
+    let new_exec = crate::agents::NewExec {
         exec_id: exec_id.clone(),
         node_id: Some(node_id.to_string()),
         run_id: Some(run_id.clone()),
@@ -1322,7 +1241,12 @@ fn dispatch_chain(
         binary_args: sanitize_args(&args),
         // F-VIEW3：续跑列表展示本次模型
         model: model.map(str::to_string),
-    }) {
+    };
+    let registered = match target_agent_id {
+        Some(target) => agents::append_exec(runtime_dir, home_id, target, provider_id, new_exec),
+        None => agents::register_agent(runtime_dir, home_id, provider_id, new_exec),
+    };
+    let agent = match registered {
         Ok(agent) => agent,
         Err(err) => {
             compensate_new_run(rpc, home_id, &run_id, run_was_newly_created);
@@ -1330,86 +1254,27 @@ fn dispatch_chain(
         }
     };
 
-    // ⑥ bindings 写入（写失败→警告不阻断）
-    let bind_result = agents::write_binding(runtime_dir, home_id, node_id, &agent.id);
-    let bind_warning = bind_result.err().map(|e| format!("绑定写入失败：{e}"));
+    // ⑥ 绑定写入（写失败 → 警告不阻断）
+    let warnings: Vec<String> = agents::write_binding(runtime_dir, home_id, node_id, &agent.id)
+        .err()
+        .map(|e| format!("绑定写入失败：{e}"))
+        .into_iter()
+        .collect();
 
-    // ⑤ 之后失败的补偿序列（补偿表：Agent 记录转 Failed + 仅 cancel 本次新建
-    // run）——⑦⑧ 两个失败点共用。
-    let fail_agent_and_compensate = |err: String| -> String {
-        let _ = agents::update_agent_status(
-            runtime_dir,
-            home_id,
-            &agent.id,
-            AgentRecordStatus::Failed,
-            AgentAttachment::None,
-        );
-        compensate_new_run(rpc, home_id, &run_id, run_was_newly_created);
-        err
-    };
-
-    // ⑦ MCP prepare（U3）。失败按补偿表：Agent 记录转 Failed + cancel 新建 run。
-    let cwd = workspace_root_of(home_path);
-    let mcp = match crate::mcp_injection::prepare(
-        omt_path,
-        runtime_dir,
-        &cwd,
-        provider_id,
-        &exec_id,
-        false,
-    ) {
-        Ok(mcp) => mcp,
-        Err(err) => return Err(fail_agent_and_compensate(err)),
-    };
-
-    // F-ACC-6 写盘（⑦ 之后、spawn 之前）：FileAttach 渠道的 prompt 文件，
-    // 失败按补偿表（Agent 转 Failed + cancel 新建 run）。
-    if let Some(path) = &prompt_file {
-        if let Some(dir) = path.parent() {
-            if let Err(e) = std::fs::create_dir_all(dir) {
-                return Err(fail_agent_and_compensate(format!("create agent dir: {e}")));
-            }
-        }
-        if let Err(e) = std::fs::write(path, &prompt) {
-            return Err(fail_agent_and_compensate(format!("write prompt file: {e}")));
-        }
-    }
-
-    // ⑧ spawn（U2）——sink 已由 tauri command 的 Channel 适配而来，穿透到
-    // 事件泵（U5 transcript 流的数据源，KD-D3：不进 daemon 事件流）。
-    // 同步失败按补偿表处理（此时不可能有 item 被 claim）。
-    let spawn_req = SpawnRequest {
-        exec_id: exec_id.clone(),
-        agent_id: agent.id.clone(),
-        home_id: home_id.to_string(),
-        home_path: home_path.to_path_buf(),
-        harness: provider_id.to_string(),
-        node_id: Some(node_id.to_string()),
-        run_id: Some(run_id.clone()),
-        program: plan.program,
-        args,
-        env_additions,
-        mcp,
-        transcript_dir: agent_dir.clone(),
-    };
-    if let Err(err) = manager.spawn(runtime_dir, spawn_req, sink) {
-        return Err(fail_agent_and_compensate(err));
-    }
-
-    Ok(ExecStartOutcome {
+    Ok(DispatchPlan {
+        agent,
         exec_id,
-        agent_id: agent.id,
         run_id,
-        warnings: vec![bind_warning.unwrap_or_default()]
-            .into_iter()
-            .filter(|s| !s.is_empty())
-            .collect(),
+        run_was_newly_created,
+        warnings,
+        agent_dir,
+        prompt,
     })
 }
 
-/// 补偿表（§3.3）：⑤⑦ 失败 → cancel 新建 run + Agent Failed。cancel 与链上
-/// 其余步骤同走 `rpc` seam（测试据此断言补偿行为）。pub(crate)：launcher
-/// 复用（Task 9）。
+/// 补偿表（§3.3）：仅 cancel 本次新建的 run。cancel 与链上其余步骤同走
+/// `rpc` seam（测试据此断言补偿行为）。pub(crate)：launcher 的 ⑨ 失败路径
+/// 复用。
 pub(crate) fn compensate_new_run(
     rpc: DaemonRpc<'_>,
     home_id: &str,
@@ -1424,51 +1289,34 @@ pub(crate) fn compensate_new_run(
     }
 }
 
-/// exec_start 的完整链编排（含补偿表）。由桌面端 tauri command（或后续的
-/// launcher）调用。
+/// 补偿表（§3.3）：⑤ 之后失败 → failure_detail 落档 + Agent 转 Failed
+/// （attachment None）+ 仅 cancel 本次新建 run。launch::start 的 ⑦ spec
+/// 落盘 / ⑧ shim 拉起两个失败点共用（此时不可能有 item 被 claim）。
 #[allow(clippy::too_many_arguments)]
-pub fn exec_start_impl(
-    rpc: &RpcFn,
-    manager: &ExecutionManager,
-    omt_path: &Path,
+pub(crate) fn fail_and_compensate(
+    rpc: DaemonRpc<'_>,
     runtime_dir: &Path,
     home_id: &str,
-    home_path: &Path,
-    node_id: &str,
-    provider_id: &str,
-    unattended: bool,
-    model: Option<&str>,
-    resume_session: Option<&str>,
-    target_agent_id: Option<&str>,
-    sink: EventSink,
-) -> Result<ExecStartOutcome, String> {
-    // model/session id 入参先校验（argv 注入面），非法即拒——不进 dispatch_chain
-    if let Some(model) = model {
-        harness::validate_model_id(model)?;
-    }
-    if let Some(session) = resume_session {
-        harness::validate_model_id(session)?;
-    }
-    manager.set_rpc(rpc.clone());
-    let _guard = DISPATCH_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let seam = |method: &str, params: serde_json::Value| rpc(method, params);
-    dispatch_chain(
-        &seam,
-        manager,
-        omt_path,
+    agent_id: &str,
+    exec_id: &str,
+    run_id: &str,
+    run_was_newly_created: bool,
+    err: String,
+) -> String {
+    let _ = agents::update_exec(runtime_dir, home_id, agent_id, exec_id, |e| {
+        if e.failure_detail.is_none() {
+            e.failure_detail = Some(err.clone());
+        }
+    });
+    let _ = agents::update_agent_status(
         runtime_dir,
         home_id,
-        home_path,
-        node_id,
-        provider_id,
-        unattended,
-        model,
-        resume_session,
-        target_agent_id,
-        sink,
-    )
+        agent_id,
+        AgentRecordStatus::Failed,
+        AgentAttachment::None,
+    );
+    compensate_new_run(rpc, home_id, run_id, run_was_newly_created);
+    err
 }
 
 /// `exec_transcript_tail` 的纯核心（测试注入 runtime 目录）。
@@ -1676,9 +1524,9 @@ pub fn reconcile_with_connector(
 }
 
 /// run/get 挑出本 exec 仍持有的 running item 并逐个释放（admin report
-/// failed + retry 回 pending）。终态线程（set_rpc 注入的租约释放）与
-/// 启动对账（reconcile_interrupted_execs）共用。run/get 失败返回 Err；
-/// 逐项释放失败记首个错误、其余项继续处理。
+/// failed + retry 回 pending）。终态线程（shim 经 set_lease_release 注入的
+/// 租约释放）与启动对账（reconcile_interrupted_execs）共用。run/get 失败
+/// 返回 Err；逐项释放失败记首个错误、其余项继续处理。
 pub fn release_items_for_exec(
     rpc: &dyn Fn(&str, serde_json::Value) -> Result<serde_json::Value, String>,
     home_id: &str,
@@ -2014,7 +1862,7 @@ mod tests {
 
     #[test]
     fn classify_prefers_requested_stop_over_external_signal() {
-        // F-U2-13：kill_all 的 request_stop 与 SIGTERM 死亡落在同一收割迭代
+        // F-U2-13：exec_stop 的 request_stop 与 SIGTERM 死亡落在同一收割迭代
         // 时（killed_by_us=false + signal=15），必须按已请求的原因收口，而不是
         // 误标 external-15。
         let dir = tempfile::tempdir().unwrap();
@@ -2068,7 +1916,7 @@ mod tests {
             seq: AtomicU64::new(0),
             first_event_seen: AtomicBool::new(true),
             finishing: AtomicBool::new(false),
-            stop_reason: Mutex::new(Some(KillReason::AppExit)),
+            stop_reason: Mutex::new(Some(KillReason::User)),
             terminal: Mutex::new(None),
         };
         let terminal = classify(
@@ -2082,7 +1930,7 @@ mod tests {
             session.started,
             STARTUP_WINDOW,
         );
-        assert_eq!(terminal, Terminal::Killed(KillReason::AppExit));
+        assert_eq!(terminal, Terminal::Killed(KillReason::User));
     }
 
     #[test]
@@ -2140,7 +1988,7 @@ mod tests {
             seq: AtomicU64::new(0),
             first_event_seen: AtomicBool::new(true),
             finishing: AtomicBool::new(false),
-            stop_reason: Mutex::new(Some(KillReason::AppExit)),
+            stop_reason: Mutex::new(Some(KillReason::User)),
             terminal: Mutex::new(None),
         };
         let terminal = classify(
@@ -2156,117 +2004,9 @@ mod tests {
     }
 
     #[test]
-    fn kill_all_timeout_branch_settles_unwaited_session() {
-        // F-U2-15（实质）：TERM 免疫 + 无等待线程的会话走 kill_all 的超时
-        // 分支（SIGKILL + 直接 finish_terminal），agents.json 仍落
-        // Killed(AppExit)/kill_reason=appexit。kill_grace 缩短以控制时长。
-        let dir = tempfile::tempdir().unwrap();
-        let runtime = dir.path().join("runtime");
-        let home_path = dir.path().join("ws").join(".omt");
-        std::fs::create_dir_all(&home_path).unwrap();
-        let manager = ExecutionManager::with_kill_grace(
-            STARTUP_WINDOW,
-            DEFAULT_MAX_DURATION,
-            Duration::from_millis(300),
-        );
-        let script = write_script(
-            dir.path(),
-            "stubborn2",
-            "trap '' TERM\necho READY\nsleep 30\n",
-        );
-        let (tx, rx) = mpsc::channel();
-        let sink: EventSink = Arc::new(move |v| {
-            let _ = tx.send(v);
-        });
-        let agent = agents::register_agent(
-            &runtime,
-            "h_test",
-            "fake",
-            NewExec {
-                exec_id: "exec-stubborn2".into(),
-                node_id: None,
-                run_id: None,
-                binary_path: None,
-                binary_args: vec![],
-                model: None,
-            },
-        )
-        .unwrap();
-        let session = manager
-            .spawn(
-                &runtime,
-                SpawnRequest {
-                    exec_id: "exec-stubborn2".into(),
-                    agent_id: agent.id.clone(),
-                    home_id: "h_test".into(),
-                    home_path: home_path.clone(),
-                    harness: "fake".into(),
-                    node_id: None,
-                    run_id: None,
-                    program: script,
-                    args: vec![],
-                    env_additions: BTreeMap::new(),
-                    mcp: McpInjection::None,
-                    transcript_dir: crate::layout::agent_dir(&runtime, "h_test", &agent.id)
-                        .unwrap(),
-                },
-                sink,
-            )
-            .unwrap();
-        // F-BENCH-22：READY 屏障——trap 装好才 kill。现写脚本首跑的 exec
-        // 评估停顿（实测退化态可至 9s+）意味着「spawn 返回 ≠ 子进程已起」，
-        // kill 撞上未装 trap 的窗口时 kill_reason 落不上（曾间歇红）
-        let saw_ready = wait_for(
-            || match rx.try_recv() {
-                Ok(ev) if ev["text"].as_str() == Some("READY") => Some(()),
-                _ => None,
-            },
-            Duration::from_secs(20),
-        );
-        assert!(saw_ready.is_some(), "READY 屏障应到达");
-
-        let started = Instant::now();
-        manager.kill_all(KillReason::AppExit);
-        let elapsed = started.elapsed();
-        assert_eq!(
-            session.terminal(),
-            Some(Terminal::Killed(KillReason::AppExit)),
-            "无等待线程的会话应由 kill_all 直接 finish_terminal"
-        );
-        assert!(
-            elapsed >= Duration::from_millis(250) && elapsed < Duration::from_secs(8),
-            "kill_all 应在 kill_grace 超时后返回：{elapsed:?}"
-        );
-        // agent 状态已落 Killed(AppExit)/kill_reason=appexit（snapshot 轮询，
-        // 消除断言与持久化写入之间的竞态）
-        let file = wait_for(
-            || {
-                let file = crate::agents::snapshot(&runtime, "h_test");
-                (file.agents.iter().any(|a| {
-                    a.execs
-                        .iter()
-                        .any(|e| e.kill_reason.as_deref() == Some("appexit"))
-                }))
-                .then_some(file)
-            },
-            Duration::from_secs(3),
-        )
-        .expect("agent 状态应在 3s 内落 Killed/appexit");
-        assert_eq!(
-            file.agents[0].status,
-            crate::agents::AgentRecordStatus::Killed
-        );
-        assert_eq!(
-            file.agents[0].execs[0].kill_reason.as_deref(),
-            Some("appexit")
-        );
-    }
-
-    #[test]
     fn term_immune_child_escalates_to_sigkill_via_exec_stop() {
         // F-U2-15（部分）：SIGTERM 免疫的子进程经 exec_stop → waiter 的
-        // TERM→KILL 升级清除，终态 Killed(User)。（kill_all 的超时分支由
-        // kill_all_timeout_branch_settles_unwaited_session 单独覆盖）
+        // TERM→KILL 升级清除，终态 Killed(User)。
         let dir = tempfile::tempdir().unwrap();
         let runtime = dir.path().join("runtime");
         let home_path = dir.path().join("ws").join(".omt");
@@ -2860,86 +2600,6 @@ mod tests {
     }
 
     #[test]
-    fn kill_all_marks_app_exit() {
-        let dir = tempfile::tempdir().unwrap();
-        let runtime = dir.path().join("runtime");
-        let home_path = dir.path().join("ws").join(".omt");
-        std::fs::create_dir_all(&home_path).unwrap();
-        let manager = ExecutionManager::with_limits(STARTUP_WINDOW, DEFAULT_MAX_DURATION);
-        let script = write_script(dir.path(), "long", "sleep 30\n");
-        let (tx, _rx) = mpsc::channel();
-        let sink: EventSink = Arc::new(move |v| {
-            let _ = tx.send(v);
-        });
-        // U4a 语义：spawn 前 Agent 记录已注册（U4 链步骤 ⑤）
-        let agent = agents::register_agent(
-            &runtime,
-            "h_test",
-            "fake",
-            NewExec {
-                exec_id: "exec-exit".into(),
-                node_id: None,
-                run_id: None,
-                binary_path: None,
-                binary_args: vec![],
-                model: None,
-            },
-        )
-        .unwrap();
-        let session = manager
-            .spawn(
-                &runtime,
-                SpawnRequest {
-                    exec_id: "exec-exit".into(),
-                    agent_id: agent.id.clone(),
-                    home_id: "h_test".into(),
-                    home_path: home_path.clone(),
-                    harness: "fake".into(),
-                    node_id: None,
-                    run_id: None,
-                    program: script,
-                    args: vec![],
-                    env_additions: BTreeMap::new(),
-                    mcp: McpInjection::None,
-                    transcript_dir: crate::layout::agent_dir(&runtime, "h_test", &agent.id)
-                        .unwrap(),
-                },
-                sink,
-            )
-            .unwrap();
-        manager.kill_all(KillReason::AppExit);
-        let terminal = wait_for(|| session.terminal(), Duration::from_secs(30));
-        assert!(matches!(
-            terminal,
-            Some(Terminal::Killed(KillReason::AppExit))
-        ));
-        // F-U2-12：kill_all 路径必须真正落盘（F-U2-1 修复的验收断言）。
-        // finish_terminal 先落账再置 terminal——用 snapshot 轮询读消除断言
-        // 与持久化写入之间的竞态（correctness 评审指出的 read-race）。
-        let persisted = wait_for(
-            || {
-                let file = crate::agents::snapshot(&runtime, "h_test");
-                (file.agents.iter().any(|a| {
-                    a.execs
-                        .iter()
-                        .any(|e| e.kill_reason.as_deref() == Some("appexit"))
-                }))
-                .then_some(file)
-            },
-            Duration::from_secs(3),
-        );
-        let file = persisted.expect("agent 状态应在 3s 内落 Killed/appexit");
-        assert_eq!(
-            file.agents[0].status,
-            crate::agents::AgentRecordStatus::Killed
-        );
-        assert_eq!(
-            file.agents[0].attachment,
-            crate::agents::AgentAttachment::None
-        );
-    }
-
-    #[test]
     fn workspace_root_strips_omt_suffix() {
         assert_eq!(
             workspace_root_of(Path::new("/ws/.omt")),
@@ -3030,10 +2690,11 @@ mod tests {
         assert!(value.get("exec_id").is_none(), "{value}");
     }
 
-    // ── U4 dispatch_chain（#5：补偿表经 rpc seam 断言）─────────────────────
+    // ── U4 dispatch（daemon 侧 ①–⑥ + 补偿表；#5：补偿表经 rpc seam 断言）──
 
-    /// dispatch_chain 的 daemon RPC 替身：按 method 返回预置 JSON，并全量记账
-    /// (method, params) 供补偿断言（cancel 是否发生 / 指向哪个 run）。
+    /// dispatch_daemon_side / fail_and_compensate 的 daemon RPC 替身：按
+    /// method 返回预置 JSON，并全量记账 (method, params) 供补偿断言（cancel
+    /// 是否发生 / 指向哪个 run）。
     struct FakeDaemon {
         calls: Mutex<Vec<(String, serde_json::Value)>>,
         node_get: serde_json::Value,
@@ -3155,7 +2816,7 @@ mod tests {
         })
     }
 
-    /// dispatch_chain 夹具：workspace（`.omt` home）+ 已启用的 Manual binary
+    /// dispatch 夹具：workspace（`.omt` home）+ 已启用的 Manual binary
     /// fake harness 配置。返回 (runtime_dir, home_path)。
     fn setup_dispatch_env(dir: &Path, provider: &str, program: &Path) -> (PathBuf, PathBuf) {
         let runtime = dir.join("runtime");
@@ -3176,16 +2837,6 @@ mod tests {
         (runtime, home_path)
     }
 
-    /// dispatch_chain 的 `omt_path`：占位一个普通文件即可让 prepare 走通
-    /// （opencode 注入只做 `is_file` 预检，值从不执行）；幂等，同目录复用。
-    fn fake_omt(dir: &Path) -> PathBuf {
-        let path = dir.join("omt");
-        if !path.is_file() {
-            std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
-        }
-        path
-    }
-
     fn read_agents_file(runtime: &Path) -> crate::agents::AgentsFile {
         crate::agents::snapshot(runtime, "h_test")
     }
@@ -3197,7 +2848,7 @@ mod tests {
         // （create_dir_all 必败），不影响 harness 配置子树的读取。
         let dir = tempfile::tempdir().unwrap();
         let program = write_script(dir.path(), "never-runs-a", "exit 0");
-        let (runtime, home_path) = setup_dispatch_env(dir.path(), "omp", &program);
+        let (runtime, _home_path) = setup_dispatch_env(dir.path(), "omp", &program);
         std::fs::create_dir_all(runtime.join("agents")).unwrap();
         std::fs::write(runtime.join("agents").join("h_test"), "occupied").unwrap();
 
@@ -3207,26 +2858,11 @@ mod tests {
             "run-new-a",
         );
         let rpc = |method: &str, params: serde_json::Value| fake.rpc(method, params);
-        let manager = ExecutionManager::with_limits(STARTUP_WINDOW, DEFAULT_MAX_DURATION);
-        let sink: EventSink = Arc::new(|_| {});
 
-        let result = dispatch_chain(
-            &rpc,
-            &manager,
-            // register_agent 先失败，omt 路径不会被用到
-            Path::new("/nonexistent/omt"),
-            &runtime,
-            "h_test",
-            &home_path,
-            "t1",
-            "omp",
-            false,
-            None,
-            None,
-            None,
-            sink,
+        let result = dispatch_daemon_side(
+            &rpc, &runtime, "h_test", "t1", "omp", false, None, None, None,
         );
-        let err = result.expect_err("register_agent 写失败应使 dispatch_chain 失败");
+        let err = result.expect_err("register_agent 写失败应使 dispatch_daemon_side 失败");
 
         // 确为「新建 run」分支：run/create 已发生，随后恰好一次 cancel 指向它
         assert!(
@@ -3247,16 +2883,17 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_mcp_prepare_failure_marks_agent_failed_and_cancels_new_run() {
-        // 补偿表 ⑦：MCP prepare 失败 → Agent 记录转 Failed（attachment None）
-        // + 仅新建 run 被 cancel。失败手法：home_path 非 `.omt` 尾 → cwd 即
-        // home_path 本身且是普通文件——omp 注入写 workspace mcp.json 必败
-        // （sidecar 缺失时则在 sidecar 预检即败，补偿路径相同）。
+    fn dispatch_fail_and_compensate_marks_agent_failed_and_cancels_new_run() {
+        // 补偿表（launch::start ⑦ spec 落盘 / ⑧ shim 拉起的共用失败路径；原
+        // dispatch_mcp_prepare_failure 测试的移植——MCP 注入已移入 shim，且
+        // 新补偿表额外落 failure_detail）：⑤ 之后的链上失败 → failure_detail
+        // 落档 + Agent 转 Failed（attachment None）+ 仅新建 run 被 cancel。
+        // 注册经真实链路：argv 脱敏断言保留（F-ACC-12 + U12）。
         let dir = tempfile::tempdir().unwrap();
         let program = write_script(dir.path(), "never-runs-b", "exit 0");
         let runtime = dir.path().join("runtime");
-        let home_path = dir.path().join("ws-as-file");
-        std::fs::write(&home_path, "not a workspace").unwrap();
+        let home_path = dir.path().join("ws").join(".omt");
+        std::fs::create_dir_all(&home_path).unwrap();
         harness::upsert_config(
             &runtime,
             "omp",
@@ -3281,21 +2918,15 @@ mod tests {
             "run-new-b",
         );
         let rpc = |method: &str, params: serde_json::Value| fake.rpc(method, params);
-        let manager = ExecutionManager::with_limits(STARTUP_WINDOW, DEFAULT_MAX_DURATION);
-        let sink: EventSink = Arc::new(|_| {});
 
-        let omt = fake_omt(dir.path());
-        let result = dispatch_chain(
-            &rpc, &manager, &omt, &runtime, "h_test", &home_path, "t1", "omp", false, None, None,
-            None, sink,
-        );
-        let err = result.expect_err("MCP prepare 失败应使 dispatch_chain 失败");
+        let plan = dispatch_daemon_side(
+            &rpc, &runtime, "h_test", "t1", "omp", false, None, None, None,
+        )
+        .expect("daemon 侧步骤应成功（MCP 注入已移入 shim）");
 
-        // Agent 已注册（⑤ 越过）且转 Failed
+        // Agent 已注册（⑤ 越过）：argv 是脱敏后的镜像
         let file = read_agents_file(&runtime);
-        assert_eq!(file.agents.len(), 1, "{err}");
-        assert_eq!(file.agents[0].status, AgentRecordStatus::Failed);
-        assert_eq!(file.agents[0].attachment, AgentAttachment::None);
+        assert_eq!(file.agents.len(), 1);
         let persisted_args = &file.agents[0].execs[0].binary_args;
         // F-ACC-12 + U12：omp 渠道 argv = headless + 结构化流 flag，其后用户 args
         assert_eq!(
@@ -3308,23 +2939,42 @@ mod tests {
                 .contains("persisted-secret"),
             "agent 记录不得持久化 argv secret"
         );
+
+        // ⑤ 之后的链上失败 → 补偿表
+        let err = fail_and_compensate(
+            &rpc,
+            &runtime,
+            "h_test",
+            &plan.agent.id,
+            &plan.exec_id,
+            &plan.run_id,
+            plan.run_was_newly_created,
+            "spec write failed".to_string(),
+        );
+        assert_eq!(err, "spec write failed", "补偿助手原样返回错误");
+        let file = read_agents_file(&runtime);
+        assert_eq!(file.agents[0].status, AgentRecordStatus::Failed);
+        assert_eq!(file.agents[0].attachment, AgentAttachment::None);
+        assert_eq!(
+            file.agents[0].execs[0].failure_detail.as_deref(),
+            Some("spec write failed"),
+            "failure_detail 应落档"
+        );
         // 仅新建 run 被补偿 cancel
         let cancels = fake.cancel_params();
-        assert_eq!(cancels.len(), 1, "应恰好一次补偿 cancel: {err}");
+        assert_eq!(cancels.len(), 1, "应恰好一次补偿 cancel");
         assert_eq!(cancels[0]["runId"], "run-new-b");
     }
 
     #[test]
-    fn dispatch_spawn_failure_marks_agent_failed_and_cancels_new_run() {
-        // 补偿表 ⑧：spawn 同步失败 → Agent 转 Failed + 仅新建 run 被 cancel。
-        // 失败手法：删除 workspace 根目录（home_path 的父目录）——spawn 入口的
-        // 「workspace 根不存在」硬校验必败。日志写在 agent 目录里，runtime
-        // 子树保持完整；prepare 须走通：opencode 注入只查 omt_path is_file →
-        // fake_omt 占位。
+    fn launch_shim_spawn_failure_marks_agent_failed_and_cancels_new_run() {
+        // 补偿表 ⑧（原 dispatch_spawn_failure 测试的移植——spawn 已随执行
+        // 面移入 shim，新的同步失败点是 exec-shim 拉起）：omt_bin 不存在 →
+        // failure_detail 落档 + Agent 转 Failed + 仅新建 run 被 cancel。
+        // daemon 侧 ①–⑥ 与 ⑦ spec 落盘均真实走通。
         let dir = tempfile::tempdir().unwrap();
         let program = write_script(dir.path(), "never-runs-c", "exit 0");
         let (runtime, home_path) = setup_dispatch_env(dir.path(), "opencode", &program);
-        std::fs::remove_dir_all(home_path.parent().unwrap()).unwrap();
 
         let fake = FakeDaemon::new(
             dispatch_node_get(serde_json::json!([])),
@@ -3332,25 +2982,48 @@ mod tests {
             "run-new-c",
         );
         let rpc = |method: &str, params: serde_json::Value| fake.rpc(method, params);
-        let manager = ExecutionManager::with_limits(STARTUP_WINDOW, DEFAULT_MAX_DURATION);
-        let sink: EventSink = Arc::new(|_| {});
 
-        let omt = fake_omt(dir.path());
-        let result = dispatch_chain(
-            &rpc, &manager, &omt, &runtime, "h_test", &home_path, "t1", "opencode", false, None,
-            None, None, sink,
-        );
-        let err = result.expect_err("spawn 失败应使 dispatch_chain 失败");
+        let missing_omt = dir.path().join("omt-does-not-exist");
+        let err = crate::launch::start(
+            &rpc,
+            &crate::launch::LaunchRequest {
+                runtime_dir: &runtime,
+                omt_bin: &missing_omt,
+                home_id: "h_test",
+                home_path: &home_path,
+                node_id: "t1",
+                harness: "opencode",
+                unattended: false,
+                model: None,
+                resume_session: None,
+                target_agent_id: None,
+                max_duration: DEFAULT_MAX_DURATION,
+            },
+        )
+        .expect_err("shim 拉起失败应使 launch 失败");
         assert!(
-            err.contains("workspace 根不存在"),
-            "失败点应落在 spawn 步骤（workspace 根缺失）: {err}"
+            err.contains("spawn exec-shim"),
+            "失败点应落在 shim 拉起步骤: {err}"
         );
 
-        // Agent 已注册且转 Failed
+        // Agent 已注册（⑤ 越过）且转 Failed（failure_detail 落档）
         let file = read_agents_file(&runtime);
         assert_eq!(file.agents.len(), 1);
         assert_eq!(file.agents[0].status, AgentRecordStatus::Failed);
         assert_eq!(file.agents[0].attachment, AgentAttachment::None);
+        assert_eq!(
+            file.agents[0].execs[0].failure_detail.as_deref(),
+            Some(err.as_str()),
+            "failure_detail 应落档"
+        );
+        // ⑦ 在 ⑧ 之前：spec 已落盘
+        let agent_id = &file.agents[0].id;
+        assert!(crate::layout::exec_file(
+            &crate::layout::agent_dir(&runtime, "h_test", agent_id).unwrap(),
+            &file.agents[0].execs[0].exec_id,
+            crate::layout::ExecFile::Spec,
+        )
+        .is_file());
         // 仅新建 run 被补偿 cancel
         let cancels = fake.cancel_params();
         assert_eq!(cancels.len(), 1);
@@ -3360,25 +3033,11 @@ mod tests {
     #[test]
     fn dispatch_reused_run_is_never_cancelled_on_later_failure() {
         // run_was_newly_created=false 门：复用已有 run（node/get 返回 runs
-        // 非空）时，后续失败（此处 ⑦ prepare 失败）绝不允许 cancel 复用的
-        // run，也不得再 create 新 run。
+        // 非空）时，链上后续失败（launch::start ⑦⑧ 的补偿路径）绝不允许
+        // cancel 复用的 run，也不得再 create 新 run。
         let dir = tempfile::tempdir().unwrap();
         let program = write_script(dir.path(), "never-runs-d", "exit 0");
-        let runtime = dir.path().join("runtime");
-        let home_path = dir.path().join("ws-as-file");
-        std::fs::write(&home_path, "not a workspace").unwrap();
-        harness::upsert_config(
-            &runtime,
-            "omp",
-            harness::HarnessUserConfig {
-                enabled: true,
-                binary: harness::BinarySource::Manual {
-                    path: program.display().to_string(),
-                },
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let (runtime, _home_path) = setup_dispatch_env(dir.path(), "omp", &program);
 
         let fake = FakeDaemon::new(
             dispatch_node_get(serde_json::json!([{ "runId": "run-existing" }])),
@@ -3386,16 +3045,25 @@ mod tests {
             "run-should-not-be-created",
         );
         let rpc = |method: &str, params: serde_json::Value| fake.rpc(method, params);
-        let manager = ExecutionManager::with_limits(STARTUP_WINDOW, DEFAULT_MAX_DURATION);
-        let sink: EventSink = Arc::new(|_| {});
 
-        let omt = fake_omt(dir.path());
-        let result = dispatch_chain(
-            &rpc, &manager, &omt, &runtime, "h_test", &home_path, "t1", "omp", false, None, None,
-            None, sink,
+        let plan = dispatch_daemon_side(
+            &rpc, &runtime, "h_test", "t1", "omp", false, None, None, None,
+        )
+        .expect("复用 run 的 daemon 侧步骤应成功");
+        assert!(!plan.run_was_newly_created);
+        assert_eq!(plan.run_id, "run-existing");
+
+        // 链上失败走补偿：复用 run 的 cancel 门关死
+        let _ = fail_and_compensate(
+            &rpc,
+            &runtime,
+            "h_test",
+            &plan.agent.id,
+            &plan.exec_id,
+            &plan.run_id,
+            plan.run_was_newly_created,
+            "launch failed".to_string(),
         );
-        assert!(result.is_err(), "prepare 失败应使 dispatch_chain 失败");
-
         // 复用分支：未 create、未 cancel 任何 run（cancel 门关死）
         assert!(
             !fake.method_names().iter().any(|m| m == "run/create"),
@@ -3417,12 +3085,13 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_success_builds_exec_start_outcome() {
-        // #9：dispatch_chain 直接返回 ExecStartOutcome——成功路径字段对账，
-        // 新建 run 的 execute/create/start 指令齐备，warnings 为空。
+    fn dispatch_success_builds_dispatch_plan() {
+        // 成功路径字段对账：新建 run 的 execute/create/start 指令齐备，
+        // warnings 为空，注册记录与 agent 目录就绪（launch::start 据此走
+        // ⑦–⑨；执行面由 shim 测试覆盖）。
         let dir = tempfile::tempdir().unwrap();
         let program = write_script(dir.path(), "happy-e", "exit 0\n");
-        let (runtime, home_path) = setup_dispatch_env(dir.path(), "opencode", &program);
+        let (runtime, _home_path) = setup_dispatch_env(dir.path(), "opencode", &program);
 
         let fake = FakeDaemon::new(
             dispatch_node_get(serde_json::json!([])),
@@ -3430,40 +3099,28 @@ mod tests {
             "run-new-e",
         );
         let rpc = |method: &str, params: serde_json::Value| fake.rpc(method, params);
-        let manager = ExecutionManager::with_limits(STARTUP_WINDOW, DEFAULT_MAX_DURATION);
-        let sink: EventSink = Arc::new(|_| {});
 
-        let omt = fake_omt(dir.path());
-        let outcome = dispatch_chain(
-            &rpc, &manager, &omt, &runtime, "h_test", &home_path, "t1", "opencode", false, None,
-            None, None, sink,
+        let plan = dispatch_daemon_side(
+            &rpc, &runtime, "h_test", "t1", "opencode", false, None, None, None,
         )
-        .expect("全链应成功");
+        .expect("daemon 侧步骤应成功");
 
-        assert!(outcome.exec_id.starts_with("exec-"), "{outcome:?}");
-        assert_eq!(outcome.agent_id, format!("agent-{}", outcome.exec_id));
-        assert_eq!(outcome.run_id, "run-new-e");
-        assert!(outcome.warnings.is_empty(), "{outcome:?}");
-        // F-ACC-6：opencode 渠道 prompt 落 per-exec 文件（argv 避开
-        // ENAMETOOLONG），文件内容含替换后的 run id。KD-E2 后在 agent 目录里。
-        let agent_dir = crate::layout::agent_dir(&runtime, "h_test", &outcome.agent_id).unwrap();
-        let prompt_file = crate::layout::exec_file(
-            &agent_dir,
-            &outcome.exec_id,
-            crate::layout::ExecFile::Prompt,
-        );
-        let prompt_body = std::fs::read_to_string(&prompt_file)
-            .unwrap_or_else(|_| panic!("prompt 文件应存在: {}", prompt_file.display()));
-        assert!(prompt_body.contains("run-new-e"), "{prompt_body}");
-        // F-PROMPT：homeId 与 per-harness 调用提示进模板（砍掉模型自查轮）
+        assert!(plan.exec_id.starts_with("exec-"));
+        assert_eq!(plan.agent.id, format!("agent-{}", plan.exec_id));
+        assert_eq!(plan.run_id, "run-new-e");
+        assert!(plan.run_was_newly_created);
+        assert!(plan.warnings.is_empty());
+        // F-PROMPT：runId/homeId 与 per-harness 调用提示进模板（砍掉模型自查轮）
+        assert!(plan.prompt.contains("run-new-e"), "{}", plan.prompt);
+        assert!(plan.prompt.contains("h_test"), "{}", plan.prompt);
         assert!(
-            prompt_body.contains("h_test"),
-            "homeId 应在 prompt: {prompt_body}"
+            plan.prompt.contains("opencode_run__claim") || plan.prompt.contains("run__claim"),
+            "工具调用提示应拼接: {}",
+            plan.prompt
         );
-        assert!(
-            prompt_body.contains("opencode_run__claim") || prompt_body.contains("run__claim"),
-            "工具调用提示应拼接: {prompt_body}"
-        );
+        // KD-E2：agent 目录已就绪（spec / shim 日志 / transcript 的落点；
+        // prompt 文件改由 shim 落盘——F-ACC-6）
+        assert!(plan.agent_dir.is_dir());
         for method in [
             "node/get",
             "node/execute",
@@ -3477,30 +3134,9 @@ mod tests {
                 fake.method_names()
             );
         }
-        // 收割子进程（脚本 exit 0 → Exited），不留给分离的等待线程
-        let session = manager.get(&outcome.exec_id).expect("session 应已注册");
-        let terminal = wait_for(|| session.terminal(), Duration::from_secs(30));
-        assert!(
-            matches!(terminal, Some(Terminal::Exited(0))),
-            "{terminal:?}"
-        );
-        // F-U12-4：规范化 jsonl——首行 header、含 session_start 与终态 exit
-        let jsonl =
-            crate::layout::exec_file(&agent_dir, &outcome.exec_id, crate::layout::ExecFile::Jsonl);
-        let text = std::fs::read_to_string(&jsonl).unwrap();
-        let mut lines = text.lines();
-        let header: serde_json::Value =
-            serde_json::from_str(lines.next().unwrap_or_default()).unwrap();
-        assert_eq!(header["kind"], "session_header");
-        assert_eq!(header["execId"], outcome.exec_id);
-        assert_eq!(header["agentId"], outcome.agent_id);
-        assert_eq!(header["harness"], "opencode");
-        let kinds: Vec<String> = lines
-            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-            .map(|e| e["kind"].as_str().unwrap_or_default().to_string())
-            .collect();
-        assert_eq!(kinds.first().map(String::as_str), Some("session_start"));
-        assert_eq!(kinds.last().map(String::as_str), Some("exit"));
+        // 注册记录对账：exec 归属新建 run
+        let file = read_agents_file(&runtime);
+        assert_eq!(file.agents[0].execs[0].run_id.as_deref(), Some("run-new-e"));
     }
 
     /// 验收回归（真实派发报「无未完成可执行成员」暴露的 mock 漂移）：
@@ -3891,66 +3527,12 @@ mod tests {
             .is_empty());
     }
 
-    /// U11：端到端——opencode 假 binary 输出带 sessionID 的 JSON 行 →
-    /// 终态归档 exec.harness_session_id 并镜像 agent.last_session_id。
-    #[test]
-    fn dispatch_captures_harness_session_id_end_to_end() {
-        let dir = tempfile::tempdir().unwrap();
-        let program = write_script(
-            dir.path(),
-            "ses-echo",
-            r#"printf '%s
-' '{"type":"step_start","sessionID":"ses_fake123","part":{"type":"step-start"}}'
-exit 0"#,
-        );
-        let (runtime, home_path) = setup_dispatch_env(dir.path(), "opencode", &program);
-        let fake = FakeDaemon::new(
-            dispatch_node_get(serde_json::json!([])),
-            dispatch_run_get("pending"),
-            "run-ses",
-        );
-        let rpc = |m: &str, p: serde_json::Value| fake.rpc(m, p);
-        let manager = ExecutionManager::with_limits(STARTUP_WINDOW, DEFAULT_MAX_DURATION);
-        let omt = fake_omt(dir.path());
-        let outcome = dispatch_chain(
-            &rpc,
-            &manager,
-            &omt,
-            &runtime,
-            "h_test",
-            &home_path,
-            "t1",
-            "opencode",
-            false,
-            None,
-            None,
-            None,
-            Arc::new(|_| {}),
-        )
-        .expect("全链应成功");
-        let session = manager.get(&outcome.exec_id).unwrap();
-        let terminal = wait_for(|| session.terminal(), Duration::from_secs(30));
-        assert!(terminal.is_some());
-        let file = read_agents_file(&runtime);
-        let exec = file.agents[0]
-            .execs
-            .iter()
-            .find(|e| e.exec_id == outcome.exec_id)
-            .unwrap();
-        assert_eq!(exec.harness_session_id.as_deref(), Some("ses_fake123"));
-        assert_eq!(
-            file.agents[0].last_session_id.as_deref(),
-            Some("ses_fake123"),
-            "update_exec 应镜像 agent.last_session_id"
-        );
-    }
-
     /// U11：定向派发到既有 agent（追加 exec 不新建）+ 运行中守卫拒绝。
     #[test]
     fn dispatch_targets_existing_agent_and_guards_running() {
         let dir = tempfile::tempdir().unwrap();
         let program = write_script(dir.path(), "target-e", "exit 0");
-        let (runtime, home_path) = setup_dispatch_env(dir.path(), "opencode", &program);
+        let (runtime, _home_path) = setup_dispatch_env(dir.path(), "opencode", &program);
         let agent = agents::register_agent(
             &runtime,
             "h_test",
@@ -3980,7 +3562,6 @@ exit 0"#,
             "run-target",
         );
         let rpc = |m: &str, p: serde_json::Value| fake.rpc(m, p);
-        let manager = ExecutionManager::with_limits(STARTUP_WINDOW, DEFAULT_MAX_DURATION);
 
         agents::update_agent_status(
             &runtime,
@@ -3990,21 +3571,16 @@ exit 0"#,
             agents::AgentAttachment::Live,
         )
         .unwrap();
-        let omt = fake_omt(dir.path());
-        let err = dispatch_chain(
+        let err = dispatch_daemon_side(
             &rpc,
-            &manager,
-            &omt,
             &runtime,
             "h_test",
-            &home_path,
             "t1",
             "opencode",
             false,
             None,
             None,
             Some(&agent.id),
-            Arc::new(|_| {}),
         )
         .unwrap_err();
         assert!(err.contains("仍在运行"), "{err}");
@@ -4017,28 +3593,22 @@ exit 0"#,
             agents::AgentAttachment::None,
         )
         .unwrap();
-        let outcome = dispatch_chain(
+        let plan = dispatch_daemon_side(
             &rpc,
-            &manager,
-            &omt,
             &runtime,
             "h_test",
-            &home_path,
             "t1",
             "opencode",
             false,
             None,
             None,
             Some(&agent.id),
-            Arc::new(|_| {}),
         )
         .expect("定向派发应成功");
-        assert_eq!(outcome.agent_id, agent.id, "不新建 agent");
+        assert_eq!(plan.agent.id, agent.id, "不新建 agent");
         let file = read_agents_file(&runtime);
         assert_eq!(file.agents.len(), 1);
         assert_eq!(file.agents[0].execs.len(), 2, "历史 + 新 exec");
-        let session = manager.get(&outcome.exec_id).unwrap();
-        let _ = wait_for(|| session.terminal(), Duration::from_secs(30));
     }
 
     /// 验收回归同源第三处：run/get item 的执行器字段是 `executorActor`

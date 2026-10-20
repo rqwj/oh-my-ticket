@@ -66,8 +66,8 @@ pub struct ExecRecord {
     pub run_id: Option<String>,
     /// epoch 毫秒（字符串化，排序用；展示格式化由前端负责）
     pub started_at: String,
-    /// 正常结束 = exit code；killed = reason（user|maxduration|appexit）；
-    /// 失败 = stderr 尾（已脱敏）。
+    /// 正常结束 = exit code；killed = reason（user|maxduration|external-<n>|
+    /// orphan）；失败 = stderr 尾（已脱敏）。
     pub exit_code: Option<i32>,
     pub kill_reason: Option<String>,
     pub failure_detail: Option<String>,
@@ -498,8 +498,8 @@ pub fn agents_list_value(runtime_dir: &Path, home_id: &str) -> Result<serde_json
 
 /// U4 步骤 ⑥：写入 bindings.json（显式绑定 nodeId → agentId）。
 /// F-U15-1 第三条写路径：走 atomic_json 的 read-merge-write（进程内锁 +
-/// companion flock + tmp/rename + corrupt 降级留证）——不再依赖调用方的
-/// DISPATCH_LOCK 做写互斥。写失败由调用方（U4 链）转为警告不阻断。
+/// companion flock + tmp/rename + corrupt 降级留证）——不依赖调用方的
+/// 派发锁做写互斥。写失败由调用方（U4 链）转为警告不阻断。
 pub fn write_binding(
     runtime_dir: &Path,
     home_id: &str,

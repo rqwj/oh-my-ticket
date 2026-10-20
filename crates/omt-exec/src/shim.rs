@@ -401,6 +401,39 @@ mod tests {
         );
     }
 
+    /// U11（原 executor 侧 dispatch_captures_harness_session_id_end_to_end
+    /// 的移植——spawn 已随执行面移入 shim）：假 pi 流携带 session id →
+    /// 终态归档 exec.harness_session_id 并镜像 agent.last_session_id。
+    #[test]
+    fn shim_captures_harness_session_id_and_mirrors_agent() {
+        let (_t, runtime, spec) = rig(
+            "echo '{\"type\":\"session\",\"version\":3,\"id\":\"ses_fake123\"}'\nexit 0",
+            Some("RUN-1"),
+        );
+        let code = execute(
+            &runtime,
+            "h_test",
+            &spec.agent_id,
+            "exec-s",
+            recording_connector(Default::default()),
+            idle_keepalive(),
+        );
+        assert_eq!(code, 0);
+        let agent = crate::agents::get_agent(&runtime, "h_test", &spec.agent_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            agent.execs[0].harness_session_id.as_deref(),
+            Some("ses_fake123"),
+            "终态应归档捕获的 session id"
+        );
+        assert_eq!(
+            agent.last_session_id.as_deref(),
+            Some("ses_fake123"),
+            "update_exec 应镜像 agent.last_session_id"
+        );
+    }
+
     #[test]
     fn shim_marks_failed_when_spec_missing() {
         let (_t, runtime, spec) = rig("exit 0", None);
