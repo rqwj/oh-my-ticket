@@ -41,7 +41,9 @@ findings_log: docs/plans/2026-09-06-1245-review-desktop-agents-dispatch-findings
 | **P-7** | **删除 agent 会连同它目录下的 transcript 一起删除** | 按 agent 拆目录后的自然语义；以前 transcript 留在 `transcripts/` 里成了无主文件 |
 | **P-8** | **启动对账替代 demote**：shim 仍活 → `attachment=live`（可控）；shim 已死 → `Failed` + `SHIM_LOST_MARKER`，harness 进程仍活则 `attachment=orphan`；最近 60s 内注册、还没记下 shim pid 的 exec 跳过（可能另一个进程正在拉起） | KD-D7 被推翻：重启后的 exec 仍然受控 |
 | **P-9** | **MCP 项目级注入（omp/pi）加跨进程 flock**；崩溃残留清扫跳过仍有存活 exec 的 workspace 和 launcher | 多个 shim 进程会共写同一个 `state.json` 的引用计数；桌面重启时清扫不能摘掉正在运行的 exec 的注入 |
-| **P-10** | **前端新增两项**：Agents 面板的「停止全部」按钮（设计 §3.4 要求，替代「退出即终止」）；重启后选中仍在运行的 agent 时，用 `exec_attach` 重新接上实时流 | 都以**可选 props** 接入，既有测试不受影响 |
+| **P-10** | **前端新增两项**：Agents 面板的「停止全部」按钮（设计 §3.4 要求，替代「退出即终止」），采用两步确认并显示进行中状态；重启后选中仍在运行的 agent 时，用 `exec_attach` 重新接上实时流。另外，失败说明、orphan 提示和删除确认框的文案改为新语义 | 都以**可选 props** 接入，既有测试不受影响 |
+| **P-11** | **退出确认**（review F6 / R2-5 / R2-6）：⌘Q 走自定义 Quit 菜单项，调用 `app.exit(0)`，从而触发 ExitRequested。有运行中的 exec 时，先弹三按钮确认框：「继续在后台运行」（Return 默认）/「全部停止后退出」/「取消」（Esc，不退出） | 用户一直默认「退出 = 停止」，改造后不能让 agent 在后台静默继续改代码、消耗 token |
+| **P-12** | **shim 负责 home 可达**（review F4/F5/R2-1/R2-2/R2-8）：<br>· 拉起 daemon 时不带 `--home`，打开全局 home，与其他面一致；<br>· 连上的 daemon 没有 workspace home 时，先 declare 再重新注册；<br>· 只 declare 已初始化的 home，且 homeId 必须与 spec 一致；<br>· harness 存活期间定期保活，间隔由 idleQuietMs 推导；<br>· 启动对账也走这条路径释放租约。<br>子项目 2 由 CLI/MCP 写 spec 时，`home_path` 必须取自 daemon 的 homeId→path 映射，不能取自调用方输入 | desktop 关闭后，workspace home 会被 idle 关闭，而 `omt mcp` 按设计不能 declare；daemon 零改动的前提下，只能由 shim 承担 |
 
 ## 文件结构
 
@@ -75,8 +77,11 @@ crates/omt-exec/                        # 新建（Task 2 起）
 
 crates/omt-runtime/
   Cargo.toml                            # 依赖 omt-exec（Task 8）
-  src/cli/mod.rs                        # 隐藏动词 exec-shim（Task 8）
-  tests/exec_shim.rs                    # 新（Task 8/12）：真二进制端到端
+  src/cli/mod.rs                        # 隐藏动词 exec-shim，先于信号处理分派（Task 8）
+  tests/exec_daemon_link.rs             # 新（Task 7）：临时授权 + home 声明，真 daemon
+  tests/exec_shim.rs                    # 新（Task 8）：shim 真二进制端到端（含 home 保活）
+  tests/exec_launch.rs                  # 新（Task 9）：launcher 端到端
+  tests/exec_survives_launcher.rs       # 新（Task 12）：发起方被杀后执行继续
 
 apps/desktop/src-tauri/
   Cargo.toml                            # 依赖 omt-harness / omt-exec
@@ -88,7 +93,7 @@ apps/desktop/src-tauri/
   src/daemon.rs                         # register_admin_grant 改走 omt_exec::grants（Task 7）
 
 apps/desktop/src/
-  bridge.ts / store.ts / AgentsPanel.tsx / App.tsx / types.ts   # Task 11
+  bridge.ts / store.ts / agentUi.tsx / AgentsPanel.tsx / App.tsx / styles.css / types.ts   # Task 8 / 11
 apps/desktop/tests/exec-plane.spec.tsx  # 新（Task 11）
 ```
 
@@ -441,15 +446,9 @@ pub type RpcFn =
 pub type LeaseRelease = Arc<dyn Fn(&str, &str, &str) + Send + Sync>;
 ```
 
-4. 用下面三段替换 `ExecutionManager::new` 与 `set_shared_session`：
+4. 用下面的代码替换 `ExecutionManager::new` 与 `set_shared_session`。`ExecutionManager` 已经带 `#[derive(Default)]`，限值字段为 None 时经 `unwrap_or` 回落到默认常量，行为与 `new()` 等价。不要再手写 `impl Default`，否则会报 E0119（实现冲突）。
 
 ```rust
-impl Default for ExecutionManager {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl ExecutionManager {
     /// 纯构造（不碰磁盘）。启动清扫见 [`startup_housekeeping`]。
     pub fn new() -> Self {
@@ -557,7 +556,12 @@ pub fn reconcile_interrupted_execs(rpc: &RpcFn, runtime_dir: &Path) -> usize {
 }
 ```
 
-8. `release_items_for_exec` 改为 `pub fn … -> Result<(), String>`：run/get 的 `Err(_) => return,` 改为 `Err(err) => return Err(err),`，函数末尾返回 `Ok(())`。其余调用方（`reconcile_interrupted_execs_with`）写成 `let _ = release_items_for_exec(...)`。
+8. `release_items_for_exec` 改为 `pub fn … -> Result<(), String>`：
+   - run/get 的 `Err(_) => return,` 改为 `Err(err) => return Err(err),`；
+   - 循环里 run/report 与 run/control 的 `let _ = rpc(...)` 改为记住第一个错误、继续处理其余项（`if let Err(e) = rpc(...) { first_err.get_or_insert(e); }`）；
+   - 函数末尾返回 `first_err.map_or(Ok(()), Err)`。
+
+   调用方 `reconcile_interrupted_execs_with` 在本 Task 里先写成 `let _ = release_items_for_exec(...)`，保持原有行为；Task 8 Step 1 再改为「只在 Ok 时标记 reconciled」。
 9. 把 Interfaces 里列出的函数与常量改为 `pub`。
 10. 测试里 `crate::agents::…`、`crate::mcp_injection::…` 的路径保持不变（同 crate）；对 `crate::atomic_json` 的引用此前已在 Task 1 改为 `omt_harness::atomic_json`。测试若调用了 `ExecutionManager::with_limits`（仍为 `#[cfg(test)]`），保持不变。
 
@@ -1539,6 +1543,7 @@ pub fn prompt_file_path(dir: &Path, exec_id: &str, channel: PromptChannel) -> Op
 | `runtime.join("transcripts").join("h_test").join(format!("{}.jsonl", id))` | `crate::layout::exec_file(&crate::layout::agent_dir(&runtime, "h_test", &agent_id).unwrap(), &id, crate::layout::ExecFile::Jsonl)`（`agent_id` 取 spawn 时传入的 `SpawnRequest.agent_id`，或 `outcome.agent_id`） |
 | 直接构造 `SpawnRequest { … }` 的测试 | 补 `transcript_dir: crate::layout::agent_dir(&runtime, "h_test", &agent.id).unwrap(),`（无注册 agent 的测试用 `runtime.join("agents").join("h_test").join("agent-test")`） |
 | `agents_path(...)` 的穿越校验测试 | 改为对 `crate::layout::home_dir(...)` 断言 |
+| `dispatch_spawn_failure_marks_agent_failed_and_cancels_new_run`：先把 `runtime/transcripts` 占成普通文件来制造 spawn 失败，再断言错误信息含 `transcripts` | 新布局下这个手法失效：日志写在 agent 目录里，派发会成功，`expect_err` 就会 panic。改为在 `setup_dispatch_env` 之后删除 workspace 根目录（`home_path` 的父目录）来制造 spawn 失败，断言错误信息含 `workspace 根不存在`。这是本表唯一允许改断言文字的一项，因为原来的失败手法本身随布局一起失效了 |
 
 依赖「整个 agents.json 损坏」的 F-U4a-1 粘性测试，改为损坏**某一个** agent 的 `agent.json`（写 `"{oops"`），断言 `agents_list_value(...)["parseFailed"] == true`、`bindings_gc_value` 返回冻结错误、`bindings_get_value(...)["parseFailed"] == true`。旧测试名保持不变，断言语义也不变（降级 → 冻结）。
 
@@ -1975,11 +1980,15 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - Consumes: `lock_exclusive`、`write_atomic`、`omt_client::{read_descriptor, pid_live, endpoint_live, wait_for_descriptor, Client, EnrollOptions}`、`executor::{RpcFn, process_start_identity}`。
 - Produces:
   - `omt_exec::grants::{register_replacing_prefix, add, remove, principals, sweep_dead_temp_grants}` 与 `TempGrant`（`TempGrant::add(runtime_dir, principal) -> Result<TempGrant, String>`，drop 时移除）
-  - `omt_exec::daemon_link::{DaemonLink, Connector, admin_connector}`：
-    - `pub type Connector = Arc<dyn Fn() -> Result<RpcFn, String> + Send + Sync>;`
-    - `DaemonLink::connect(runtime_dir: &Path, kind: &str, daemon_bin: Option<&Path>) -> Result<DaemonLink, String>`
-    - `DaemonLink::principal(&self) -> &str`、`DaemonLink::call(&mut self, method, params) -> Result<Value, String>`
-    - `admin_connector(runtime_dir: PathBuf, daemon_bin: Option<PathBuf>) -> Connector`（连接 + 临时授权，返回的 RpcFn 被 drop 时授权随之撤销）
+  - `omt_exec::daemon_link::{DaemonLink, Connector, admin_connector, plain_connector}`：
+    - `pub type Connector = Arc<dyn Fn(&Path, &str) -> Result<RpcFn, String> + Send + Sync>;`：参数依次是要保证在凭据范围内的 home（`.omt` 目录）和它应有的 homeId。shim 读到 spec 之后才知道这两个值，所以不在构造 connector 时传入。
+    - `DaemonLink::connect(runtime_dir: &Path, kind: &str, daemon_bin: Option<&Path>, home_path: &Path, expected_home_id: Option<&str>) -> Result<DaemonLink, String>`：
+      - 拉起 daemon 时**不带** `--home`，与 desktop、CLI、DSH 一致，打开全局 home（review R2-1）。
+      - 连上的 daemon 若没有这个 home，就先 `home/declare` 再重新注册。
+      - 给了 `expected_home_id` 时，只声明已初始化（含 `omt.db`）的 home，并要求最终的 homeId 与期望一致（review R2-8）。
+    - `DaemonLink::principal(&self) -> &str`、`DaemonLink::home_id_for(&self, home_path: &Path) -> Option<String>`、`DaemonLink::call(&mut self, method, params) -> Result<Value, String>`
+    - `admin_connector(runtime_dir: PathBuf, daemon_bin: Option<PathBuf>) -> Connector`：连接并加临时授权；返回的 RpcFn 被 drop 时，授权随之撤销。
+    - `plain_connector(runtime_dir: PathBuf, daemon_bin: Option<PathBuf>) -> Connector`：只连接、不授权，供 Task 8 的 home 保活使用。
 
 - [ ] **Step 1: 写 grants 的失败测试**
 
@@ -2216,6 +2225,22 @@ Expected：grants 4 passed；桌面测试全绿。
 //! shim 侧的 daemon 连接（设计 §3.2「daemon 连接」）：discover-or-spawn →
 //! enroll（kind 由调用方给，shim 用 "cli"）。不复用存储的凭据，principal
 //! 恒为 `<kind>:<本进程 pid>`，P-1 的临时授权据此登记。
+//!
+//! **home 必须在凭据范围内**（review F4，P-12）：desktop 关闭后没有别的面再
+//! 访问 workspace home，它静默 idleQuietMs 后会被关闭，daemon 随之退出；凭据
+//! 能访问哪些 home 在注册那一刻就固定了（auth.rs）。所以连上的 daemon 没有
+//! 该 home 时，先 `home/declare` 再重新注册。
+//!
+//! **拉起 daemon 时不带 `--home`**（review R2-1）：与 desktop / CLI / DSH 拉起
+//! 的 daemon 一致，打开全局 home（`$OMT_HOME` 或 `~/.omt`；home 的 kind 由路径
+//! 是否等于全局 home 决定，homes.rs）。只带 workspace `--home` 的 daemon 没有
+//! 全局 home，DSH 插件与 CLI 会把 workspace home 误当成全局 home。workspace
+//! home 由上面的 declare 加入。测试通过给子进程设置 `OMT_HOME` 指向临时目录，
+//! 避免碰到开发者真实的 `~/.omt`。
+//!
+//! **home 路径必须与 homeId 绑定**（review R2-8）：spec 里的 home 路径与
+//! homeId 不一致时，shim 会把任意目录初始化成新 home。给了期望 homeId 时，
+//! 只声明已初始化的 home（含 `omt.db`），并校验最终 homeId。
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -2225,11 +2250,13 @@ use std::time::Duration;
 use crate::executor::RpcFn;
 use crate::grants::TempGrant;
 
-pub type Connector = Arc<dyn Fn() -> Result<RpcFn, String> + Send + Sync>;
+/// 参数 = (需要在凭据范围内的 home（`.omt` 目录）, 它应有的 homeId)。
+pub type Connector = Arc<dyn Fn(&Path, &str) -> Result<RpcFn, String> + Send + Sync>;
 
 pub struct DaemonLink {
     client: omt_client::Client,
     principal: String,
+    handshake: serde_json::Value,
 }
 
 fn live_descriptor(runtime_dir: &Path) -> Option<omt_client::Descriptor> {
@@ -2243,6 +2270,7 @@ fn spawn_daemon(bin: &Path, runtime_dir: &Path) -> Result<omt_client::Descriptor
     command
         .arg("--runtime-dir")
         .arg(runtime_dir)
+        // 不带 --home：打开全局 home，与其他面拉起的 daemon 一致（review R2-1）
         .env("OMT_RUNTIME_DIR", runtime_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -2262,14 +2290,8 @@ fn spawn_daemon(bin: &Path, runtime_dir: &Path) -> Result<omt_client::Descriptor
 }
 
 impl DaemonLink {
-    pub fn connect(runtime_dir: &Path, kind: &str, daemon_bin: Option<&Path>) -> Result<Self, String> {
-        let descriptor = match live_descriptor(runtime_dir) {
-            Some(d) => d,
-            None => {
-                let bin = daemon_bin.ok_or("daemon 不在线，且没有可拉起的 omt-daemon")?;
-                spawn_daemon(bin, runtime_dir)?
-            }
-        };
+    fn enroll(runtime_dir: &Path, kind: &str) -> Result<Self, String> {
+        let descriptor = live_descriptor(runtime_dir).ok_or("daemon descriptor 不可用")?;
         let options = omt_client::EnrollOptions {
             kind: kind.into(),
             name: Some(format!("omt-exec-{kind}")),
@@ -2289,6 +2311,60 @@ impl DaemonLink {
         Ok(Self {
             client: enrollment.client,
             principal,
+            handshake: enrollment.handshake,
+        })
+    }
+
+    /// discover-or-spawn，并保证 `home_path`（`.omt` 目录）在本连接的凭据范围内。
+    /// `expected_home_id` 为 Some 时（shim 的所有调用）：只声明已初始化的 home，
+    /// 且最终 homeId 必须与之相等。
+    pub fn connect(
+        runtime_dir: &Path,
+        kind: &str,
+        daemon_bin: Option<&Path>,
+        home_path: &Path,
+        expected_home_id: Option<&str>,
+    ) -> Result<Self, String> {
+        if live_descriptor(runtime_dir).is_none() {
+            let bin = daemon_bin.ok_or("daemon 不在线，且没有可拉起的 omt-daemon")?;
+            spawn_daemon(bin, runtime_dir)?;
+        }
+        let mut link = Self::enroll(runtime_dir, kind)?;
+        if link.home_id_for(home_path).is_none() {
+            if expected_home_id.is_some() && !home_path.join("omt.db").is_file() {
+                return Err(format!(
+                    "{} 不是已初始化的 omt home，拒绝声明（shim 不新建 home）",
+                    home_path.display()
+                ));
+            }
+            // daemon 在线但没打开这个 home（idle 关闭 / 由别的面拉起）：声明后
+            // 重新注册——declare 返回 requiresRehandshake，旧凭据看不到新 home
+            link.call(
+                "home/declare",
+                serde_json::json!({ "path": home_path.display().to_string() }),
+            )?;
+            link = Self::enroll(runtime_dir, kind)?;
+        }
+        match (link.home_id_for(home_path), expected_home_id) {
+            (None, _) => Err(format!("home {} 声明后仍不在凭据范围内", home_path.display())),
+            (Some(actual), Some(expected)) if actual != expected => Err(format!(
+                "home {} 的 id 是 {actual}，与期望的 {expected} 不一致",
+                home_path.display()
+            )),
+            _ => Ok(link),
+        }
+    }
+
+    /// handshake 的 `homes[]`（已按凭据范围过滤）里路径与 `home_path` 相同的 homeId。
+    pub fn home_id_for(&self, home_path: &Path) -> Option<String> {
+        let want = std::fs::canonicalize(home_path).unwrap_or_else(|_| home_path.to_path_buf());
+        self.handshake["homes"].as_array()?.iter().find_map(|home| {
+            let path = std::fs::canonicalize(home["path"].as_str()?).ok()?;
+            if path == want {
+                home["homeId"].as_str().map(str::to_string)
+            } else {
+                None
+            }
         })
     }
 
@@ -2306,8 +2382,8 @@ impl DaemonLink {
 /// P-1：连接 + 临时 admin 授权。返回的 RpcFn 持有连接与授权守卫；RpcFn
 /// 被 drop（shim 释放完租约）时授权随之撤销。
 pub fn admin_connector(runtime_dir: PathBuf, daemon_bin: Option<PathBuf>) -> Connector {
-    Arc::new(move || {
-        let link = DaemonLink::connect(&runtime_dir, "cli", daemon_bin.as_deref())?;
+    Arc::new(move |home_path: &Path, home_id: &str| {
+        let link = DaemonLink::connect(&runtime_dir, "cli", daemon_bin.as_deref(), home_path, Some(home_id))?;
         let grant = TempGrant::add(&runtime_dir, link.principal())?;
         let shared = Arc::new(Mutex::new((link, grant)));
         let rpc: RpcFn = Arc::new(move |method: &str, params: serde_json::Value| {
@@ -2315,6 +2391,21 @@ pub fn admin_connector(runtime_dir: PathBuf, daemon_bin: Option<PathBuf>) -> Con
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             guard.0.call(method, params)
+        });
+        Ok(rpc)
+    })
+}
+
+/// 只连接、不授权（Task 8 的 home 保活用）。
+pub fn plain_connector(runtime_dir: PathBuf, daemon_bin: Option<PathBuf>) -> Connector {
+    Arc::new(move |home_path: &Path, home_id: &str| {
+        let link = DaemonLink::connect(&runtime_dir, "cli", daemon_bin.as_deref(), home_path, Some(home_id))?;
+        let shared = Arc::new(Mutex::new(link));
+        let rpc: RpcFn = Arc::new(move |method: &str, params: serde_json::Value| {
+            shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .call(method, params)
         });
         Ok(rpc)
     })
@@ -2330,23 +2421,96 @@ pub fn admin_connector(runtime_dir: PathBuf, daemon_bin: Option<PathBuf>) -> Con
 `crates/omt-runtime/tests/exec_daemon_link.rs`：
 
 ```rust
-//! P-1 端到端：shim 侧连接以 cli 身份 enroll；未授权时 admin 路径被拒，
-//! 临时授权期间放行，授权撤销后再次被拒。daemon 零改动的前提下验证。
+//! P-1 / P-12 端到端：shim 侧连接以 cli 身份 enroll；临时授权开关 admin；
+//! 在线 daemon 缺少 workspace home 时 declare + 重新注册；home 路径必须与
+//! homeId 绑定。daemon 零改动的前提下验证。
+//!
+//! daemon 不带 `--home` 拉起时会打开全局 home（`$OMT_HOME`）。本文件的测试
+//! 都会拉起真 daemon，所以**串行执行**，并把 `OMT_HOME` 指向各自的临时目录：
+//! 绝不碰开发者真实的 `~/.omt`，也避免两个 daemon 争同一个全局 home 的锁。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
+
+static SERIAL: Mutex<()> = Mutex::new(());
+
+fn isolated(tmp: &Path) -> MutexGuard<'static, ()> {
+    let guard = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let global = tmp.join("global-home");
+    std::fs::create_dir_all(&global).unwrap();
+    // 子进程（daemon）继承本进程环境；串行锁保证没有别的测试同时改它
+    std::env::set_var("OMT_HOME", &global);
+    guard
+}
 
 fn daemon_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_omt-daemon"))
 }
 
+fn stop_daemon(runtime: &Path) {
+    let _ = std::process::Command::new(env!("CARGO_BIN_EXE_omt"))
+        .args(["--runtime-dir", runtime.to_str().unwrap(), "daemon-stop"])
+        .status();
+}
+
+fn connect(runtime: &Path, home: &Path, expected: Option<&str>) -> Result<omt_exec::daemon_link::DaemonLink, String> {
+    omt_exec::daemon_link::DaemonLink::connect(runtime, "cli", Some(&daemon_bin()), home, expected)
+}
+
+/// review F4 / R2-1：shim 拉起的 daemon 带全局 home；在线 daemon 缺 workspace
+/// home 时，connect 先 declare 再重新注册。
+#[test]
+fn connect_opens_global_and_declares_workspace_homes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _serial = isolated(tmp.path());
+    let runtime = tmp.path().join("run");
+    let home_a = tmp.path().join("a").join(".omt");
+    let home_b = tmp.path().join("b").join(".omt");
+    for dir in [&runtime, &home_a, &home_b] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let first = connect(&runtime, &home_a, None).expect("spawn（全局 home）+ declare a");
+    assert!(first.home_id_for(&home_a).is_some());
+    assert!(
+        first.home_id_for(&tmp.path().join("global-home")).is_some(),
+        "shim 拉起的 daemon 必须带全局 home（review R2-1）"
+    );
+    let second = connect(&runtime, &home_b, None).expect("declare b on the live daemon");
+    assert!(second.home_id_for(&home_b).is_some(), "declare 后重新注册，b 应在凭据范围内");
+    stop_daemon(&runtime);
+}
+
+/// review R2-8：给了期望 homeId 时，路径与 id 不一致或目录不是已初始化的 home → 拒绝。
+#[test]
+fn connect_rejects_unbound_home_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _serial = isolated(tmp.path());
+    let runtime = tmp.path().join("run");
+    let real = tmp.path().join("real").join(".omt");
+    let blank = tmp.path().join("blank").join(".omt");
+    for dir in [&runtime, &real, &blank] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let id = connect(&runtime, &real, None).unwrap().home_id_for(&real).unwrap();
+    assert!(connect(&runtime, &real, Some(&id)).is_ok(), "id 一致 → 通过");
+    let err = connect(&runtime, &real, Some("h_wrong")).err().expect("id 不一致必须拒绝");
+    assert!(err.contains("不一致"), "{err}");
+    let err = connect(&runtime, &blank, Some("h_any")).err().expect("未初始化目录必须拒绝");
+    assert!(err.contains("不是已初始化"), "{err}");
+    assert!(!blank.join("omt.db").exists(), "拒绝时不得在该目录里建 home");
+    stop_daemon(&runtime);
+}
+
 #[test]
 fn temp_grant_toggles_admin_authority() {
     let tmp = tempfile::tempdir().unwrap();
+    let _serial = isolated(tmp.path());
     let runtime = tmp.path().join("run");
+    let home = tmp.path().join("ws").join(".omt");
     std::fs::create_dir_all(&runtime).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
 
-    let mut link = omt_exec::daemon_link::DaemonLink::connect(&runtime, "cli", Some(&daemon_bin()))
-        .expect("discover-or-spawn + enroll");
+    let mut link = connect(&runtime, &home, None).expect("discover-or-spawn + enroll");
     assert!(link.principal().starts_with("cli:"), "{}", link.principal());
 
     // 未授权：admin-only 的 home/reindex（human_administrative）应被拒
@@ -2366,9 +2530,7 @@ fn temp_grant_toggles_admin_authority() {
         .unwrap_err();
     assert!(again.contains("admin"), "撤销后应回到被拒：{again}");
 
-    let _ = std::process::Command::new(env!("CARGO_BIN_EXE_omt"))
-        .args(["--runtime-dir", runtime.to_str().unwrap(), "daemon-stop"])
-        .status();
+    stop_daemon(&runtime);
 }
 ```
 
@@ -2378,13 +2540,13 @@ fn temp_grant_toggles_admin_authority() {
 cargo test -p omt-runtime --test exec_daemon_link -- --nocapture 2>&1 | tail -20
 ```
 
-若 `home/reindex` 未授权时报的不是含 `admin` 的错误（例如 `FORBIDDEN`），把两处断言改为匹配实际的错误码；若 `home/reindex` 对 cli 有「离线独占」的特殊放行（`dispatch.rs:1488` 附近），改用另一个只认 admin 的路径——无 leaseToken 的 `run/report` 打到不存在的 run 上，未授权时报 admin 相关错误，授权后报 NOT_FOUND。
+若 `home/reindex` 未授权时报的错误不含 `admin`（例如是 `FORBIDDEN`），把两处断言改为匹配实际的错误码。（review 已核实 `home/reindex` 会先检查 admin-required 再查 home，所以这条路径可用。不要改用「无 leaseToken 的 `run/report` 打到不存在的 run」：它在检查授权之前就会因 run 不存在而报 NOT_FOUND，测不到授权。）
 
 - [ ] **Step 6: 提交**
 
 ```bash
 cargo test --workspace 2>&1 | grep -E '^test result: FAILED|panicked' ; echo "(应为空)"
-git add -A crates/omt-exec crates/omt-runtime apps/desktop/src-tauri
+git add -A crates/omt-exec crates/omt-runtime apps/desktop/src-tauri Cargo.lock
 git commit -m "feat: locked admin-grants helper and shim-side daemon link (plan P-1)
 
 Desktop and exec-shim now write admin-grants.json under one flock. The
@@ -2406,10 +2568,11 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - Modify: `apps/desktop/src/types.ts`（`ExecRecord` 新字段）
 
 **Interfaces:**
-- Consumes: Task 4 的 `layout`、Task 7 的 `daemon_link::{Connector, admin_connector}`、`executor::{ExecutionManager::with_max_duration, set_lease_release, SpawnRequest, release_items_for_exec, workspace_root_of}`、`mcp_injection::{prepare, release}`、`omt_harness::harness::{resolve_launch, compose_launch_args, prompt_file_path}`。
+- Consumes: Task 4 的 `layout`、Task 7 的 `daemon_link::{Connector, admin_connector, plain_connector}`、`executor::{ExecutionManager::with_max_duration, set_lease_release, SpawnRequest, release_items_for_exec, workspace_root_of}`、`mcp_injection::{prepare, release}`、`omt_harness::harness::{resolve_launch, compose_launch_args, prompt_file_path}`。
 - Produces:
   - `omt_exec::spec::{LaunchSpec, SPEC_SCHEMA_VERSION}`；`LaunchSpec::write(&self, path) -> Result<(), String>`、`LaunchSpec::read(path) -> Result<LaunchSpec, String>`
-  - `omt_exec::shim::run(runtime_dir: &Path, home_id: &str, agent_id: &str, exec_id: &str, connector: Connector) -> i32`
+  - `omt_exec::shim::run(runtime_dir: &Path, home_id: &str, agent_id: &str, exec_id: &str, lease: Connector, keepalive: Connector) -> i32`：安装 SIGTERM/SIGINT 处理后调用 `execute`。
+  - `omt_exec::shim::execute(...)`：参数相同，不装信号处理，供进程内单测使用，避免在 cargo test 进程里装全局 handler。`lease` 用 `admin_connector`，`keepalive` 用 `plain_connector`。
   - `ExecRecord` 新字段：`shim_pid: Option<u32>`、`shim_start_id: Option<String>`、`lease_release_pending: bool`（均 `#[serde(default)]`）
   - CLI：`omt [--runtime-dir <d>] exec-shim <homeId> <agentId> <execId>`（不进 USAGE）
 
@@ -2458,7 +2621,63 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 pub const SHIM_LOST_MARKER: &str = "exec shim exited before finishing";
 ```
 
-`reconcile_interrupted_execs_with` 里置 `exec.reconciled = true` 的闭包同时写 `exec.lease_release_pending = false;`。
+`reconcile_interrupted_execs_with`（executor.rs）改为：**只有释放成功才**置 `reconciled = true` 并清掉 `lease_release_pending`；释放失败则保留为对账目标，留给下一次对账（review F10）。desktop 只在建立第一个会话时对账一次，那时 workspace home 往往还没声明，所以这次很容易失败。循环体如下：
+
+```rust
+    for t in &targets {
+        if let Err(err) = release_items_for_exec(rpc, &t.home_id, &t.run_id, &t.exec_id) {
+            eprintln!("对账：exec {} 租约释放失败（{err}），保留为对账目标", t.exec_id);
+            continue;
+        }
+        mark_reconciled(runtime_dir, t);
+        handled += 1;
+    }
+```
+
+循环体里的落盘抽成 helper（Task 10 的 shim 路径对账复用）：
+
+```rust
+/// 租约已释放：置 reconciled、清待对账标记，并从 raw.log 回填 session id。
+pub(crate) fn mark_reconciled(runtime_dir: &Path, t: &agents::ReconcileTarget) {
+    let backfill_session =
+        session_id_from_raw_log(runtime_dir, &t.home_id, &t.agent_id, &t.exec_id, &t.harness);
+    let _ = agents::update_exec(runtime_dir, &t.home_id, &t.agent_id, &t.exec_id, |exec| {
+        exec.reconciled = true;
+        exec.lease_release_pending = false;
+        if exec.harness_session_id.is_none() {
+            exec.harness_session_id = backfill_session.clone();
+        }
+    });
+}
+```
+
+在 executor.rs 的 `mod tests` 里加：
+
+```rust
+    /// review F10：释放失败不得标记 reconciled，也不得清掉待对账标记。
+    #[test]
+    fn reconcile_keeps_target_when_release_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = dir.path();
+        let agent = crate::agents::register_agent(rt, "h_t", "pi", crate::agents::NewExec {
+            exec_id: "exec-r".into(), node_id: None, run_id: Some("RUN-1".into()),
+            binary_path: None, binary_args: vec![], model: None,
+        })
+        .unwrap();
+        crate::agents::update_exec(rt, "h_t", &agent.id, "exec-r", |e| e.lease_release_pending = true)
+            .unwrap();
+        let failing = |_: &str, _: serde_json::Value| -> Result<serde_json::Value, String> {
+            Err("home not opened".into())
+        };
+        assert_eq!(reconcile_interrupted_execs_with(&failing, rt), 0);
+        assert_eq!(crate::agents::list_reconcile_targets(rt).unwrap().len(), 1, "失败后仍是对账目标");
+        let ok = |_: &str, _: serde_json::Value| -> Result<serde_json::Value, String> {
+            Ok(serde_json::json!({ "items": [] }))
+        };
+        assert_eq!(reconcile_interrupted_execs_with(&ok, rt), 1);
+        assert!(crate::agents::list_reconcile_targets(rt).unwrap().is_empty());
+    }
+```
 
 - [ ] **Step 2: spec 与它的测试**
 
@@ -2632,7 +2851,7 @@ mod tests {
     }
 
     fn recording_connector(calls: Arc<Mutex<Vec<String>>>) -> Connector {
-        Arc::new(move || {
+        Arc::new(move |_home: &Path, _home_id: &str| {
             let calls = calls.clone();
             let rpc: RpcFn = Arc::new(move |method: &str, _params: serde_json::Value| {
                 calls.lock().unwrap().push(method.to_string());
@@ -2642,11 +2861,30 @@ mod tests {
         })
     }
 
+    /// 保活在单测里不连 daemon（保活间隔远大于测试时长，不会触发）。
+    fn idle_keepalive() -> Connector {
+        Arc::new(|_: &Path, _: &str| Err("keepalive not used in unit tests".to_string()))
+    }
+
+    /// review R2-2：保活间隔从 daemon.json 的 idleQuietMs 推导（≤ 5 分钟、取 1/3），
+    /// 0 表示 daemon 不做 idle 退出、无需保活；环境变量优先。
+    #[test]
+    fn keepalive_interval_follows_daemon_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = tmp.path();
+        assert_eq!(keepalive_every_from(rt, None), Some(Duration::from_secs(300)), "缺省 30 分钟 → 5 分钟");
+        std::fs::write(rt.join("daemon.json"), r#"{"idleQuietMs": 60000}"#).unwrap();
+        assert_eq!(keepalive_every_from(rt, None), Some(Duration::from_millis(20_000)));
+        std::fs::write(rt.join("daemon.json"), r#"{"idleQuietMs": 0}"#).unwrap();
+        assert_eq!(keepalive_every_from(rt, None), None);
+        assert_eq!(keepalive_every_from(rt, Some("250")), Some(Duration::from_millis(250)));
+    }
+
     #[test]
     fn shim_runs_harness_to_completion_and_archives() {
         let (_t, runtime, spec) = rig("echo '{\"type\":\"agent_end\"}'\nexit 0", Some("RUN-1"));
         let calls = Arc::new(Mutex::new(Vec::new()));
-        let code = run(&runtime, "h_test", &spec.agent_id, "exec-s", recording_connector(calls.clone()));
+        let code = execute(&runtime, "h_test", &spec.agent_id, "exec-s", recording_connector(calls.clone()), idle_keepalive());
         assert_eq!(code, 0);
         let agent = crate::agents::get_agent(&runtime, "h_test", &spec.agent_id).unwrap().unwrap();
         assert_eq!(agent.status, crate::agents::AgentRecordStatus::Exited);
@@ -2663,7 +2901,7 @@ mod tests {
         let (_t, runtime, spec) = rig("exit 0", None);
         let dir = crate::layout::agent_dir(&runtime, "h_test", &spec.agent_id).unwrap();
         std::fs::remove_file(crate::layout::exec_file(&dir, "exec-s", crate::layout::ExecFile::Spec)).unwrap();
-        let code = run(&runtime, "h_test", &spec.agent_id, "exec-s", recording_connector(Default::default()));
+        let code = execute(&runtime, "h_test", &spec.agent_id, "exec-s", recording_connector(Default::default()), idle_keepalive());
         assert_eq!(code, 1);
         let agent = crate::agents::get_agent(&runtime, "h_test", &spec.agent_id).unwrap().unwrap();
         assert_eq!(agent.status, crate::agents::AgentRecordStatus::Failed);
@@ -2673,8 +2911,8 @@ mod tests {
     #[test]
     fn unreachable_daemon_leaves_lease_release_pending() {
         let (_t, runtime, spec) = rig("exit 0", Some("RUN-1"));
-        let failing: Connector = Arc::new(|| Err("daemon down".to_string()));
-        assert_eq!(run(&runtime, "h_test", &spec.agent_id, "exec-s", failing), 0);
+        let failing: Connector = Arc::new(|_: &Path, _: &str| Err("daemon down".to_string()));
+        assert_eq!(execute(&runtime, "h_test", &spec.agent_id, "exec-s", failing, idle_keepalive()), 0);
         let agent = crate::agents::get_agent(&runtime, "h_test", &spec.agent_id).unwrap().unwrap();
         assert!(agent.execs[0].lease_release_pending);
     }
@@ -2686,7 +2924,7 @@ mod tests {
 ```bash
 cargo test -p omt-exec shim:: 2>&1 | tail -3
 ```
-Expected：编译失败（`run` / `Connector` 未定义）。
+Expected：编译失败（`execute` / `Connector` 未定义）。
 
 - [ ] **Step 4: 实现 shim**
 
@@ -2699,11 +2937,20 @@ Expected：编译失败（`run` / `Connector` 未定义）。
 //!
 //! 停止：SIGTERM / SIGINT 置标志，主循环转成 `exec_stop`（TERM → 宽限 → KILL
 //! 升级沿用执行器原逻辑）。信号处理函数在 exec 时被内核重置，harness 不受影响。
+//! **约束（review F1）**：shim 绝不能运行在 `omt` CLI 的信号屏蔽之下——CLI 的
+//! `signal::install` 会在所有线程屏蔽 SIGTERM/SIGINT 并由 sigwait 线程消费，
+//! 本模块的处理函数将永远收不到信号。CLI 必须在安装信号处理**之前**分派
+//! `exec-shim`（见 Task 8 Step 6）。
+//!
+//! home 保活（review F5）：desktop 关闭后没有别的面访问 workspace home，静默
+//! idleQuietMs 后会被 daemon 关闭，harness 经 `omt mcp` 的认领 / 汇报随之失败
+//! （mcp 按设计不能 declare）。harness 存活期间，shim 定期经普通（非 admin）
+//! 连接发一个只读 RPC，让 home 保持打开；连接时若 home 已关闭会自动 declare。
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::agents::{self, AgentAttachment, AgentRecordStatus};
 use crate::daemon_link::Connector;
@@ -2725,10 +2972,51 @@ fn install_stop_handler() {
     }
 }
 
-/// shim 主体；返回进程退出码（0 = 走完收尾，1 = 启动阶段失败）。
-pub fn run(runtime_dir: &Path, home_id: &str, agent_id: &str, exec_id: &str, connector: Connector) -> i32 {
+/// 保活间隔（review R2-2）：从 daemon 读的同一个配置推导——`<runtime>/daemon.json`
+/// 的 idleQuietMs（缺省 30 分钟），取其 1/3 且不超过 5 分钟；idleQuietMs 为 0
+/// （daemon 不做 idle 退出）时不保活。环境变量 `OMT_SHIM_KEEPALIVE_MS` 优先（测试用）。
+fn keepalive_every(runtime_dir: &Path) -> Option<Duration> {
+    keepalive_every_from(runtime_dir, std::env::var("OMT_SHIM_KEEPALIVE_MS").ok().as_deref())
+}
+
+fn keepalive_every_from(runtime_dir: &Path, override_ms: Option<&str>) -> Option<Duration> {
+    if let Some(ms) = override_ms.and_then(|v| v.parse::<u64>().ok()) {
+        return Some(Duration::from_millis(ms));
+    }
+    let idle_ms = std::fs::read_to_string(runtime_dir.join("daemon.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|config| config["idleQuietMs"].as_i64())
+        .unwrap_or(1_800_000);
+    if idle_ms <= 0 {
+        return None;
+    }
+    Some(Duration::from_millis((idle_ms as u64 / 3).min(5 * 60 * 1000)))
+}
+
+/// 进程入口：安装停止信号处理后执行。返回进程退出码。
+pub fn run(
+    runtime_dir: &Path,
+    home_id: &str,
+    agent_id: &str,
+    exec_id: &str,
+    lease: Connector,
+    keepalive: Connector,
+) -> i32 {
     install_stop_handler();
-    match run_inner(runtime_dir, home_id, agent_id, exec_id, connector) {
+    execute(runtime_dir, home_id, agent_id, exec_id, lease, keepalive)
+}
+
+/// shim 主体（不装信号处理，单测直接调用）；0 = 走完收尾，1 = 启动阶段失败。
+pub fn execute(
+    runtime_dir: &Path,
+    home_id: &str,
+    agent_id: &str,
+    exec_id: &str,
+    lease: Connector,
+    keepalive: Connector,
+) -> i32 {
+    match run_inner(runtime_dir, home_id, agent_id, exec_id, lease, keepalive) {
         Ok(()) => 0,
         Err(detail) => {
             eprintln!("exec-shim {exec_id}: {detail}");
@@ -2754,8 +3042,10 @@ fn run_inner(
     home_id: &str,
     agent_id: &str,
     exec_id: &str,
-    connector: Connector,
+    lease: Connector,
+    keepalive: Connector,
 ) -> Result<(), String> {
+    layout::validate_segment("exec id", exec_id)?;
     let agent_dir = layout::agent_dir(runtime_dir, home_id, agent_id)?;
     let spec = LaunchSpec::read(&layout::exec_file(&agent_dir, exec_id, ExecFile::Spec))?;
     if spec.home_id != home_id || spec.agent_id != agent_id || spec.exec_id != exec_id {
@@ -2783,7 +3073,12 @@ fn run_inner(
     }
 
     let manager = ExecutionManager::with_max_duration(Duration::from_secs(spec.max_duration_secs));
-    manager.set_lease_release(lease_releaser(runtime_dir.to_path_buf(), agent_id.to_string(), connector));
+    manager.set_lease_release(lease_releaser(
+        runtime_dir.to_path_buf(),
+        agent_id.to_string(),
+        spec.home_path.clone(),
+        lease,
+    ));
     let request = SpawnRequest {
         exec_id: exec_id.to_string(),
         agent_id: agent_id.to_string(),
@@ -2800,8 +3095,18 @@ fn run_inner(
     };
     // 事件已由执行器写入 jsonl（KD-E3）；进程内 sink 无人消费
     let session = manager.spawn(runtime_dir, request, Arc::new(|_| {}))?;
+    let done = Arc::new(AtomicBool::new(false));
+    let keeper = spawn_keepalive(
+        keepalive_every(runtime_dir),
+        spec.home_path.clone(),
+        home_id.to_string(),
+        keepalive,
+        done.clone(),
+    );
     loop {
         if session.terminal().is_some() {
+            done.store(true, Ordering::SeqCst);
+            let _ = keeper.join();
             return Ok(());
         }
         if STOP_REQUESTED.swap(false, Ordering::SeqCst) {
@@ -2811,11 +3116,57 @@ fn run_inner(
     }
 }
 
-/// 终态租约释放：按需连接 daemon（长时间执行期间 daemon 可能已 idle 退出）。
-/// 失败只记待对账标记，不影响收尾的其余步骤。
-fn lease_releaser(runtime_dir: PathBuf, agent_id: String, connector: Connector) -> crate::executor::LeaseRelease {
+/// review F5：harness 存活期间保持 workspace home 打开。连接按需建立，失败就
+/// 丢弃，下一轮重连（重连时 DaemonLink::connect 会在 home 已被关闭时自动
+/// declare）。`run/list` 是只读 RPC，任何到达 home actor 的请求都会重置它的
+/// 静默计时。homeId 用 spec 里的值——connect 已校验它就是 daemon 为该路径
+/// 分配的 id（review R2-3 / R2-8），否则请求会在到达 home actor 前被拒，
+/// 起不到保活作用。`every` 为 None（daemon 不做 idle 退出）时不保活。
+fn spawn_keepalive(
+    every: Option<Duration>,
+    home_path: PathBuf,
+    home_id: String,
+    connector: Connector,
+    done: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let Some(every) = every else {
+            return;
+        };
+        let mut rpc: Option<RpcFn> = None;
+        loop {
+            let deadline = Instant::now() + every;
+            while Instant::now() < deadline {
+                if done.load(Ordering::SeqCst) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            if rpc.is_none() {
+                rpc = connector(&home_path, &home_id).ok();
+            }
+            let alive = rpc
+                .as_ref()
+                .map(|call| call("run/list", serde_json::json!({ "homeId": home_id })).is_ok())
+                .unwrap_or(false);
+            if !alive {
+                rpc = None;
+            }
+        }
+    })
+}
+
+/// 终态租约释放：按需连接 daemon（长时间执行期间 daemon 可能已 idle 退出；
+/// 连接时保证 home 在凭据范围内，review F4）。失败只记待对账标记，不影响
+/// 收尾的其余步骤。
+fn lease_releaser(
+    runtime_dir: PathBuf,
+    agent_id: String,
+    home_path: PathBuf,
+    connector: Connector,
+) -> crate::executor::LeaseRelease {
     Arc::new(move |home_id: &str, run_id: &str, exec_id: &str| {
-        let outcome = connector()
+        let outcome = connector(&home_path, home_id)
             .and_then(|rpc: RpcFn| crate::executor::release_items_for_exec(&*rpc, home_id, run_id, exec_id));
         if let Err(err) = outcome {
             eprintln!("exec-shim {exec_id}: 租约释放失败（{err}），留待对账");
@@ -2827,42 +3178,60 @@ fn lease_releaser(runtime_dir: PathBuf, agent_id: String, connector: Connector) 
 }
 ```
 
-（`release_items_for_exec` 在 Task 2 已改为返回 `Result<(), String>`。这里的 `connector()` 返回的 `RpcFn` 在闭包结束时 drop，临时授权随之撤销。）
+（`release_items_for_exec` 在 Task 2 已改为返回 `Result<(), String>`。这里的 `connector(&home_path, home_id)` 返回的 `RpcFn` 在闭包结束时 drop，临时授权随之撤销。）
 
 - [ ] **Step 5: 跑 shim 单测**
 
 ```bash
 cargo test -p omt-exec shim:: 2>&1 | grep -E '^test result|FAILED|panicked'
 ```
-Expected：3 passed。
+Expected：4 passed（含保活间隔推导）。
 
 - [ ] **Step 6: CLI 隐藏动词**
 
 `crates/omt-runtime/Cargo.toml` 的 `[dependencies]` 加 `omt-exec = { path = "../omt-exec" }`（Task 7 加的 dev-dependency 可删除，改由普通依赖覆盖）。
 
-`crates/omt-runtime/src/cli/mod.rs` 的 `dispatch_args` 中，在 `"mcp" => …` 分支之后加：
+`crates/omt-runtime/src/cli/mod.rs`：**`exec-shim` 必须在 `real_run` 安装 CLI 信号处理之前分派**（review F1）。`crate::signal::install` 会用 `pthread_sigmask` 在主线程及之后所有线程里屏蔽 SIGTERM/SIGINT，并由一个 sigwait 线程消费这两个信号，shim 自己装的处理函数就永远收不到。
+
+`real_run` 开头改为（原来在 install 之后收集 args，这里提前）：
 
 ```rust
-        // 设计 §3.2 / KD-E1：每 exec 一个分离 shim（launcher 拉起，不进 USAGE）。
-        // 参数用位置参数——全局 `--home` 会被 split_globals 吞掉。
-        "exec-shim" => {
-            let args = rest.make_contiguous();
-            let [home_id, agent_id, exec_id] = args else {
-                return Err(usage_err("exec-shim <homeId> <agentId> <execId>"));
-            };
-            let runtime_dir = crate::paths::resolve(split.globals.runtime_dir.as_deref());
-            let daemon_bin = std::env::current_exe()
-                .ok()
-                .and_then(|exe| exe.parent().map(|dir| dir.join("omt-daemon")))
-                .filter(|path| path.is_file());
-            let connector = omt_exec::daemon_link::admin_connector(runtime_dir.clone(), daemon_bin);
-            std::process::exit(omt_exec::shim::run(
-                &runtime_dir, home_id, agent_id, exec_id, connector,
-            ));
-        }
+fn real_run() -> i32 {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // 设计 §3.2 / KD-E1：每 exec 一个分离 shim（launcher 拉起，不进 USAGE）。
+    // 必须先于 signal::install——shim 要保持默认信号掩码，用自己的处理函数。
+    if let Some(code) = exec_shim_entry(&args) {
+        return code;
+    }
+    // Arm SIGINT/SIGTERM handling: …（以下保持原样）
 ```
 
-（`let [a, b, c] = args else` 是对 `&mut [String]` 的切片模式，三个绑定都是 `&mut String`，可自动解引用为 `&str`。若编译器对可变借用报错，改为 `match &*args { [h, a, e] => …, _ => return Err(…) }`。）
+新增函数（放在 `real_run` 之后）：
+
+```rust
+/// `omt [--runtime-dir <d>] exec-shim <homeId> <agentId> <execId>`。位置参数——
+/// 全局 `--home` 会被 split_globals 吞掉。返回 None 表示不是 exec-shim 调用。
+fn exec_shim_entry(args: &[String]) -> Option<i32> {
+    let split = split_globals(args).ok()?;
+    if split.rest.first().map(String::as_str) != Some("exec-shim") {
+        return None;
+    }
+    let [home_id, agent_id, exec_id] = &split.rest[1..] else {
+        eprintln!("usage: omt [--runtime-dir <dir>] exec-shim <homeId> <agentId> <execId>");
+        return Some(EXIT_USAGE);
+    };
+    let runtime_dir = crate::paths::resolve(split.globals.runtime_dir.as_deref());
+    let daemon_bin = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("omt-daemon")))
+        .filter(|path| path.is_file());
+    let lease = omt_exec::daemon_link::admin_connector(runtime_dir.clone(), daemon_bin.clone());
+    let keepalive = omt_exec::daemon_link::plain_connector(runtime_dir.clone(), daemon_bin);
+    Some(omt_exec::shim::run(&runtime_dir, home_id, agent_id, exec_id, lease, keepalive))
+}
+```
+
+（`dispatch_args` 里**不要**再加 `"exec-shim"` 分支；走到那里时信号屏蔽已经装上了。`EXIT_USAGE` 是该文件已有的常量；若 `split_globals` 的签名接收 `&[String]` 以外的类型，按它调整调用方式。）
 
 - [ ] **Step 7: 真二进制端到端测试**
 
@@ -2890,14 +3259,20 @@ fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
 struct Rig {
     _tmp: tempfile::TempDir,
     runtime: PathBuf,
+    home_id: String,
     agent_id: String,
 }
 
 fn rig(harness_body: &str) -> Rig {
-    let tmp = tempfile::tempdir().unwrap();
+    rig_at(tempfile::tempdir().unwrap(), "h_test", harness_body)
+}
+
+/// `tmp` 下固定布局：`run/`（runtime）、`ws/.omt`（home）、`global/`（OMT_HOME）。
+fn rig_at(tmp: tempfile::TempDir, home_id: &str, harness_body: &str) -> Rig {
     let runtime = tmp.path().join("run");
     let home_path = tmp.path().join("ws").join(".omt");
     std::fs::create_dir_all(&home_path).unwrap();
+    std::fs::create_dir_all(tmp.path().join("global")).unwrap();
     let fake = write_script(tmp.path(), "fake-pi", harness_body);
     omt_harness::harness::upsert_config(
         &runtime,
@@ -2912,7 +3287,7 @@ fn rig(harness_body: &str) -> Rig {
     .unwrap();
     let agent = omt_exec::agents::register_agent(
         &runtime,
-        "h_test",
+        home_id,
         "pi",
         omt_exec::agents::NewExec {
             exec_id: "exec-e2e".into(),
@@ -2926,7 +3301,7 @@ fn rig(harness_body: &str) -> Rig {
     .unwrap();
     let spec = omt_exec::spec::LaunchSpec {
         schema_version: omt_exec::spec::SPEC_SCHEMA_VERSION,
-        home_id: "h_test".into(),
+        home_id: home_id.into(),
         home_path,
         agent_id: agent.id.clone(),
         exec_id: "exec-e2e".into(),
@@ -2940,19 +3315,22 @@ fn rig(harness_body: &str) -> Rig {
         max_duration_secs: 60,
         omt_path: omt(),
     };
-    let dir = omt_exec::layout::agent_dir(&runtime, "h_test", &agent.id).unwrap();
+    let dir = omt_exec::layout::agent_dir(&runtime, home_id, &agent.id).unwrap();
     spec.write(&omt_exec::layout::exec_file(&dir, "exec-e2e", omt_exec::layout::ExecFile::Spec)).unwrap();
-    Rig { _tmp: tmp, runtime, agent_id: agent.id }
+    Rig { _tmp: tmp, runtime, home_id: home_id.to_string(), agent_id: agent.id }
 }
 
+/// shim 子进程的 OMT_HOME 指向临时目录：它若需要拉起 daemon，daemon 打开的
+/// 全局 home 是临时的，不碰开发者真实的 ~/.omt。
 fn shim(rig: &Rig) -> Command {
     let mut cmd = Command::new(omt());
-    cmd.args(["--runtime-dir", rig.runtime.to_str().unwrap(), "exec-shim", "h_test", &rig.agent_id, "exec-e2e"]);
+    cmd.args(["--runtime-dir", rig.runtime.to_str().unwrap(), "exec-shim", &rig.home_id, &rig.agent_id, "exec-e2e"])
+        .env("OMT_HOME", rig._tmp.path().join("global"));
     cmd
 }
 
 fn agent(rig: &Rig) -> omt_exec::agents::AgentRecord {
-    omt_exec::agents::get_agent(&rig.runtime, "h_test", &rig.agent_id).unwrap().unwrap()
+    omt_exec::agents::get_agent(&rig.runtime, &rig.home_id, &rig.agent_id).unwrap().unwrap()
 }
 
 #[test]
@@ -2985,6 +3363,54 @@ fn sigterm_to_shim_kills_harness_as_user_stop() {
     assert_eq!(a.status, omt_exec::agents::AgentRecordStatus::Killed);
     assert_eq!(a.execs[0].kill_reason.as_deref(), Some("user"));
 }
+
+/// review F5 / R2-2 / R2-3：desktop 关闭后，home 只靠 shim 保活。daemon 的静默
+/// 阈值调到 1.5s（保活间隔由此推导为 500ms，不设环境变量——顺带验证推导）；
+/// harness 睡 4s 后用 CLI 访问 home（代替 MCP 的认领 / 汇报）。spec 用 daemon
+/// 为该 home 分配的真实 homeId（否则保活请求在到达 home 前就被拒）。有保活
+/// 时成功；用环境变量把间隔调大（相当于没有保活）时，home 被关闭，访问失败——
+/// 反例证明这个测试确实测到了保活。
+#[test]
+fn shim_keeps_workspace_home_open_while_harness_runs() {
+    fn run_case(keepalive_override_ms: Option<&str>) -> Option<i32> {
+        let omt_bin = omt();
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = tmp.path().join("run");
+        let home = tmp.path().join("ws").join(".omt");
+        let global = tmp.path().join("global");
+        for dir in [&runtime, &home, &global] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(runtime.join("daemon.json"), r#"{"idleQuietMs": 1500}"#).unwrap();
+        let started = Command::new(&omt_bin)
+            .args(["--runtime-dir", runtime.to_str().unwrap(), "--home", home.to_str().unwrap(), "daemon-start"])
+            .env("OMT_HOME", &global)
+            .status()
+            .unwrap();
+        assert!(started.success(), "daemon-start（模拟 desktop 打开的 home）");
+        let home_id = omt_exec::daemon_link::DaemonLink::connect(&runtime, "cli", None, &home, None)
+            .unwrap()
+            .home_id_for(&home)
+            .unwrap();
+        let body = format!(
+            "sleep 4\n\"{}\" --runtime-dir \"$OMT_RUNTIME_DIR\" --home \"$PWD/.omt\" run-list >/dev/null 2>&1\nexit $?",
+            omt_bin.display()
+        );
+        let rig = rig_at(tmp, &home_id, &body);
+        let mut cmd = shim(&rig);
+        if let Some(ms) = keepalive_override_ms {
+            cmd.env("OMT_SHIM_KEEPALIVE_MS", ms);
+        }
+        assert!(cmd.status().unwrap().success());
+        let code = agent(&rig).execs[0].exit_code;
+        let _ = Command::new(&omt_bin)
+            .args(["--runtime-dir", rig.runtime.to_str().unwrap(), "daemon-stop"])
+            .status();
+        code
+    }
+    assert_eq!(run_case(None), Some(0), "有保活（间隔由 idleQuietMs 推导）：home 在 harness 运行期间保持打开");
+    assert_ne!(run_case(Some("600000")), Some(0), "无保活：home 静默关闭后访问失败（反例）");
+}
 ```
 
 `crates/omt-runtime/Cargo.toml` 的 `[dev-dependencies]` 加 `omt-harness = { path = "../omt-harness" }`；`libc` 已是普通依赖。
@@ -2992,7 +3418,7 @@ fn sigterm_to_shim_kills_harness_as_user_stop() {
 ```bash
 cargo test -p omt-runtime --test exec_shim 2>&1 | grep -E '^test result|FAILED|panicked'
 ```
-Expected：2 passed。若 `kill_reason` 的实际取值不是 `"user"`，以 `KillReason::User.key()` 的返回值为准修改断言。
+Expected：3 passed。如果反例那半没有失败（例如 `run-list` 在 home 关闭后仍然成功），说明 daemon 的静默关闭机制和这里的假设不同。这时先读 `homes.rs` 的 idle watchdog 与 `server.rs` 的 home 关闭路径，再调整阈值或改用其他检测手段；不要删掉反例。若 `kill_reason` 的实际取值不是 `"user"`，以 `KillReason::User.key()` 的返回值为准修改断言。
 
 - [ ] **Step 8: 确认 daemon 二进制不链接 omt_exec**
 
@@ -3034,7 +3460,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - Produces:
   - `omt_exec::launch::LaunchRequest<'a>`（字段见代码）、`omt_exec::launch::start(rpc: &dyn Fn(&str, Value) -> Result<Value, String>, req: &LaunchRequest) -> Result<ExecStartOutcome, String>`
   - `omt_exec::launch::spawn_shim(omt_bin, runtime_dir, home_id, agent_id, exec_id, log_path) -> Result<u32, String>`
-  - `omt_exec::control::{find_exec, identity_alive, shim_alive, exec_active, stop_exec, stop_all, reconcile_on_startup, exec_id_live}`（签名见代码）
+  - `omt_exec::control::{find_exec, identity_alive, shim_alive, exec_active, active_exec_count, stop_exec, stop_all, reconcile_on_startup, exec_id_live}`（签名见代码）
 
 - [ ] **Step 1: 写 control 的失败测试**
 
@@ -3109,6 +3535,25 @@ mod tests {
         let id = reg(tmp.path(), "exec-done");
         crate::agents::update_agent_status(tmp.path(), "h_t", &id, AgentRecordStatus::Exited, AgentAttachment::None).unwrap();
         assert!(stop_exec(tmp.path(), "exec-done").is_ok());
+    }
+
+    /// review F9：shim 还活着时，即使状态已是终态，也算活跃（exit 行可能还没写出）。
+    #[test]
+    fn exec_active_follows_shim_liveness_not_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = reg(tmp.path(), "exec-tail");
+        let me = std::process::id();
+        let start = crate::executor::process_start_identity(me).unwrap();
+        update_exec(tmp.path(), "h_t", &id, "exec-tail", |e| {
+            e.shim_pid = Some(me);
+            e.shim_start_id = Some(start.clone());
+        })
+        .unwrap();
+        crate::agents::update_agent_status(tmp.path(), "h_t", &id, AgentRecordStatus::Exited, AgentAttachment::None).unwrap();
+        assert!(exec_active(tmp.path(), "h_t", &id, "exec-tail"));
+        assert_eq!(active_exec_count(tmp.path()), 0, "终态 agent 不计入退出确认");
+        update_exec(tmp.path(), "h_t", &id, "exec-tail", |e| e.shim_start_id = Some("macos:0:0".into())).unwrap();
+        assert!(!exec_active(tmp.path(), "h_t", &id, "exec-tail"), "shim 不在且已终态 → 不活跃");
     }
 
     #[test]
@@ -3200,15 +3645,37 @@ fn within_launch_grace(exec: &ExecRecord) -> bool {
     exec.shim_pid.is_none() && now.saturating_sub(started) < LAUNCH_GRACE.as_millis()
 }
 
-/// 尾随方用：exec 是否仍可能产出事件。
+/// 尾随方用：exec 是否仍可能产出事件。review F9：只要 shim 还活着就算活跃，
+/// 不看 agent 状态。shim 收尾时先写终态状态，再释放租约（连接 daemon、临时
+/// 授权，可能耗时数秒），最后才追加 exit 行；按状态判断会让尾随方在 exit 行
+/// 写出之前就放弃。
 pub fn exec_active(runtime_dir: &Path, home_id: &str, agent_id: &str, exec_id: &str) -> bool {
-    match agents::get_agent(runtime_dir, home_id, agent_id) {
-        Ok(Some(agent)) if is_active(&agent) => match latest_exec(&agent) {
-            Some(exec) if exec.exec_id == exec_id => shim_alive(exec) || within_launch_grace(exec),
-            _ => false,
-        },
-        _ => false,
-    }
+    let Ok(Some(agent)) = agents::get_agent(runtime_dir, home_id, agent_id) else {
+        return false;
+    };
+    let Some(exec) = agent.execs.iter().find(|e| e.exec_id == exec_id) else {
+        return false;
+    };
+    shim_alive(exec) || (is_active(&agent) && within_launch_grace(exec))
+}
+
+/// review F6：退出确认用——所有 home 中仍在运行的 exec 数（shim 存活，或仍在
+/// 启动宽限期内）。
+pub fn active_exec_count(runtime_dir: &Path) -> usize {
+    layout::home_ids(runtime_dir)
+        .iter()
+        .map(|home_id| {
+            agents::list_agents(runtime_dir, home_id)
+                .map(|(agents, _)| {
+                    agents
+                        .iter()
+                        .filter(|a| is_active(a))
+                        .filter(|a| latest_exec(a).is_some_and(|e| shim_alive(e) || within_launch_grace(e)))
+                        .count()
+                })
+                .unwrap_or(0)
+        })
+        .sum()
 }
 
 /// MCP 残留清扫用：launcher id（= exec id）对应的 exec 是否仍在运行。
@@ -3296,7 +3763,7 @@ pub fn reconcile_on_startup(runtime_dir: &Path) -> usize {
 ```bash
 cargo test -p omt-exec control:: 2>&1 | grep -E '^test result|FAILED'
 ```
-Expected：4 passed。
+Expected：5 passed。
 
 - [ ] **Step 3: 实现 launch**
 
@@ -3606,7 +4073,10 @@ pub fn spawn_shim(
 
 ```rust
 //! launcher 端到端：假 daemon RPC（脚本化响应）+ 真 omt exec-shim + 假 harness。
-//! 覆盖：就绪握手成功、MCP 注入失败时同步报错并补偿、发起方不等执行结束。
+//! 覆盖：就绪握手成功、发起方不等执行结束、shim 拉不起来时同步报错并补偿。
+//! （shim 启动后在 MCP 注入阶段失败、经就绪握手 Failed 分支回报的路径，只由
+//! Task 8 的 shim 单测覆盖——launcher 只有一个 omt_bin，无法在这里单独让 MCP
+//! 桥缺失而 shim 存在。）
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -3618,6 +4088,19 @@ fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
     std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     path
+}
+
+/// launcher 拉起的 shim 继承本进程环境；shim 收尾时可能拉起真 daemon（打开
+/// 全局 home）。把 OMT_HOME 指向临时目录，绝不碰开发者真实的 ~/.omt；本文件
+/// 只有一个测试会走到 daemon，串行锁保证环境变量不被并发修改。
+static SERIAL: Mutex<()> = Mutex::new(());
+
+fn isolated(tmp: &Path) -> std::sync::MutexGuard<'static, ()> {
+    let guard = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let global = tmp.join("global-home");
+    std::fs::create_dir_all(&global).unwrap();
+    std::env::set_var("OMT_HOME", &global);
+    guard
 }
 
 struct FakeDaemon {
@@ -3676,7 +4159,8 @@ fn request<'a>(runtime: &'a Path, home_path: &'a Path, omt_bin: &'a Path) -> omt
 fn launch_returns_once_harness_is_spawned_and_exec_finishes_later() {
     // harness 跑 5s：launcher 在 pid 落盘后就返回，此刻 exec 必然尚未结束。
     // 不断言耗时——macOS 首次 exec 新写入脚本可能停顿数秒（F-BENCH-22）。
-    let (_t, runtime, home_path) = setup("sleep 5\necho done\nexit 0");
+    let (t, runtime, home_path) = setup("sleep 5\necho done\nexit 0");
+    let _serial = isolated(t.path());
     let omt = PathBuf::from(env!("CARGO_BIN_EXE_omt"));
     let fake = FakeDaemon { calls: Mutex::new(vec![]) };
     let outcome = omt_exec::launch::start(
@@ -3701,17 +4185,30 @@ fn launch_returns_once_harness_is_spawned_and_exec_finishes_later() {
         assert!(Instant::now() < deadline, "exec 未在 40s 内结束：{agent:?}");
         std::thread::sleep(Duration::from_millis(200));
     }
-    // 收尾时 shim 会为释放 RUN-1 的租约拉起临时 runtime 里的真 daemon
-    //（假 run 不存在 → lease_release_pending）；测试结束前停掉它
+    // 收尾时 shim 会为释放 RUN-1 的租约，用 --home <临时 home> 拉起临时 runtime
+    // 里的真 daemon（假 run 不存在 → lease_release_pending）。状态写成终态在
+    // 租约释放之前，所以要等 shim 进程退出后再停 daemon，否则 daemon 会在
+    // stop 之后才被拉起而泄漏（review F2）
+    let shim_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let agent = omt_exec::agents::get_agent(&runtime, "h_test", &outcome.agent_id).unwrap().unwrap();
+        if !omt_exec::control::shim_alive(&agent.execs[0]) {
+            break;
+        }
+        assert!(Instant::now() < shim_deadline, "shim 未在 30s 内退出");
+        std::thread::sleep(Duration::from_millis(200));
+    }
     let _ = std::process::Command::new(&omt)
         .args(["--runtime-dir", runtime.to_str().unwrap(), "daemon-stop"])
         .status();
 }
 
 #[test]
-fn missing_mcp_bridge_fails_synchronously_and_cancels_new_run() {
-    let (_t, runtime, home_path) = setup("exit 0");
-    // omt_bin 用真 omt 作 shim，但 spec 里的 MCP 桥路径不存在 → shim 启动阶段失败
+fn unspawnable_shim_fails_synchronously_and_cancels_new_run() {
+    let (t, runtime, home_path) = setup("exit 0");
+    let _serial = isolated(t.path());
+    // omt_bin 指向不存在的路径 → spawn_shim 本身失败（shim 根本没起来），
+    // launcher 走补偿：agent 转 Failed + cancel 本次新建的 run
     let omt = PathBuf::from(env!("CARGO_BIN_EXE_omt"));
     let fake = FakeDaemon { calls: Mutex::new(vec![]) };
     let mut req = request(&runtime, &home_path, &omt);
@@ -3724,7 +4221,7 @@ fn missing_mcp_bridge_fails_synchronously_and_cancels_new_run() {
 }
 ```
 
-第二个测试里 `omt_bin` 不存在，`spawn_shim` 直接失败，走 `fail_and_compensate`。（「shim 启动后在 MCP 注入阶段失败」的路径由 Task 8 的 `shim_marks_failed_when_spec_missing` 与 `wait_ready` 的 `Failed` 分支共同覆盖。）
+第二个测试里 `omt_bin` 不存在，`spawn_shim` 直接失败，走 `fail_and_compensate`。「shim 启动后失败」这条路径只有部分覆盖：Task 8 的 `shim_marks_failed_when_spec_missing` 验证了 shim 会把 agent 标成 Failed；`wait_ready` 里读到 Failed 后同步回报并补偿的分支，没有端到端测试。
 
 ```bash
 cargo test -p omt-runtime --test exec_launch 2>&1 | grep -E '^test result|FAILED|panicked'
@@ -3756,7 +4253,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - Modify: `apps/desktop/src-tauri/src/{executor,lib,state,rpc_bridge}.rs`
 
 **Interfaces:**
-- Consumes: `launch::{start, LaunchRequest}`、`control::{stop_exec, stop_all, exec_active, exec_id_live, reconcile_on_startup}`、`grants::sweep_dead_temp_grants`。
+- Consumes: `launch::{start, LaunchRequest}`、`control::{stop_exec, stop_all, exec_active, active_exec_count, exec_id_live, reconcile_on_startup}`、`layout::home_ids`、`grants::sweep_dead_temp_grants`。
 - Produces:
   - `omt_exec::follow::follow_jsonl(path: PathBuf, after_seq: Option<u64>, sink: EventSink, active: Arc<dyn Fn() -> bool + Send + Sync>) -> std::thread::JoinHandle<()>`
   - tauri commands：`exec_start`（签名不变）、`exec_stop`（签名不变）、`exec_transcript_tail`（不变）、`exec_kill_orphan`（不变）、新增 `exec_stop_all(home_id: String) -> Result<usize, String>`、`exec_attach(home_id: String, exec_id: String, after_seq: Option<u64>, channel: Channel<Value>) -> Result<(), String>`
@@ -3946,7 +4443,77 @@ pub fn startup_housekeeping(runtime_dir: &Path) {
 }
 ```
 
-`agents::demote_live_agents` 已无调用方：删除它及其测试（`cargo build` 会报 dead_code）。`RESTART_MARKER` 保留，仅用于识别旧记录（`list_reconcile_targets`）。
+`agents::demote_live_agents` 已无调用方：删除它及其测试（`cargo build` 会报 dead_code）。
+
+**对账改走 shim 路径**（review R2-4）：desktop 的 U10 对账只在第一个会话建立时跑一次，那时 workspace home 往往还没声明，下一次启动也是同样的时机，所以「只在成功时置标记」会让同一个目标每次启动都失败一遍，租约永远释放不掉。在 executor.rs 加：
+
+```rust
+/// review R2-4：对账目标的租约释放走与 shim 相同的路径——按该 exec 的 spec 里的
+/// home 路径连接（必要时 declare，且校验 homeId），加临时授权后释放。没有 spec
+/// 的旧记录（RESTART_MARKER）留给 desktop 会话的 U10 对账。
+pub fn reconcile_with_connector(connector: &crate::daemon_link::Connector, runtime_dir: &Path) -> usize {
+    let Ok(targets) = agents::list_reconcile_targets(runtime_dir) else {
+        return 0;
+    };
+    let mut handled = 0usize;
+    for t in &targets {
+        let Ok(dir) = crate::layout::agent_dir(runtime_dir, &t.home_id, &t.agent_id) else {
+            continue;
+        };
+        let spec_path = crate::layout::exec_file(&dir, &t.exec_id, crate::layout::ExecFile::Spec);
+        let Ok(spec) = crate::spec::LaunchSpec::read(&spec_path) else {
+            continue;
+        };
+        let outcome = connector(&spec.home_path, &t.home_id)
+            .and_then(|rpc| release_items_for_exec(&*rpc, &t.home_id, &t.run_id, &t.exec_id));
+        if let Err(err) = outcome {
+            eprintln!("对账：exec {} 经 shim 路径释放失败（{err}），保留为对账目标", t.exec_id);
+            continue;
+        }
+        mark_reconciled(runtime_dir, t);
+        handled += 1;
+    }
+    handled
+}
+```
+
+在 executor.rs 的 `mod tests` 里加：
+
+```rust
+    /// review R2-4：有 spec 的目标经 connector（shim 路径）释放；connector 失败则保留。
+    #[test]
+    fn reconcile_with_connector_uses_spec_home_and_keeps_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = dir.path();
+        let agent = crate::agents::register_agent(rt, "h_t", "pi", crate::agents::NewExec {
+            exec_id: "exec-c".into(), node_id: None, run_id: Some("RUN-1".into()),
+            binary_path: None, binary_args: vec![], model: None,
+        })
+        .unwrap();
+        crate::agents::update_exec(rt, "h_t", &agent.id, "exec-c", |e| e.lease_release_pending = true).unwrap();
+        let mut spec = crate::spec::sample(&rt.join("ws").join(".omt"), Path::new("/bin/omt"));
+        spec.home_id = "h_t".into();
+        spec.agent_id = agent.id.clone();
+        spec.exec_id = "exec-c".into();
+        let adir = crate::layout::agent_dir(rt, "h_t", &agent.id).unwrap();
+        spec.write(&crate::layout::exec_file(&adir, "exec-c", crate::layout::ExecFile::Spec)).unwrap();
+
+        let failing: crate::daemon_link::Connector = Arc::new(|_: &Path, _: &str| Err("down".to_string()));
+        assert_eq!(reconcile_with_connector(&failing, rt), 0);
+        assert_eq!(crate::agents::list_reconcile_targets(rt).unwrap().len(), 1);
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<(PathBuf, String)>::new()));
+        let seen2 = seen.clone();
+        let ok: crate::daemon_link::Connector = Arc::new(move |home: &Path, id: &str| {
+            seen2.lock().unwrap().push((home.to_path_buf(), id.to_string()));
+            let rpc: RpcFn = Arc::new(|_: &str, _: serde_json::Value| Ok(serde_json::json!({ "items": [] })));
+            Ok(rpc)
+        });
+        assert_eq!(reconcile_with_connector(&ok, rt), 1);
+        assert_eq!(seen.lock().unwrap()[0], (rt.join("ws").join(".omt"), "h_t".to_string()));
+        assert!(crate::agents::list_reconcile_targets(rt).unwrap().is_empty());
+    }
+````RESTART_MARKER` 保留，仅用于识别旧记录（`list_reconcile_targets`）。
 
 - [ ] **Step 4: 桌面端 command 改写**
 
@@ -4052,10 +4619,142 @@ pub fn exec_attach(
     // 执行面启动清扫（迁移 / 启动对账 / 临时授权与 MCP 残留）——放在任何
     // command 可被调用之前；对账只改记录，不发信号。
     omt_exec::executor::startup_housekeeping(&daemon::runtime_dir());
+    // review R2-4：shim 丢失 / 释放失败的租约走 shim 路径释放（声明 home + 临时
+    // 授权），不依赖 desktop 会话此刻是否已打开该 workspace home。后台执行，
+    // 不阻塞窗口出现；旧记录仍由 rpc_bridge 的 U10 对账处理。
+    {
+        let runtime_dir = daemon::runtime_dir();
+        let daemon_bin = daemon::sidecar_path("omt-daemon").ok();
+        std::thread::spawn(move || {
+            let connector = omt_exec::daemon_link::admin_connector(runtime_dir.clone(), daemon_bin);
+            let released = omt_exec::executor::reconcile_with_connector(&connector, &runtime_dir);
+            if released > 0 {
+                eprintln!("启动对账：经 shim 路径释放了 {released} 个 exec 的租约");
+            }
+        });
+    }
 ```
 
+在 builder 链上（`.invoke_handler(...)` 之前）安装自定义应用菜单（review R2-5）。默认 macOS 菜单的 Quit 走 `terminate:`，直接结束进程，不会产生 `ExitRequested`，下面的退出确认就永远弹不出来。自定义的 Quit 菜单项改为调用 `app.exit(0)`，这样会经 RequestExit 产生 `ExitRequested`：
+
+```rust
+        .menu(|handle| {
+            use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
+            let quit = MenuItem::with_id(handle, "quit", "退出 oh-my-ticket", true, Some("CmdOrCtrl+Q"))?;
+            let app_menu = Submenu::with_items(
+                handle,
+                "oh-my-ticket",
+                true,
+                &[
+                    &PredefinedMenuItem::about(handle, None, None)?,
+                    &PredefinedMenuItem::separator(handle)?,
+                    &PredefinedMenuItem::hide(handle, None)?,
+                    &PredefinedMenuItem::hide_others(handle, None)?,
+                    &PredefinedMenuItem::separator(handle)?,
+                    &quit,
+                ],
+            )?;
+            // 编辑菜单必须保留：没有它，webview 里的 ⌘C / ⌘V / ⌘A 在 macOS 上失效
+            let edit_menu = Submenu::with_items(
+                handle,
+                "编辑",
+                true,
+                &[
+                    &PredefinedMenuItem::undo(handle, None)?,
+                    &PredefinedMenuItem::redo(handle, None)?,
+                    &PredefinedMenuItem::separator(handle)?,
+                    &PredefinedMenuItem::cut(handle, None)?,
+                    &PredefinedMenuItem::copy(handle, None)?,
+                    &PredefinedMenuItem::paste(handle, None)?,
+                    &PredefinedMenuItem::select_all(handle, None)?,
+                ],
+            )?;
+            let window_menu = Submenu::with_items(
+                handle,
+                "窗口",
+                true,
+                &[
+                    &PredefinedMenuItem::minimize(handle, None)?,
+                    &PredefinedMenuItem::close_window(handle, None)?,
+                ],
+            )?;
+            Menu::with_items(handle, &[&app_menu, &edit_menu, &window_menu])
+        })
+        .on_menu_event(|app, event| {
+            if event.id() == "quit" {
+                app.exit(0);
+            }
+        })
+```
+
+（若 tauri 2.12 的菜单 API 签名与上面略有出入，以编译器为准；要求只有一条：⌘Q 必须走自定义菜单项，并调用 `app.exit(0)`。）
+
 3. `invoke_handler` 列表在 `executor::exec_kill_orphan,` 后加 `executor::exec_stop_all,` 与 `executor::exec_attach,`；
-4. `.run(|app, event| { … })` 中整个 `ExitRequested` 分支删除，改为 `.run(|_app, _event| {})`。在 `run()` 函数上方的模块注释里加一句：「设计 §3.4：桌面退出不再终止执行（KD-D7 已被 KD-E1 修订），停止改由 Agents 面板『停止全部』。」
+4. `.run(|app, event| { … })` 中的 `kill_all` 删除，换成**退出确认**（review F6）。用户一直默认「退出 = 停止」，改造后 agent 会在后台继续改代码、消耗 token，所以还有运行中的 exec 时，必须先告诉用户：
+
+```rust
+/// review F6：用户在确认框里选过之后，再次进入 ExitRequested 时直接放行。
+static QUIT_CONFIRMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+```
+
+```rust
+        .run(|app, event| {
+            // 设计 §3.4：退出不再终止执行（KD-D7 已被 KD-E1 修订）。还有运行中的
+            // exec 时先问用户：全部停止后退出，或让它们在后台继续（review F6）
+            if let tauri::RunEvent::ExitRequested { api, .. } = event {
+                use std::sync::atomic::Ordering;
+                if QUIT_CONFIRMED.load(Ordering::SeqCst) {
+                    return;
+                }
+                let runtime_dir = daemon::runtime_dir();
+                let running = omt_exec::control::active_exec_count(&runtime_dir);
+                if running == 0 {
+                    return;
+                }
+                api.prevent_exit();
+                let handle = app.clone();
+                use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogResult};
+                const KEEP: &str = "继续在后台运行";
+                const STOP: &str = "全部停止后退出";
+                const CANCEL: &str = "取消";
+                app.dialog()
+                    .message(format!(
+                        "还有 {running} 个 agent 在运行。选择「{KEEP}」后，它们会一直执行到完成或超时；\
+                         随时可以重新打开本应用查看或停止。"
+                    ))
+                    .title("退出 oh-my-ticket")
+                    // review R2-6：第一个按钮是 Return 默认键，放安全的「继续在后台运行」；
+                    // 「取消」= 不退出（误按 ⌘Q 时可以反悔）
+                    .buttons(MessageDialogButtons::YesNoCancelCustom(KEEP.into(), STOP.into(), CANCEL.into()))
+                    .show_with_result(move |result| {
+                        let choice = match result {
+                            MessageDialogResult::Custom(label) => label,
+                            MessageDialogResult::Yes => KEEP.to_string(),
+                            MessageDialogResult::No => STOP.to_string(),
+                            _ => CANCEL.to_string(),
+                        };
+                        match choice.as_str() {
+                            KEEP => {}
+                            STOP => {
+                                for home_id in omt_exec::layout::home_ids(&runtime_dir) {
+                                    let _ = omt_exec::control::stop_all(&runtime_dir, &home_id);
+                                }
+                            }
+                            _ => return, // 取消 / Esc / 关闭对话框：不退出
+                        }
+                        QUIT_CONFIRMED.store(true, Ordering::SeqCst);
+                        handle.exit(0);
+                    });
+            }
+        });
+```
+
+按钮语义（review R2-6）：
+- 第一个按钮「继续在后台运行」是 macOS 的 Return 默认键，反射性按 Enter 不会打断工作；
+- 「全部停止后退出」必须显式点击；
+- 「取消」以及 Esc、关闭对话框都不退出应用。
+
+`tauri-plugin-dialog` 2.7.1 提供 `YesNoCancelCustom` 与 `show_with_result`。如果 `MessageDialogResult` 的变体名与上面不同，以该版本的定义为准，并保持上述三种语义。`run()` 函数上方的模块注释同步改为：「设计 §3.4：桌面退出不再终止执行（KD-D7 已被 KD-E1 修订）；有运行中的 exec 时退出前确认，并提供 Agents 面板『停止全部』。」
 
 `rpc_bridge.rs` 的 U10 对账保持 Task 2 的写法（它负责释放 `SHIM_LOST_MARKER` / `lease_release_pending` 的租约）。
 
@@ -4076,7 +4775,7 @@ Expected：Rust 全绿。`omt-exec` 里原来驱动 `ExecutionManager` 的进程
 cd apps/desktop && pnpm tauri:dev
 ```
 1. 派发一个 ticket 给 pi：弹窗无报错，Agents 面板实时显示 transcript；
-2. 派发后**退出桌面端**（⌘Q），在终端执行 `ps -ef | grep 'exec-shim' | grep -v grep`：shim 仍在；
+2. 派发后**退出桌面端**（⌘Q）：应弹出退出确认（自定义 Quit 菜单项生效），选「继续在后台运行」。在终端执行 `ps -ef | grep 'exec-shim' | grep -v grep`，shim 应仍在；
 3. 等执行结束后重开桌面端：该 agent 为 `exited`，transcript 完整（历史回载），run 进度正确；
 4. 再派发一个长任务，执行中退出并立刻重开：该 agent 显示「运行中」并可停止；点停止后显示 `killed`。
 
@@ -4099,18 +4798,29 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ---
 
-### Task 11: 前端补齐「停止全部」与重启后接回实时流（P-10）
+### Task 11: 前端补齐「停止全部」、重启后接回实时流与状态说明（P-10 + review）
 
 **Files:**
-- Modify: `apps/desktop/src/bridge.ts`、`apps/desktop/src/store.ts`、`apps/desktop/src/AgentsPanel.tsx`、`apps/desktop/src/App.tsx`
+- Modify: `apps/desktop/src/bridge.ts`、`apps/desktop/src/store.ts`、`apps/desktop/src/agentUi.tsx`、`apps/desktop/src/AgentsPanel.tsx`、`apps/desktop/src/App.tsx`、`apps/desktop/src/styles.css`
 - Create: `apps/desktop/tests/exec-plane.spec.tsx`
 
 **Interfaces:**
-- Consumes: Task 10 的 `exec_stop_all`、`exec_attach` command。
+- Consumes: Task 10 的 `exec_stop_all`、`exec_attach` command；Task 9 的 `SHIM_LOST_MARKER` 文案（`"exec shim exited before finishing"`）。
 - Produces:
   - `bridge.ts`：`execStopAll(homeId: string): Promise<number>`、`execAttach(options: { homeId: string; execId: string; afterSeq: number | null; channel: Channel<TranscriptEvent> }): Promise<void>`
-  - `store.ts` 返回对象新增：`attachTranscript(execId: string, homeId: string): void`、`stopAll(): Promise<void>`
-  - `AgentsPanel` 新增**可选** props：`attachTranscript?: (execId: string, homeId: string) => void`、`onStopAll?: () => void`
+  - `store.ts` 返回对象新增：`attachTranscript(execId: string, homeId: string): void`、`stopAll(): Promise<number | null>`（返回发出停止的数量；**失败返回 null**，review R2-7）
+  - `agentUi.tsx`：`ConfirmStopAllButton({ running, claimed, busy, onConfirm })`、`describeFailure(detail: string): string`
+  - `AgentsPanel` 新增**可选** props：`attachTranscript?: (execId: string, homeId: string) => void`、`onStopAll?: () => Promise<number | null>`
+
+本 Task 涉及的 review 修正，都已经写进下面的步骤：
+- 「停止全部」用两步确认，并显示运行数和已认领项总数（F7）；
+- 「停止全部」有进行中状态、结果反馈和作用范围说明（F14）；
+- shim 丢失等失败显示可读说明（F8）；
+- orphan 提示改为新语义（F11）；
+- 删除确认框说明 transcript 会一并删除（F3）。
+- 第 2 轮：停止失败显示「停止失败」而不是「0 个」（R2-7）；确认文案可以换行（R2-10）；派发进行中不重复接回实时流，避免事件显示两次（R2-9）。按 seq 去重不可行：既有测试会连续送入两条同 seq、不同 status 的 exit 事件（`agents.spec.tsx` 的 U16 通知用例）。
+
+既有测试只断言 orphan 角标正文「不受控·只读」（`agents.spec.tsx`），所以角标正文保持不变，只改它的 `title` 和分组标题。
 
 - [ ] **Step 1: 写失败测试**
 
@@ -4118,19 +4828,23 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ```tsx
 /**
- * 执行面子项目 1（P-10）：Agents 面板的「停止全部」与重启后接回实时流。
- * 只测新增的可选 props；既有 agents.spec 不改。
+ * 执行面子项目 1（P-10 + review F3/F7/F8/F11/F14）：Agents 面板的「停止全部」、
+ * 重启后接回实时流、失败与 orphan 的状态说明。只测新增行为；既有 agents.spec 不改。
  */
 import { describe, expect, it, vi, afterEach } from 'vitest'
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import type { AgentRecord } from '../src/types'
 
 afterEach(cleanup)
 
+const invokeMock = vi.fn()
 vi.mock('@tauri-apps/api/core', () => ({
-  invoke: vi.fn(),
+  invoke: (...args: unknown[]) => invokeMock(...args),
   Channel: class {
     onmessage: ((m: unknown) => void) | null = null
+    toJSON() {
+      return '__CHANNEL__'
+    }
   },
 }))
 vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn().mockResolvedValue(() => {}) }))
@@ -4216,14 +4930,49 @@ describe('exec plane P-10', () => {
     expect(history).toHaveBeenCalledWith('exec-1', 'h_test')
   })
 
-  it('shows 停止全部 only when something is running and wires the callback', () => {
-    const stopAll = vi.fn()
+  it('停止全部 needs a second confirm, shows progress, then the result', async () => {
+    let resolve!: (n: number) => void
+    const stopAll = vi.fn(() => new Promise<number>(r => { resolve = r }))
     renderPanel({ onStopAll: stopAll })
     fireEvent.click(screen.getByRole('button', { name: '停止全部' }))
+    expect(stopAll).not.toHaveBeenCalled()
+    expect(screen.getByText(/确认停止 1 个 agent/)).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: '确认' }))
     expect(stopAll).toHaveBeenCalledTimes(1)
-    cleanup()
-    renderPanel({ agents: [agent({ status: 'exited', attachment: 'none' })], onStopAll: stopAll })
+    expect(screen.getByRole('button', { name: '停止中…' })).toHaveProperty('disabled', true)
+    await act(async () => {
+      resolve(1)
+    })
+    expect(screen.getByText(/已向 1 个 agent 发出停止信号/)).toBeTruthy()
+  })
+
+  it('停止全部 failure is reported as failure, not as 0 stopped (review R2-7)', async () => {
+    renderPanel({ onStopAll: vi.fn().mockResolvedValue(null) })
+    fireEvent.click(screen.getByRole('button', { name: '停止全部' }))
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '确认' }))
+    })
+    expect(screen.getByText(/停止失败/)).toBeTruthy()
+    expect(screen.queryByText(/已向 0 个/)).toBeNull()
+  })
+
+  it('hides 停止全部 when nothing is running', () => {
+    renderPanel({ agents: [agent({ status: 'exited', attachment: 'none' })], onStopAll: vi.fn() })
     expect(screen.queryByRole('button', { name: '停止全部' })).toBeNull()
+  })
+
+  it('explains a failed agent whose shim was lost', () => {
+    const failed = agent({ status: 'failed', attachment: 'none' })
+    failed.execs[0].failureDetail = 'exec shim exited before finishing'
+    renderPanel({ agents: [failed] })
+    expect(screen.getAllByText(/执行进程异常退出/).length).toBeGreaterThan(0)
+  })
+
+  it('orphan badge no longer promises a live tail', () => {
+    renderPanel({ agents: [agent({ status: 'failed', attachment: 'orphan' })] })
+    const badge = screen.getByText('不受控·只读')
+    expect(badge.getAttribute('title')).toMatch(/不会再有新输出/)
+    expect(screen.queryByText('不受控（重启遗留）')).toBeNull()
   })
 
   it('renders without the new props (existing callers unaffected)', () => {
@@ -4231,14 +4980,45 @@ describe('exec plane P-10', () => {
     expect(screen.queryByRole('button', { name: '停止全部' })).toBeNull()
   })
 })
+
+describe('exec plane store guards', () => {
+  /** review R2-9：派发（含续跑的就绪握手，最长 30s）进行中不接回实时流——否则
+   * exec_start 返回后会出现第二个跟随者，事件全部显示两次。 */
+  it('does not start a second follower while a dispatch is in flight', async () => {
+    let finishStart!: (v: unknown) => void
+    invokeMock.mockReset()
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === 'exec_start') return new Promise(resolve => { finishStart = resolve })
+      return Promise.resolve({})
+    })
+    const { useTreeStore } = await import('../src/store')
+    const { renderHook } = await import('@testing-library/react')
+    const { result } = renderHook(() => useTreeStore())
+    const home = { homeId: 'h1', kind: 'workspace', path: '/tmp/ws/.omt' } as never
+    let dispatch!: Promise<unknown>
+    act(() => {
+      dispatch = result.current.startDispatch({ home, nodeId: 'TICKET-1', harness: 'pi', unattended: true, agentId: 'agent-x' })
+    })
+    act(() => { result.current.attachTranscript('exec-new', 'h1') })
+    expect(invokeMock).not.toHaveBeenCalledWith('exec_attach', expect.anything())
+    await act(async () => {
+      finishStart({ execId: 'exec-new', agentId: 'agent-x', runId: 'RUN-1', warnings: [] })
+      await dispatch
+    })
+    act(() => { result.current.attachTranscript('exec-new', 'h1') })
+    expect(invokeMock).not.toHaveBeenCalledWith('exec_attach', expect.anything())
+    act(() => { result.current.attachTranscript('exec-other', 'h1') })
+    expect(invokeMock).toHaveBeenCalledWith('exec_attach', expect.objectContaining({ execId: 'exec-other' }))
+  })
+})
 ```
 
-（若 `agents.spec.tsx` 里 mock 的通知插件路径或 `fetchRun` 的返回形状与这里不同，按它改，保证新文件与既有 mock 边界一致。）
+（如果 `agents.spec.tsx` 里 mock 的通知插件路径，或 `fetchRun` 的返回形状与这里不同，按它改，让新文件与既有的 mock 边界保持一致。）
 
 ```bash
-cd apps/desktop && pnpm vitest run tests/exec-plane.spec.tsx 2>&1 | tail -15
+cd apps/desktop && pnpm vitest run tests/exec-plane.spec.tsx 2>&1 | tail -20
 ```
-Expected：前 3 个用例失败（`attachTranscript` 未被调用；找不到「停止全部」按钮），第 4 个通过。
+Expected：P-10 组第 1、3、4、6、7 个用例失败（依次是：`attachTranscript` 未被调用；找不到「停止全部」按钮；同上；没有失败说明；orphan 提示仍是旧文案）。第 2、5、8 个用例通过，它们锁定的是既有行为。store guards 组的唯一用例失败（`attachTranscript` 不存在）。
 
 - [ ] **Step 2: 实现 bridge**
 
@@ -4279,7 +5059,19 @@ export async function execAttach(options: {
   const attachedRef = useRef<Set<string>>(new Set())
 ```
 
-3. `startDispatch` 里 `const outcome = await execStart({...})` 之后加 `attachedRef.current.add(outcome.execId)`；
+3. `transcriptsRef` 声明旁再加 `const dispatchingRef = useRef(0)`（review R2-9：派发进行中的计数）。`startDispatch` 里把 `const outcome = await execStart({...})` 包成：
+
+```ts
+      dispatchingRef.current += 1
+      let outcome: ExecStartOutcome
+      try {
+        outcome = await execStart({ /* …原参数不变… */ })
+      } finally {
+        dispatchingRef.current -= 1
+      }
+      attachedRef.current.add(outcome.execId)
+```
+
 4. 在 `stopAgent` 之后加：
 
 ```ts
@@ -4287,6 +5079,9 @@ export async function execAttach(options: {
   const attachTranscript = useCallback(
     (execId: string, homeId: string) => {
       if (attachedRef.current.has(execId)) return
+      // review R2-9：派发进行中（续跑的就绪握手最长 30s）先不接——新 exec 的
+      // 跟随者会由 exec_start 建立；其余 exec 在派发结束后的下一次列表重拉时再接
+      if (dispatchingRef.current > 0) return
       attachedRef.current.add(execId)
       const channel = new Channel<TranscriptEvent>()
       channel.onmessage = ev => ingestTranscriptEvent(ev)
@@ -4301,35 +5096,126 @@ export async function execAttach(options: {
     [ingestTranscriptEvent],
   )
 
-  /** P-10：停止当前 home 的全部运行中 exec。 */
-  const stopAll = useCallback(async () => {
+  /** P-10 / review F14 / R2-7：停止当前 home 的全部运行中 exec，返回发出停止的
+   * 数量；失败返回 null（不能与「本来就没有运行中的」0 混淆）。 */
+  const stopAll = useCallback(async (): Promise<number | null> => {
     const home = activeHomeRef.current
-    if (!home) return
+    if (!home) return null
     try {
-      await execStopAll(home.homeId)
+      const count = await execStopAll(home.homeId)
       scheduleAgentsRepull()
+      return count
     } catch (error) {
       setState(s => ({ ...s, error: presentError(error) }))
+      return null
     }
   }, [scheduleAgentsRepull])
 ```
 
 5. store 返回对象（`loadHistoryTail,` 所在的那个对象字面量）加 `attachTranscript,` 与 `stopAll,`。
 
-- [ ] **Step 4: 实现 AgentsPanel 与 App 接线**
+- [ ] **Step 4: 实现 agentUi 组件**
+
+`apps/desktop/src/agentUi.tsx` 末尾加（`useState` / `useEffect` / `CONFIRM_RESET_MS` 在该文件中已有）：
+
+```tsx
+/** review F7/F14：「停止全部」两段式确认（误点保护不弱于单个终止），进行中禁用。 */
+export function ConfirmStopAllButton({
+  running,
+  claimed,
+  busy,
+  onConfirm,
+}: {
+  running: number
+  claimed: number | null
+  busy: boolean
+  onConfirm: () => void
+}) {
+  const [arming, setArming] = useState(false)
+  useEffect(() => {
+    if (!arming) return
+    const timer = setTimeout(() => setArming(false), CONFIRM_RESET_MS)
+    return () => clearTimeout(timer)
+  }, [arming])
+  if (busy) {
+    return (
+      <button type="button" className="chip agents-stop-all" disabled>
+        停止中…
+      </button>
+    )
+  }
+  if (!arming) {
+    return (
+      <button
+        type="button"
+        className="chip agents-stop-all"
+        title="只停止当前 workspace 中可控的 agent；不受控（orphan）的需单独强制终止"
+        onClick={() => setArming(true)}
+      >
+        停止全部
+      </button>
+    )
+  }
+  return (
+    <span className="confirm-stop agents-stop-all">
+      确认停止 {running} 个 agent{claimed !== null ? `，将释放 ${claimed} 个已认领项` : ''}
+      <button
+        type="button"
+        className="chip active"
+        onClick={() => {
+          setArming(false)
+          onConfirm()
+        }}
+      >
+        确认
+      </button>
+      <button type="button" className="chip" onClick={() => setArming(false)}>
+        取消
+      </button>
+    </span>
+  )
+}
+
+/** review F8：失败详情的展示文案。已知的内部标记映射为可读说明，其余截断原文。 */
+export function describeFailure(detail: string): string {
+  if (detail === 'exec shim exited before finishing') {
+    return '执行进程异常退出（运行项会在对账时释放，可续跑）'
+  }
+  if (detail === 'app restarted before exec finished') {
+    return '应用重启时执行被中断（运行项会在对账时释放，可续跑）'
+  }
+  return detail.length > 120 ? `${detail.slice(0, 120)}…` : detail
+}
+```
+
+- [ ] **Step 5: 实现 AgentsPanel、App 与样式**
 
 `apps/desktop/src/AgentsPanel.tsx`：
-1. `Props` 在 `loadHistoryTail` 之后加：
+1. import 改为 `import { agentDisplayName, ConfirmStopAllButton, ConfirmStopButton, describeFailure } from './agentUi'`；
+2. `Props` 在 `loadHistoryTail` 之后加：
 
 ```ts
   /** P-10：选中仍在运行、但本会话无事件的 agent 时接回实时流（桌面重启后） */
   attachTranscript?: (execId: string, homeId: string) => void
-  /** P-10：停止全部运行中 exec（替代桌面退出即终止） */
-  onStopAll?: () => void
+  /** P-10：停止全部运行中 exec（替代桌面退出即终止）；返回发出停止的数量，失败为 null */
+  onStopAll?: () => Promise<number | null>
 ```
 
-2. 解构参数加 `attachTranscript,` 与 `onStopAll,`；
-3. F-PI-3 的 effect 中 `if (live) return` 改为：
+3. 解构参数加 `attachTranscript,` 与 `onStopAll,`；
+4. 在组件顶部其余 `useState` 旁加（hooks 必须在提前 return 之前）：
+
+```ts
+  /** review F14：停止全部的进行中状态与结果提示（5 秒后消失） */
+  const [stoppingAll, setStoppingAll] = useState(false)
+  const [stopAllNotice, setStopAllNotice] = useState<string | null>(null)
+  useEffect(() => {
+    if (!stopAllNotice) return
+    const timer = setTimeout(() => setStopAllNotice(null), 5000)
+    return () => clearTimeout(timer)
+  }, [stopAllNotice])
+```
+
+5. F-PI-3 的 effect 中 `if (live) return` 改为：
 
 ```ts
     if (live) {
@@ -4339,21 +5225,69 @@ export async function execAttach(options: {
     }
 ```
 
-4. 主布局 `agents-list` 里 `{gcBar}` 之后加：
+6. 在 `groups` 计算之后（主布局 return 之前）加：
+
+```ts
+  // review F7：确认框里显示的已认领项总数（拉不到 run 详情的 agent 不计入）
+  const activeClaimed = groups.active.reduce<number | null>((sum, a) => {
+    const exec = latestExecOf(a)
+    const stat = exec?.runId ? stats[exec.runId] : undefined
+    if (!exec || !stat) return sum
+    return (sum ?? 0) + claimedCountForExec(stat.items, exec.execId)
+  }, null)
+  const handleStopAll = async () => {
+    if (!onStopAll) return
+    setStoppingAll(true)
+    try {
+      const count = await onStopAll()
+      const orphanNote =
+        groups.orphan.length > 0 ? `；${groups.orphan.length} 个不受控 agent 需单独强制终止` : ''
+      // review R2-7：失败、无事可做、成功三种结果分开提示
+      setStopAllNotice(
+        count === null
+          ? '停止失败，请重试'
+          : count === 0
+            ? '当前没有运行中的 agent'
+            : `已向 ${count} 个 agent 发出停止信号${orphanNote}`,
+      )
+    } finally {
+      setStoppingAll(false)
+    }
+  }
+```
+
+7. 主布局 `agents-list` 里 `{gcBar}` 之后加：
 
 ```tsx
         {onStopAll && groups.active.length > 0 && (
-          <button type="button" className="agents-stop-all" onClick={onStopAll}>
-            停止全部
-          </button>
+          <ConfirmStopAllButton
+            running={groups.active.length}
+            claimed={activeClaimed}
+            busy={stoppingAll}
+            onConfirm={() => void handleStopAll()}
+          />
         )}
+        {stopAllNotice && <p className="agents-notice">{stopAllNotice}</p>}
 ```
+
+8. review F8：`renderRow` 的 `agent-row-sub` 里，在 `run-progress` 那个 span 之后加：
+
+```tsx
+          {agent.status === 'failed' && exec?.failureDetail && (
+            <span className="agent-failure" title={exec.failureDetail}>
+              {describeFailure(exec.failureDetail)}
+            </span>
+          )}
+```
+
+9. review F11：orphan 角标的 `title` 改为 `"执行进程已丢失，harness 进程仍在运行：不会再有新输出，只能强制终止"`（角标正文「不受控·只读」不变，既有测试断言它）。分组标题 `不受控（重启遗留）` 改为 `不受控（执行进程已丢失）`。文件头注释里「Orphan 行带『不受控·只读』角标：只读尾随」一句同步改为「执行进程已丢失、harness 仍活，只能强制终止」。
+10. review F3：删除确认框文案 `将移除该 agent 的记录与执行历史（transcript 文件保留在磁盘）。此操作不可恢复。` 改为 `将删除该 agent 的记录、执行历史和 transcript 文件。此操作不可恢复。`
 
 `apps/desktop/src/App.tsx` 的 `<AgentsPanel …>` 在 `loadHistoryTail={store.loadHistoryTail}` 之后加：
 
 ```tsx
                     attachTranscript={store.attachTranscript}
-                    onStopAll={() => void store.stopAll()}
+                    onStopAll={store.stopAll}
 ```
 
 `apps/desktop/src/styles.css` 末尾加：
@@ -4363,23 +5297,42 @@ export async function execAttach(options: {
   margin: 4px 8px;
   align-self: flex-start;
 }
+/* review R2-10：确认文案 + 两个按钮超过 340px 列宽时换行，确认按钮不被裁掉 */
+.confirm-stop.agents-stop-all {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+.agents-notice {
+  margin: 0 8px 4px;
+  font-size: 12px;
+  opacity: 0.8;
+}
+.agent-failure {
+  color: var(--danger, #cf222e);
+}
 ```
 
-- [ ] **Step 5: 跑测试**
+（`.agents-list` 若不是 flex 列布局，`align-self` 无效、也无害；`--danger` 若项目已有别名，就换成已有的危险色变量。）
+
+- [ ] **Step 6: 跑测试**
 
 ```bash
 cd apps/desktop && pnpm vitest run tests/exec-plane.spec.tsx && pnpm test && pnpm exec tsc --noEmit && pnpm build
 ```
-Expected：新文件 4 passed；全量 131 + 4 = 135 passed；既有测试文件无改动（`git diff --stat apps/desktop/tests` 只有新文件）。
+Expected：新文件 9 passed；全量 131 + 9 = 140 passed；既有测试文件无改动（`git diff --stat apps/desktop/tests` 只有新文件）。如果某个既有测试因为第 8 步新增的失败说明出现「同一文本匹配到多个元素」而失败，不要改那个测试：把失败说明改成只对已知标记显示映射文案（未知详情只放在 `title` 里）。
 
-- [ ] **Step 6: 提交**
+- [ ] **Step 7: 提交**
 
 ```bash
 git add apps/desktop/src apps/desktop/tests/exec-plane.spec.tsx
-git commit -m "feat(desktop): stop-all button and live re-attach after restart (plan P-10)
+git commit -m "feat(desktop): guarded stop-all, live re-attach, failure and orphan wording
 
-Both wired as optional AgentsPanel props, so existing callers and tests
-are untouched.
+Stop-all is a two-step confirm with progress and result; restarted
+live execs re-attach their stream; shim-lost failures get a readable
+explanation; orphan and delete-dialog copy match the new semantics.
+All wired as optional AgentsPanel props, existing tests untouched.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -4515,11 +5468,16 @@ cd apps/desktop && pnpm test && pnpm exec tsc --noEmit && pnpm build
 | 2 | 执行中点「停止」 | 3s 内 `killed`，run item 回到 pending（租约已释放） |
 | 3 | 空闲 agent「续跑」 | 同一 agent 追加 exec，新 jsonl 在同一目录 |
 | 4 | 进入信任门（awaiting_confirmation）后在桌面端裁决 | 与改造前一致 |
-| 5 | 执行中 ⌘Q 退出，等执行结束再打开 | agent `exited`，transcript 完整，run 进度正确 |
-| 6 | 执行中 ⌘Q 退出后立刻打开 | agent「运行中」，实时流接回（P-10），可停止 |
-| 7 | 执行中 `kill -9 <shim pid>`，再打开桌面端 | agent `failed`（shim lost），租约被对账释放；harness 若仍活则显示为不受控、可强制终止 |
-| 8 | 「停止全部」 | 所有运行中 exec 进入 `killed` |
+| 5 | 执行中 ⌘Q，在退出确认框选「继续在后台运行」，等执行结束再打开 | agent `exited`，transcript 完整，run 进度正确 |
+| 6 | 执行中 ⌘Q 选「继续在后台运行」后立刻打开 | agent「运行中」，实时流接回（P-10），可停止 |
+| 7 | 执行中 `kill -9 <shim pid>`，再打开桌面端 | agent `failed`，行内说明「执行进程异常退出…」；租约被对账释放；harness 若仍活则进入「不受控（执行进程已丢失）」分组，可强制终止 |
+| 8 | 「停止全部」 | 第一次点击只出现确认（显示运行数与已认领项数）；确认后按钮显示「停止中…」，随后提示停止数量；所有运行中 exec 进入 `killed` |
 | 9 | 旧版本留下的 `agents.json` 数据 | 首次启动迁移，Agents 面板列表与历史 transcript 完整 |
+| 10 | 执行中 ⌘Q，在退出确认框选「全部停止后退出」 | 应用退出；所有 exec 进入 `killed`，run item 回到 pending |
+| 11 | 删除一个已结束的 agent | 确认框写明 transcript 一并删除；删除后磁盘上该 agent 目录（含 jsonl）不存在，与文案一致 |
+| 12 | 长任务期间关闭桌面端（可在 `daemon.json` 把 `idleQuietMs` 调到 60000 加速；保活间隔会自动推导为 20 秒） | harness 在静默期之后的认领 / 汇报仍成功（shim 保活）；结束后 run 进度正确，`leaseReleasePending` 为 false |
+| 13 | 有运行中的 exec 时按 ⌘Q，然后：(a) 直接按 Return；(b) 按 Esc；(c) 点「取消」 | ⌘Q 必定弹出确认框（自定义 Quit 菜单项）；(a) 继续在后台运行并退出；(b)(c) 不退出，exec 不受影响 |
+| 14 | 只开着 DSH 插件、desktop 已关闭，长任务结束后 shim 拉起过 daemon | `omt daemon-status` 显示的 daemon 同时有全局 home 和 workspace home；DSH 的全局 ticket 操作仍落在 `~/.omt` |
 
 - [ ] **Step 4: 实测项 §8「resume 后的 usage 语义」**
 
@@ -4561,3 +5519,19 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - §8 实测项中属于子项目 1 的「resume 后 usage 语义」→ Task 12 Step 4。
 
 **已知的有意简化**：P-6 纯轮询；跨进程的派发互斥（`LAUNCH_LOCK` 仅进程内）留给子项目 2；`kill_orphan` 仍只做单 pid SIGKILL。
+
+## Deferred / Open Questions
+
+### From 2026-10-21 review
+
+- **F-U4a-3 回归测试测不到它要防的竞态** — Task 3 Step 1（锁内复核测试） (P2, coherence, confidence 75)
+
+  按现在的写法，`read_json` 锁内复核逻辑一旦回归，这个测试拦不住。原因：测试一开始写入的就是好文件，然后直接调用锁内复核函数，从头到尾没有走「快路径读到坏内容 → 取锁 → 复核」这条路径。写测试时应该先写入坏内容，让快路径失败；在锁内复核之前换成好内容；最后断言没有产生 `.corrupt` 留证文件。
+
+- **Task 8 太大，难以作为一次评审单元** — Task 8：launch spec 与 `omt exec-shim` (P2, scope-guardian, confidence 75)
+
+  按现在的写法，时序敏感的保活测试一旦失败，或者对账语义的修改需要讨论，整个 Task 8 都会被卡住。原因是一次提交里放了五块可以分开交付的内容：ExecRecord 字段与对账语义、LaunchSpec、shim 主循环与 CLI 动词、home 保活，以及三个真二进制端到端测试。可以考虑拆成三个 Task：8a（ExecRecord 字段与对账修改）、8b（spec、shim 核心与 CLI 动词）、8c（保活与它的反例测试）。拆分时要同步调整后面各 Task 的编号。
+
+- **Task 11 把新功能和纯文案修改混在一起** — Task 11：前端补齐「停止全部」、重启后接回实时流与状态说明 (P2, scope-guardian, confidence 75)
+
+  按现在的写法，评审者要同时核对 store 的 ref / effect 时序和中文文案；文案改动一旦让既有测试失败，也会卡住功能部分。可以考虑拆成 11a（「停止全部」、重启后接回实时流、派发进行中的防护）和 11b（失败说明、orphan 文案、删除确认框文案，以及对应的测试）。140 个测试的验证门放在 11b 之后检查。
