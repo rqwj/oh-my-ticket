@@ -84,9 +84,11 @@ pub struct ExecRecord {
     /// 最终快照）——成本承接的第一层落盘。
     pub usage_tokens: Option<u64>,
     pub usage_cost: Option<f64>,
-    /// F-BENCH-20：usage 归档口径。Some("message-sum") = 按消息/步求和
-    /// （da9c376 起）；None = 旧口径（只含最后一条消息的 usage，少报）——
-    /// 历史记录未重算，消费方须按 None 区分展示。
+    /// F-BENCH-20：usage 归档口径。Some("message-sum") = 按消息/步求和、
+    /// Some("cumulative-last") = 会话累计取末值（e87a99a 起）；None = 旧
+    /// 口径（只含最后一条消息的 usage，少报）——历史记录未重算，消费方须
+    /// 按 None 区分展示。（注：da9c376..e87a99a 之间归档的记录已是求和
+    /// 口径但无标记——开发期数据，按旧口径对待只影响展示精度。）
     #[serde(default)]
     pub usage_caliber: Option<String>,
     /// 本次派发选用的模型（F-VIEW3：续跑列表展示）。

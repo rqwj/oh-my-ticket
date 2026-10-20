@@ -126,9 +126,10 @@ export interface ExecRecord {
   /** F-U12-4：终态归档的会话累计用量（无 usage 事件为 null） */
   usageTokens?: number | null
   usageCost?: number | null
-  /** F-BENCH-20：usage 归档口径。'message-sum' = 按消息/步求和（新口径）；
-   * null/缺省 = 旧口径（只含末条消息，少报）——历史记录未重算，消费方据此区分。 */
-  usageCaliber?: 'message-sum' | null
+  /** F-BENCH-20：usage 归档口径。'message-sum' = 按消息/步求和、
+   * 'cumulative-last' = 会话累计取末值（e87a99a 起）；null/缺省 = 旧口径
+   * （只含末条消息，少报）——历史记录未重算，消费方据此区分。 */
+  usageCaliber?: 'message-sum' | 'cumulative-last' | null
   /** 本次派发选用的模型（F-VIEW3：弹窗空闲 Agent 列表展示；未指定为 null） */
   model?: string | null
   /** Rust-captured process identity; never accepted from the renderer for kill authorization. */

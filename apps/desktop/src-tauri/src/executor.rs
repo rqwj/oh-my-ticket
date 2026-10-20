@@ -30,6 +30,10 @@ use std::os::unix::process::ExitStatusExt;
 
 const STARTUP_WINDOW: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_DURATION: Duration = Duration::from_secs(120 * 60);
+/// F-BENCH-26(b)：子进程退出 + kill_tree 清孤儿后 join reader 的上限。
+/// EOF 已由清场保证，剩余耗时只是逐行解析 + sink 回调——10s 覆盖慢
+/// sink（UI Channel 拥塞 / 机器负载）的尾部积压，又不会挂死等待线程。
+const READER_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 const KILL_GRACE: Duration = Duration::from_secs(3);
 const STDERR_TAIL_MAX_CHARS: usize = 2000;
 
@@ -132,9 +136,17 @@ impl UsageTotals {
 
     /// 最终合计：有 cumulative 用 cumulative，否则 message 求和。
     pub fn final_totals(&self) -> Option<(u64, Option<f64>)> {
-        self.cumulative
-            .or(Some((self.message_tokens, Some(self.message_cost))))
-            .filter(|(t, _)| *t > 0 || self.message_cost > 0.0)
+        self.final_with_caliber().map(|(t, c, _)| (t, c))
+    }
+
+    /// F-BENCH-20/§35：合计 + 口径（按实际产出分支）——归档写入
+    /// ExecRecord.usage_caliber，cumulative 分支不再被误标 message-sum。
+    pub fn final_with_caliber(&self) -> Option<(u64, Option<f64>, &'static str)> {
+        if let Some((t, c)) = self.cumulative {
+            return Some((t, c, "cumulative-last"));
+        }
+        Some((self.message_tokens, Some(self.message_cost), "message-sum"))
+            .filter(|(t, _, _)| *t > 0 || self.message_cost > 0.0)
     }
 }
 
@@ -176,6 +188,9 @@ pub struct ExecSession {
     /// session_start 恒为 seq 0，之后严格递增。
     seq: AtomicU64,
     first_event_seen: AtomicBool,
+    /// F-BENCH-26(a)：终态收口进行中（幂等 guard）。`terminal` 要等全部
+    /// 落账完成才发布，不能再用 terminal.is_some() 当 guard。
+    finishing: AtomicBool,
     /// 终止方设置的原因：exec_stop=User、kill_all=AppExit、watchdog=MaxDuration
     stop_reason: Mutex<Option<KillReason>>,
     terminal: Mutex<Option<Terminal>>,
@@ -532,6 +547,7 @@ impl ExecutionManager {
             sink: on_event.clone(),
             seq: AtomicU64::new(0),
             first_event_seen: AtomicBool::new(false),
+            finishing: AtomicBool::new(false),
             stop_reason: Mutex::new(None),
             terminal: Mutex::new(None),
         });
@@ -629,8 +645,13 @@ impl ExecutionManager {
                         );
                         // F-U2-4(b)：harness 本体已退出，进程组内的残留成员是
                         // 孤儿（继承 stdout 会卡住 reader）——KD-D7 语义清场
-                        // （本分支只会进入一次）
+                        //（本分支只会进入一次）
                         waiter_session.kill_tree(libc::SIGKILL);
+                        // F-BENCH-26(b)：孤儿清场后管道必然 EOF——先排空
+                        // reader（有界），末条 message_end / session id 等
+                        // 尾部事件全部落账后才 classify/finish；否则 usage
+                        // 少记末条、jsonl 在 exit 之后还会追加行
+                        drain_readers(&mut readers, READER_DRAIN_TIMEOUT, &waiter_session.exec_id);
                         let code = status.code();
                         #[cfg(unix)]
                         let signal = status.signal();
@@ -654,6 +675,7 @@ impl ExecutionManager {
                     {
                         // 兜底：升级 KILL 后仍未收割（极端）——强制按 Killed 收口
                         waiter_session.kill_tree(libc::SIGKILL);
+                        drain_readers(&mut readers, READER_DRAIN_TIMEOUT, &waiter_session.exec_id);
                         let terminal =
                             Terminal::Killed(kill_reason.unwrap_or(KillReason::MaxDuration));
                         finish_terminal(&waiter_session, &terminal);
@@ -666,7 +688,8 @@ impl ExecutionManager {
                     }
                 }
             }
-            for reader in readers {
+            // Err 路径（try_wait 失败，不落账）同样回收 reader
+            for reader in readers.drain(..) {
                 let _ = reader.join();
             }
         });
@@ -864,16 +887,17 @@ fn classify(
 }
 
 /// 终态收口：写 agents.json（仅状态变化时落盘）+ 终态事件。
+/// F-BENCH-26(a)：幂等 guard 是独立的 `finishing` 标记——`terminal` 在
+/// 全部落账（MCP 释放 / agents.json 状态与 usage / session id / 租约
+/// 释放 / exit 事件与行）完成之后**最后**发布；轮询方（测试 wait_for、
+/// kill_all 收口、UI）在 terminal() 变 Some 的瞬间读到的就是完整数据。
 fn finish_terminal(session: &ExecSession, terminal: &Terminal) {
+    if session
+        .finishing
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
     {
-        let mut guard = session
-            .terminal
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if guard.is_some() {
-            return; // 已收口（如 kill_all 与等待线程竞争）
-        }
-        *guard = Some(terminal.clone());
+        return; // 已收口（如 kill_all 与等待线程竞争）
     }
     let runtime_dir = &session.runtime_dir;
     let (status, _detail) = match terminal {
@@ -901,7 +925,7 @@ fn finish_terminal(session: &ExecSession, terminal: &Terminal) {
         .usage_totals
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .final_totals();
+        .final_with_caliber();
     let _ = agents::update_exec(
         runtime_dir,
         &session.home_id,
@@ -913,11 +937,12 @@ fn finish_terminal(session: &ExecSession, terminal: &Terminal) {
                 Terminal::Failed(detail) => exec.failure_detail = Some(detail.clone()),
                 Terminal::Killed(reason) => exec.kill_reason = Some(reason.key()),
             }
-            if let Some((tokens, cost)) = final_usage {
+            if let Some((tokens, cost, caliber)) = final_usage {
                 exec.usage_tokens = Some(tokens);
                 exec.usage_cost = cost;
-                // F-BENCH-20：口径自描述——旧记录（da9c376 前）无此字段
-                exec.usage_caliber = Some("message-sum".into());
+                // F-BENCH-20：口径按实际产出分支写入（§35 nit：cumulative
+                // 不再误标 message-sum）
+                exec.usage_caliber = Some(caliber.to_string());
             }
         },
     );
@@ -968,6 +993,31 @@ fn finish_terminal(session: &ExecSession, terminal: &Terminal) {
     (session.sink)(exit_event.clone());
     // F-U12-4：exit 事件同样落 jsonl（回放含终态行）
     append_event_line(session, &exit_event);
+    // F-BENCH-26(a)：terminal 最后发布——此刻全部落账已完成
+    *session
+        .terminal
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(terminal.clone());
+}
+
+/// F-BENCH-26(b)：有界 join reader 线程。kill_tree(SIGKILL) 清场后管道
+/// 必然 EOF，reader 的剩余耗时只是逐行解析 + sink 回调——上限防 sink
+/// 死锁把等待线程挂死；超时放弃剩余句柄（detach，不优于修复前但不会
+/// 更差）。
+fn drain_readers(readers: &mut Vec<std::thread::JoinHandle<()>>, timeout: Duration, exec_id: &str) {
+    let deadline = Instant::now() + timeout;
+    for handle in readers.drain(..) {
+        while !handle.is_finished() {
+            if Instant::now() >= deadline {
+                eprintln!(
+                    "[executor] reader 排空超时（exec {exec_id}）——继续收口，尾部事件可能缺失"
+                );
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = handle.join();
+    }
 }
 
 /// 幂等终止（§3.4）：对已终态/不存在的 execId 直接成功。
@@ -2087,6 +2137,7 @@ mod tests {
             sink: Arc::new(|_| {}),
             seq: AtomicU64::new(0),
             first_event_seen: AtomicBool::new(true),
+            finishing: AtomicBool::new(false),
             stop_reason: Mutex::new(Some(KillReason::AppExit)),
             terminal: Mutex::new(None),
         };
@@ -2153,6 +2204,7 @@ mod tests {
             sink: Arc::new(|_| {}),
             seq: AtomicU64::new(0),
             first_event_seen: AtomicBool::new(true),
+            finishing: AtomicBool::new(false),
             stop_reason: Mutex::new(Some(KillReason::AppExit)),
             terminal: Mutex::new(None),
         };
@@ -2402,7 +2454,10 @@ mod tests {
             released,
             ("h_test".into(), "run-1".into(), "exec-lease".into())
         );
-        assert!(session.terminal().is_some());
+        // F-BENCH-26(a)：terminal 是**最后**发布的信号——租约释放之后
+        // 还有 exit 事件/行与 terminal 发布，等待而非立即断言
+        let term = wait_for(|| session.terminal(), Duration::from_secs(10));
+        assert!(term.is_some(), "租约释放后 terminal 应随即发布");
         assert!(lease_rx.try_recv().is_err(), "幂等终态不得重复释放租约");
     }
 
@@ -2464,6 +2519,79 @@ mod tests {
         assert_eq!(exec.usage_tokens, Some(250), "按消息求和归档");
         assert!((exec.usage_cost.unwrap() - 0.03).abs() < 1e-9);
         assert_eq!(exec.usage_caliber.as_deref(), Some("message-sum"));
+    }
+
+    /// F-BENCH-26 回归（评审方确定性复现，§35）：sink 慢（每事件 700ms，
+    /// 模拟 UI Channel 拥塞 / 机器负载）→ reader 落后于进程退出。契约：
+    /// terminal() 发布即完整——wait_for 返回后**立即**读到的 usage 必须
+    /// 是两条 message_end 的求和（250），jsonl 末行必须是 exit。
+    #[test]
+    fn slow_sink_tail_events_settle_before_terminal() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        let home_path = dir.path().join("ws").join(".omt");
+        std::fs::create_dir_all(&home_path).unwrap();
+        let manager = ExecutionManager::with_limits(STARTUP_WINDOW, DEFAULT_MAX_DURATION);
+        let script = write_script(
+            dir.path(),
+            "usage-pi-slow",
+            "echo '{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"usage\":{\"totalTokens\":100,\"cost\":{\"total\":0.01}}}}'\necho '{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"usage\":{\"totalTokens\":150,\"cost\":{\"total\":0.02}}}}'",
+        );
+        let agent = agents::register_agent(
+            &runtime,
+            "h_test",
+            "pi",
+            NewExec {
+                exec_id: "exec-slow".into(),
+                node_id: None,
+                run_id: None,
+                binary_path: None,
+                binary_args: vec![],
+                model: None,
+            },
+        )
+        .unwrap();
+        let session = manager
+            .spawn(
+                &runtime,
+                SpawnRequest {
+                    exec_id: "exec-slow".into(),
+                    agent_id: agent.id,
+                    home_id: "h_test".into(),
+                    home_path,
+                    harness: "pi".into(),
+                    node_id: None,
+                    run_id: None,
+                    program: script,
+                    args: vec![],
+                    env_additions: BTreeMap::new(),
+                    mcp: McpInjection::None,
+                },
+                Arc::new(|_| std::thread::sleep(Duration::from_millis(700))),
+            )
+            .unwrap();
+        wait_for(|| session.terminal().map(|_| ()), Duration::from_secs(30)).expect("应到达终态");
+        // 刻意不 sleep：「terminal 发布即完整」是 F-BENCH-26(a) 的契约本身
+        let (file, _) = crate::atomic_json::read_json::<crate::agents::AgentsFile>(
+            &runtime.join("agents").join("h_test").join("agents.json"),
+        )
+        .unwrap();
+        let exec = &file.agents[0].execs[0];
+        assert_eq!(exec.usage_tokens, Some(250), "末条 message_end 不得漏记");
+        assert_eq!(exec.usage_caliber.as_deref(), Some("message-sum"));
+        let jsonl = std::fs::read_to_string(
+            runtime
+                .join("transcripts")
+                .join("h_test")
+                .join("exec-slow.jsonl"),
+        )
+        .unwrap();
+        let last_kind = jsonl
+            .lines()
+            .last()
+            .and_then(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .and_then(|v| v["kind"].as_str().map(str::to_string));
+        assert_eq!(last_kind.as_deref(), Some("exit"), "exit 必须是 jsonl 末行");
     }
 
     #[test]
