@@ -40,7 +40,8 @@ static DISPATCH_LOCK: Mutex<()> = Mutex::new(());
 
 /// 派发 prompt 模板（§3.6.11 不可信内容规则 + §3.3 纪律）。
 /// `{run_id}` 由 exec_start 替换；ticket/claim context 正文是不可信数据。
-const DISPATCH_PROMPT: &str = "\
+/// pub(crate)：launcher（launch::start）复用同一模板（Task 9）。
+pub(crate) const DISPATCH_PROMPT: &str = "\
 You are executing tickets from an OMT run. Follow these rules exactly.\n\
 Home: homeId \"{home_id}\" (pass it as the homeId argument to every omt tool call).\n\
 1. Call the omt tool run__claim with homeId \"{home_id}\" and runId \"{run_id}\" to claim the next pending item.\n\
@@ -1079,12 +1080,13 @@ pub struct ExecStartOutcome {
 
 /// dispatch_chain 的 daemon RPC seam（#5）：生产侧由 `exec_start_impl` 包装
 /// 调用方注入的 `RpcFn`（行为不变），测试侧注入脚本化替身——补偿表（cancel）
-/// 才能被断言。
-type DaemonRpc<'a> = &'a dyn Fn(&str, serde_json::Value) -> Result<serde_json::Value, String>;
+/// 才能被断言。pub(crate)：launcher 复用同一 seam（Task 9）。
+pub(crate) type DaemonRpc<'a> =
+    &'a dyn Fn(&str, serde_json::Value) -> Result<serde_json::Value, String>;
 
 /// F-U3-9 后续：收集子树内可执行的 ticket/subticket 成员（跳过 done/archived），
-/// 语义对齐 DSH 面 collectRunMembers。
-fn collect_members(
+/// 语义对齐 DSH 面 collectRunMembers。pub(crate)：launcher 复用（Task 9）。
+pub(crate) fn collect_members(
     rpc: DaemonRpc<'_>,
     home_id: &str,
     node_id: &str,
@@ -1402,8 +1404,14 @@ fn dispatch_chain(
 }
 
 /// 补偿表（§3.3）：⑤⑦ 失败 → cancel 新建 run + Agent Failed。cancel 与链上
-/// 其余步骤同走 `rpc` seam（测试据此断言补偿行为）。
-fn compensate_new_run(rpc: DaemonRpc<'_>, home_id: &str, run_id: &str, was_newly_created: bool) {
+/// 其余步骤同走 `rpc` seam（测试据此断言补偿行为）。pub(crate)：launcher
+/// 复用（Task 9）。
+pub(crate) fn compensate_new_run(
+    rpc: DaemonRpc<'_>,
+    home_id: &str,
+    run_id: &str,
+    was_newly_created: bool,
+) {
     if was_newly_created {
         let _ = rpc(
             "run/control",

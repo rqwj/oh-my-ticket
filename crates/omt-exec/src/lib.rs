@@ -2,9 +2,11 @@
 //! 后续 Task 加入 launcher / shim / 控制与对账。daemon 代码路径不引用本 crate。
 
 pub mod agents;
+pub mod control;
 pub mod daemon_link;
 pub mod executor;
 pub mod grants;
+pub mod launch;
 pub mod layout;
 pub mod mcp_injection;
 pub mod migrate;
