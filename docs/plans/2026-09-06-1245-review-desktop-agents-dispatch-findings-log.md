@@ -74,12 +74,12 @@ branch: feat/desktop-agents-dispatch
 | F-U2-8 | P3 | gated_auto | U2 | `executor.rs::sanitize_line` / `session_start.args` | `to_lowercase()` 索引原串，非 ASCII 行偏移错位可能欠脱敏（改 `to_ascii_lowercase`）；`args` 事件/日志未脱敏（extra_args 可含 `--api-key`） | fixed(12e4d91)（sanitize_line 改 ascii lowercase；新增 sanitize_args 并用于 session_start 事件与会话记录） | — |
 | F-U2-9 | P3 | advisory | U2 | `agents::demote_live_agents` × dev 多实例 | `OMT_ALLOW_MULTI_INSTANCE` 下第二实例启动 demote 会把首实例的 Live agent 标 Failed；dev-notes 需补「同时隔离 `OMT_RUNTIME_DIR`」 | fixed(af28ca2)（dev-notes §1.4 已补 OMT_RUNTIME_DIR 隔离说明） | — |
 | F-U2-10 | P3 | gated_auto | U2 | `executor.rs::spawn` raw_log 路径 | `home_id` 未经 `validate_home_id` 即拼路径 | fixed(12e4d91)（spawn 入口复用 agents::validate_home_id（提为 pub(crate)）） | — |
-| F-U2-11 | P3 | advisory | U2 | `harness.rs::probe_descriptor` | 探针失败重试一次把 `harness_list` 最坏延迟翻倍（8s）；注释归因「fork→exec 卡死」需复现记录 | open | — |
+| F-U2-11 | P3 | advisory | U2 | `harness.rs::probe_descriptor` | 探针失败重试一次把 `harness_list` 最坏延迟翻倍（8s）；注释归因「fork→exec 卡死」需复现记录 | superseded（F-BENCH-25：根因已定性为 exec 评估停顿，probe_all 并行探测 + 梯子 2/6/6，e87a99a） | — |
 | F-U4a-1 | P2 | manual | U4a | `atomic_json::read_json_locked` / `agents::agents_list` | `parseFailed` 是**瞬态**信号（损坏文件被 rename 后第二次读即 false + 空列表），U9「解析失败期间冻结 GC」硬规则会失效并清空全部绑定 | open（U9 前置） | — |
 | F-U4a-2 | P2 | gated_auto | U4a→U2 | `agents::register_agent` 写 `attachment: Live` | Live 持久化后跨重启失真：U10（P1）才 reconcile，P0 期间重启/崩溃后 `agents_list` 仍报 Live+Starting/Running | fixed(b8b00f8)（`demote_live_agents` + ExecutionManager::new 启动 demote + 测试） | — |
-| F-U4a-3 | P3 | gated_auto | U4a | `atomic_json::read_json` | 读路径的损坏 rename 不在 flock 内，与另一进程的写 rename 竞态可能把刚写好的文件挪成 `.corrupt` | open | — |
-| F-U4a-4 | P3 | gated_auto | U4a | `atomic_json::write_tmp_and_rename` | rename 前无 `sync_all`，断电可能留下 0 字节文件 → 下次降级丢 agents 列表 | open | — |
-| F-U4a-5 | P3 | advisory | U4a | `atomic_json::STORE_LOCK` | 全局锁横跨所有 store 文件且持锁等 flock 最长 10s，未来 CLI 长持 agents 锁会连 harness config 保存一起阻塞 | open（v1 接受） | — |
+| F-U4a-3 | P3 | gated_auto | U4a | `atomic_json::read_json` | 读路径的损坏 rename 不在 flock 内，与另一进程的写 rename 竞态可能把刚写好的文件挪成 `.corrupt` | fixed(cd2a0d4)：快路径 + 锁内复核（双侧测试：好内容不隔离、真损坏仍隔离），现位于 omt-harness | — |
+| F-U4a-4 | P3 | gated_auto | U4a | `atomic_json::write_tmp_and_rename` | rename 前无 `sync_all`，断电可能留下 0 字节文件 → 下次降级丢 agents 列表 | fixed(cd2a0d4)：tmp fsync + rename + 父目录 best-effort fsync | — |
+| F-U4a-5 | P3 | advisory | U4a | `atomic_json::STORE_LOCK` | 全局锁横跨所有 store 文件且持锁等 flock 最长 10s，未来 CLI 长持 agents 锁会连 harness config 保存一起阻塞 | resolved-by-design（按 agent 拆分后单文件即单 agent，b2057cc；跨进程由 companion flock 串行） | — |
 | F-U4a-6 | P3 | advisory | U4a | `agents::now_iso` / §3.2 | 函数名 iso 实为 epoch ms；transcript header `startedAt` 格式未定，U2 必须与 `execs[].startedAt` 同格式 | fixed(b8b00f8)（`now_epoch_ms` 改名；计划 §3.2 补「header 与 execs[] 同为 epoch ms 字符串」；header 本身尚未写入，见 F-U2-7） | — |
 | F-U4a-7 | P3 | advisory | U4a | `agents.rs` API | 无「向既有 Agent 追加 exec」入口；U11 续跑与 U6 add-members 需要 `append_exec` | open（U11 补） | — |
 | F-U4a-8 | P3 | advisory | U4a | 计划 U4a Files | 列了 `bridge.ts` 但未动，`agents_list` 尚无 TS 封装 | fixed(b8b00f8)（计划记注：bridge.ts 移至 U5 Files） | — |
@@ -1418,6 +1418,31 @@ F-BENCH-13 查证结论：4e960a2 提交说明声称的探针/capture/lib 改动
 - F-U2-11（探针重试拉长 `harness_list` 延迟）已被 F-BENCH-25 的并行探测吸收，可标 superseded；
 - F-U4a-3 / F-U4a-4（atomic_json 读路径 rename 不在 flock 内、rename 前无 `sync_all`）仍为 P3 open，与执行面拆分（子项目 1）直接相关，建议在搬迁 `atomic_json` 时一并处理；
 - 观察项：等待线程收割子进程后，在排空期间（最长 10s）`kill_all` / `exec_stop` 仍可能对已收割的 pgid 发信号。macOS 的 pid 顺序分配，几秒内复用的概率极低，不单列 finding；子项目 1 的 exec-shim 设计里应把「已收割」作为信号前的检查条件。
+
+### 执行面子项目 1 验收（2026-10-21）
+
+**自动化验证（已全绿）**：`cargo test --workspace` 三遍全绿（345 passed / 0 failed）；clippy `-D warnings`、fmt 干净；`nm -a target/debug/omt-daemon | grep -c omt_exec` = 0（KD-E9）；桌面 vitest 140 passed（含新增 exec-plane.spec.tsx 9 例，既有 131 例未改动）+ tsc/build 干净。端到端覆盖：exec_shim（真二进制：完成归档 / SIGTERM→kill_reason=user / 保活正反例）、exec_launch（launcher 就绪握手 / shim 拉不起同步报错+补偿）、exec_survives_launcher（发起方被 KILL 后执行继续）、exec_daemon_link（真 daemon：临时授权开关 / declare / homeId 绑定）。
+
+**待手工验收（设计 §6 桌面端一节，`pnpm tauri:dev` 下逐项）**：
+
+| # | 场景 | 期望 | 结果 |
+|---|---|---|---|
+| 1 | 派发 pi / omp / opencode 各一次 | 实时 transcript 与改造前一致；结束后 run 进度正确 | 待验收 |
+| 2 | 执行中点「停止」 | 3s 内 `killed`，run item 回到 pending（租约已释放） | 待验收 |
+| 3 | 空闲 agent「续跑」 | 同一 agent 追加 exec，新 jsonl 在同一目录 | 待验收 |
+| 4 | 进入信任门（awaiting_confirmation）后在桌面端裁决 | 与改造前一致 | 待验收 |
+| 5 | 执行中 ⌘Q，在退出确认框选「继续在后台运行」，等执行结束再打开 | agent `exited`，transcript 完整，run 进度正确 | 待验收 |
+| 6 | 执行中 ⌘Q 选「继续在后台运行」后立刻打开 | agent「运行中」，实时流接回（P-10），可停止 | 待验收 |
+| 7 | 执行中 `kill -9 <shim pid>`，再打开桌面端 | agent `failed`，行内说明「执行进程异常退出…」；租约被对账释放；harness 若仍活则进入「不受控（执行进程已丢失）」分组，可强制终止 | 待验收 |
+| 8 | 「停止全部」 | 第一次点击只出现确认（显示运行数与已认领项数）；确认后按钮显示「停止中…」，随后提示停止数量；所有运行中 exec 进入 `killed` | 待验收 |
+| 9 | 旧版本留下的 `agents.json` 数据 | 首次启动迁移，Agents 面板列表与历史 transcript 完整 | 待验收 |
+| 10 | 执行中 ⌘Q，在退出确认框选「全部停止后退出」 | 应用退出；所有 exec 进入 `killed`，run item 回到 pending | 待验收 |
+| 11 | 删除一个已结束的 agent | 确认框写明 transcript 一并删除；删除后磁盘上该 agent 目录（含 jsonl）不存在 | 待验收 |
+| 12 | 长任务期间关闭桌面端（可在 `daemon.json` 把 `idleQuietMs` 调到 60000 加速） | harness 在静默期之后的认领 / 汇报仍成功（shim 保活）；结束后 run 进度正确，`leaseReleasePending` 为 false | 待验收 |
+| 13 | 有运行中的 exec 时按 ⌘Q：(a) Return；(b) Esc；(c) 点「取消」 | ⌘Q 必弹确认框；(a) 后台继续并退出；(b)(c) 不退出，exec 不受影响 | 待验收 |
+| 14 | 只开着 DSH 插件、desktop 已关闭，长任务结束后 shim 拉起过 daemon | `omt daemon-status` 的 daemon 同时有全局 home 和 workspace home；DSH 的全局 ticket 操作仍落在 `~/.omt` | 待验收 |
+
+**待实测（§8）**：pi 与 omp 各一次「派发 → 结束 → 续跑」，比较续跑 exec 首条 usage 与前一 exec 末值（判定逐消息计 vs 延续累计），结论写回设计 §8。
 
 ### 残留状态核查（第二轮验收后）
 

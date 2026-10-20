@@ -1,7 +1,7 @@
 ---
 title: 执行面下沉到 omt + 主控 agent 编排 - 设计
 type: design
-status: draft
+status: sub-project-1-done
 date: 2026-10-20
 supersedes_in_part: docs/plans/2026-09-05-1245-feat-desktop-harness-executor-design.md（KD-D1 / KD-D3 / KD-D7，见 §1.2）
 related:
@@ -256,7 +256,7 @@ desktop agents dispatch 已全量落地（PR #9），但 harness 的拉起、执
 
 | # | 子项目 | 验收 |
 |---|---|---|
-| 1 | **执行面下沉**：两个 crate、shim、存储拆分与迁移、前置修复、桌面端改走 crate | 桌面端功能不变（§3.4 验收门）；关闭桌面端后执行继续 |
+| 1 | **执行面下沉**：两个 crate、shim、存储拆分与迁移、前置修复、桌面端改走 crate | 桌面端功能不变（§3.4 验收门）；关闭桌面端后执行继续。**已完成（2026-10-21，实现序列 d6d07cd 起，自动化验证与待手工验收清单见 findings log「执行面子项目 1 验收」）** |
 | 2 | **CLI / MCP 本地工具族 + policy** | 主控经 MCP 查询 harness / 模型并派发一次 pi 冒烟，桌面端可见 |
 | 3 | **主控附着（方案 B）** | Claude Code 会话出现在 Agents 面板，其派发的 exec 挂在其下 |
 | 4 | **编排文件与可视化** | 主控写入的编排在桌面端可视化，exec 与角色关联 |

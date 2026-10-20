@@ -10,10 +10,16 @@ Oh-My-Ticket has two runtime planes and four main source surfaces:
 - The ticket/domain plane lives in `crates/`. Rust owns domain rules, SQLite and Markdown
   persistence, the JSON-RPC daemon, CLI, and MCP server. Do not duplicate domain logic in UI or
   TypeScript adapters.
-- The desktop execution plane lives in `apps/desktop/src-tauri/`. It owns local harness discovery
-  and configuration (`harness.rs`), agent and binding persistence (`agents.rs`), process lifecycle
-  and dispatch (`executor.rs`), atomic JSON state (`atomic_json.rs`), and temporary MCP injection
-  (`mcp_injection.rs`). This plane may coordinate the daemon, but it does not replace domain rules.
+- The execution plane is split across two shared crates. `crates/omt-harness` is the pure-library
+  half: harness registry, probing, launch composition, stream adapters, the benchmark analyzer,
+  and atomic JSON state. `crates/omt-exec` owns agent storage (per-agent dirs), MCP injection,
+  the executor kernel, the launcher, the control/reconcile plane, jsonl tailing, and the per-exec
+  `omt exec-shim` process (a hidden verb of the `omt` CLI). Every exec runs in a detached shim,
+  so quitting the desktop app no longer terminates running execs. `omt-daemon` must never link
+  `omt-exec`.
+- The desktop app (`apps/desktop/src-tauri/`) keeps only Tauri command wrappers, the daemon
+  session bridge, and jsonl tailing into UI channels; it coordinates the daemon but owns neither
+  domain rules nor execution anymore.
 - `src/` is the DSH plugin adapter and browser UI.
 - `packages/client-ts/` is the shared TypeScript daemon client.
 
