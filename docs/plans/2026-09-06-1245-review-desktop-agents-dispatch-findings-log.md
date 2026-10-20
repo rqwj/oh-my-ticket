@@ -25,16 +25,21 @@ branch: feat/desktop-agents-dispatch
 
 | ID | 级别 | 类型 | 单元 | 位置 | 摘要 | 状态 | 负责人 |
 |---|---|---|---|---|---|---|---|
-| F-BENCH-3 | P1 | gated_auto | BENCH | `bench.rs::analyze_jsonl` | omp 经 `write xd://mcp__omt_*` 调 MCP，`is_omt` 只看名字 → omp 的 discovery_overhead 恒等于全部调用，硬门永久红（§27） | open | — |
-| F-BENCH-4 | P1 | manual | BENCH | fixture 回放测试 | 语料未对 `parse_line` / `parse_models_output` 回放；事件词汇测试 grep 冻结的 adapter 产物，测不出漂移（§27） | open | — |
-| F-BENCH-5 | P1 | manual | BENCH | `harness_probe.rs` / `harness-capture.rs` | 探针硬编码 binary 路径与 model_list_args，测的是自己的 registry 副本（违反 R-1，F-PI-2 类漂移测不出）（§27） | open | — |
-| F-BENCH-6 | P2 | gated_auto | BENCH | `harness-capture.rs` | omp `--version` 为 `omp/18.12.2` → 落到 `omp/omp/18.12.2/` | open | — |
-| F-BENCH-7 | P2 | gated_auto | BENCH | `harness-capture.rs` | 重跑 capture 覆盖手写 meta.json 出处 | open | — |
-| F-BENCH-8 | P2 | gated_auto | BENCH | `fixtures_are_normalized` / `normalize` | 归一测试不含 omp 卷与 help/models；raw 内嵌时间戳未归一；未过 sanitize_line | open | — |
-| F-BENCH-9 | P2 | gated_auto | BENCH | `bench.rs` opencode 测试 | 注释过时（实为 3 次）且未断言 tool_calls==3 | open | — |
-| F-BENCH-10 | P3 | gated_auto | BENCH | 探针 / capture | 裸 `.output()` 无超时（F1 教训） | open | — |
-| F-BENCH-11 | P3 | advisory | BENCH | omp 卷 | 无 usage 事件 → omp tokens/cost 恒 None | open | — |
-| F-BENCH-12 | P3 | advisory | BENCH | 注释 / §26 | 「MCP 握手」未实现、adapter-lines 文件名不符、「上两级」应为三级 | open | — |
+| F-BENCH-13 | P1 | manual | BENCH | `4e960a2` 提交说明 / §27（修复节） | 提交说明与日志称 F-BENCH-5/6/7/10 及 8/12 部分已修，但 `harness_probe.rs`、`harness-capture.rs`、`lib.rs` 自 f6eeaed 后**未改动**（无 worktree / stash / 其他分支留存）——改动疑似未提交即丢失（§28） | open | — |
+| F-BENCH-14 | P1 | manual | BENCH/U12 | `executor.rs` usage 归档 / `bench.rs` / `adapters.rs` | **usage 是每条消息的值，不是会话累计**：pi 1.3.0 与 omp 18.12.2 语料中 cost 逐消息非单调（0.0349→0.0095→0.0078→0.0092）。F-U12-3「累计快照取末值」的口径错误——ExecRecord 的 usage 与分析器的 tokens/cost 只记最后一条消息：pi 卷报 $0.0092 实为 $0.0615（少报 6.7 倍），omp 卷报 $0.0096 实为 $0.0431（§28） | open | — |
+| F-BENCH-15 | P1 | manual | BENCH | `bench.rs::raw_lines_reparse_through_current_adapter` | 重放测不到解析漂移：语料的 raw 行只是采集时**未产出事件**的行，产出 tool_call / thinking / text 的源行没有保留，无从重放；该测试能通过只因 4e960a2 新增的 turn_end usage 提取（改动前 pi 的 raw 行重放结构化数为 0）（§28） | open | — |
+| F-BENCH-16 | P3 | gated_auto | BENCH | `bench.rs::analyze_jsonl` is_omt | `path.contains("omt_")` 过宽：写普通文件（如 `docs/omt_notes.md`）也会被算作 omt 调用；应收紧为 `path.starts_with("xd://mcp__omt")` 并补反例测试 | open | — |
+| F-BENCH-17 | P3 | testing-gap | BENCH | `adapters.rs` end 族 usage 分支 | 新分支无 adapters 单测，只经分析器的 fixture 测试间接覆盖 | open | — |
+| F-BENCH-3 | P1 | gated_auto | BENCH | `bench.rs::analyze_jsonl` | omp 经 `write xd://mcp__omt_*` 调 MCP，`is_omt` 只看名字 → omp 的 discovery_overhead 恒等于全部调用，硬门永久红（§27） | fixed(4e960a2)（P3 余项见 F-BENCH-16） | — |
+| F-BENCH-4 | P1 | manual | BENCH | fixture 回放测试 | 语料未对 `parse_line` / `parse_models_output` 回放；事件词汇测试 grep 冻结的 adapter 产物，测不出漂移（§27） | 部分（4e960a2 加了 raw 重放，但语料不含产出结构化事件的源行，测不到 tool_call/thinking/text 漂移——见 F-BENCH-15） | — |
+| F-BENCH-5 | P1 | manual | BENCH | `harness_probe.rs` / `harness-capture.rs` | 探针硬编码 binary 路径与 model_list_args，测的是自己的 registry 副本（违反 R-1，F-PI-2 类漂移测不出）（§27） | open（4e960a2 提交说明称已修，但 harness_probe.rs / lib.rs 未改动——见 F-BENCH-13） | — |
+| F-BENCH-6 | P2 | gated_auto | BENCH | `harness-capture.rs` | omp `--version` 为 `omp/18.12.2` → 落到 `omp/omp/18.12.2/` | open（同上，harness-capture.rs 未改动） | — |
+| F-BENCH-7 | P2 | gated_auto | BENCH | `harness-capture.rs` | 重跑 capture 覆盖手写 meta.json 出处 | open（同上） | — |
+| F-BENCH-8 | P2 | gated_auto | BENCH | `fixtures_are_normalized` / `normalize` | 归一测试不含 omp 卷与 help/models；raw 内嵌时间戳未归一；未过 sanitize_line | 部分（测试已遍历全部语料；capture 未过 sanitize_line、raw 内嵌时间戳未归一） | — |
+| F-BENCH-9 | P2 | gated_auto | BENCH | `bench.rs` opencode 测试 | 注释过时（实为 3 次）且未断言 tool_calls==3 | fixed(4e960a2) | — |
+| F-BENCH-10 | P3 | gated_auto | BENCH | 探针 / capture | 裸 `.output()` 无超时（F1 教训） | open（探针/capture 未加超时） | — |
+| F-BENCH-11 | P3 | advisory | BENCH | omp 卷 | 无 usage 事件 → omp tokens/cost 恒 None | superseded(F-BENCH-14)（end 族提取已补，但取末值的口径本身是错的） | — |
+| F-BENCH-12 | P3 | advisory | BENCH | 注释 / §26 | 「MCP 握手」未实现、adapter-lines 文件名不符、「上两级」应为三级 | 部分（bench.rs「上两级」注释仍在；probe 模块注释未改） | — |
 | F-U3-15 | P1 | manual | U3 | `mcp_injection.rs::prepare_omp_with` :279→:283 | **merge 先于 state.json 写入**：二者之间崩溃 → 首个 exec 无 `workspace` 记录，sweep 跳过该目录且删光 launcher → 用户文件留悬空 `omt`；下次 prepare 把污染后的文件当"原件"备份，永远恢复不干净（556c1d2 引入，§8 漏检） | fixed(d53b191) | — |
 | F-U3-16 | P1 | manual | U3 | `mcp_injection.rs` :281/:304 | **writtenSha 每次 prepare 都重置基线**：两 exec 重叠期间用户改了文件 → 第二次 prepare 把改动吸进 S2 → 最后 release 比对 S2 相等 → 整体恢复到第一次 prepare 时的 backup，用户改动静默丢失（556c1d2 引入，§8 漏检） | fixed(d53b191) | — |
 | F-U3-11 | P2 | gated_auto | U3 | `mcp_injection.rs::finalize_release` :310/:323 | **b3500cb 回归**：user_modified 分支打印「备份保留于 …」后无条件 `remove_dir_all(state_dir)` 删掉 backup；外科手术 no-op（command 不匹配/文件不可解析）时用户文件仍被污染且唯一原件已毁 | fixed(d53b191) | — |
@@ -1236,6 +1241,24 @@ opencode 本就无发现开销（工具直声明），homeId 修复后同样 3 �
 - **F-BENCH-11**（P3）：溯源——omp 18.12.2 的 usage 挂 turn_end 的 message.usage（1.3 在 message_update）；adapter 补 end 族提取 + 分析器 raw 重放兜底（语料是采集时 adapter 输出，当前代码重放补齐——正是语料库价值）；omp 卷 tokens/cost 断言入测。
 - **F-BENCH-12**（P3）：注释/文档与实现对齐（`omt__`→`omt_`、模块注释与代码一致）。
 - 质量：workspace 292 全绿（探针超时负载 flake 1 次，重跑绿）。
+
+### §28. `4e960a2` · 评测复核修复 · code review（2026-10-20）
+
+**评审方式**：单上下文内联；逐文件比对 `git diff f6eeaed 4e960a2`，用 python 逐帧统计 pi / omp 语料的 usage 与 raw 行类型。复跑：`cargo test -p oh-my-ticket-desktop bench::` 8 过、`adapters::` 5 过。（注：上方两个小节都编号为 §27，本节顺延为 §28。）
+
+**结论**：真正落地的只有 F-BENCH-3、9 和 11 的提取部分；**提交说明与修复节所述有一半不在提交里**；另外语料揭示了一个波及生产的 usage 口径错误。
+
+| ID | 级别 | 发现 |
+|---|---|---|
+| F-BENCH-13 | P1 | **声称的修复不在提交中**：`4e960a2` 只改了 `adapters.rs`、`bench.rs` 和本日志。`tests/harness_probe.rs`、`examples/harness-capture.rs`、`src/lib.rs` 自 f6eeaed 起无任何改动——没有 pub 导出，探针仍硬编码路径与 flag、找不到 binary 时仍静默跳过、无超时；capture 仍会落到 `omp/omp/18.12.2/`、仍覆盖 meta.json、未过 `sanitize_line`。worktree、stash、其他分支均无留存，疑似改动未提交即丢失。修复节「探针超时负载 flake 1 次」所指的超时代码也不存在。需恢复或重做，并把总览表状态改回 open（已改） |
+| F-BENCH-14 | P1 | **usage 是逐条消息的值，不是会话累计**（推翻 F-U12-3 的前提）。语料逐帧：pi `message_update` 的 usage 每条消息先归零再给出该消息的值（11738 / 13134 / 13359 / 14109，cost 0.0349 / 0.0095 / 0.0078 / 0.0092，非单调）；omp 的 `message_end` / `turn_end` 同样是逐消息的值（同一消息两帧相同）。当前「取末值」的口径让 ExecRecord（F-U12-4，桌面端用量展示）和分析器都只记最后一条消息：pi 卷报 14109 tokens / $0.0092，实为 52340 / $0.0615；omp 卷报 11668 / $0.0096，实为 42430 / $0.0431。修法：按 assistant 消息在 `message_end` 处累加（`turn_end` 与 `message_end` 同值，取其一），exec 总量 = 各消息之和，agent 总量 = 各 exec 之和；`message_update` 的 usage 仅作消息内进度。这也回答了执行面设计 §8「resume 后 usage 语义」的实测项：不存在会话累计，按消息求和即可 |
+| F-BENCH-15 | P1 | **重放测不到解析漂移**：jsonl 里的 raw 行只是采集时 adapter **没有产出事件**的行（pi：turn_start/end、message_start/end、tool_execution_start/update、agent_start、agent_settled；omp 另加 444 行 message_update）。产出 tool_call、thinking、text 的源行（`tool_execution_end`、带 *_end 的 message_update）落盘时已转成结构化事件，原文不在语料里，因此无从重放。`raw_lines_reparse_through_current_adapter` 能通过，只因本次新增的 `turn_end` usage 提取：改动前 pi 的 raw 行重放结构化数为 0。跳过列表也不一致：跳过了现在会产出 usage 的 `message_end` / `agent_end`，却没跳过 `turn_end`。修法：语料增加归一化后的 `raw.log`（executor 已原样落盘 harness stdout），对全部行重放，断言重放得到的 tool_call 名称与数量、assistant_text / thinking 数量 ⊇ 卷内记录 |
+| F-BENCH-16 | P3 | `is_omt` 的 `path.contains("omt_")` 过宽，写普通文件（如 `docs/omt_notes.md`）也会被算作 omt 调用；`path.contains("run__claim")` 等是冗余条件。收紧为 `path.starts_with("xd://mcp__omt")` 并补反例测试 |
+| F-BENCH-17 | P3 | `adapters.rs` 新增的 end 族 usage 分支没有 adapters 单测，只经分析器的 fixture 测试间接覆盖；修 F-BENCH-14 时一并补上 |
+
+**已确认修好**：F-BENCH-3（omp 3 次调用 / 开销 0 已入测）、F-BENCH-9（opencode 断言 `tool_calls == 3`）、F-BENCH-8 的测试扩面（遍历全部语料文件、下限 ≥ 9）。
+
+**建议顺序**：F-BENCH-13（先确认改动去向，恢复或重做）→ F-BENCH-14（波及桌面端用量展示，应单独提交修复）→ F-BENCH-15（采集 raw.log + 重放断言）→ P3。
 
 ### 残留状态核查（第二轮验收后）
 
