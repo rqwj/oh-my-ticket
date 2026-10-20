@@ -161,6 +161,15 @@ impl McpInjection {
 /// （single-instance + U15 后跨进程由 omt CLI 共写约定接管）。
 static PROJECT_LOCK: Mutex<()> = Mutex::new(());
 
+/// P-9：项目级注入的跨进程锁（多个 shim 进程共写同一 state.json 的引用
+/// 计数）。与进程内 PROJECT_LOCK 叠加使用：先拿进程内锁，再拿 flock。
+fn project_flock(runtime_dir: &Path, spec: ProjectSpec) -> Result<std::fs::File, String> {
+    omt_harness::atomic_json::lock_exclusive(
+        &spec.injection_root(runtime_dir).join(".project"),
+        omt_harness::atomic_json::LOCK_ACQUIRE_TIMEOUT,
+    )
+}
+
 /// F-U3-5：`DefaultHasher` 的内部算法不保证跨 Rust 版本稳定——用于
 /// **持久化**比对（workspace hash、写入内容 hash）必须用稳定算法，否则
 /// toolchain 升级后旧记录全部判"用户改过"、永不恢复。
@@ -372,6 +381,7 @@ fn prepare_project_with(
     let _guard = PROJECT_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _flock = project_flock(runtime_dir, spec)?;
     if persistent {
         // 固定名 launcher：跨多次派发复用，不绑定单次 exec 身份（没有意义——
         // 这条连接的目的是让用户随时手动用 omp 连上 omt，不属于任何 run）。
@@ -539,6 +549,7 @@ fn release_project(
     let _guard = PROJECT_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _flock = project_flock(runtime_dir, spec)?;
     let state_dir = state_dir(runtime_dir, workspace_root, spec);
     let mut state = omp_state(&state_dir);
     let refcount = state["refcount"].as_u64().unwrap_or(0);
@@ -634,15 +645,27 @@ pub fn release(runtime_dir: &Path, injection: &McpInjection) -> Result<(), Strin
 /// 随后清扫真正的孤儿 launcher（F-U3-18：跳过 persistent.sh，它没有
 /// state 目录、每次正常重启都要继续用）。omp 与 pi 各自的 state/launcher
 /// 命名空间独立清扫。返回成功处理的 workspace 数。
-pub fn sweep_crash_residue(runtime_dir: &Path) -> Result<usize, String> {
+///
+/// P-9：`is_exec_live` 判定某个 exec（launcher id 即 exec id，`persistent`
+/// 除外）是否仍在运行——仍有存活 exec 的 workspace 与 launcher 一律跳过
+/// （desktop 重启时 shim 可能还在跑，清扫不能摘掉在跑 exec 的注入，由其
+/// shim 收尾时释放）。
+pub fn sweep_crash_residue(
+    runtime_dir: &Path,
+    is_exec_live: &dyn Fn(&str) -> bool,
+) -> Result<usize, String> {
     let mut swept_total = 0usize;
     for spec in [OMP_SPEC, PI_SPEC] {
-        swept_total += sweep_spec_crash_residue(runtime_dir, spec)?;
+        swept_total += sweep_spec_crash_residue(runtime_dir, spec, is_exec_live)?;
     }
     Ok(swept_total)
 }
 
-fn sweep_spec_crash_residue(runtime_dir: &Path, spec: ProjectSpec) -> Result<usize, String> {
+fn sweep_spec_crash_residue(
+    runtime_dir: &Path,
+    spec: ProjectSpec,
+    is_exec_live: &dyn Fn(&str) -> bool,
+) -> Result<usize, String> {
     let root = spec.injection_root(runtime_dir);
     let Ok(entries) = std::fs::read_dir(&root) else {
         return Ok(0);
@@ -657,9 +680,17 @@ fn sweep_spec_crash_residue(runtime_dir: &Path, spec: ProjectSpec) -> Result<usi
         if workspace.is_empty() {
             continue;
         }
+        let has_live = state["launchers"]
+            .as_array()
+            .map(|ids| ids.iter().filter_map(|v| v.as_str()).any(is_exec_live))
+            .unwrap_or(false);
+        if has_live {
+            continue; // 该 workspace 仍被存活 exec 使用，由其 shim 收尾时释放
+        }
         let _guard = PROJECT_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _flock = project_flock(runtime_dir, spec)?;
         match finalize_release(
             runtime_dir,
             &entry.path(),
@@ -678,12 +709,18 @@ fn sweep_spec_crash_residue(runtime_dir: &Path, spec: ProjectSpec) -> Result<usi
     }
     // 上面每个 workspace 的 finalize_release 已经清了自己追踪到的
     // launcher；这里只兜底真正的孤儿（例如 state 目录在记录 `workspace`
-    // 之前就整个丢失）。绝不动 persistent.sh。
+    // 之前就整个丢失）。绝不动 persistent.sh，也不动存活 exec 的 launcher
+    // （P-9）。
     if let Ok(entries) = std::fs::read_dir(spec.launchers_dir(runtime_dir)) {
         let persistent = launcher_path(runtime_dir, spec, "persistent");
         for entry in entries.flatten() {
             let path = entry.path();
-            if path != persistent {
+            let id = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_string();
+            if path != persistent && !is_exec_live(&id) {
                 let _ = std::fs::remove_file(&path);
             }
         }
@@ -1080,7 +1117,7 @@ mod tests {
         )
         .unwrap();
         assert!(OMP_SPEC.workspace_file(&rig.workspace).is_file());
-        let swept = sweep_crash_residue(&rig.runtime).unwrap();
+        let swept = sweep_crash_residue(&rig.runtime, &|_| false).unwrap();
         assert_eq!(swept, 1);
         assert_eq!(
             std::fs::read_to_string(OMP_SPEC.workspace_file(&rig.workspace)).unwrap(),
@@ -1088,7 +1125,7 @@ mod tests {
         );
         assert_eq!(launcher_count(&rig.runtime), 0);
         // 二次清扫幂等
-        assert_eq!(sweep_crash_residue(&rig.runtime).unwrap(), 0);
+        assert_eq!(sweep_crash_residue(&rig.runtime, &|_| false).unwrap(), 0);
     }
 
     #[test]
@@ -1114,7 +1151,7 @@ mod tests {
             serde_json::to_string_pretty(&root).unwrap(),
         )
         .unwrap();
-        sweep_crash_residue(&rig.runtime).unwrap();
+        sweep_crash_residue(&rig.runtime, &|_| false).unwrap();
         let after = std::fs::read_to_string(OMP_SPEC.workspace_file(&rig.workspace)).unwrap();
         let after_json: serde_json::Value = serde_json::from_str(&after).unwrap();
         assert!(after_json["mcpServers"].get("omt").is_none(), "{after}");
@@ -1150,7 +1187,7 @@ mod tests {
         )
         .unwrap();
 
-        sweep_crash_residue(&rig.runtime).unwrap();
+        sweep_crash_residue(&rig.runtime, &|_| false).unwrap();
         let after = std::fs::read_to_string(OMP_SPEC.workspace_file(&rig.workspace)).unwrap();
         let after_json: serde_json::Value = serde_json::from_str(&after).unwrap();
         assert!(after_json["mcpServers"].get("omt").is_none(), "{after}");
@@ -1245,7 +1282,7 @@ mod tests {
         .unwrap();
         let _ = persistent;
         assert_eq!(launcher_count(&rig.runtime), 1);
-        sweep_crash_residue(&rig.runtime).unwrap();
+        sweep_crash_residue(&rig.runtime, &|_| false).unwrap();
         assert_eq!(
             launcher_count(&rig.runtime),
             1,
@@ -1373,9 +1410,62 @@ mod tests {
         )
         .unwrap();
         assert!(rig.workspace.join(".pi").join("mcp.json").exists());
-        let swept = sweep_crash_residue(&rig.runtime).unwrap();
+        let swept = sweep_crash_residue(&rig.runtime, &|_| false).unwrap();
         assert!(swept >= 1, "至少清扫 pi 一个 workspace");
         assert!(!rig.workspace.join(".pi").join("mcp.json").exists());
-        assert_eq!(sweep_crash_residue(&rig.runtime).unwrap(), 0);
+        assert_eq!(sweep_crash_residue(&rig.runtime, &|_| false).unwrap(), 0);
+    }
+
+    /// P-9：桌面端重启时 shim 可能仍在运行——清扫不得摘掉存活 exec 的注入。
+    #[test]
+    fn sweep_skips_workspaces_with_live_execs() {
+        let rig = rig();
+        let inj = prepare(
+            &rig.fake_omt,
+            &rig.runtime,
+            &rig.workspace,
+            "omp",
+            "exec-live",
+            false,
+        )
+        .unwrap();
+        let mcp = rig.workspace.join(".omp").join("mcp.json");
+        assert!(std::fs::read_to_string(&mcp).unwrap().contains("omt"));
+        let swept = sweep_crash_residue(&rig.runtime, &|id| id == "exec-live").unwrap();
+        assert_eq!(swept, 0);
+        assert!(
+            std::fs::read_to_string(&mcp).unwrap().contains("omt"),
+            "存活 exec 的注入必须保留"
+        );
+        assert_eq!(
+            launcher_count(&rig.runtime),
+            1,
+            "存活 exec 的 launcher 必须保留"
+        );
+        // exec 结束后同一清扫照常恢复
+        let swept = sweep_crash_residue(&rig.runtime, &|_| false).unwrap();
+        assert_eq!(swept, 1);
+        drop(inj);
+    }
+
+    /// P-9：跨进程锁——持锁期间另一个 prepare 必须等待而不是并发改写 state。
+    #[test]
+    fn project_ops_take_the_cross_process_lock() {
+        let rig = rig();
+        let held = project_flock(&rig.runtime, OMP_SPEC).unwrap();
+        let runtime = rig.runtime.clone();
+        let workspace = rig.workspace.clone();
+        let omt = rig.fake_omt.clone();
+        let started = std::time::Instant::now();
+        let t = std::thread::spawn(move || {
+            prepare(&omt, &runtime, &workspace, "omp", "exec-2", false).map(|_| started.elapsed())
+        });
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        drop(held);
+        let waited = t.join().unwrap().unwrap();
+        assert!(
+            waited >= std::time::Duration::from_millis(350),
+            "{waited:?}"
+        );
     }
 }

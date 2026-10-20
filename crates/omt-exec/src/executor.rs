@@ -684,7 +684,7 @@ pub fn startup_housekeeping(runtime_dir: &Path) {
         Err(err) => eprintln!("启动 demote 失败：{err}"),
         _ => {}
     }
-    match crate::mcp_injection::sweep_crash_residue(runtime_dir) {
+    match crate::mcp_injection::sweep_crash_residue(runtime_dir, &|_| false) {
         Ok(n) if n > 0 => eprintln!("启动清扫：{n} 个 workspace 的 omp MCP 注入残留已恢复"),
         Err(err) => eprintln!("omp 注入残留清扫失败：{err}"),
         _ => {}
