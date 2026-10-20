@@ -66,13 +66,13 @@ pub(crate) fn which_binary_in(path_var: &str, name: &str) -> Option<PathBuf> {
 }
 
 /// 在增广 PATH 上查找可执行文件。
-pub(crate) fn which_binary(name: &str) -> Option<PathBuf> {
+pub fn which_binary(name: &str) -> Option<PathBuf> {
     which_binary_in(&augmented_path(), name)
 }
 
 /// `<binary> <probe_args>` 首行输出，带超时（F1：原 `.output()` 会永久挂起）。
 /// 超时后 kill 子进程；探针是 best-effort，失败只表现为无版本号。
-pub(crate) fn probe_version(binary: &Path, args: &[&str], timeout_secs: u64) -> Option<String> {
+pub fn probe_version(binary: &Path, args: &[&str], timeout_secs: u64) -> Option<String> {
     use std::io::Read;
     use std::process::{Command, Stdio};
     let mut child = Command::new(binary)

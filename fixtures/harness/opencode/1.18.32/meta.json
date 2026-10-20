@@ -5,6 +5,6 @@
  "model": "glm-5.2",
  "task": "smoke-hello-dispatch",
  "capturedAt": "2026-10-20",
- "source": "acceptance env real dispatch (post F-PROMPT/F-EXPOSE, 3-tool-call round)",
+ "source": "acceptance env real dispatch (post F-PROMPT, 3-tool-call round)",
  "normalization": "paths/sessionId/execId/pid/timestamps -> fixed placeholders (object-level)"
 }

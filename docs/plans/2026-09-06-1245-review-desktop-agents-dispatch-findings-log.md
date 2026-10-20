@@ -1260,6 +1260,23 @@ opencode 本就无发现开销（工具直声明），homeId 修复后同样 3 �
 
 **建议顺序**：F-BENCH-13（先确认改动去向，恢复或重做）→ F-BENCH-14（波及桌面端用量展示，应单独提交修复）→ F-BENCH-15（采集 raw.log + 重放断言）→ P3。
 
+
+### §29. F-BENCH-13~17 修复（2026-10-20，da9c376 + 本轮）
+
+F-BENCH-13 查证结论：4e960a2 提交说明声称的探针/capture/lib 改动**从未存在**——中途脚本报错后未核实就写进提交说明（虚假闭环第三次，F-U2-15/18 同款）。本轮重做：
+
+- **F-BENCH-5**：fixed（探针/capture 改 REGISTRY 驱动（lib.rs 最小 pub 面：descriptor_of/which_binary/probe_version）；binary 缺失即 panic 不静默；超时 30s 兜底（TimeoutGuard/try_wait 循环））
+- **F-BENCH-6**：fixed（capture 版本串取 rsplit('/') 末段——omp/18.12.2 → 18.12.2）
+- **F-BENCH-7**：fixed（meta.json 改合并（entry().or_insert 保留已有字段）；三家被早期冲掉的出处信息（model/task/source/normalization/omtVersion）已手工补回）
+- **F-BENCH-10**：fixed（探针 run_with_timeout + capture 均带 30s 超时 kill）
+- **F-BENCH-13**：fixed（确认：4e960a2 声称的改动从未存在（worktree/stash/全 ref 查证）——本轮重做并逐项验证）
+- **F-BENCH-14**：fixed（usage 按消息求和：adapter scope 标记（message/cumulative）+ reader UsageTotals 累计 + analyzer 求和（raw 重放优先）；语料实证 pi 52340 tok/$0.0615、omp 42430/$0.0431 断言入测）
+- **F-BENCH-15**：fixed（语料补 raw.log（原始 stdout 全量，归一化）；重放测试改全量对账——工具调用名序列逐一比对）
+- **F-BENCH-16**：fixed（is_omt 路径匹配改 starts_with("xd://mcp__omt") 前缀精确）
+- **F-BENCH-17**：fixed（usage_scopes_message_end_vs_cumulative 单测（含 turn_end 不重复、message_update 零产出、opencode cumulative））
+
+质量门：workspace 全绿（探针/负载 flake 单跑绿）、clippy/fmt 干净。
+
 ### 残留状态核查（第二轮验收后）
 
 失败尝试在 daemon 侧已成功创建 RUN-0001（pending，持有 TICKET-0001，无执行器），EPIC-0001/TICKET-0001 被 node/execute 标为 in_progress。重试无需清理：ensure-run 复用路径按 pending → start 正常接管（已实测 run-get 确认）。

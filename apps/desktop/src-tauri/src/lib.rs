@@ -5,6 +5,10 @@
 //! connection bridged to the frontend through tauri commands.
 
 mod adapters;
+
+/// F-BENCH-5：探针/capture/分析器的最小 pub 面——registry 驱动，杜绝
+/// 探针自带 flag 副本（R-1 否决项）。§6.3 搬迁时整体移入 omt-harness。
+pub use harness::{descriptor_of, probe_version, which_binary, HarnessDescriptor};
 mod agents;
 mod atomic_json;
 mod bench;
