@@ -14,7 +14,7 @@
 
 use tauri::{AppHandle, Emitter, State};
 
-use crate::harness::{augmented_path, probe_version, which_binary};
+use omt_harness::harness::{augmented_path, probe_version, which_binary};
 
 /// 检测本机已安装的 agent harness（dsh / opencode）：PATH 查找 +
 /// 版本探针。渲染进程无 fs/shell 能力，探测只能在 Rust 侧做。

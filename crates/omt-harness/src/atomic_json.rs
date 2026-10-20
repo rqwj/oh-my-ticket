@@ -79,7 +79,7 @@ fn flock_exclusive(file: &std::fs::File, timeout: Duration) -> Result<(), String
 
 /// unix-only 的 0600/0700 打开模式（v1 macOS-only，§3.6.3）；desktop 各
 /// 状态文件与 launcher 共用。
-pub(crate) trait OpenOptionsUnix {
+pub trait OpenOptionsUnix {
     fn mode_if_unix(&mut self, mode: u32) -> &mut Self;
 }
 

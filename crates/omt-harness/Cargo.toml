@@ -1,0 +1,15 @@
+[package]
+name = "omt-harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Harness registry, probing, launch composition, stream adapters and the benchmark analyzer — the pure-library half of the exec plane (design §3.1)."
+
+[dependencies]
+libc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+regex = "1"
+tempfile = { workspace = true }

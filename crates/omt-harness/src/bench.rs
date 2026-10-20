@@ -246,9 +246,9 @@ mod tests {
     use super::*;
 
     fn fixture(provider: &str, version: &str, file: &str) -> std::path::PathBuf {
-        // CARGO_MANIFEST_DIR = apps/desktop/src-tauri → 上两级是仓库根
+        // CARGO_MANIFEST_DIR = crates/omt-harness → 上两级是仓库根
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../fixtures/harness")
+            .join("../../fixtures/harness")
             .join(provider)
             .join(version)
             .join(file)
@@ -304,7 +304,7 @@ mod tests {
     #[test]
     fn fixtures_are_normalized() {
         let root =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../fixtures/harness");
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/harness");
         // F-BENCH-18/23：每家语料的必需文件清单——raw.log 与 jsonl 同名成对
         // （<stem>.raw.log）。raw.log 曾被 .gitignore 的 *.log 吞掉（本机绿、
         // 干净 clone 红），缺一即红，不再只靠数量下限。

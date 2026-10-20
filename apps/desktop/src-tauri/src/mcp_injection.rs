@@ -55,8 +55,8 @@ use std::sync::Mutex;
 
 use sha2::{Digest, Sha256};
 
-use crate::atomic_json::OpenOptionsUnix;
 use crate::daemon;
+use omt_harness::atomic_json::OpenOptionsUnix;
 
 /// 项目级 MCP 注入的 per-provider 参数。omp 的目录与条目形状是**已持久化
 /// 的兼容面**（在途 state 的 writtenSha 基线、用户机器上的 launcher 目录），

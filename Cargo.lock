@@ -2619,7 +2619,7 @@ version = "0.6.6"
 dependencies = [
  "libc",
  "omt-client",
- "regex",
+ "omt-harness",
  "serde",
  "serde_json",
  "sha2",
@@ -2661,6 +2661,17 @@ dependencies = [
  "omt-contracts",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "omt-harness"
+version = "0.6.6"
+dependencies = [
+ "libc",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

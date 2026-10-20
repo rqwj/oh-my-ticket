@@ -1,7 +1,7 @@
 //! 评测机制 §6.2（F-BENCH-2/5/6/7/10/13）：语料采集 example
 //!（三轮评审定案：cargo example 形态，不加第二个 `[[bin]]`）。
 //!
-//! 用法：`cargo run -p oh-my-ticket-desktop --example harness-capture -- <provider>`
+//! 用法：`cargo run -p omt-harness --example harness-capture -- <provider>`
 //! 产出 `fixtures/harness/<provider>/<version>/` 下的 version/help/models
 //! （事件流采样需要一次真实派发，由 runner 层（§6.4）负责——本 example
 //! 只做零成本面）。
@@ -12,7 +12,7 @@
 //! - **超时**（F-BENCH-10）：每命令 30s 兜底
 //! - 采样即归一（二轮评审 B）：HOME → `__HOME__` 让跨机器 diff 稳定
 
-use oh_my_ticket_desktop_lib::{descriptor_of, which_binary};
+use omt_harness::{descriptor_of, which_binary};
 use std::io::Read;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -45,7 +45,7 @@ fn main() {
     );
 
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../fixtures/harness")
+        .join("../../fixtures/harness")
         .join(&provider)
         .join(&version);
     std::fs::create_dir_all(&dir).expect("建目录");

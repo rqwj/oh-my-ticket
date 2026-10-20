@@ -22,9 +22,10 @@ use std::time::{Duration, Instant};
 use crate::agents::NewExec;
 use crate::agents::{self, AgentAttachment, AgentRecordStatus};
 use crate::daemon;
-use crate::harness;
 use crate::mcp_injection::McpInjection;
 use crate::state::SharedSession;
+use omt_harness::harness;
+use omt_harness::sanitize::{sanitize_args, sanitize_stderr_tail};
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 
@@ -35,7 +36,6 @@ const DEFAULT_MAX_DURATION: Duration = Duration::from_secs(120 * 60);
 /// sink（UI Channel 拥塞 / 机器负载）的尾部积压，又不会挂死等待线程。
 const READER_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 const KILL_GRACE: Duration = Duration::from_secs(3);
-const STDERR_TAIL_MAX_CHARS: usize = 2000;
 
 /// 进程内派发互斥锁：串行化预检 + 建链，闭合读侧 TOCTOU（§3.3）。
 static DISPATCH_LOCK: Mutex<()> = Mutex::new(());
@@ -229,100 +229,6 @@ impl ExecSession {
             libc::kill(-self.pgid, sig);
         }
     }
-}
-
-/// §3.1 secrets 纪律：无 regex 依赖的行级启发式脱敏——宁枉勿纵，只用于
-/// Failed 的 stderr 尾诊断。
-fn sanitize_line(line: &str) -> String {
-    const KEYWORDS: &[&str] = &["key", "token", "secret", "password", "bearer"];
-    // F-U2-8(a)：ascii 小写不改字节长度——lower 的偏移对原串安全（多字节
-    // 非 ASCII 字符不会被 to_ascii_lowercase 改写）。
-    let lower = line.to_ascii_lowercase();
-    let mut cut: Option<usize> = None;
-    for kw in KEYWORDS {
-        if let Some(pos) = lower.find(kw) {
-            let after = lower[pos + kw.len()..].trim_start();
-            // 关键字后紧跟分隔符（= 或 :）即视为键值形态；bearer 单独算
-            let is_kv = after.starts_with('=') || after.starts_with(':');
-            let is_bearer = *kw == "bearer";
-            if is_kv || is_bearer {
-                let value_start = if is_kv {
-                    let rest = &lower[pos + kw.len()..];
-                    rest.find(|c: char| c != '=' && c != ':' && c != ' ')
-                        .map(|off| {
-                            rest.char_indices()
-                                .nth(off)
-                                .map(|(i, _)| pos + kw.len() + i)
-                                .unwrap_or(line.len())
-                        })
-                        .unwrap_or(line.len())
-                } else {
-                    pos + kw.len()
-                };
-                cut = Some(cut.map_or(value_start, |c| c.min(value_start)));
-            }
-        }
-    }
-    if let Some(pos) = lower.find("sk-") {
-        // sk- 前缀密钥形态：保留 sk-，值部分替换
-        cut = Some(cut.map_or(pos + 3, |c| c.min(pos + 3)));
-    }
-    match cut {
-        Some(idx) if idx <= line.len() && line.is_char_boundary(idx) => {
-            format!("{} ***", line[..idx].trim_end())
-        }
-        _ => line.to_string(),
-    }
-}
-
-fn sanitize_stderr_tail(tail: &str) -> String {
-    let mut joined = tail
-        .lines()
-        .map(sanitize_line)
-        .collect::<Vec<_>>()
-        .join("\n");
-    if joined.len() > STDERR_TAIL_MAX_CHARS {
-        let mut end = STDERR_TAIL_MAX_CHARS;
-        while !joined.is_char_boundary(end) {
-            end -= 1;
-        }
-        joined.truncate(end);
-    }
-    joined
-}
-
-/// F-U2-8(b)：argv 进事件/日志前的脱敏。`--api-key=xxx` 同词内替换值；
-/// `--api-key xxx` 值在下一个 arg，置 redact_next。宁枉勿纵：以 `-` 开头的
-/// 词以关键字结尾即视为敏感标志位。
-fn sanitize_args(args: &[String]) -> Vec<String> {
-    const KEYWORDS: &[&str] = &["key", "token", "secret", "password"];
-    let mut out = Vec::with_capacity(args.len());
-    let mut redact_next = false;
-    for arg in args {
-        if redact_next {
-            out.push("***".to_string());
-            redact_next = false;
-            continue;
-        }
-        let lower = arg.to_ascii_lowercase();
-        let bare = lower.trim_start_matches('-');
-        if let Some(eq) = bare.find('=') {
-            if KEYWORDS.iter().any(|kw| bare[..eq].ends_with(kw)) {
-                out.push(format!(
-                    "{}=***",
-                    &arg[..arg.find('=').unwrap_or(arg.len())]
-                ));
-                continue;
-            }
-        }
-        if KEYWORDS.iter().any(|kw| bare.ends_with(kw)) {
-            out.push(arg.clone());
-            redact_next = true;
-            continue;
-        }
-        out.push(arg.clone());
-    }
-    out
 }
 
 /// home（`.omt`）目录 → workspace 根（§3.6.4：spawn cwd 不允许落在 `.omt` 里）。
@@ -796,7 +702,7 @@ fn spawn_reader(
             let Ok(line) = line else { break };
             session.first_event_seen.store(true, Ordering::Relaxed);
             // U11：首见 session id 即记（幂等——后续同 id 覆盖无差）
-            if let Some(id) = crate::adapters::extract_session_id(&harness, &line) {
+            if let Some(id) = omt_harness::adapters::extract_session_id(&harness, &line) {
                 *session
                     .harness_session_id
                     .lock()
@@ -804,7 +710,7 @@ fn spawn_reader(
             }
             // U12：JSON 事件流 → 统一事件（adapters.rs；解析失败/未知
             // harness 一律回落 raw——契约是降级保证可用）
-            let mut parts = crate::adapters::parse_line(&harness, &line);
+            let mut parts = omt_harness::adapters::parse_line(&harness, &line);
             if parts.is_empty() {
                 parts = vec![serde_json::json!({
                     "kind": "raw",
@@ -1251,7 +1157,7 @@ fn dispatch_chain(
     let dispatch_id = format!(
         "d-{}-{}",
         agents::now_epoch_ms(),
-        crate::atomic_json::unique_suffix()
+        omt_harness::atomic_json::unique_suffix()
     );
 
     // ① 预检（锁内）
@@ -1348,7 +1254,7 @@ fn dispatch_chain(
                 .unwrap_or(""),
         );
     // exec_id 提前生成：prompt 文件名、Agent 记录、spawn 三方共用
-    let exec_id = format!("exec-{}", crate::atomic_json::unique_suffix());
+    let exec_id = format!("exec-{}", omt_harness::atomic_json::unique_suffix());
     // F-ACC-6（验收 ENAMETOOLONG）：opencode 对位置参数 lstat 判文件附件，
     // 多行长 prompt 被当路径启动即炸。FileAttach 渠道把 prompt 落 per-exec
     // 文件（与 raw.log 同目录，无 secrets——desktop 模板 + run_id），argv 只
@@ -1657,7 +1563,7 @@ fn transcript_tail_from(
             };
             // U12：结构化模式下 raw.log 里是 JSON 行——嗅探解析回结构化
             // 事件（与实时流一致的历史回放）；非 JSON/嗅探不认识 → raw
-            let mut parts = crate::adapters::parse_line_auto(body);
+            let mut parts = omt_harness::adapters::parse_line_auto(body);
             if parts.is_empty() {
                 parts = vec![serde_json::json!({
                     "kind": "raw",
@@ -1731,7 +1637,7 @@ fn session_id_from_raw_log(
             .strip_prefix("[stdout] ")
             .or_else(|| line.strip_prefix("[stderr] "))
             .unwrap_or(line);
-        if let Some(id) = crate::adapters::extract_session_id(harness, body) {
+        if let Some(id) = omt_harness::adapters::extract_session_id(harness, body) {
             return Some(id);
         }
     }
@@ -2031,7 +1937,7 @@ mod tests {
         };
         assert!(detail.contains("起动窗"), "{detail}");
         // agents.json 同步落了 Failed（F-U2-3：attach None）
-        let (file, _) = crate::atomic_json::read_json::<crate::agents::AgentsFile>(
+        let (file, _) = omt_harness::atomic_json::read_json::<crate::agents::AgentsFile>(
             &runtime.join("agents").join("h_test").join("agents.json"),
         )
         .unwrap();
@@ -2301,10 +2207,11 @@ mod tests {
             "kill_all 应在 kill_grace 超时后返回：{elapsed:?}"
         );
         // agents.json 已落 Killed(AppExit)/kill_reason=appexit
-        let (file, parse_failed) = crate::atomic_json::read_json::<crate::agents::AgentsFile>(
-            &runtime.join("agents").join("h_test").join("agents.json"),
-        )
-        .unwrap();
+        let (file, parse_failed) =
+            omt_harness::atomic_json::read_json::<crate::agents::AgentsFile>(
+                &runtime.join("agents").join("h_test").join("agents.json"),
+            )
+            .unwrap();
         assert!(!parse_failed);
         assert_eq!(
             file.agents[0].status,
@@ -2373,28 +2280,6 @@ mod tests {
         // 进程组确已清空（SIGKILL 升级生效）
         let alive = unsafe { libc::kill(-session.pgid, 0) };
         assert_ne!(alive, 0, "TERM 免疫进程应被 SIGKILL 升级清除");
-    }
-
-    #[test]
-    fn sanitize_stderr_tail_redacts_secret_lines() {
-        let tail = "starting up\nAPI_KEY=sk-abcdef123\nAuthorization: Bearer abc.def\ndone\n";
-        let sanitized = sanitize_stderr_tail(tail);
-        assert!(!sanitized.contains("sk-abcdef123"), "{sanitized}");
-        assert!(!sanitized.contains("abc.def"), "{sanitized}");
-        assert!(sanitized.contains("API_KEY= ***"), "{sanitized}");
-        assert!(
-            sanitized.contains("Authorization: Bearer ***"),
-            "{sanitized}"
-        );
-    }
-
-    #[test]
-    fn sanitize_stderr_tail_truncates_on_utf8_boundary() {
-        let tail = "界".repeat(STDERR_TAIL_MAX_CHARS);
-        let sanitized = sanitize_stderr_tail(&tail);
-        assert!(sanitized.len() <= STDERR_TAIL_MAX_CHARS);
-        assert!(sanitized.is_char_boundary(sanitized.len()));
-        assert!(!sanitized.is_empty());
     }
 
     #[test]
@@ -2510,10 +2395,11 @@ mod tests {
             )
             .unwrap();
         wait_for(|| session.terminal().map(|_| ()), Duration::from_secs(20)).expect("应到达终态");
-        let (file, parse_failed) = crate::atomic_json::read_json::<crate::agents::AgentsFile>(
-            &runtime.join("agents").join("h_test").join("agents.json"),
-        )
-        .unwrap();
+        let (file, parse_failed) =
+            omt_harness::atomic_json::read_json::<crate::agents::AgentsFile>(
+                &runtime.join("agents").join("h_test").join("agents.json"),
+            )
+            .unwrap();
         assert!(!parse_failed);
         let exec = &file.agents[0].execs[0];
         assert_eq!(exec.usage_tokens, Some(250), "按消息求和归档");
@@ -2572,7 +2458,7 @@ mod tests {
             .unwrap();
         wait_for(|| session.terminal().map(|_| ()), Duration::from_secs(30)).expect("应到达终态");
         // 刻意不 sleep：「terminal 发布即完整」是 F-BENCH-26(a) 的契约本身
-        let (file, _) = crate::atomic_json::read_json::<crate::agents::AgentsFile>(
+        let (file, _) = omt_harness::atomic_json::read_json::<crate::agents::AgentsFile>(
             &runtime.join("agents").join("h_test").join("agents.json"),
         )
         .unwrap();
@@ -2592,25 +2478,6 @@ mod tests {
             .and_then(|l| serde_json::from_str::<serde_json::Value>(l).ok())
             .and_then(|v| v["kind"].as_str().map(str::to_string));
         assert_eq!(last_kind.as_deref(), Some("exit"), "exit 必须是 jsonl 末行");
-    }
-
-    #[test]
-    fn sanitize_args_redacts_key_value_flags() {
-        let args = vec![
-            "--model".to_string(),
-            "k3".to_string(),
-            "--api-key".to_string(),
-            "sk-live123".to_string(),
-            "--token=abcdef".to_string(),
-            "--verbose".to_string(),
-        ];
-        let sanitized = sanitize_args(&args);
-        assert_eq!(sanitized[0], "--model");
-        assert_eq!(sanitized[1], "k3");
-        assert_eq!(sanitized[2], "--api-key");
-        assert_eq!(sanitized[3], "***");
-        assert_eq!(sanitized[4], "--token=***");
-        assert_eq!(sanitized[5], "--verbose");
     }
 
     #[test]
@@ -3008,7 +2875,7 @@ mod tests {
         let persisted = wait_for(
             || {
                 let (file, parse_failed) =
-                    crate::atomic_json::read_json::<crate::agents::AgentsFile>(&agents_file)
+                    omt_harness::atomic_json::read_json::<crate::agents::AgentsFile>(&agents_file)
                         .unwrap_or_default();
                 (!parse_failed
                     && file.agents.iter().any(|a| {
@@ -3119,15 +2986,6 @@ mod tests {
         assert!(value.get("runId").is_some(), "{value}");
         assert!(value.get("warnings").is_some(), "{value}");
         assert!(value.get("exec_id").is_none(), "{value}");
-    }
-
-    #[test]
-    fn sanitize_line_redacts_secret_shapes() {
-        assert_eq!(sanitize_line("API_KEY=sk-abcdef123"), "API_KEY= ***");
-        assert!(sanitize_line("Authorization: Bearer abc.def").starts_with("Authorization:"));
-        assert!(sanitize_line("Authorization: Bearer abc.def").ends_with("***"));
-        assert!(sanitize_line("password: hunter2").ends_with("***"));
-        assert!(!sanitize_line("plain log line").contains("***"));
     }
 
     // ── U4 dispatch_chain（#5：补偿表经 rpc seam 断言）─────────────────────
@@ -3291,10 +3149,11 @@ mod tests {
     }
 
     fn read_agents_file(runtime: &Path) -> crate::agents::AgentsFile {
-        let (file, parse_failed) = crate::atomic_json::read_json::<crate::agents::AgentsFile>(
-            &runtime.join("agents").join("h_test").join("agents.json"),
-        )
-        .unwrap();
+        let (file, parse_failed) =
+            omt_harness::atomic_json::read_json::<crate::agents::AgentsFile>(
+                &runtime.join("agents").join("h_test").join("agents.json"),
+            )
+            .unwrap();
         assert!(!parse_failed);
         file
     }

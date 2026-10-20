@@ -12,8 +12,8 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::atomic_json::{has_unrecovered_corrupt, read_json, update_json};
 use crate::daemon;
+use omt_harness::atomic_json::{has_unrecovered_corrupt, read_json, update_json};
 
 // ---------------------------------------------------------------------------
 // 持久化 schema（§3.2；camelCase 落盘）

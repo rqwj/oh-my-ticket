@@ -1,6 +1,6 @@
 //! 评测机制 §6.2（F-BENCH-2/5/10/13）：契约探针——`#[ignore]` 集成测试形态
 //!（三轮评审：不加第二个 `[[bin]]`；需真实 harness，默认不进 CI，按需
-//! `cargo test -p oh-my-ticket-desktop --test harness_probe -- --ignored`）。
+//! `cargo test -p omt-harness --test harness_probe -- --ignored`）。
 //!
 //! **registry 驱动**（F-BENCH-5）：binary 解析走 `which_binary`（REGISTRY 的
 //! binary_name），model_list_args 从 descriptor 读——探针不再自带 flag 副本，
@@ -9,7 +9,7 @@
 //!
 //! 语料采集（harness-capture）在同目录 example。
 
-use oh_my_ticket_desktop_lib::{descriptor_of, which_binary, REGISTRY};
+use omt_harness::{descriptor_of, which_binary, REGISTRY};
 use std::io::Read;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -116,7 +116,7 @@ fn probe_model_list_executable() {
 /// （fixture 由 capture/采样脚本产出；此处断言统一事件面要素。）
 #[test]
 fn probe_event_vocabulary_from_fixtures() {
-    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../fixtures");
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
     for (provider, version) in [("pi", "1.3.0"), ("omp", "18.12.2"), ("opencode", "1.18.32")] {
         let text = std::fs::read_to_string(
             root.join("harness")

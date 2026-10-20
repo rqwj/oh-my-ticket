@@ -4,14 +4,7 @@
 //! kind:"desktop", single-entry admin-grant refresh, and the Rust-held
 //! connection bridged to the frontend through tauri commands.
 
-mod adapters;
-
-/// F-BENCH-5：探针/capture/分析器的最小 pub 面——registry 驱动，杜绝
-/// 探针自带 flag 副本（R-1 否决项）。§6.3 搬迁时整体移入 omt-harness。
-pub use harness::{descriptor_of, probe_version, which_binary, HarnessDescriptor, REGISTRY};
 mod agents;
-mod atomic_json;
-mod bench;
 mod daemon;
 // U2 内核先于 U4 exec_start 接线落地——spawn 侧 API 在 U4 前是死代码
 #[allow(dead_code)]
