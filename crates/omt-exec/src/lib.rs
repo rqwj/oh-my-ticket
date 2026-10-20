@@ -8,3 +8,5 @@ pub mod grants;
 pub mod layout;
 pub mod mcp_injection;
 pub mod migrate;
+pub mod shim;
+pub mod spec;

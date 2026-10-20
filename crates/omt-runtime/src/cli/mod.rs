@@ -19,7 +19,7 @@ use omt_storage::clock::MillisClock;
 use omt_storage::{Problem, Result};
 
 const EXIT_OK: i32 = 0;
-const EXIT_USAGE: i32 = 2;
+pub const EXIT_USAGE: i32 = 2;
 const EXIT_PROBLEM: i32 = 3;
 const EXIT_CANCELED: i32 = 130;
 
@@ -88,6 +88,8 @@ pub fn real_run_code() -> i32 {
 fn real_run() -> i32 {
     // Arm SIGINT/SIGTERM handling: the wake closure flips CANCELED and
     // shuts the active socket down so a blocked call aborts promptly.
+    // (`omt exec-shim` is dispatched in cli_main.rs BEFORE this runs — the
+    // shim must keep the default signal mask for its own handler, F1.)
     crate::signal::install(Box::new(|| {
         CANCELED.store(true, Ordering::SeqCst);
         if let Some(fd) = *ACTIVE_FD.lock().expect("fd slot") {
@@ -129,6 +131,44 @@ enum CliError {
     Usage(String),
     Problem(Problem),
     Canceled,
+}
+
+/// `omt [--runtime-dir <d>] exec-shim <homeId> <agentId> <execId>`（设计
+/// §3.2 / KD-E1）：launcher 拉起的隐藏动词，不进 USAGE。本函数只做**解析**——
+/// `omt_exec` 的接线留在 `omt` 二进制（`cli_main.rs`），lib（因而 omt-daemon）
+/// 不经本模块引用到 omt_exec（KD-E9，Task 8 Step 8 的 nm 验证）。
+pub struct ExecShimTarget {
+    pub runtime_dir: std::path::PathBuf,
+    pub home_id: String,
+    pub agent_id: String,
+    pub exec_id: String,
+}
+
+/// exec-shim 调用的解析结果：`NotExecShim` = 其他动词（含 split_globals 的
+/// 用法错误——交给正常分派报 USAGE）；`Usage` = 是 exec-shim 但位置参数不对。
+pub enum ExecShimParse {
+    NotExecShim,
+    Usage,
+    Target(ExecShimTarget),
+}
+
+/// 位置参数——全局 `--home` 会被 split_globals 吞掉。
+pub fn parse_exec_shim(args: &[String]) -> ExecShimParse {
+    let Ok(split) = split_globals(args) else {
+        return ExecShimParse::NotExecShim;
+    };
+    if split.rest.first().map(String::as_str) != Some("exec-shim") {
+        return ExecShimParse::NotExecShim;
+    }
+    match &split.rest[1..] {
+        [home_id, agent_id, exec_id] => ExecShimParse::Target(ExecShimTarget {
+            runtime_dir: crate::paths::resolve(split.globals.runtime_dir.as_deref()),
+            home_id: home_id.clone(),
+            agent_id: agent_id.clone(),
+            exec_id: exec_id.clone(),
+        }),
+        _ => ExecShimParse::Usage,
+    }
 }
 
 impl From<Problem> for CliError {
