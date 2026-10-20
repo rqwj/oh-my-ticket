@@ -191,8 +191,21 @@ pub fn list_agents(runtime_dir: &Path, home_id: &str) -> Result<(Vec<AgentRecord
             agents.push(record);
         }
     }
+    // F-EXEC-1：home 级旧版单文件仍以原名存在 = 未迁移 / 迁移因损坏跳过 /
+    // 迁移中断未改名——旧 agent 没进新表，agent 表无法证明有效（悬空判定
+    // 会把指向旧 agent 的绑定误判删除）；升级前的 `.corrupt-*` 留证同理。
+    // 两者都置 parseFailed，让 bindings_get/bindings_gc 一并冻结。
+    let legacy = legacy_agents_monolith(runtime_dir, home_id)?;
+    parse_failed |= legacy.is_file() || has_unrecovered_corrupt(&legacy);
     agents.sort_by(|a, b| first_started(a).cmp(first_started(b)).then(a.id.cmp(&b.id)));
     Ok((agents, parse_failed))
+}
+
+/// 旧版 home 级单文件存储的路径（迁移成功后改名为 `.migrated`，见
+/// migrate.rs；名字拼出以避开迁移 grep 的字面量，先例见 tests 的
+/// register_writes_one_dir_per_agent_and_seq_is_monotonic）。
+fn legacy_agents_monolith(runtime_dir: &Path, home_id: &str) -> Result<PathBuf, String> {
+    Ok(layout::home_dir(runtime_dir, home_id)?.join(format!("{}.json", "agents")))
 }
 
 /// 持久单调的 agent 序号（`Agent N` 的 N）。
@@ -915,6 +928,118 @@ mod tests {
         assert!(err.contains("冻结"), "{err}");
         let persisted = read_bindings(&runtime, &home).unwrap();
         assert_eq!(persisted.len(), 2, "缺失路径下绑定原样保留: {persisted:?}");
+    }
+
+    /// 旧版 home 级单文件的路径（名字拼出以避开迁移 grep 的字面量，先例
+    /// register_writes_one_dir_per_agent_and_seq_is_monotonic）。
+    fn legacy_monolith(runtime: &Path, home: &str) -> PathBuf {
+        crate::layout::home_dir(runtime, home)
+            .unwrap()
+            .join(format!("{}.json", "agents"))
+    }
+
+    /// 旧版单文件的 `.corrupt-<ts>` 留证路径（升级前 atomic_json 降级产物）。
+    fn legacy_corrupt_evidence(runtime: &Path, home: &str) -> PathBuf {
+        let legacy = legacy_monolith(runtime, home);
+        let name = legacy.file_name().unwrap().to_string_lossy().to_string();
+        legacy.with_file_name(format!("{name}.corrupt-1760000000000"))
+    }
+
+    #[test]
+    fn bindings_gc_frozen_while_legacy_agents_monolith_unmigrated() {
+        // F-EXEC-1 场景 A：旧版单文件损坏 → 迁移跳过并留原地；用户在新布局
+        // 下派发一次后 seq.json 出现，「seq.json 缺失」冻结条件失效——若
+        // parseFailed 仍为 false，GC 会把指向未迁移旧 agent 的绑定当悬空删
+        // （评审复现 removed:1）。旧文件仍在 = agent 表无法证明有效，必须冻结。
+        let (_dir, runtime, home) = temp_runtime();
+        let legacy = legacy_monolith(&runtime, &home);
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "{oops").unwrap();
+        // 模拟派发一次后的新布局状态：seq.json 存在 + 健康的新 agent
+        seed_agents(&runtime, &home, &["new1"]);
+        assert!(crate::layout::seq_file(&runtime, &home).unwrap().exists());
+        write_binding(&runtime, &home, "T-legacy", "agent-old-unmigrated").unwrap();
+        write_binding(&runtime, &home, "T-new", "agent-new1").unwrap();
+
+        let degraded = bindings_get_value(&runtime, &home).unwrap();
+        assert_eq!(degraded["parseFailed"], true, "旧文件未迁移必须降级");
+
+        let err = bindings_gc_value(&runtime, &home).unwrap_err();
+        assert!(err.contains("冻结"), "{err}");
+        let persisted = read_bindings(&runtime, &home).unwrap();
+        assert_eq!(
+            persisted.len(),
+            2,
+            "指向未迁移旧 agent 的绑定不得被当悬空清掉: {persisted:?}"
+        );
+        assert_eq!(
+            persisted.get("T-legacy").map(String::as_str),
+            Some("agent-old-unmigrated")
+        );
+    }
+
+    #[test]
+    fn legacy_corrupt_evidence_keeps_list_degraded() {
+        // F-EXEC-1 场景 A2：升级前遗留的 `.corrupt-*` 留证（旧 atomic_json
+        // 降级改名产物）在迁移后被无视——降级判定必须把它计入，否则留证
+        // 形同虚设，悬空判定会在缺失的旧表上误判。
+        let (_dir, runtime, home) = temp_runtime();
+        seed_agents(&runtime, &home, &["a1"]); // 健康的按 agent 目录
+        let evidence = legacy_corrupt_evidence(&runtime, &home);
+        std::fs::write(&evidence, "{oops").unwrap();
+        write_binding(&runtime, &home, "T-1", "agent-a1").unwrap();
+
+        let (agents, failed) = list_agents(&runtime, &home).unwrap();
+        assert_eq!(agents.len(), 1, "健康的按 agent 记录仍应列出");
+        assert!(failed, "未恢复的旧损坏留证必须保持降级");
+        let degraded = bindings_get_value(&runtime, &home).unwrap();
+        assert_eq!(degraded["parseFailed"], true);
+    }
+
+    #[test]
+    fn fully_migrated_home_is_not_degraded_and_gc_works() {
+        // F-EXEC-1 收紧的另一侧：迁移完成后（旧文件改名 .migrated、原名
+        // 消失）不得继续降级——GC 正常清悬空。用真实迁移入口构造终态。
+        let (_dir, runtime, home) = temp_runtime();
+        let legacy = legacy_monolith(&runtime, &home);
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(
+            &legacy,
+            serde_json::to_string(&AgentsFile {
+                meta: AgentsMeta { agent_seq: 3 },
+                agents: vec![AgentRecord {
+                    id: "agent-migrated".into(),
+                    display_name: "Agent 3".into(),
+                    harness: "pi".into(),
+                    last_exec_id: Some("exec-old".into()),
+                    execs: vec![ExecRecord {
+                        exec_id: "exec-old".into(),
+                        started_at: "1760000000000".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let report = crate::migrate::migrate_legacy(&runtime).unwrap();
+        assert_eq!(report.homes, 1);
+        assert!(
+            !legacy.exists(),
+            "迁移成功后旧文件必须消失（改名 .migrated）"
+        );
+
+        let (agents, failed) = list_agents(&runtime, &home).unwrap();
+        assert!(!failed, "迁移完成后不得继续降级");
+        assert_eq!(agents.len(), 1);
+
+        write_binding(&runtime, &home, "T-live", "agent-migrated").unwrap();
+        write_binding(&runtime, &home, "T-dangling", "agent-gone").unwrap();
+        let result = bindings_gc_value(&runtime, &home).unwrap();
+        assert_eq!(result["removed"], 1);
+        assert_eq!(result["bindings"]["T-live"], "agent-migrated");
+        assert!(result["bindings"].get("T-dangling").is_none());
     }
 
     #[test]
