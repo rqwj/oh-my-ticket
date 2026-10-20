@@ -25,13 +25,13 @@ branch: feat/desktop-agents-dispatch
 
 | ID | 级别 | 类型 | 单元 | 位置 | 摘要 | 状态 | 负责人 |
 |---|---|---|---|---|---|---|---|
-| F-BENCH-18 | P1 | gated_auto | BENCH | `.gitignore:26` / `fixtures/harness/*/raw.log` | **raw.log 语料未入库**：`*.log` 规则把三份 raw.log 全部忽略，只存在于本机。`raw_log_replay_matches_recorded_events` 在干净 clone / CI 上会 panic（「raw.log 应存在」），CI rust 任务必红；F-BENCH-15 在仓库里实际未关闭（§30） | fixed(55a8e55)：三份 raw.log 已入库、逐行 JSON 合法；但「时间戳已清洗」「≥12 文件下限」两项声明不实——见 F-BENCH-24 | — |
+| F-BENCH-18 | P1 | gated_auto | BENCH | `.gitignore:26` / `fixtures/harness/*/raw.log` | **raw.log 语料未入库**：`*.log` 规则把三份 raw.log 全部忽略，只存在于本机。`raw_log_replay_matches_recorded_events` 在干净 clone / CI 上会 panic（「raw.log 应存在」），CI rust 任务必红；F-BENCH-15 在仓库里实际未关闭（§30） | fixed(55a8e55 + 2b8e036)：入库 + 必需文件清单入测（缺一即红）；「时间戳已清洗」「≥12 下限」两项不实声明由 F-BENCH-24 在 2b8e036 兑现 | — |
 | F-BENCH-19 | P1 | gated_auto | BENCH/U12 | `adapters.rs::parse_opencode` step_finish | **opencode 的 usage 也是逐步的值，被误标为累计**：语料 4 个 step_finish 各带不同 messageID，每个 total = 该步 input + output + reasoning + cache.read（如 1518+45+109+23040 = 24712）。按「累计取末值」报 25460，实为 98225（少报约 3.9 倍）；本卷免费档 cost=0 掩盖了问题，付费 provider 会少报费用（§30） | fixed(55a8e55)：opencode 标 message，98225 入测 | — |
 | F-BENCH-20 | P3 | testing-gap | BENCH/U12 | `executor.rs::UsageTotals` | `record` / `final_totals` 无直接单测（混合 scope、全零、历史无 scope 事件）；修复前归档的 ExecRecord 用量仍是旧口径，未重算也未标注 | 部分 fixed(55a8e55)：UsageTotals 四形态单测已补；历史 ExecRecord 旧口径未重算/未标注（advisory） | — |
-| F-BENCH-21 | P3 | gated_auto | BENCH | `harness_probe.rs::run_with_timeout` / `harness-capture.rs::capture` | 进程退出后才读 stdout：输出超过管道缓冲（约 64KB）时子进程阻塞在写，30s 后被误判超时；`PROVIDERS` 是手写列表，REGISTRY 新增 provider 不会被探测 | 部分 fixed(55a8e55)：探针读线程已前置；`all_providers()` 仍写死三家（注释却称「从 REGISTRY 遍历」），`harness-capture::capture` 仍退出后读、且现在两个管道都如此（§31） | — |
-| F-BENCH-22 | P3 | advisory | 测试稳定性 | `harness.rs` / `executor.rs` 计时类测试 | 全量 `cargo test -p oh-my-ticket-desktop --lib` 3 次中 2 次失败，失败的测试每次不同（`probe_version_times_out_hanging_binary`、`harness_entry_projects_state_from_binary_source`、`kill_all_timeout_branch_settles_unwaited_session`），单独运行均通过。这些代码路径本轮未改，应是既有 flake；§29「重跑即绿」的做法会让 CI 偶发红，需要单独定位 | open：.cargo/config.toml 不在 CI 生效，且 4 线程下仍复现；根因更像 ETXTBSY 而非计时（§31） | — |
-| F-BENCH-23 | P2 | gated_auto | BENCH | `bench.rs::analyze_jsonl` raw.log 回落 | **语料目录的 raw.log 被同目录所有 jsonl 共用**：找不到 `<execId>.raw.log` 时回落到 `raw.log`。omp 18.12.2 目录有两卷（smoke-hello 与 synthetic-lines），分析 synthetic-lines 时会用 smoke 那次运行的 raw.log 覆盖用量，报出另一条流的 42430 tokens。修法：语料按 executor 的命名存成 `<stem>.raw.log`，删掉回落分支（§31） | open | — |
-| F-BENCH-24 | P3 | gated_auto | BENCH | `fixtures/harness/*/raw.log` / `bench.rs::fixtures_are_normalized` | 55a8e55 提交说明称「时间戳已清洗」「覆盖下限 ≥12」，实际 raw.log 仍有 170 处内嵌 ISO 时间戳（omp 100 / opencode 10 / pi 60，与 §30 计数相同），测试下限仍是 `checked >= 9`，归一化测试也不检查时间戳；另含 `mcp:93364` 这类真实 pid（§31） | open | — |
+| F-BENCH-21 | P3 | gated_auto | BENCH | `harness_probe.rs::run_with_timeout` / `harness-capture.rs::capture` | 进程退出后才读 stdout：输出超过管道缓冲（约 64KB）时子进程阻塞在写，30s 后被误判超时；`PROVIDERS` 是手写列表，REGISTRY 新增 provider 不会被探测 | fixed(2b8e036)：capture 双读线程前置、all_providers 真遍历 REGISTRY、探针 flag 面用 d.probe_args（§32） | — |
+| F-BENCH-22 | P2 | gated_auto | 测试稳定性 | `harness.rs` / `executor.rs` 计时类测试 | 全量 `cargo test -p oh-my-ticket-desktop --lib` 3 次中 2 次失败，失败的测试每次不同（`probe_version_times_out_hanging_binary`、`harness_entry_projects_state_from_binary_source`、`kill_all_timeout_branch_settles_unwaited_session`），单独运行均通过。这些代码路径本轮未改，应是既有 flake；§29「重跑即绿」的做法会让 CI 偶发红，需要单独定位 | fixed(2b8e036)：真因是 macOS 首次 exec 现写文件的系统评估停顿（插桩三轮定案，ETXTBSY 被证伪），探针梯子 2/6/6s + 测试预算 20s + READY 屏障 + 线程上限移仓库根；4T×5 + 16T×2 + worktree 全绿（§32） | — |
+| F-BENCH-23 | P2 | gated_auto | BENCH | `bench.rs::analyze_jsonl` raw.log 回落 | **语料目录的 raw.log 被同目录所有 jsonl 共用**：找不到 `<execId>.raw.log` 时回落到 `raw.log`。omp 18.12.2 目录有两卷（smoke-hello 与 synthetic-lines），分析 synthetic-lines 时会用 smoke 那次运行的 raw.log 覆盖用量，报出另一条流的 42430 tokens。修法：语料按 executor 的命名存成 `<stem>.raw.log`，删掉回落分支（§31） | fixed(2b8e036)：改名成对 + 回退删除 + gitignore `*.raw.log` + 必需文件清单（§32） | — |
+| F-BENCH-24 | P3 | gated_auto | BENCH | `fixtures/harness/*/raw.log` / `bench.rs::fixtures_are_normalized` | 55a8e55 提交说明称「时间戳已清洗」「覆盖下限 ≥12」，实际 raw.log 仍有 170 处内嵌 ISO 时间戳（omp 100 / opencode 10 / pi 60，与 §30 计数相同），测试下限仍是 `checked >= 9`，归一化测试也不检查时间戳；另含 `mcp:93364` 这类真实 pid（§31） | fixed(2b8e036)：288 处 ISO + 87 处 pid 清洗（行级解析一致性保持）、防回退断言 + 下限 13、capture normalize() 生成侧补齐、meta.json 说明如实化（§32） | — |
 | F-BENCH-13 | P1 | manual | BENCH | `4e960a2` 提交说明 / §27（修复节） | 提交说明与日志称 F-BENCH-5/6/7/10 及 8/12 部分已修，但 `harness_probe.rs`、`harness-capture.rs`、`lib.rs` 自 f6eeaed 后**未改动**（无 worktree / stash / 其他分支留存）——改动疑似未提交即丢失（§28） | fixed(3192d60)（改动已重做并核实存在） | — |
 | F-BENCH-14 | P1 | manual | BENCH/U12 | `executor.rs` usage 归档 / `bench.rs` / `adapters.rs` | **usage 是每条消息的值，不是会话累计**：pi 1.3.0 与 omp 18.12.2 语料中 cost 逐消息非单调（0.0349→0.0095→0.0078→0.0092）。F-U12-3「累计快照取末值」的口径错误——ExecRecord 的 usage 与分析器的 tokens/cost 只记最后一条消息：pi 卷报 $0.0092 实为 $0.0615（少报 6.7 倍），omp 卷报 $0.0096 实为 $0.0431（§28） | fixed(da9c376 + 55a8e55)：三家均按消息/步求和 | — |
 | F-BENCH-15 | P1 | manual | BENCH | `bench.rs::raw_lines_reparse_through_current_adapter` | 重放测不到解析漂移：语料的 raw 行只是采集时**未产出事件**的行，产出 tool_call / thinking / text 的源行没有保留，无从重放；该测试能通过只因 4e960a2 新增的 turn_end usage 提取（改动前 pi 的 raw 行重放结构化数为 0）（§28） | fixed(55a8e55)：raw.log 已入库，重放对账测试在干净树上可跑 | — |
@@ -42,7 +42,7 @@ branch: feat/desktop-agents-dispatch
 | F-BENCH-5 | P1 | manual | BENCH | `harness_probe.rs` / `harness-capture.rs` | 探针硬编码 binary 路径与 model_list_args，测的是自己的 registry 副本（违反 R-1，F-PI-2 类漂移测不出）（§27） | fixed(3192d60) | — |
 | F-BENCH-6 | P2 | gated_auto | BENCH | `harness-capture.rs` | omp `--version` 为 `omp/18.12.2` → 落到 `omp/omp/18.12.2/` | fixed(3192d60) | — |
 | F-BENCH-7 | P2 | gated_auto | BENCH | `harness-capture.rs` | 重跑 capture 覆盖手写 meta.json 出处 | fixed(3192d60)（三家 meta 出处已补回） | — |
-| F-BENCH-8 | P2 | gated_auto | BENCH | `fixtures_are_normalized` / `normalize` | 归一测试不含 omp 卷与 help/models；raw 内嵌时间戳未归一；未过 sanitize_line | 部分（测试已遍历全部语料；capture 未过 sanitize_line、raw 内嵌时间戳未归一） | — |
+| F-BENCH-8 | P2 | gated_auto | BENCH | `fixtures_are_normalized` / `normalize` | 归一测试不含 omp 卷与 help/models；raw 内嵌时间戳未归一；未过 sanitize_line | 部分（测试已遍历全部语料；raw 内嵌时间戳已清洗 fixed(2b8e036)；capture 未过 sanitize_line 仍开放） | — |
 | F-BENCH-9 | P2 | gated_auto | BENCH | `bench.rs` opencode 测试 | 注释过时（实为 3 次）且未断言 tool_calls==3 | fixed(4e960a2) | — |
 | F-BENCH-10 | P3 | gated_auto | BENCH | 探针 / capture | 裸 `.output()` 无超时（F1 教训） | fixed(3192d60)（余项见 F-BENCH-21） | — |
 | F-BENCH-11 | P3 | advisory | BENCH | omp 卷 | 无 usage 事件 → omp tokens/cost 恒 None | superseded(F-BENCH-14)（end 族提取已补，但取末值的口径本身是错的） | — |
@@ -1318,6 +1318,28 @@ F-BENCH-13 查证结论：4e960a2 提交说明声称的探针/capture/lib 改动
 | F-BENCH-24 | P3 | raw.log 的内嵌时间戳（omt 工具返回体里的 `createdAt` / `updatedAt` / `finishedAt` 等）未清洗，`fixtures_are_normalized` 不检查时间戳、下限仍是 9（现在有 13 个可扫文件）。若决定保留时间戳（它们在字符串内，不影响解析），请在 meta.json 里注明并删掉提交说明中的说法；若要清洗，加一条 ISO 时间戳正则断言防回归 |
 
 **建议顺序**：F-BENCH-22（CI 稳定性；改用 `/bin/sh` 执行最省事）→ F-BENCH-23（改名，顺带解决 gitignore 规则）→ F-BENCH-21 / 24。另：五次「声称已修、实际不在」都能在提交前通过 `git stash -u && cargo test` 或干净 worktree 跑一遍查出，建议把它写进收尾清单。
+
+### §32. F-BENCH-21~24 修复 + flake 真因调查（2026-10-20，2b8e036）
+
+**指控核实**（§31 四项「说明与代码不符」全部坐实后才动手）：`all_providers()` 硬编码三家 + 假注释、raw.log 170 处 ISO（omp 100 / opencode 10 / pi 60，另 jsonl 里还有 117 处转义字符串体）、`checked >= 9`、§31 当时确不存在（ef7328d 先原样提交评审方文档）。
+
+**F-BENCH-22 真因（插桩三轮定案，推翻 §31 的 ETXTBSY 推断）**：
+1. spawn 错误路径插桩（probe_version / capture_with_timeout 两处）：20+ 轮复现中 **spawn 从不报错**（仅有的 [diag] 是 pendingVerification 用例的预期 NotFound）——且 ETXTBSY 在 darwin 上三种形态（append/truncate 持有、脚本/二进制目标、经 sh 的真 execve）均无法合成复现；
+2. 超时/空输出分支插桩：失败全部走 **TIMEOUT** 路径；
+3. 超时分支 kill 后 `wait()` 状态 = signal 9（我们自己的 SIGKILL）——子进程真活着没跑完，非 waitpid/WNOHANG 观察盲区；
+4. 独立实验（16 线程并发各 100 次）：**冷 exec 刚写入的脚本 p50 6.3s / worst 9.3s；重复 exec 同文件 39ms；`sh <file>`（脚本作数据读）37ms**。
+
+结论：macOS 对「首次 exec 刚落盘的可执行文件」存在系统级评估停顿，退化态秒级排队；测试里的假 harness 脚本全是现写的，1-5s 级断言预算在该窗口内必挂。§31 建议的 `/bin/sh` 执行方向碰巧可避开评估（sh 把脚本当数据），但探针走生产 `probe_version`（必须 exec 真二进制文件），故修法取**预算/屏障放宽**而非 shell 包装；**ETXTBSY 重试不加**（已被插桩证伪，不留无证据的代码路径）。
+
+修复：探针梯子 2s×3 → **2/6/6s**（`probe_descriptor`：首试保 F1 的 TUI 快否决语义，后两级覆盖评估停顿窗口）；`probe_version_times_out_hanging_binary` 的 good 预算 5→20s、hanging 相位独立计时（10s 余量）；`kill_all_timeout_branch_settles_unwaited_session` 加 READY 屏障（trap 装好才 kill——spawn 返回 ≠ 子进程已起，kill 撞上未装 trap 的窗口时 kill_reason 落不上）；`RUST_TEST_THREADS=4` 移到**仓库根** `.cargo/config.toml`（cargo 只从 CWD 向上查找，原 apps/desktop/src-tauri 位置 CI 的根目录 `cargo test --workspace` 读不到），注释如实写明真因。
+
+**F-BENCH-23**：三份语料 `git mv` 为 `stream-smoke-hello.raw.log`（与 executor 的 `<execId>.raw.log` 同构）；`analyze_jsonl` 删除目录级 `raw.log` 回退（omp synthetic 卷曾会串用 smoke 的 42430）；gitignore 否定改 `!fixtures/harness/**/*.raw.log`；每家 6 文件必需清单入测（缺一即红——F-BENCH-18 的「.gitignore 吞文件、本机绿 CI 红」形态不再依赖数量下限兜底）；扫描下限 9→13。
+
+**F-BENCH-21**：`harness-capture::capture` 双读线程先于等待循环（stderr 已 piped 后两路各有 ~64KB 死锁面；与探针 `run_with_timeout` 同款写法）；`all_providers()` 真正遍历 REGISTRY（lib.rs 导出 `REGISTRY`）；探针 flag 面改用 `d.probe_args`（原测试仍自带 `--version` 副本）。
+
+**F-BENCH-24**：语料清洗共 **288 处 ISO → `__TS__`**（raw.log 170 + jsonl 117 + 分钟精度 1，含 omt 工具返回体里的 createdAt/startedAt/finishedAt）、**87 处 `mcp:<pid>` → `mcp:__PID__`**（3 个真实 pid：69754/93364/94180）；清洗以行级 JSON 可解析性逐行一致为约束；`fixtures_are_normalized` 加 ISO（到分钟精度）/mcp:pid 防回退断言（该断言在清洗前先红过一次，逼出 jsonl 转义体残留——防回退即生效）；capture `normalize()` 生成侧同步补齐；meta.json normalization 说明如实更新（原说明声称已含 pid/timestamps，与事实不符，一并修正）。
+
+**验证**：fmt / clippy `-D warnings` 干净；桌面 crate 4 线程 ×5 + 16 线程 ×2 + workspace 全绿（修复前同机 16 线程 3 次中 2 次失败）；**干净 worktree**（2b8e036 检出，sidecar 从主检出 stage）`cargo test -p oh-my-ticket-desktop` 124+1 passed / 0 failed。收尾清单自此固定：提交说明逐项 grep 核实 + 干净 worktree 跑测（桌面 crate 需先 stage sidecar，见 F-BENCH-18/§31 教训）。
 
 ### 残留状态核查（第二轮验收后）
 
