@@ -8,10 +8,12 @@
 //! - **跨进程 flock**：companion `<file>.lock`（稳定 inode，rename 不影响
 //!   互斥），有界等待后报错而非永久阻塞；
 //! - **tmp/rename 原子替换**：tmp 名含 pid + 进程内序号；0600（凭据可能经
-//!   env 注入，§3.1 secrets 纪律）；
+//!   env 注入，§3.1 secrets 纪律）；rename 前 fsync 内容、rename 后 fsync
+//!   父目录（F-U4a-4，断电不留 0 字节文件）；
 //! - **残留清扫**：每次 update 顺手清同目录超过 1h 的 `*.tmp-*`（F-U1-9）；
-//! - **损坏降级**：解析失败 → 改名 `.corrupt-<ms>` 留证 + 返回默认值 +
-//!   `parse_failed` 标志（agents.json 的该标志供 U9 冻结 GC）。
+//! - **损坏降级**：解析失败 → 取 flock 在锁内复核，仍坏才改名 `.corrupt-<ms>`
+//!   留证 + 返回默认值 + `parse_failed` 标志（F-U4a-3，不误隔离另一写入方
+//!   刚修好的文件；agents.json 的该标志供 U9 冻结 GC）。
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -21,7 +23,7 @@ use std::time::{Duration, Instant};
 /// 提供。锁保护的是写互斥而非不变量——poison 直接穿透（F-U1-8）。
 static STORE_LOCK: Mutex<()> = Mutex::new(());
 
-const LOCK_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(10);
+pub const LOCK_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(10);
 const TMP_STALE_AFTER: Duration = Duration::from_secs(3600);
 
 /// `update_json` / `read_json` 的附加结果。
@@ -75,6 +77,25 @@ fn flock_exclusive(file: &std::fs::File, timeout: Duration) -> Result<(), String
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// 在 `<path>.lock`（稳定 inode）上取跨进程排他锁；返回的句柄 drop 即释放。
+/// 给 atomic_json 之外、但需要与它同一把锁语义的写入方使用（grants、
+/// MCP 项目注入、迁移）。
+pub fn lock_exclusive(path: &Path, timeout: Duration) -> Result<std::fs::File, String> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("create_dir_all: {e}"))?;
+    }
+    let handle = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode_if_unix(0o600)
+        .open(lock_file_of(path))
+        .map_err(|e| format!("open lock file: {e}"))?;
+    flock_exclusive(&handle, timeout)?;
+    Ok(handle)
 }
 
 /// unix-only 的 0600/0700 打开模式（v1 macOS-only，§3.6.3）；desktop 各
@@ -145,11 +166,31 @@ fn write_tmp_and_rename(path: &Path, text: &str) -> Result<(), String> {
             .map_err(|e| format!("open tmp: {e}"))?;
         file.write_all(text.as_bytes())
             .map_err(|e| format!("write tmp: {e}"))?;
+        // F-U4a-4：rename 前落盘，断电不会留下 0 字节文件
+        file.sync_all().map_err(|e| format!("fsync tmp: {e}"))?;
     }
-    std::fs::rename(&tmp, path).map_err(|e| format!("rename: {e}"))
+    std::fs::rename(&tmp, path).map_err(|e| format!("rename: {e}"))?;
+    // 目录项落盘（best-effort：部分文件系统不支持对目录 fsync）
+    if let Some(dir) = path.parent() {
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+    Ok(())
 }
 
-/// 锁内读取：返回 (值, parse_failed)。文件不存在 → 默认值。
+/// 0600 原子写（tmp + fsync + rename）。调用方自行负责互斥。
+pub fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("create_dir_all: {e}"))?;
+    }
+    write_tmp_and_rename(path, text)
+}
+
+/// 读取：返回 (值, parse_failed)。文件不存在 → 默认值。
+/// F-U4a-3：健康文件走无 flock 的快路径；解析失败时取跨进程 flock 后
+/// 在锁内重读复核，仍然损坏才改名留证——不会把另一写入方刚写好的文件
+/// 挪成 .corrupt。
 pub fn read_json<T>(path: &Path) -> Result<(T, bool), String>
 where
     T: Default + serde::Serialize + serde::de::DeserializeOwned,
@@ -157,6 +198,21 @@ where
     let _store_guard = STORE_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Ok((T::default(), false));
+    };
+    if let Ok(value) = serde_json::from_str::<T>(&text) {
+        return Ok((value, false));
+    }
+    recover_corrupt_under_lock::<T>(path)
+}
+
+/// 锁内复核 + 降级（调用方已持 STORE_LOCK）。
+fn recover_corrupt_under_lock<T>(path: &Path) -> Result<(T, bool), String>
+where
+    T: Default + serde::Serialize + serde::de::DeserializeOwned,
+{
+    let _flock = lock_exclusive(path, LOCK_ACQUIRE_TIMEOUT)?;
     read_json_locked::<T>(path)
 }
 
@@ -227,15 +283,7 @@ where
     }
     sweep_stale_tmp(path, TMP_STALE_AFTER);
 
-    let lock_handle = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode_if_unix(0o600)
-        .open(lock_file_of(path))
-        .map_err(|e| format!("open lock file: {e}"))?;
-    flock_exclusive(&lock_handle, LOCK_ACQUIRE_TIMEOUT)?;
+    let _flock = lock_exclusive(path, LOCK_ACQUIRE_TIMEOUT)?;
 
     let (mut value, parse_failed) = read_json_locked::<T>(path)?;
     let changed = mutate(&mut value);
@@ -412,5 +460,72 @@ mod tests {
         });
         let (map, _) = read_json::<BTreeMap<String, String>>(&path).unwrap();
         assert_eq!(map.len(), 8, "{map:?}");
+    }
+
+    /// F-U4a-3：损坏降级的 rename 必须在 flock 内做「复核」——若锁内重读
+    /// 发现文件已被另一写入方修好，不得把好文件挪成 .corrupt。
+    ///
+    /// 这里的确定性模拟正是竞态的 post-swap 状态：read_json 的快路径读到
+    /// 坏内容、取锁之前，另一写入方已经 tmp/rename 换上了好内容。直接对
+    /// 好内容调用 `recover_corrupt_under_lock` 等价于「锁内复核时文件已经
+    /// 是好的」——复核必须直接采纳，不得隔离。
+    #[test]
+    fn corrupt_recovery_rechecks_under_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(&path, r#"{"a":1}"#).unwrap();
+        // 模拟：快路径读到坏内容后、取锁前，另一进程已写入好内容
+        let (value, failed) = recover_corrupt_under_lock::<BTreeMap<String, i32>>(&path).unwrap();
+        assert!(!failed);
+        assert_eq!(value.get("a"), Some(&1));
+        let evidence = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().contains(".corrupt-"));
+        assert!(!evidence, "好文件不得被挪成 .corrupt");
+    }
+
+    /// F-U4a-3 的另一侧（companion）：内容真的坏（没有并发修复方）时，
+    /// 锁内复核后仍必须降级——parse_failed=true 且留下 `.corrupt-*` 留证。
+    /// 防止「复核」被实现成「从不隔离」。
+    #[test]
+    fn corrupt_recovery_quarantines_truly_corrupt_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(&path, r#"{oops"#).unwrap();
+        let (value, failed) = read_json::<BTreeMap<String, i32>>(&path).unwrap();
+        assert!(failed, "真损坏的文件必须报告 parse_failed");
+        assert!(value.is_empty(), "降级必须返回默认值");
+        let evidence = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().contains(".corrupt-"));
+        assert!(evidence, "真损坏的文件必须留下 .corrupt-* 留证");
+    }
+
+    #[test]
+    fn lock_exclusive_blocks_second_holder_until_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.json");
+        let _held = lock_exclusive(&path, Duration::from_secs(1)).unwrap();
+        let err = lock_exclusive(&path, Duration::from_millis(200)).unwrap_err();
+        assert!(err.contains("flock"), "{err}");
+    }
+
+    #[test]
+    fn write_atomic_writes_0600_without_leftover_tmp() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.json");
+        write_atomic(&path, "{}").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty());
     }
 }
