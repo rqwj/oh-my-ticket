@@ -27,12 +27,12 @@ branch: feat/desktop-agents-dispatch
 |---|---|---|---|---|---|---|---|
 | F-BENCH-18 | P1 | gated_auto | BENCH | `.gitignore:26` / `fixtures/harness/*/raw.log` | **raw.log 语料未入库**：`*.log` 规则把三份 raw.log 全部忽略，只存在于本机。`raw_log_replay_matches_recorded_events` 在干净 clone / CI 上会 panic（「raw.log 应存在」），CI rust 任务必红；F-BENCH-15 在仓库里实际未关闭（§30） | fixed(55a8e55 + 2b8e036)：入库 + 必需文件清单入测（缺一即红）；「时间戳已清洗」「≥12 下限」两项不实声明由 F-BENCH-24 在 2b8e036 兑现 | — |
 | F-BENCH-19 | P1 | gated_auto | BENCH/U12 | `adapters.rs::parse_opencode` step_finish | **opencode 的 usage 也是逐步的值，被误标为累计**：语料 4 个 step_finish 各带不同 messageID，每个 total = 该步 input + output + reasoning + cache.read（如 1518+45+109+23040 = 24712）。按「累计取末值」报 25460，实为 98225（少报约 3.9 倍）；本卷免费档 cost=0 掩盖了问题，付费 provider 会少报费用（§30） | fixed(55a8e55)：opencode 标 message，98225 入测 | — |
-| F-BENCH-20 | P3 | testing-gap | BENCH/U12 | `executor.rs::UsageTotals` | `record` / `final_totals` 无直接单测（混合 scope、全零、历史无 scope 事件）；修复前归档的 ExecRecord 用量仍是旧口径，未重算也未标注 | 部分 fixed(55a8e55)：UsageTotals 四形态单测已补；历史 ExecRecord 旧口径未重算/未标注（advisory） | — |
+| F-BENCH-20 | P3 | testing-gap | BENCH/U12 | `executor.rs::UsageTotals` | `record` / `final_totals` 无直接单测（混合 scope、全零、历史无 scope 事件）；修复前归档的 ExecRecord 用量仍是旧口径，未重算也未标注 | fixed(55a8e55 + e87a99a)：UsageTotals 四形态单测；口径自描述——ExecRecord.usageCaliber（"message-sum"，旧 JSON 兼容读 None = 末条口径）+ 归档直达测试 + TS 类型；不重算（usageTokens/usageCost 无 UI 消费点，标注路线即关闭，§34） | — |
 | F-BENCH-21 | P3 | gated_auto | BENCH | `harness_probe.rs::run_with_timeout` / `harness-capture.rs::capture` | 进程退出后才读 stdout：输出超过管道缓冲（约 64KB）时子进程阻塞在写，30s 后被误判超时；`PROVIDERS` 是手写列表，REGISTRY 新增 provider 不会被探测 | fixed(2b8e036)：capture 双读线程前置、all_providers 真遍历 REGISTRY、探针 flag 面用 d.probe_args（§32） | — |
 | F-BENCH-22 | P2 | gated_auto | 测试稳定性 | `harness.rs` / `executor.rs` 计时类测试 | 全量 `cargo test -p oh-my-ticket-desktop --lib` 3 次中 2 次失败，失败的测试每次不同（`probe_version_times_out_hanging_binary`、`harness_entry_projects_state_from_binary_source`、`kill_all_timeout_branch_settles_unwaited_session`），单独运行均通过。这些代码路径本轮未改，应是既有 flake；§29「重跑即绿」的做法会让 CI 偶发红，需要单独定位 | fixed(2b8e036)：真因是 macOS 首次 exec 现写文件的系统评估停顿（插桩三轮定案，ETXTBSY 被证伪），探针梯子 2/6/6s + 测试预算 20s + READY 屏障 + 线程上限移仓库根；4T×5 + 16T×2 + worktree 全绿（§32） | — |
 | F-BENCH-23 | P2 | gated_auto | BENCH | `bench.rs::analyze_jsonl` raw.log 回落 | **语料目录的 raw.log 被同目录所有 jsonl 共用**：找不到 `<execId>.raw.log` 时回落到 `raw.log`。omp 18.12.2 目录有两卷（smoke-hello 与 synthetic-lines），分析 synthetic-lines 时会用 smoke 那次运行的 raw.log 覆盖用量，报出另一条流的 42430 tokens。修法：语料按 executor 的命名存成 `<stem>.raw.log`，删掉回落分支（§31） | fixed(2b8e036)：改名成对 + 回退删除 + gitignore `*.raw.log` + 必需文件清单（§32） | — |
 | F-BENCH-24 | P3 | gated_auto | BENCH | `fixtures/harness/*/raw.log` / `bench.rs::fixtures_are_normalized` | 55a8e55 提交说明称「时间戳已清洗」「覆盖下限 ≥12」，实际 raw.log 仍有 170 处内嵌 ISO 时间戳（omp 100 / opencode 10 / pi 60，与 §30 计数相同），测试下限仍是 `checked >= 9`，归一化测试也不检查时间戳；另含 `mcp:93364` 这类真实 pid（§31） | fixed(2b8e036)：288 处 ISO + 87 处 pid 清洗（行级解析一致性保持）、防回退断言 + 下限 13、capture normalize() 生成侧补齐、meta.json 说明如实化（§32） | — |
-| F-BENCH-25 | P3 | advisory | 设置页 / 探针 | `harness.rs::probe_descriptor` / `harness_list` | 探针梯子 2/6/6s 后，挂起型 binary（flag 写错起 TUI）每家最长 14s（原 6s）；`harness_list` 按 REGISTRY 串行探测，三家都挂时设置页约 42s 才出结果。注释「首试保 TUI 快否决」不成立——首试超时后仍会再等 12s。可改为各 provider 并行探测，或在 UI 先返回 pending 再回填版本（§33） | open | — |
+| F-BENCH-25 | P3→P2 | gated_auto | 设置页 / 探针 | `harness.rs::probe_descriptor` / `harness_list` | 探针梯子 2/6/6s 后，挂起型 binary（flag 写错起 TUI）每家最长 14s（原 6s）；`harness_list` 按 REGISTRY 串行探测，三家都挂时设置页约 42s 才出结果。注释「首试保 TUI 快否决」不成立——首试超时后仍会再等 12s。可改为各 provider 并行探测，或在 UI 先返回 pending 再回填版本（§33） | fixed(e87a99a)：probe_all 并行探测（保序，墙钟 = 最慢一家）+ 并行性测试；不实注释已改写（挂起判定 6→14s 如实记录，由并行补偿）；根配置线程上限注释改为「冗余保险」定位（§34） | — |
 | F-BENCH-13 | P1 | manual | BENCH | `4e960a2` 提交说明 / §27（修复节） | 提交说明与日志称 F-BENCH-5/6/7/10 及 8/12 部分已修，但 `harness_probe.rs`、`harness-capture.rs`、`lib.rs` 自 f6eeaed 后**未改动**（无 worktree / stash / 其他分支留存）——改动疑似未提交即丢失（§28） | fixed(3192d60)（改动已重做并核实存在） | — |
 | F-BENCH-14 | P1 | manual | BENCH/U12 | `executor.rs` usage 归档 / `bench.rs` / `adapters.rs` | **usage 是每条消息的值，不是会话累计**：pi 1.3.0 与 omp 18.12.2 语料中 cost 逐消息非单调（0.0349→0.0095→0.0078→0.0092）。F-U12-3「累计快照取末值」的口径错误——ExecRecord 的 usage 与分析器的 tokens/cost 只记最后一条消息：pi 卷报 $0.0092 实为 $0.0615（少报 6.7 倍），omp 卷报 $0.0096 实为 $0.0431（§28） | fixed(da9c376 + 55a8e55)：三家均按消息/步求和 | — |
 | F-BENCH-15 | P1 | manual | BENCH | `bench.rs::raw_lines_reparse_through_current_adapter` | 重放测不到解析漂移：语料的 raw 行只是采集时**未产出事件**的行，产出 tool_call / thinking / text 的源行没有保留，无从重放；该测试能通过只因 4e960a2 新增的 turn_end usage 提取（改动前 pi 的 raw 行重放结构化数为 0）（§28） | fixed(55a8e55)：raw.log 已入库，重放对账测试在干净树上可跑 | — |
@@ -1359,6 +1359,16 @@ F-BENCH-13 查证结论：4e960a2 提交说明声称的探针/capture/lib 改动
 | — | 备注 | 仓库根 `RUST_TEST_THREADS=4` 现在作用于整个 workspace。真因已经用预算和屏障处理，16 线程也已验证全绿；这个上限今后可能掩盖新的计时类 flake，可以考虑去掉，或在注释里写明它只是冗余保险 |
 
 本轮之后，F-BENCH 系列只剩 F-BENCH-20、F-BENCH-25 两个 advisory 级条目，benchmark tier-1 可以收尾。
+
+### §34. F-BENCH-25/20 修复（2026-10-20，e87a99a）
+
+**F-BENCH-25**：`probe_all` 并行探测——scoped threads 对 REGISTRY 逐条求值，输出保持顺序，墙钟 = 最慢一家（14s）而非 3×14s；`probe_all_runs_entries_concurrently` 用纯线程 sleep 验证并行性与保序（不 spawn 进程，不受 exec 停顿影响）。§33 指出的「首试 2s 快否决 TUI 挂起」不实注释已改写为如实描述：挂起型 binary 判「无版本」等满全梯 6→14s，由并行探测补偿墙钟。§33 备注的根配置线程上限定位问题已采纳：注释改为「冗余保险」（真修复是预算/屏障/并行；上限可能掩盖未来新的计时类 flake，未来可去掉）。
+
+**F-BENCH-20**：走「标注」路线关闭——`ExecRecord.usageCaliber`（`"message-sum"`）由 `finish_terminal` 归档时写入；旧 JSON 兼容读（`None` = 旧口径：只含末条消息、少报、未重算）；直达归档测试（假 pi 流两条 message_end 求和 250 tok/$0.03 + caliber 断言，顺带补上了 F-U12-4 归档路径原本缺失的直达测试）+ TS 类型。不重算的原因：`usageTokens`/`usageCost` 目前**无 UI 消费点**（只在 types.ts 声明），无处标 UI——数据层自描述后，未来任何消费者都能按 caliber 区分。
+
+**顺带（F-BENCH-22 余量收尾）**：全量验证中复现 `dispatch_captures_harness_session_id_end_to_end` 偶发红（单跑绿）——terminal 等待窗口 15/10s 对 exec 评估停顿仅 ~1.6× 余量；executor 测试全部 terminal 等待窗口统一放宽至 30s、boom 测试 startup 窗口 10→30s。桌面 crate 连续 ×6 全绿、前端 pnpm build + vitest 131 全绿。
+
+**勘误**：3568a4c 提交说明中测试名误写为 `probe_all_runs_entries_concurrency`（实名 `..._concurrently`），已在推送前的 amend（e87a99a）中修正。
 
 ### 残留状态核查（第二轮验收后）
 
