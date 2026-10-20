@@ -33,7 +33,7 @@ branch: feat/desktop-agents-dispatch
 | F-BENCH-23 | P2 | gated_auto | BENCH | `bench.rs::analyze_jsonl` raw.log 回落 | **语料目录的 raw.log 被同目录所有 jsonl 共用**：找不到 `<execId>.raw.log` 时回落到 `raw.log`。omp 18.12.2 目录有两卷（smoke-hello 与 synthetic-lines），分析 synthetic-lines 时会用 smoke 那次运行的 raw.log 覆盖用量，报出另一条流的 42430 tokens。修法：语料按 executor 的命名存成 `<stem>.raw.log`，删掉回落分支（§31） | fixed(2b8e036)：改名成对 + 回退删除 + gitignore `*.raw.log` + 必需文件清单（§32） | — |
 | F-BENCH-24 | P3 | gated_auto | BENCH | `fixtures/harness/*/raw.log` / `bench.rs::fixtures_are_normalized` | 55a8e55 提交说明称「时间戳已清洗」「覆盖下限 ≥12」，实际 raw.log 仍有 170 处内嵌 ISO 时间戳（omp 100 / opencode 10 / pi 60，与 §30 计数相同），测试下限仍是 `checked >= 9`，归一化测试也不检查时间戳；另含 `mcp:93364` 这类真实 pid（§31） | fixed(2b8e036)：288 处 ISO + 87 处 pid 清洗（行级解析一致性保持）、防回退断言 + 下限 13、capture normalize() 生成侧补齐、meta.json 说明如实化（§32） | — |
 | F-BENCH-25 | P3→P2 | gated_auto | 设置页 / 探针 | `harness.rs::probe_descriptor` / `harness_list` | 探针梯子 2/6/6s 后，挂起型 binary（flag 写错起 TUI）每家最长 14s（原 6s）；`harness_list` 按 REGISTRY 串行探测，三家都挂时设置页约 42s 才出结果。注释「首试保 TUI 快否决」不成立——首试超时后仍会再等 12s。可改为各 provider 并行探测，或在 UI 先返回 pending 再回填版本（§33） | fixed(e87a99a)：probe_all 并行探测（保序，墙钟 = 最慢一家）+ 并行性测试；不实注释已改写（挂起判定 6→14s 如实记录，由并行补偿）；根配置线程上限注释改为「冗余保险」定位（§34） | — |
-| F-BENCH-26 | P2 | gated_auto | U2/U12 | `executor.rs::finish_terminal` / 等待线程 `:640-670` | **终态先于落账发布**：(a) `finish_terminal` 第一步就写 `terminal`，之后才算 usage、写 agents.json、写 session id、追加 exit 行——轮询 `terminal()` 的一方会读到半成品；(b) reader 线程在 `finish_terminal` **之后**才 join，等待线程只等「首事件」≤300ms——最后几行 stdout（通常正是最后一条 `message_end`）可能还没被解析，usage 少记最后一条、session id 丢失、exit 之后还有 raw 行。16 线程下 6 次有 3 次失败（三个不同测试，均秒级失败，不是 30s 窗口超时）；慢 sink 确定性复现 3/3：归档 100 而非 250、jsonl 末行不是 exit；4 线程上限把它掩盖了（§35） | open | — |
+| F-BENCH-26 | P2 | gated_auto | U2/U12 | `executor.rs::finish_terminal` / 等待线程 `:640-670` | **终态先于落账发布**：(a) `finish_terminal` 第一步就写 `terminal`，之后才算 usage、写 agents.json、写 session id、追加 exit 行——轮询 `terminal()` 的一方会读到半成品；(b) reader 线程在 `finish_terminal` **之后**才 join，等待线程只等「首事件」≤300ms——最后几行 stdout（通常正是最后一条 `message_end`）可能还没被解析，usage 少记最后一条、session id 丢失、exit 之后还有 raw 行。16 线程下 6 次有 3 次失败（三个不同测试，均秒级失败，不是 30s 窗口超时）；慢 sink 确定性复现 3/3：归档 100 而非 250、jsonl 末行不是 exit；4 线程上限把它掩盖了（§35） | fixed(9e6331e)：waiter 清孤儿后先 drain_readers（有界 10s）再落账；幂等 guard 改 finishing 原子标记、terminal 最后发布；评审复现改编为回归测试（不 sleep，(a)(b) 同钉）；16T ×10 验证门全绿后线程上限已删除（§36） | — |
 | F-BENCH-13 | P1 | manual | BENCH | `4e960a2` 提交说明 / §27（修复节） | 提交说明与日志称 F-BENCH-5/6/7/10 及 8/12 部分已修，但 `harness_probe.rs`、`harness-capture.rs`、`lib.rs` 自 f6eeaed 后**未改动**（无 worktree / stash / 其他分支留存）——改动疑似未提交即丢失（§28） | fixed(3192d60)（改动已重做并核实存在） | — |
 | F-BENCH-14 | P1 | manual | BENCH/U12 | `executor.rs` usage 归档 / `bench.rs` / `adapters.rs` | **usage 是每条消息的值，不是会话累计**：pi 1.3.0 与 omp 18.12.2 语料中 cost 逐消息非单调（0.0349→0.0095→0.0078→0.0092）。F-U12-3「累计快照取末值」的口径错误——ExecRecord 的 usage 与分析器的 tokens/cost 只记最后一条消息：pi 卷报 $0.0092 实为 $0.0615（少报 6.7 倍），omp 卷报 $0.0096 实为 $0.0431（§28） | fixed(da9c376 + 55a8e55)：三家均按消息/步求和 | — |
 | F-BENCH-15 | P1 | manual | BENCH | `bench.rs::raw_lines_reparse_through_current_adapter` | 重放测不到解析漂移：语料的 raw 行只是采集时**未产出事件**的行，产出 tool_call / thinking / text 的源行没有保留，无从重放；该测试能通过只因 4e960a2 新增的 turn_end usage 提取（改动前 pi 的 raw 行重放结构化数为 0）（§28） | fixed(55a8e55)：raw.log 已入库，重放对账测试在干净树上可跑 | — |
@@ -1390,6 +1390,19 @@ F-BENCH-13 查证结论：4e960a2 提交说明声称的探针/capture/lib 改动
 **确定性复现（评审方，干净 worktree @ a1a6890）**：在 `terminal_archives_usage_with_caliber` 的基础上只改一处——sink 回调每个事件 sleep 700ms（模拟 UI Channel 慢 / 机器负载）。终态后再等 3 秒才读文件，以排除竞态 (a)。结果 **3 次全部复现**：agents.json 归档 `usage_tokens = 100`（应为 250，第二条 `message_end` 永久漏记，记录却带着 `message-sum` 标记），jsonl 最后一行是 `usage` 而不是 `exit`（exit 之后又追加了事件）。这证明 (b) 是生产数据错误，不只是测试读早了。复现补丁可直接作为修复的回归测试。
 
 **线程上限**：这正是 §33 担心的情况——4 线程上限掩盖了一个真实的竞态。建议修完 F-BENCH-26 后在 16 线程下连跑 10 次全绿，再决定这个上限去留。
+
+### §36. F-BENCH-26 修复（2026-10-20，9e6331e）
+
+按 §35 处方两项都做，外加两处连带：
+
+- **(b) reader 先于落账排空**：waiter 在子进程退出 + `kill_tree(SIGKILL)` 清孤儿后（管道必然 EOF），先 `drain_readers`（有界 join，`READER_DRAIN_TIMEOUT` = 10s——EOF 已由清场保证，剩余耗时只是逐行解析 + sink 回调；超时 detach 并 eprintln，不劣于修复前），之后才 classify / `finish_terminal`；max_duration 兜底分支同样排空。末条 `message_end` / session id 不再漏记。
+- **(a) terminal 最后发布**：幂等 guard 改 `ExecSession.finishing`（AtomicBool `compare_exchange`，独立于 terminal）；`finish_terminal` 内 MCP 释放 → agents.json（状态/三字段/usage+caliber/session id）→ 租约释放 → exit 事件 + jsonl 行**全部完成后**才写 terminal——`wait_for(terminal)` 返回即完整。
+- **回归测试**：评审方复现改编为 `slow_sink_tail_events_settle_before_terminal`（sink 每事件 700ms；刻意不 sleep——「terminal 发布即完整」是 (a) 的契约本身，250 + caliber + jsonl 末行 exit 三个断言把 (a)(b) 同时钉死）。评审已证修复前确定性红（3/3）。
+- **契约连带**：`terminal_finalization_releases_run_lease_once` 原在收到租约释放消息后立即断言 `terminal`——新顺序下租约释放先于 terminal 发布（§36 修复过程中它先确定性红了，恰好当了一次免费的契约哨兵），改为 `wait_for(terminal)`。
+- **nit**：`UsageTotals::final_with_caliber` 按实际产出分支给口径（cumulative → `"cumulative-last"`，不再误标 message-sum）；agents.rs / types.ts 注释起始改 e87a99a 并注明 da9c376..e87a99a 的无标记空窗（开发期数据）。
+- **线程上限移除**：§35 验证门（16 线程 ×10 全绿）通过后删除仓库根 `.cargo/config.toml`。§34「16 线程亦已验证全绿」在当前代码不成立的指正确认——当时 2 次样本掩盖了 F-BENCH-26，上限正是掩盖源，按 §33/§35 的担心与建议撤除。
+
+**验证**：fmt / clippy `-D warnings` 干净；16T ×10 + 默认（16）×3 + workspace 全绿；前端 build + vitest 131 全绿；干净 worktree @9e6331e（sidecar 另行 stage）桌面 crate 128+1 passed / 0 failed。
 
 ### 残留状态核查（第二轮验收后）
 
