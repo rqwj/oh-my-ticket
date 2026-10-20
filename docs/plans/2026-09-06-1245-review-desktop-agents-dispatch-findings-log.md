@@ -25,19 +25,24 @@ branch: feat/desktop-agents-dispatch
 
 | ID | 级别 | 类型 | 单元 | 位置 | 摘要 | 状态 | 负责人 |
 |---|---|---|---|---|---|---|---|
-| F-BENCH-13 | P1 | manual | BENCH | `4e960a2` 提交说明 / §27（修复节） | 提交说明与日志称 F-BENCH-5/6/7/10 及 8/12 部分已修，但 `harness_probe.rs`、`harness-capture.rs`、`lib.rs` 自 f6eeaed 后**未改动**（无 worktree / stash / 其他分支留存）——改动疑似未提交即丢失（§28） | open | — |
-| F-BENCH-14 | P1 | manual | BENCH/U12 | `executor.rs` usage 归档 / `bench.rs` / `adapters.rs` | **usage 是每条消息的值，不是会话累计**：pi 1.3.0 与 omp 18.12.2 语料中 cost 逐消息非单调（0.0349→0.0095→0.0078→0.0092）。F-U12-3「累计快照取末值」的口径错误——ExecRecord 的 usage 与分析器的 tokens/cost 只记最后一条消息：pi 卷报 $0.0092 实为 $0.0615（少报 6.7 倍），omp 卷报 $0.0096 实为 $0.0431（§28） | open | — |
-| F-BENCH-15 | P1 | manual | BENCH | `bench.rs::raw_lines_reparse_through_current_adapter` | 重放测不到解析漂移：语料的 raw 行只是采集时**未产出事件**的行，产出 tool_call / thinking / text 的源行没有保留，无从重放；该测试能通过只因 4e960a2 新增的 turn_end usage 提取（改动前 pi 的 raw 行重放结构化数为 0）（§28） | open | — |
-| F-BENCH-16 | P3 | gated_auto | BENCH | `bench.rs::analyze_jsonl` is_omt | `path.contains("omt_")` 过宽：写普通文件（如 `docs/omt_notes.md`）也会被算作 omt 调用；应收紧为 `path.starts_with("xd://mcp__omt")` 并补反例测试 | open | — |
-| F-BENCH-17 | P3 | testing-gap | BENCH | `adapters.rs` end 族 usage 分支 | 新分支无 adapters 单测，只经分析器的 fixture 测试间接覆盖 | open | — |
+| F-BENCH-18 | P1 | gated_auto | BENCH | `.gitignore:26` / `fixtures/harness/*/raw.log` | **raw.log 语料未入库**：`*.log` 规则把三份 raw.log 全部忽略，只存在于本机。`raw_log_replay_matches_recorded_events` 在干净 clone / CI 上会 panic（「raw.log 应存在」），CI rust 任务必红；F-BENCH-15 在仓库里实际未关闭（§30） | open | — |
+| F-BENCH-19 | P1 | gated_auto | BENCH/U12 | `adapters.rs::parse_opencode` step_finish | **opencode 的 usage 也是逐步的值，被误标为累计**：语料 4 个 step_finish 各带不同 messageID，每个 total = 该步 input + output + reasoning + cache.read（如 1518+45+109+23040 = 24712）。按「累计取末值」报 25460，实为 98225（少报约 3.9 倍）；本卷免费档 cost=0 掩盖了问题，付费 provider 会少报费用（§30） | open | — |
+| F-BENCH-20 | P3 | testing-gap | BENCH/U12 | `executor.rs::UsageTotals` | `record` / `final_totals` 无直接单测（混合 scope、全零、历史无 scope 事件）；修复前归档的 ExecRecord 用量仍是旧口径，未重算也未标注 | open | — |
+| F-BENCH-21 | P3 | gated_auto | BENCH | `harness_probe.rs::run_with_timeout` / `harness-capture.rs::capture` | 进程退出后才读 stdout：输出超过管道缓冲（约 64KB）时子进程阻塞在写，30s 后被误判超时；`PROVIDERS` 是手写列表，REGISTRY 新增 provider 不会被探测 | open | — |
+| F-BENCH-22 | P3 | advisory | 测试稳定性 | `harness.rs` / `executor.rs` 计时类测试 | 全量 `cargo test -p oh-my-ticket-desktop --lib` 3 次中 2 次失败，失败的测试每次不同（`probe_version_times_out_hanging_binary`、`harness_entry_projects_state_from_binary_source`、`kill_all_timeout_branch_settles_unwaited_session`），单独运行均通过。这些代码路径本轮未改，应是既有 flake；§29「重跑即绿」的做法会让 CI 偶发红，需要单独定位 | open | — |
+| F-BENCH-13 | P1 | manual | BENCH | `4e960a2` 提交说明 / §27（修复节） | 提交说明与日志称 F-BENCH-5/6/7/10 及 8/12 部分已修，但 `harness_probe.rs`、`harness-capture.rs`、`lib.rs` 自 f6eeaed 后**未改动**（无 worktree / stash / 其他分支留存）——改动疑似未提交即丢失（§28） | fixed(3192d60)（改动已重做并核实存在） | — |
+| F-BENCH-14 | P1 | manual | BENCH/U12 | `executor.rs` usage 归档 / `bench.rs` / `adapters.rs` | **usage 是每条消息的值，不是会话累计**：pi 1.3.0 与 omp 18.12.2 语料中 cost 逐消息非单调（0.0349→0.0095→0.0078→0.0092）。F-U12-3「累计快照取末值」的口径错误——ExecRecord 的 usage 与分析器的 tokens/cost 只记最后一条消息：pi 卷报 $0.0092 实为 $0.0615（少报 6.7 倍），omp 卷报 $0.0096 实为 $0.0431（§28） | 部分 fixed(da9c376)：pi / omp 按消息求和正确；opencode 被误标为累计——见 F-BENCH-19 | — |
+| F-BENCH-15 | P1 | manual | BENCH | `bench.rs::raw_lines_reparse_through_current_adapter` | 重放测不到解析漂移：语料的 raw 行只是采集时**未产出事件**的行，产出 tool_call / thinking / text 的源行没有保留，无从重放；该测试能通过只因 4e960a2 新增的 turn_end usage 提取（改动前 pi 的 raw 行重放结构化数为 0）（§28） | open（测试已改，但 raw.log 被 .gitignore 忽略、未入库——见 F-BENCH-18） | — |
+| F-BENCH-16 | P3 | gated_auto | BENCH | `bench.rs::analyze_jsonl` is_omt | `path.contains("omt_")` 过宽：写普通文件（如 `docs/omt_notes.md`）也会被算作 omt 调用；应收紧为 `path.starts_with("xd://mcp__omt")` 并补反例测试 | fixed(da9c376) | — |
+| F-BENCH-17 | P3 | testing-gap | BENCH | `adapters.rs` end 族 usage 分支 | 新分支无 adapters 单测，只经分析器的 fixture 测试间接覆盖 | fixed(da9c376) | — |
 | F-BENCH-3 | P1 | gated_auto | BENCH | `bench.rs::analyze_jsonl` | omp 经 `write xd://mcp__omt_*` 调 MCP，`is_omt` 只看名字 → omp 的 discovery_overhead 恒等于全部调用，硬门永久红（§27） | fixed(4e960a2)（P3 余项见 F-BENCH-16） | — |
-| F-BENCH-4 | P1 | manual | BENCH | fixture 回放测试 | 语料未对 `parse_line` / `parse_models_output` 回放；事件词汇测试 grep 冻结的 adapter 产物，测不出漂移（§27） | 部分（4e960a2 加了 raw 重放，但语料不含产出结构化事件的源行，测不到 tool_call/thinking/text 漂移——见 F-BENCH-15） | — |
-| F-BENCH-5 | P1 | manual | BENCH | `harness_probe.rs` / `harness-capture.rs` | 探针硬编码 binary 路径与 model_list_args，测的是自己的 registry 副本（违反 R-1，F-PI-2 类漂移测不出）（§27） | open（4e960a2 提交说明称已修，但 harness_probe.rs / lib.rs 未改动——见 F-BENCH-13） | — |
-| F-BENCH-6 | P2 | gated_auto | BENCH | `harness-capture.rs` | omp `--version` 为 `omp/18.12.2` → 落到 `omp/omp/18.12.2/` | open（同上，harness-capture.rs 未改动） | — |
-| F-BENCH-7 | P2 | gated_auto | BENCH | `harness-capture.rs` | 重跑 capture 覆盖手写 meta.json 出处 | open（同上） | — |
+| F-BENCH-4 | P1 | manual | BENCH | fixture 回放测试 | 语料未对 `parse_line` / `parse_models_output` 回放；事件词汇测试 grep 冻结的 adapter 产物，测不出漂移（§27） | 随 F-BENCH-15（重放测试已改为全量对账，但 raw.log 未入库——见 F-BENCH-18） | — |
+| F-BENCH-5 | P1 | manual | BENCH | `harness_probe.rs` / `harness-capture.rs` | 探针硬编码 binary 路径与 model_list_args，测的是自己的 registry 副本（违反 R-1，F-PI-2 类漂移测不出）（§27） | fixed(3192d60) | — |
+| F-BENCH-6 | P2 | gated_auto | BENCH | `harness-capture.rs` | omp `--version` 为 `omp/18.12.2` → 落到 `omp/omp/18.12.2/` | fixed(3192d60) | — |
+| F-BENCH-7 | P2 | gated_auto | BENCH | `harness-capture.rs` | 重跑 capture 覆盖手写 meta.json 出处 | fixed(3192d60)（三家 meta 出处已补回） | — |
 | F-BENCH-8 | P2 | gated_auto | BENCH | `fixtures_are_normalized` / `normalize` | 归一测试不含 omp 卷与 help/models；raw 内嵌时间戳未归一；未过 sanitize_line | 部分（测试已遍历全部语料；capture 未过 sanitize_line、raw 内嵌时间戳未归一） | — |
 | F-BENCH-9 | P2 | gated_auto | BENCH | `bench.rs` opencode 测试 | 注释过时（实为 3 次）且未断言 tool_calls==3 | fixed(4e960a2) | — |
-| F-BENCH-10 | P3 | gated_auto | BENCH | 探针 / capture | 裸 `.output()` 无超时（F1 教训） | open（探针/capture 未加超时） | — |
+| F-BENCH-10 | P3 | gated_auto | BENCH | 探针 / capture | 裸 `.output()` 无超时（F1 教训） | fixed(3192d60)（余项见 F-BENCH-21） | — |
 | F-BENCH-11 | P3 | advisory | BENCH | omp 卷 | 无 usage 事件 → omp tokens/cost 恒 None | superseded(F-BENCH-14)（end 族提取已补，但取末值的口径本身是错的） | — |
 | F-BENCH-12 | P3 | advisory | BENCH | 注释 / §26 | 「MCP 握手」未实现、adapter-lines 文件名不符、「上两级」应为三级 | 部分（bench.rs「上两级」注释仍在；probe 模块注释未改） | — |
 | F-U3-15 | P1 | manual | U3 | `mcp_injection.rs::prepare_omp_with` :279→:283 | **merge 先于 state.json 写入**：二者之间崩溃 → 首个 exec 无 `workspace` 记录，sweep 跳过该目录且删光 launcher → 用户文件留悬空 `omt`；下次 prepare 把污染后的文件当"原件"备份，永远恢复不干净（556c1d2 引入，§8 漏检） | fixed(d53b191) | — |
@@ -1276,6 +1281,22 @@ F-BENCH-13 查证结论：4e960a2 提交说明声称的探针/capture/lib 改动
 - **F-BENCH-17**：fixed（usage_scopes_message_end_vs_cumulative 单测（含 turn_end 不重复、message_update 零产出、opencode cumulative））
 
 质量门：workspace 全绿（探针/负载 flake 单跑绿）、clippy/fmt 干净。
+
+### §30. `da9c376` + `3192d60` · F-BENCH-13~17 修复 · code review（2026-10-20）
+
+**评审方式**：单上下文内联；逐文件比对 `git diff f5acae0 3192d60`；核对 `git ls-files fixtures/harness` 与磁盘文件；用 python 逐帧统计 opencode raw.log 的 step_finish；全量 `cargo test -p oh-my-ticket-desktop --lib` 跑 3 次（1 次全绿，2 次各有 2 个计时类测试失败，单跑均通过），clippy `-D warnings` 干净。
+
+**确认修好**：F-BENCH-5 / 6 / 7 / 10 / 13（探针与 capture 改由 REGISTRY 驱动、缺 binary 即失败、30s 超时、omp 版本目录、meta 合并，均已在代码中核实）；F-BENCH-14 的 pi / omp 部分（按消息求和，52340 / $0.0615、42430 / $0.0431 已入测）；F-BENCH-16、17。
+
+| ID | 级别 | 发现 |
+|---|---|---|
+| F-BENCH-18 | P1 | **raw.log 没有入库**。`.gitignore:26` 的 `*.log` 忽略了三份 `fixtures/harness/*/raw.log`，`git ls-files fixtures/harness` 里没有它们。本机测试能过，干净 clone 和 CI 上 `raw_log_replay_matches_recorded_events` 会直接 panic，CI rust 任务必红。这是「声称已修、仓库里不存在」的第四次（F-BENCH-13 同类）。修法：`.gitignore` 加 `!fixtures/harness/**/raw.log`（或改名为非 .log 后缀）并提交；同时把 raw.log 纳入 `fixtures_are_normalized` 的扫描（目前只扫 .jsonl / help / models），它会顺带暴露 raw.log 里残留的 170 处内嵌 ISO 时间戳。建议今后在声明关闭前，于干净 clone 中跑一遍测试 |
+| F-BENCH-19 | P1 | **opencode 也是逐步的值，不是累计**。语料里 4 个 `step_finish` 各对应一个不同的 `messageID`，每个 total 恰为该步的 input + output + reasoning + cache.read（第 2 步 1518 + 45 + 109 + 23040 = 24712）——和 pi 的形态完全一致（总量随上下文缓慢增长，但每一步都是独立计费）。`scope: "cumulative"` 让 exec 总量只取最后一步：报 25460，实为 98225。本卷是免费档，cost 恒为 0，所以没暴露；换付费 provider 就会少报费用。修法：opencode 的 step_finish 也标 `scope: "message"` 求和，补 opencode 总量断言（98225）。改完后 `cumulative` 分支没有任何生产者，可删除或注明仅为兼容历史事件 |
+| F-BENCH-20 | P3 | `UsageTotals::record` / `final_totals` 没有直接单测。修复前已归档的 ExecRecord 用量仍是旧口径（只含最后一条消息），既没重算也没标注；桌面端若展示历史用量会偏低。可以用分析器对已有 raw.log 重算，或至少在 UI 上标注 |
+| F-BENCH-21 | P3 | 探针和 capture 在子进程退出后才读 stdout：输出超过管道缓冲（约 64KB）时，子进程会卡在写管道上，30s 后被误判为超时。应在单独线程里持续读取。另外 `PROVIDERS` 是手写列表，REGISTRY 新增 provider 时探针不会覆盖到，建议导出 REGISTRY 迭代 |
+| F-BENCH-22 | P3 | 测试套件存在既有 flake：全量运行 3 次有 2 次失败，失败的是不同的计时类测试（见总览），单跑全部通过；这些代码本轮未改动。§29 写的是「重跑即绿」，但 CI 不会重跑，迟早会偶发红。怀疑是新写入的脚本立即执行时撞上其他测试线程 fork（ETXTBSY）或负载下的超时余量不足，需要单独定位 |
+
+**建议顺序**：F-BENCH-18（几分钟的事，但不修 CI 就红）→ F-BENCH-19（与 F-BENCH-14 同一类问题，单独提交）→ F-BENCH-22（CI 稳定性）→ P3。
 
 ### 残留状态核查（第二轮验收后）
 
