@@ -50,8 +50,12 @@ pub fn analyze_jsonl(path: &Path) -> Option<ExecMetrics> {
     let mut seen_omt_call = false;
     let mut turns = 0usize;
     let mut duration_ms = None;
-    let mut tokens = None;
-    let mut cost = None;
+    // F-BENCH-14：按消息求和（scope=message）/ 累计取末值（cumulative）；
+    // raw 重放（当前 adapter）优先于 jsonl 记录的 usage 事件
+    let mut msg_tokens: u64 = 0;
+    let mut msg_cost: f64 = 0.0;
+    let mut cumulative: Option<(u64, Option<f64>)> = None;
+    let mut jsonl_usage: Option<(u64, Option<f64>)> = None;
     let mut errors = 0usize;
     let mut outcome = None;
 
@@ -72,13 +76,13 @@ pub fn analyze_jsonl(path: &Path) -> Option<ExecMetrics> {
                 let path = ev["input"]["path"].as_str().unwrap_or_default();
                 // omp 虚拟路径形如 xd://mcp__omt_run_claim（omt 与动词间是
                 // 单下划线）；工具名形如 mcp__omt__run__claim（双下划线）
+                // F-BENCH-16：虚拟路径以 xd://mcp__omt 前缀精确匹配——
+                // contains("omt_") 会把写普通文件（docs/omt_notes.md）
+                // 误判成 omt 调用
                 let is_omt = name.contains("run__")
                     || name.contains("node__")
                     || name.contains("omt")
-                    || path.contains("omt_")
-                    || path.contains("run__claim")
-                    || path.contains("run__report")
-                    || path.contains("node__");
+                    || path.starts_with("xd://mcp__omt");
                 if is_omt {
                     seen_omt_call = true;
                 } else if !seen_omt_call {
@@ -86,28 +90,38 @@ pub fn analyze_jsonl(path: &Path) -> Option<ExecMetrics> {
                 }
             }
             "usage" => {
-                // usage 是去重后的累计快照（F-U12-3）——末值即终值
-                if let Some(t) = ev["tokens"].as_u64() {
-                    tokens = Some(t);
-                }
-                if let Some(c) = ev["cost"].as_f64() {
-                    cost = Some(c);
+                // jsonl 记录的 usage（采集时 adapter 产物）——scopeless 视为
+                // cumulative 取末值；仅当 raw 重放无产出时生效
+                match ev["scope"].as_str() {
+                    Some("message") => {
+                        msg_tokens += ev["tokens"].as_u64().unwrap_or(0);
+                        msg_cost += ev["cost"].as_f64().unwrap_or(0.0);
+                    }
+                    _ => {
+                        jsonl_usage =
+                            Some((ev["tokens"].as_u64().unwrap_or(0), ev["cost"].as_f64()))
+                    }
                 }
             }
             "raw" => {
-                // F-BENCH-11 兜底：语料是采集当时 adapter 的输出——usage
-                // 提取若在采集后才修（omp 18.12.2 的 end 族挂载），卷里就没
-                // 有 usage 事件。经当前 adapter 重放 raw 行补提取，与语料库
-                // 「当前代码重放历史」定位一致。
+                // F-BENCH-11/14：语料是采集当时 adapter 的输出——经**当前**
+                // adapter 重放 raw 行得到的 usage 才是事实源（求和/末值按
+                // scope），有产出则 jsonl 记录的 usage 让位。
                 let body = ev["text"].as_str().unwrap_or_default();
                 if body.trim_start().starts_with('{') {
                     for part in crate::adapters::parse_line(&harness, body) {
                         if part["kind"] == "usage" {
-                            if let Some(t) = part["tokens"].as_u64() {
-                                tokens = Some(t);
-                            }
-                            if let Some(c) = part["cost"].as_f64() {
-                                cost = Some(c);
+                            match part["scope"].as_str() {
+                                Some("message") => {
+                                    msg_tokens += part["tokens"].as_u64().unwrap_or(0);
+                                    msg_cost += part["cost"].as_f64().unwrap_or(0.0);
+                                }
+                                _ => {
+                                    cumulative = Some((
+                                        part["tokens"].as_u64().unwrap_or(0),
+                                        part["cost"].as_f64(),
+                                    ))
+                                }
                             }
                         }
                     }
@@ -148,6 +162,13 @@ pub fn analyze_jsonl(path: &Path) -> Option<ExecMetrics> {
             }
         }
     }
+    let (tokens, cost) = match (cumulative, msg_tokens) {
+        (Some((t, c)), _) => (Some(t), c),
+        (None, n) if n > 0 => (Some(n), Some(msg_cost)),
+        (None, _) => jsonl_usage
+            .map(|(t, c)| (Some(t), c))
+            .unwrap_or((None, None)),
+    };
     Some(ExecMetrics {
         exec_id,
         harness,
@@ -314,53 +335,53 @@ mod tests {
         assert!(m.cost.is_some(), "{m:?}");
     }
 
-    /// F-BENCH-4（语料库核心价值）：raw JSON 行重放进**当前** adapter——
-    /// 语料是采集时 adapter 的产物，只有重放当前代码才能测漂移。
-    /// 断言：每卷至少有若干 raw 行产出结构化事件（非全落 raw 兜底）。
-    /// opencode 卷的 raw 行恰全为 step_start 噪声（统一事件来自 adapter
-    /// 直接解析不落 raw）——其重放面由事件词汇测试覆盖，本测试针对
-    /// raw 含信号行的 pi/omp。
+    /// F-BENCH-4/15（语料库核心价值）：raw.log 全量重放进**当前** adapter，
+    /// 与 jsonl 记录的结构化事件**对账**——工具调用名与数量必须一致。
+    /// （jsonl 里的 raw 行只是采集时 adapter 未解析的行——真正产出事件的
+    /// 原文当时已转结构化、未保存，测不出解析器漂移；raw.log 才是全量。）
     #[test]
-    fn raw_lines_reparse_through_current_adapter() {
-        for (p, v) in [("pi", "1.3.0"), ("omp", "18.12.2")] {
-            let text = std::fs::read_to_string(fixture(p, v, "stream-smoke-hello.jsonl")).unwrap();
-            let mut raw_json = 0usize;
-            let mut structured = 0usize;
-            for line in text.lines() {
-                let Ok(ev) = serde_json::from_str::<serde_json::Value>(line) else {
-                    continue;
-                };
-                if ev["kind"] != "raw" {
-                    continue;
-                }
-                let body = ev["text"].as_str().unwrap_or_default().to_string();
-                if !body.trim_start().starts_with('{') {
-                    continue;
-                }
-                // 已知噪声行（step_start / 系统消息帧）本就应产出空——不算漂移
-                if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&body) {
-                    let t = raw["type"].as_str().unwrap_or_default();
-                    if matches!(
-                        t,
-                        "step_start" | "message_start" | "message_end" | "agent_end"
-                    ) {
-                        continue;
+    fn raw_log_replay_matches_recorded_events() {
+        for (p, v) in [("pi", "1.3.0"), ("omp", "18.12.2"), ("opencode", "1.18.32")] {
+            let raw_text = std::fs::read_to_string(fixture(p, v, "raw.log"))
+                .unwrap_or_else(|_| panic!("{p} raw.log 应存在"));
+            let jsonl_text =
+                std::fs::read_to_string(fixture(p, v, "stream-smoke-hello.jsonl")).unwrap();
+
+            // 重放侧的工具调用名序列
+            let mut replayed: Vec<String> = Vec::new();
+            for line in raw_text.lines() {
+                for part in crate::adapters::parse_line(p, line) {
+                    if part["kind"] == "tool_call" {
+                        replayed.push(part["name"].as_str().unwrap_or_default().to_string());
                     }
                 }
-                raw_json += 1;
-                if crate::adapters::parse_line(p, &body)
-                    .iter()
-                    .any(|x| x["kind"] != "raw")
-                {
-                    structured += 1;
-                }
             }
-            assert!(raw_json > 0, "{p} 语料应含信号行");
-            assert!(
-                structured > 0,
-                "{p}: 当前 adapter 对 {raw_json} 行信号 raw JSON 全落兜底——漂移！"
+            // 记录侧
+            let recorded: Vec<String> = jsonl_text
+                .lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .filter(|ev| ev["kind"] == "tool_call")
+                .map(|ev| ev["name"].as_str().unwrap_or_default().to_string())
+                .collect();
+            assert!(!recorded.is_empty(), "{p} jsonl 应记录工具调用");
+            assert_eq!(
+                replayed, recorded,
+                "{p}: 当前 adapter 重放 raw.log 的工具序列与采集时不一致——解析器漂移"
             );
         }
+    }
+
+    /// F-BENCH-14 验证：usage 按消息求和后的会话总量（语料实证值）。
+    #[test]
+    fn usage_totals_sum_per_message() {
+        // pi 4 条 message_end：11738+13134+13359+14109 = 52340 tok / $0.0615
+        let pi = analyze_jsonl(&fixture("pi", "1.3.0", "stream-smoke-hello.jsonl")).unwrap();
+        assert_eq!(pi.tokens, Some(52340), "pi 求和总量: {pi:?}");
+        assert!((pi.cost.unwrap() - 0.0614784).abs() < 1e-9, "{pi:?}");
+        // omp 4 条 message_end：合计 42430 tok / $0.0431
+        let omp = analyze_jsonl(&fixture("omp", "18.12.2", "stream-smoke-hello.jsonl")).unwrap();
+        assert_eq!(omp.tokens, Some(42430), "omp 求和总量: {omp:?}");
+        assert!((omp.cost.unwrap() - 0.0431).abs() < 1e-3, "{omp:?}");
     }
 
     /// F-BENCH-4 续：models.txt 过形状校验（深度比对待 §6.3 暴露

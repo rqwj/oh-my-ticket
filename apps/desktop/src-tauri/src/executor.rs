@@ -106,6 +106,38 @@ pub type EventSink = Arc<dyn Fn(serde_json::Value) + Send + Sync>;
 type LeaseRelease = Arc<dyn Fn(&str, &str, &str) + Send + Sync>;
 
 /// 单个 exec 的注册表条目（Arc 共享给读线程/等待线程）。
+/// F-BENCH-14：exec 用量合计（message 求和 + cumulative 末值二择）。
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct UsageTotals {
+    message_tokens: u64,
+    message_cost: f64,
+    /// opencode 型会话累计（tokens, cost）
+    cumulative: Option<(u64, Option<f64>)>,
+}
+
+impl UsageTotals {
+    /// 记一条 usage 事件（按 scope 分派）。
+    pub fn record(&mut self, part: &serde_json::Value) {
+        let tokens = part["tokens"].as_u64().unwrap_or(0);
+        let cost = part["cost"].as_f64().unwrap_or(0.0);
+        match part["scope"].as_str() {
+            Some("message") => {
+                self.message_tokens += tokens;
+                self.message_cost += cost;
+            }
+            // cumulative / 无 scope（历史事件）——取末值
+            _ => self.cumulative = Some((tokens, part["cost"].as_f64())),
+        }
+    }
+
+    /// 最终合计：有 cumulative 用 cumulative，否则 message 求和。
+    pub fn final_totals(&self) -> Option<(u64, Option<f64>)> {
+        self.cumulative
+            .or(Some((self.message_tokens, Some(self.message_cost))))
+            .filter(|(t, _)| *t > 0 || self.message_cost > 0.0)
+    }
+}
+
 pub struct ExecSession {
     pub exec_id: String,
     pub agent_id: String,
@@ -127,9 +159,10 @@ pub struct ExecSession {
     lease_release: Option<LeaseRelease>,
     /// spawn 时刻（durationMs 与 kill 兜底计算用）
     pub started: Instant,
-    /// 最近一条 usage 快照（F-U12-3：pi/omp 的 usage 是会话累计值、随每个
-    /// message_update 帧重发——值不变不发，防 transcript 刷屏）
-    pub last_usage: std::sync::Mutex<Option<(u64, Option<f64>)>>,
+    /// F-BENCH-14：exec 用量累计。pi/omp 的 usage 是**每条消息各自的值**
+    ///（scope=message，求和）；opencode 是会话累计（scope=cumulative，取
+    /// 末值）。终态归档 ExecRecord.usage_* = 最终合计。
+    pub usage_totals: std::sync::Mutex<UsageTotals>,
     /// F-U12-4：规范化事件日志（`<execId>.jsonl`，首行 session_header，
     /// 随后统一事件逐行）——U10 reconcile 与成本承接的持久层。
     pub events_log: PathBuf,
@@ -493,7 +526,7 @@ impl ExecutionManager {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone(),
             started,
-            last_usage: std::sync::Mutex::new(None),
+            usage_totals: std::sync::Mutex::new(UsageTotals::default()),
             harness_session_id: std::sync::Mutex::new(None),
             events_log,
             sink: on_event.clone(),
@@ -721,12 +754,6 @@ fn append_event_line(session: &ExecSession, event: &serde_json::Value) {
     let _ = f.write_all(line.as_bytes());
 }
 
-/// usage 事件的去重键（tokens + cost；None 字段以 0/无值参与比较）。
-/// 纯函数供测试。
-fn usage_key(part: &serde_json::Value) -> (u64, Option<f64>) {
-    (part["tokens"].as_u64().unwrap_or(0), part["cost"].as_f64())
-}
-
 fn spawn_reader(
     pipe: impl std::io::Read + Send + 'static,
     stream: &'static str,
@@ -763,18 +790,15 @@ fn spawn_reader(
                 })];
             }
             for mut part in parts {
-                // F-U12-3：usage 是会话累计快照（pi/omp 每帧重发）——
-                // 值不变不发，transcript 只见变化点
+                // F-BENCH-14：usage 记账（message 求和 / cumulative 末值）。
+                // 事件照常发出——adapter 已停发 message_update 快照（F-U12-3
+                // 刷屏源），现在每条 = 一条消息的定值，per-turn 展示正合适。
                 if part["kind"] == "usage" {
-                    let key = usage_key(&part);
-                    let mut last = session
-                        .last_usage
+                    session
+                        .usage_totals
                         .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if *last == Some(key) {
-                        continue;
-                    }
-                    *last = Some(key);
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .record(&part);
                 }
                 let n = session.seq.fetch_add(1, Ordering::Relaxed);
                 part["execId"] = serde_json::json!(session.exec_id);
@@ -872,11 +896,12 @@ fn finish_terminal(session: &ExecSession, terminal: &Terminal) {
         AgentAttachment::None,
     );
     // F-U2-3：exec 终态三字段一次回写（U5 显示退出码、U10 reconcile 依赖）；
-    // F-U12-4：usage 终态归档（去重后的最终累计快照）
-    let final_usage = *session
-        .last_usage
+    // F-U12-4/F-BENCH-14：usage 终态归档（message 求和 / cumulative 末值）
+    let final_usage = session
+        .usage_totals
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .final_totals();
     let _ = agents::update_exec(
         runtime_dir,
         &session.home_id,
@@ -1568,7 +1593,6 @@ fn transcript_tail_from(
         all[start..].to_vec()
     };
     let mut seq = 0u64;
-    let mut last_usage_tail: Option<(u64, Option<f64>)> = None;
     let events = lines
         .iter()
         .flat_map(|line| {
@@ -1594,18 +1618,6 @@ fn transcript_tail_from(
                 parts[0]["stream"] = serde_json::json!(stream);
             }
             parts
-        })
-        // F-U12-3：与实时流同款 usage 去重（累计快照重复帧不发）
-        .filter(|part| {
-            if part["kind"] != "usage" {
-                return true;
-            }
-            let key = usage_key(part);
-            if last_usage_tail == Some(key) {
-                return false;
-            }
-            last_usage_tail = Some(key);
-            true
         })
         .map(|mut part| {
             seq += 1;
@@ -2061,7 +2073,7 @@ mod tests {
             runtime_dir: runtime.clone(),
             mcp: McpInjection::None,
             lease_release: None,
-            last_usage: std::sync::Mutex::new(None),
+            usage_totals: std::sync::Mutex::new(UsageTotals::default()),
             harness_session_id: std::sync::Mutex::new(None),
             events_log: runtime
                 .join("transcripts")
@@ -2128,7 +2140,7 @@ mod tests {
             mcp: McpInjection::None,
             lease_release: None,
             started: Instant::now(),
-            last_usage: std::sync::Mutex::new(None),
+            usage_totals: std::sync::Mutex::new(UsageTotals::default()),
             harness_session_id: std::sync::Mutex::new(None),
             events_log: runtime
                 .join("transcripts")
@@ -3480,21 +3492,22 @@ mod tests {
         );
     }
 
-    /// F-U12-3：累计 usage 快照重复帧不发（实时 reader 与历史回载同语义）。
+    /// F-BENCH-14：usage 语义——message_update 流式快照零产出（刷屏源根除），
+    /// message_end 每条消息恰好一个事件；tail 原样呈现全部。
     #[test]
-    fn transcript_tail_dedupes_repeated_usage_snapshots() {
+    fn transcript_tail_usage_per_message_not_snapshots() {
         let dir = tempfile::tempdir().unwrap();
         let runtime = dir.path().join("runtime");
         let home_dir = runtime.join("transcripts").join("h_u");
         std::fs::create_dir_all(&home_dir).unwrap();
-        let usage_frame = r#"{"type":"message_update","usage":{"totalTokens":13980,"cost":{"total":0.0419}},"assistantMessageEvent":{"type":"thinking_delta","delta":"x"}}"#;
-        let usage_frame2 = r#"{"type":"message_update","usage":{"totalTokens":14210,"cost":{"total":0.0101}},"assistantMessageEvent":{"type":"thinking_delta","delta":"y"}}"#;
+        let snap = r#"{"type":"message_update","usage":{"totalTokens":13980,"cost":{"total":0.0419}},"assistantMessageEvent":{"type":"thinking_delta","delta":"x"}}"#;
+        let m1 = r#"{"type":"message_end","message":{"role":"assistant","usage":{"totalTokens":13980,"cost":{"total":0.0419}}}}"#;
+        let m2 = r#"{"type":"message_end","message":{"role":"assistant","usage":{"totalTokens":14210,"cost":{"total":0.0101}}}}"#;
         let mut log = String::new();
         for _ in 0..26 {
-            log.push_str(&format!("[stdout] {usage_frame}\n"));
+            log.push_str(&format!("[stdout] {snap}\n"));
         }
-        log.push_str(&format!("[stdout] {usage_frame2}\n"));
-        log.push_str(&format!("[stdout] {usage_frame2}\n"));
+        log.push_str(&format!("[stdout] {m1}\n[stdout] {m2}\n"));
         std::fs::write(home_dir.join("exec-u.raw.log"), log).unwrap();
         let events = transcript_tail_from(&runtime, "h_u", "exec-u", None);
         let usages: Vec<&serde_json::Value> =
@@ -3502,13 +3515,11 @@ mod tests {
         assert_eq!(
             usages.len(),
             2,
-            "26 条同值快照只发 1 条 + 新值 1 条: {}",
+            "26 条快照零产出 + 每条消息一个 message_end: {}",
             serde_json::to_string(&events).unwrap()
         );
         assert_eq!(usages[0]["tokens"], 13980);
         assert_eq!(usages[1]["tokens"], 14210);
-        // delta 帧（thinking_delta）本体不产生 thinking 事件（只 *_end 产生）
-        assert!(events.iter().all(|e| e["kind"] != "assistant_thinking"));
     }
 
     /// U10 启动对账：中断 exec（demote 签名 + run）→ 释放序列执行 + 幂等标记。
