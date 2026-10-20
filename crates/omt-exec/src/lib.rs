@@ -5,6 +5,7 @@ pub mod agents;
 pub mod control;
 pub mod daemon_link;
 pub mod executor;
+pub mod follow;
 pub mod grants;
 pub mod launch;
 pub mod layout;

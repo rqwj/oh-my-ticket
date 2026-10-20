@@ -672,22 +672,26 @@ impl ExecutionManager {
     }
 }
 
-/// 桌面端启动时的一次性清扫（原 ExecutionManager::new 的副作用）：demote
-/// 上次运行遗留的 Live 记录 + omp/pi 注入的崩溃残留。Task 10 改为启动对账。
+/// 任一面启动时的一次性清扫（P-8 / P-9 / P-1）：迁移旧存储 → 启动对账
+/// （shim 存活的保持受控，已死的标 Failed）→ 清扫临时授权残留 → 清扫
+/// MCP 注入残留（跳过仍在运行的 exec）。
 pub fn startup_housekeeping(runtime_dir: &Path) {
     match crate::migrate::migrate_legacy(runtime_dir) {
         Ok(r) if r.homes > 0 || !r.skipped_corrupt.is_empty() => eprintln!("存储迁移：{r:?}"),
         Err(err) => eprintln!("存储迁移失败：{err}（下次启动重试）"),
         _ => {}
     }
-    match agents::demote_live_agents(runtime_dir) {
-        Ok(n) if n > 0 => eprintln!("启动 demote：{n} 个 Live agent 已降级（app 重启）"),
-        Err(err) => eprintln!("启动 demote 失败：{err}"),
-        _ => {}
+    let lost = crate::control::reconcile_on_startup(runtime_dir);
+    if lost > 0 {
+        eprintln!("启动对账：{lost} 个 exec 的 shim 已不在，标记为失败");
     }
-    match crate::mcp_injection::sweep_crash_residue(runtime_dir, &|_| false) {
-        Ok(n) if n > 0 => eprintln!("启动清扫：{n} 个 workspace 的 omp MCP 注入残留已恢复"),
-        Err(err) => eprintln!("omp 注入残留清扫失败：{err}"),
+    if let Err(err) = crate::grants::sweep_dead_temp_grants(runtime_dir) {
+        eprintln!("临时授权清扫失败：{err}");
+    }
+    let live = |id: &str| crate::control::exec_id_live(runtime_dir, id);
+    match crate::mcp_injection::sweep_crash_residue(runtime_dir, &live) {
+        Ok(n) if n > 0 => eprintln!("启动清扫：{n} 个 workspace 的 MCP 注入残留已恢复"),
+        Err(err) => eprintln!("MCP 注入残留清扫失败：{err}"),
         _ => {}
     }
 }
@@ -1633,6 +1637,40 @@ pub fn reconcile_interrupted_execs(rpc: &RpcFn, runtime_dir: &Path) -> usize {
     let handled = reconcile_interrupted_execs_with(&seam, runtime_dir);
     if handled > 0 {
         eprintln!("U10 对账：释放了 {handled} 个中断 exec 的 daemon 租约");
+    }
+    handled
+}
+
+/// review R2-4：对账目标的租约释放走与 shim 相同的路径——按该 exec 的 spec 里的
+/// home 路径连接（必要时 declare，且校验 homeId），加临时授权后释放。没有 spec
+/// 的旧记录（RESTART_MARKER）留给 desktop 会话的 U10 对账。
+pub fn reconcile_with_connector(
+    connector: &crate::daemon_link::Connector,
+    runtime_dir: &Path,
+) -> usize {
+    let Ok(targets) = agents::list_reconcile_targets(runtime_dir) else {
+        return 0;
+    };
+    let mut handled = 0usize;
+    for t in &targets {
+        let Ok(dir) = crate::layout::agent_dir(runtime_dir, &t.home_id, &t.agent_id) else {
+            continue;
+        };
+        let spec_path = crate::layout::exec_file(&dir, &t.exec_id, crate::layout::ExecFile::Spec);
+        let Ok(spec) = crate::spec::LaunchSpec::read(&spec_path) else {
+            continue;
+        };
+        let outcome = connector(&spec.home_path, &t.home_id)
+            .and_then(|rpc| release_items_for_exec(&*rpc, &t.home_id, &t.run_id, &t.exec_id));
+        if let Err(err) = outcome {
+            eprintln!(
+                "对账：exec {} 经 shim 路径释放失败（{err}），保留为对账目标",
+                t.exec_id
+            );
+            continue;
+        }
+        mark_reconciled(runtime_dir, t);
+        handled += 1;
     }
     handled
 }
@@ -3783,6 +3821,71 @@ mod tests {
             Ok(serde_json::json!({ "items": [] }))
         };
         assert_eq!(reconcile_interrupted_execs_with(&ok, rt), 1);
+        assert!(crate::agents::list_reconcile_targets(rt)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// review R2-4：有 spec 的目标经 connector（shim 路径）释放；connector 失败则保留。
+    #[test]
+    fn reconcile_with_connector_uses_spec_home_and_keeps_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = dir.path();
+        let agent = crate::agents::register_agent(
+            rt,
+            "h_t",
+            "pi",
+            crate::agents::NewExec {
+                exec_id: "exec-c".into(),
+                node_id: None,
+                run_id: Some("RUN-1".into()),
+                binary_path: None,
+                binary_args: vec![],
+                model: None,
+            },
+        )
+        .unwrap();
+        crate::agents::update_exec(rt, "h_t", &agent.id, "exec-c", |e| {
+            e.lease_release_pending = true
+        })
+        .unwrap();
+        let mut spec = crate::spec::sample(&rt.join("ws").join(".omt"), Path::new("/bin/omt"));
+        spec.home_id = "h_t".into();
+        spec.agent_id = agent.id.clone();
+        spec.exec_id = "exec-c".into();
+        let adir = crate::layout::agent_dir(rt, "h_t", &agent.id).unwrap();
+        spec.write(&crate::layout::exec_file(
+            &adir,
+            "exec-c",
+            crate::layout::ExecFile::Spec,
+        ))
+        .unwrap();
+
+        let failing: crate::daemon_link::Connector =
+            Arc::new(|_: &Path, _: &str| Err("down".to_string()));
+        assert_eq!(reconcile_with_connector(&failing, rt), 0);
+        assert_eq!(
+            crate::agents::list_reconcile_targets(rt).unwrap().len(),
+            1,
+            "connector 失败后仍是对账目标"
+        );
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<(PathBuf, String)>::new()));
+        let seen2 = seen.clone();
+        let ok: crate::daemon_link::Connector = Arc::new(move |home: &Path, id: &str| {
+            seen2
+                .lock()
+                .unwrap()
+                .push((home.to_path_buf(), id.to_string()));
+            let rpc: RpcFn =
+                Arc::new(|_: &str, _: serde_json::Value| Ok(serde_json::json!({ "items": [] })));
+            Ok(rpc)
+        });
+        assert_eq!(reconcile_with_connector(&ok, rt), 1);
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            (rt.join("ws").join(".omt"), "h_t".to_string())
+        );
         assert!(crate::agents::list_reconcile_targets(rt)
             .unwrap()
             .is_empty());

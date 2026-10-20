@@ -11,13 +11,35 @@ mod harness;
 mod rpc_bridge;
 mod state;
 
-use state::{ExecutionState, SharedSession};
+use state::SharedSession;
 use tauri::Manager;
 
+/// review F6：用户在确认框里选过之后，再次进入 ExitRequested 时直接放行。
+static QUIT_CONFIRMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 设计 §3.4：桌面退出不再终止执行（KD-D7 已被 KD-E1 修订）；有运行中的
+/// exec 时退出前确认，并提供 Agents 面板「停止全部」。
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // single-instance 必须最先注册（插件约定）：双开 = 两个 ExecutionManager
-    // 对 agents/bindings 的跨进程并发写（计划 §3.6.9），第二实例直接退出并聚焦首实例。
+    // 执行面启动清扫（迁移 / 启动对账 / 临时授权与 MCP 残留）——放在任何
+    // command 可被调用之前；对账只改记录，不发信号。
+    omt_exec::executor::startup_housekeeping(&daemon::runtime_dir());
+    // review R2-4：shim 丢失 / 释放失败的租约走 shim 路径释放（声明 home + 临时
+    // 授权），不依赖 desktop 会话此刻是否已打开该 workspace home。后台执行，
+    // 不阻塞窗口出现；旧记录仍由 rpc_bridge 的 U10 对账处理。
+    {
+        let runtime_dir = daemon::runtime_dir();
+        let daemon_bin = daemon::sidecar_path("omt-daemon").ok();
+        std::thread::spawn(move || {
+            let connector = omt_exec::daemon_link::admin_connector(runtime_dir.clone(), daemon_bin);
+            let released = omt_exec::executor::reconcile_with_connector(&connector, &runtime_dir);
+            if released > 0 {
+                eprintln!("启动对账：经 shim 路径释放了 {released} 个 exec 的租约");
+            }
+        });
+    }
+    // single-instance 必须最先注册（插件约定）：双开 = 两个发起方对
+    // agents/bindings 的跨进程并发写（计划 §3.6.9），第二实例直接退出并聚焦首实例。
     // 注意这是 best-effort 守卫（如 socket 被同机其他用户占用时插件会静默放行），
     // 跨进程写安全的正确性守卫是 U4a 的文件锁（计划 §3.6.6）——不要省掉文件锁。
     let single_instance = tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -44,7 +66,62 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(SharedSession::new())
-        .manage(ExecutionState::new())
+        // 自定义应用菜单（review R2-5）：默认 macOS 菜单的 Quit 走 `terminate:`，
+        // 直接结束进程，不产生 ExitRequested，下面的退出确认永远弹不出来。
+        // 自定义 Quit 菜单项改调 app.exit(0)——经 RequestExit 产生 ExitRequested。
+        .menu(|handle| {
+            use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
+            let quit = MenuItem::with_id(
+                handle,
+                "quit",
+                "退出 oh-my-ticket",
+                true,
+                Some("CmdOrCtrl+Q"),
+            )?;
+            let app_menu = Submenu::with_items(
+                handle,
+                "oh-my-ticket",
+                true,
+                &[
+                    &PredefinedMenuItem::about(handle, None, None)?,
+                    &PredefinedMenuItem::separator(handle)?,
+                    &PredefinedMenuItem::hide(handle, None)?,
+                    &PredefinedMenuItem::hide_others(handle, None)?,
+                    &PredefinedMenuItem::separator(handle)?,
+                    &quit,
+                ],
+            )?;
+            // 编辑菜单必须保留：没有它，webview 里的 ⌘C / ⌘V / ⌘A 在 macOS 上失效
+            let edit_menu = Submenu::with_items(
+                handle,
+                "编辑",
+                true,
+                &[
+                    &PredefinedMenuItem::undo(handle, None)?,
+                    &PredefinedMenuItem::redo(handle, None)?,
+                    &PredefinedMenuItem::separator(handle)?,
+                    &PredefinedMenuItem::cut(handle, None)?,
+                    &PredefinedMenuItem::copy(handle, None)?,
+                    &PredefinedMenuItem::paste(handle, None)?,
+                    &PredefinedMenuItem::select_all(handle, None)?,
+                ],
+            )?;
+            let window_menu = Submenu::with_items(
+                handle,
+                "窗口",
+                true,
+                &[
+                    &PredefinedMenuItem::minimize(handle, None)?,
+                    &PredefinedMenuItem::close_window(handle, None)?,
+                ],
+            )?;
+            Menu::with_items(handle, &[&app_menu, &edit_menu, &window_menu])
+        })
+        .on_menu_event(|app, event| {
+            if event.id() == "quit" {
+                app.exit(0);
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             rpc_bridge::omt_call,
             rpc_bridge::daemon_status,
@@ -68,18 +145,62 @@ pub fn run() {
             executor::exec_stop,
             executor::exec_transcript_tail,
             executor::exec_kill_orphan,
+            executor::exec_stop_all,
+            executor::exec_attach,
         ])
         .build(tauri::generate_context!())
         .expect("error while building oh-my-ticket desktop")
         .run(|app, event| {
-            // KD-D7：app 退出 = 执行终止。F-U2-1 后 kill_all 同步收口：
-            // SIGTERM → 有界等待（≤ KILL_GRACE+2s）等待线程落盘 → 超时则
-            // SIGKILL 并由本路径直接 finish_terminal 落盘。
-            if let tauri::RunEvent::ExitRequested { .. } = event {
-                use omt_exec::executor::KillReason;
-                app.state::<ExecutionState>()
-                    .0
-                    .kill_all(KillReason::AppExit);
+            // 设计 §3.4：退出不再终止执行（KD-D7 已被 KD-E1 修订）。还有运行中的
+            // exec 时先问用户：全部停止后退出，或让它们在后台继续（review F6）
+            if let tauri::RunEvent::ExitRequested { api, .. } = event {
+                use std::sync::atomic::Ordering;
+                if QUIT_CONFIRMED.load(Ordering::SeqCst) {
+                    return;
+                }
+                let runtime_dir = daemon::runtime_dir();
+                let running = omt_exec::control::active_exec_count(&runtime_dir);
+                if running == 0 {
+                    return;
+                }
+                api.prevent_exit();
+                let handle = app.clone();
+                use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogResult};
+                const KEEP: &str = "继续在后台运行";
+                const STOP: &str = "全部停止后退出";
+                const CANCEL: &str = "取消";
+                app.dialog()
+                    .message(format!(
+                        "还有 {running} 个 agent 在运行。选择「{KEEP}」后，它们会一直执行到完成或超时；\
+                         随时可以重新打开本应用查看或停止。"
+                    ))
+                    .title("退出 oh-my-ticket")
+                    // review R2-6：第一个按钮是 Return 默认键，放安全的「继续在后台运行」；
+                    // 「取消」= 不退出（误按 ⌘Q 时可以反悔）
+                    .buttons(MessageDialogButtons::YesNoCancelCustom(
+                        KEEP.into(),
+                        STOP.into(),
+                        CANCEL.into(),
+                    ))
+                    .show_with_result(move |result| {
+                        let choice = match result {
+                            MessageDialogResult::Custom(label) => label,
+                            MessageDialogResult::Yes => KEEP.to_string(),
+                            MessageDialogResult::No => STOP.to_string(),
+                            _ => CANCEL.to_string(),
+                        };
+                        match choice.as_str() {
+                            KEEP => {}
+                            STOP => {
+                                for home_id in omt_exec::layout::home_ids(&runtime_dir) {
+                                    let _ = omt_exec::control::stop_all(&runtime_dir, &home_id);
+                                }
+                            }
+                            _ => return, // 取消 / Esc / 关闭对话框：不退出
+                        }
+                        QUIT_CONFIRMED.store(true, Ordering::SeqCst);
+                        handle.exit(0);
+                    });
             }
         });
 }

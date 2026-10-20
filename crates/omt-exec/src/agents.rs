@@ -230,47 +230,6 @@ pub(crate) fn snapshot(runtime_dir: &Path, home_id: &str) -> AgentsFile {
     }
 }
 
-/// F-U4a-2（P0 半）：启动 demote——扫描所有 home 的每个 agent.json，把
-/// `attachment == Live` 的记录降级：`attachment=None`、`Starting/Running →
-/// Failed`（failure_detail 注明 app 重启）。pid liveness 与 Orphan 只读
-/// 尾随是 U10 的活；这里只保证 P0 期间「重启后不再把死 agent 当可控项」。
-/// 返回降级条数。
-pub fn demote_live_agents(runtime_dir: &Path) -> Result<usize, String> {
-    let mut demoted = 0usize;
-    for home_id in layout::home_ids(runtime_dir) {
-        for agent_id in layout::agent_ids(runtime_dir, &home_id)? {
-            let path = layout::agent_file(runtime_dir, &home_id, &agent_id)?;
-            let (_, changed) = update_json(&path, |agent: &mut AgentRecord| {
-                if agent.id.is_empty() {
-                    return false; // 空记录（损坏降级后的默认值）不得被写出来
-                }
-                let mut touched = false;
-                if agent.attachment == AgentAttachment::Live {
-                    agent.attachment = AgentAttachment::None;
-                    demoted += 1;
-                    touched = true;
-                }
-                if matches!(
-                    agent.status,
-                    AgentRecordStatus::Starting | AgentRecordStatus::Running
-                ) {
-                    agent.status = AgentRecordStatus::Failed;
-                    for exec in &mut agent.execs {
-                        if exec.failure_detail.is_none() {
-                            exec.failure_detail =
-                                Some("app restarted before exec finished".to_string());
-                        }
-                    }
-                    touched = true;
-                }
-                touched
-            })?;
-            let _ = changed;
-        }
-    }
-    Ok(demoted)
-}
-
 /// 一次派发的 exec 标识（U4 链步骤 ⑤ 的入参；binary 信息进 execs[] 用于
 /// 展示与审计——env 值不落盘，§3.1）。
 pub struct NewExec {
@@ -793,27 +752,6 @@ mod tests {
         };
         let text = serde_json::to_string(&exec).unwrap();
         assert!(!text.contains("\"env\""), "{text}");
-    }
-
-    #[test]
-    fn demote_live_agents_after_restart() {
-        // F-U4a-2：写入 Live 后模拟重启 → 列表不再 Live
-        let (_dir, runtime, home) = temp_runtime();
-        register_agent(&runtime, &home, "omp", new_exec("exec-1")).unwrap();
-        assert_eq!(demote_live_agents(&runtime).unwrap(), 1);
-        let file = snapshot(&runtime, &home);
-        assert_eq!(file.agents[0].attachment, AgentAttachment::None);
-        assert_eq!(file.agents[0].status, AgentRecordStatus::Failed);
-        assert!(
-            file.agents[0].execs[0]
-                .failure_detail
-                .as_deref()
-                .unwrap()
-                .contains("app restarted"),
-            "failure_detail 应注明重启"
-        );
-        // 幂等：再次 demote 无新增
-        assert_eq!(demote_live_agents(&runtime).unwrap(), 0);
     }
 
     #[test]

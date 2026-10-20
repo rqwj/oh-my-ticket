@@ -78,20 +78,3 @@ impl SharedSession {
         Self(Arc::new(Mutex::new(None)))
     }
 }
-
-/// U2: 所有执行会话的持有者（照 SharedSession 模式 manage）。构造时执行
-/// 启动清扫（F-U4a-2 demote + MCP 残留 sweep）。
-pub struct ExecutionState(pub omt_exec::executor::ExecutionManager);
-
-impl ExecutionState {
-    pub fn new() -> Self {
-        omt_exec::executor::startup_housekeeping(&daemon::runtime_dir());
-        Self(omt_exec::executor::ExecutionManager::new())
-    }
-}
-
-impl Default for ExecutionState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
