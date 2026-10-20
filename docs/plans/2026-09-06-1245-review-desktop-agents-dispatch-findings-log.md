@@ -1404,6 +1404,21 @@ F-BENCH-13 查证结论：4e960a2 提交说明声称的探针/capture/lib 改动
 
 **验证**：fmt / clippy `-D warnings` 干净；16T ×10 + 默认（16）×3 + workspace 全绿；前端 build + vitest 131 全绿；干净 worktree @9e6331e（sidecar 另行 stage）桌面 crate 128+1 passed / 0 failed。
 
+### §37. `9e6331e` + `1d7110c` · F-BENCH-26 修复 · code review（2026-10-20）
+
+**结论：通过，benchmark tier-1 收尾。F-BENCH 系列全部关闭。**
+
+**评审方核实**：
+- 修复与 §35 处方一致：子进程退出 → `kill_tree(SIGKILL)` → `drain_readers`（有界 10s，超时 detach）→ classify → `finish_terminal`；幂等改用 `finishing` 的 `compare_exchange`，`terminal` 在 exit 事件和 jsonl 行之后最后发布。max_duration 兜底分支同样排空，Err 分支也回收 reader。
+- 回归测试 `slow_sink_tail_events_settle_before_terminal` 比评审方的复现更严格（终态后不 sleep，直接断言 250 + `message-sum` + jsonl 末行 exit），评审方复现已证明修复前 3/3 红。
+- 与 `kill_all` 的交互：等待线程排空期间 `kill_all` 超过期限时由它抢到 `finishing` 同步落账（尾部 usage 可能缺，属于强制终止路径，可接受），等待线程随后的 `finish_terminal` 为 no-op；反过来等待线程先抢到时 `kill_all` 的调用为 no-op。不会双写。相比修复前，`kill_all` 的等待循环现在等的是「落账完成」而不是「落账开始」，app 退出时丢写的窗口反而缩小了。
+- `.cargo/config.toml` 已删除，测试在默认线程数下：桌面 lib 连跑 6 次全绿（128）、`RUST_TEST_THREADS=32` 1 次全绿；`cargo test --workspace` 2 次全绿；clippy `--workspace -D warnings`、fmt 干净；桌面 vitest 131、`tsc --noEmit` 通过。
+
+**余项（均不阻塞）**：
+- F-U2-11（探针重试拉长 `harness_list` 延迟）已被 F-BENCH-25 的并行探测吸收，可标 superseded；
+- F-U4a-3 / F-U4a-4（atomic_json 读路径 rename 不在 flock 内、rename 前无 `sync_all`）仍为 P3 open，与执行面拆分（子项目 1）直接相关，建议在搬迁 `atomic_json` 时一并处理；
+- 观察项：等待线程收割子进程后，在排空期间（最长 10s）`kill_all` / `exec_stop` 仍可能对已收割的 pgid 发信号。macOS 的 pid 顺序分配，几秒内复用的概率极低，不单列 finding；子项目 1 的 exec-shim 设计里应把「已收割」作为信号前的检查条件。
+
 ### 残留状态核查（第二轮验收后）
 
 失败尝试在 daemon 侧已成功创建 RUN-0001（pending，持有 TICKET-0001，无执行器），EPIC-0001/TICKET-0001 被 node/execute 标为 in_progress。重试无需清理：ensure-run 复用路径按 pending → start 正常接管（已实测 run-get 确认）。
