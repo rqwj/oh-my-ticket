@@ -12,7 +12,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { omtCall, type TranscriptEvent } from './bridge'
 import type { AgentRecord, ExecRecord, OmtNode, RunDetail, RunItemView } from './types'
 import { claimedCountForExec, danglingBindingsOf, nodeTitlesById } from './store'
-import { agentDisplayName, ConfirmStopButton } from './agentUi'
+import { agentDisplayName, ConfirmStopAllButton, ConfirmStopButton } from './agentUi'
 import { TranscriptView } from './TranscriptView'
 import { DeleteIcon } from './icons'
 
@@ -67,6 +67,10 @@ interface Props {
   homeId: string
   /** F-PI-3：历史尾部回载（窗口空且非 live 时从 raw.log 拉取） */
   loadHistoryTail: (execId: string, homeId: string) => void
+  /** P-10：选中仍在运行、但本会话无事件的 agent 时接回实时流（桌面重启后） */
+  attachTranscript?: (execId: string, homeId: string) => void
+  /** P-10：停止全部运行中 exec（替代桌面退出即终止）；返回发出停止的数量，失败为 null */
+  onStopAll?: () => Promise<number | null>
   onSelectAgent: (id: string) => void
   onStopAgent: (execId: string) => void
   /** U10：空闲 agent 一键续跑（App → store.resumeAgent） */
@@ -90,6 +94,8 @@ export function AgentsPanel({
   eventsOf,
   homeId,
   loadHistoryTail,
+  attachTranscript,
+  onStopAll,
   onSelectAgent,
   onStopAgent,
   onResumeAgent,
@@ -107,6 +113,14 @@ export function AgentsPanel({
   const [deleteTarget, setDeleteTarget] = useState<AgentRecord | null>(null)
   const [deleting, setDeleting] = useState(false)
   const [deleteError, setDeleteError] = useState<string | null>(null)
+  /** review F14（P-10）：停止全部的进行中状态与结果提示（5 秒后消失） */
+  const [stoppingAll, setStoppingAll] = useState(false)
+  const [stopAllNotice, setStopAllNotice] = useState<string | null>(null)
+  useEffect(() => {
+    if (!stopAllNotice) return
+    const timer = setTimeout(() => setStopAllNotice(null), 5000)
+    return () => clearTimeout(timer)
+  }, [stopAllNotice])
   // U14：全面板待裁决项（底部弹窗）——跨所有已拉取的 run 聚合。普通计算
   //（不得用 useMemo——须位于提前 return 之前且避免 hooks 位点抖动；stats 规模小）
   const awaitingItems: Array<{ runId: string; nodeId: string; title?: string }> = []
@@ -243,6 +257,7 @@ export function AgentsPanel({
 
   // F-PI-3：选中非 live 的 exec 且本会话无事件 → 从 raw.log 尾部回载一次
   //（跨重启的历史 agent；live exec 的事件由 Channel 实时推送，不走此路）。
+  // P-10：live 且本会话无事件 = 重启后的存活 exec → 接回实时流（exec_attach）。
   // 选中态在 effect 内自算——hooks 须位于提前 return 之前。
   useEffect(() => {
     const selectedAgent = agents.find(a => a.id === selectedAgentId) ?? null
@@ -251,7 +266,11 @@ export function AgentsPanel({
     const live =
       selectedAgent.attachment === 'live' &&
       (selectedAgent.status === 'running' || selectedAgent.status === 'starting')
-    if (live) return
+    if (live) {
+      // P-10：本会话没有事件 = 重启后的存活 exec，接回实时流
+      if (eventsOf(exec.execId).length === 0) attachTranscript?.(exec.execId, homeId)
+      return
+    }
     if (eventsOf(exec.execId).length > 0) return
     loadHistoryTail(exec.execId, homeId)
     // 每个 execId 只需触发一次；eventsOf 为尾窗快照读
@@ -275,6 +294,32 @@ export function AgentsPanel({
   }
 
   const groups = groupAgents(agents)
+  // review F7（P-10）：确认框里显示的已认领项总数（拉不到 run 详情的 agent 不计入）
+  const activeClaimed = groups.active.reduce<number | null>((sum, a) => {
+    const exec = latestExecOf(a)
+    const stat = exec?.runId ? stats[exec.runId] : undefined
+    if (!exec || !stat) return sum
+    return (sum ?? 0) + claimedCountForExec(stat.items, exec.execId)
+  }, null)
+  const handleStopAll = async () => {
+    if (!onStopAll) return
+    setStoppingAll(true)
+    try {
+      const count = await onStopAll()
+      const orphanNote =
+        groups.orphan.length > 0 ? `；${groups.orphan.length} 个不受控 agent 需单独强制终止` : ''
+      // review R2-7：失败、无事可做、成功三种结果分开提示
+      setStopAllNotice(
+        count === null
+          ? '停止失败，请重试'
+          : count === 0
+            ? '当前没有运行中的 agent'
+            : `已向 ${count} 个 agent 发出停止信号${orphanNote}`,
+      )
+    } finally {
+      setStoppingAll(false)
+    }
+  }
   const selected = agents.find(a => a.id === selectedAgentId) ?? null
   const selectedExec = selected ? latestExecOf(selected) : null
   const selectedStat = selectedExec?.runId ? stats[selectedExec.runId] : undefined
@@ -362,6 +407,15 @@ export function AgentsPanel({
           <p className="error-banner">agents.json 解析失败——已降级为空列表（损坏文件已留证 .corrupt-*）</p>
         )}
         {gcBar}
+        {onStopAll && groups.active.length > 0 && (
+          <ConfirmStopAllButton
+            running={groups.active.length}
+            claimed={activeClaimed}
+            busy={stoppingAll}
+            onConfirm={() => void handleStopAll()}
+          />
+        )}
+        {stopAllNotice && <p className="agents-notice">{stopAllNotice}</p>}
         {groups.active.length > 0 && <p className="agents-group-label">运行中</p>}
         {groups.active.map(renderRow)}
         {groups.orphan.length > 0 && <p className="agents-group-label">不受控（重启遗留）</p>}

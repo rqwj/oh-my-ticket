@@ -550,3 +550,21 @@ body {
   background: var(--panel-raised); color: var(--accent); font-size: 12px; cursor: pointer;
 }
 .idle-hint { color: #d29922; font-size: 12px; margin: 6px 0 0; }
+
+/* P-10 / review F7/F14：「停止全部」按钮与结果提示 */
+.agents-stop-all {
+  margin: 4px 8px;
+  align-self: flex-start;
+}
+/* review R2-10：确认文案 + 两个按钮超过 340px 列宽时换行，确认按钮不被裁掉 */
+.confirm-stop.agents-stop-all {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+.agents-notice {
+  margin: 0 8px 4px;
+  font-size: 12px;
+  opacity: 0.8;
+}

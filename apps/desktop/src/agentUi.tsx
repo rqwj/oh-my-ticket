@@ -69,3 +69,63 @@ export function ConfirmStopButton({
     </span>
   )
 }
+
+/**
+ * review F7/F14（P-10）：「停止全部」两段式确认（误点保护不弱于单个终止），
+ * 进行中禁用；确认文案带运行数与已认领项总数。
+ */
+export function ConfirmStopAllButton({
+  running,
+  claimed,
+  busy,
+  onConfirm,
+}: {
+  running: number
+  claimed: number | null
+  busy: boolean
+  onConfirm: () => void
+}) {
+  const [arming, setArming] = useState(false)
+  useEffect(() => {
+    if (!arming) return
+    const timer = setTimeout(() => setArming(false), CONFIRM_RESET_MS)
+    return () => clearTimeout(timer)
+  }, [arming])
+  if (busy) {
+    return (
+      <button type="button" className="chip agents-stop-all" disabled>
+        停止中…
+      </button>
+    )
+  }
+  if (!arming) {
+    return (
+      <button
+        type="button"
+        className="chip agents-stop-all"
+        title="只停止当前 workspace 中可控的 agent；不受控（orphan）的需单独强制终止"
+        onClick={() => setArming(true)}
+      >
+        停止全部
+      </button>
+    )
+  }
+  return (
+    <span className="confirm-stop agents-stop-all">
+      确认停止 {running} 个 agent{claimed !== null ? `，将释放 ${claimed} 个已认领项` : ''}
+      <button
+        type="button"
+        className="chip active"
+        onClick={() => {
+          setArming(false)
+          onConfirm()
+        }}
+      >
+        确认
+      </button>
+      <button type="button" className="chip" onClick={() => setArming(false)}>
+        取消
+      </button>
+    </span>
+  )
+}

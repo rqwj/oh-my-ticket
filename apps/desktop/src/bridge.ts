@@ -233,6 +233,28 @@ export async function execKillOrphan(homeId: string, agentId: string, execId: st
   return invoke<void>('exec_kill_orphan', { homeId, agentId, execId })
 }
 
+/** P-10：停止当前 home 的全部运行中 exec（设计 §3.4：替代「桌面退出即终止」）。
+ * 返回发出停止信号的数量。 */
+export async function execStopAll(homeId: string): Promise<number> {
+  return invoke<number>('exec_stop_all', { homeId })
+}
+
+/** P-10：重新接上仍在运行的 exec 的实时 transcript（桌面重启后 shim 仍在跑）。
+ * `afterSeq` = 已有的最后一个事件 seq（无则 null，从头推）。 */
+export async function execAttach(options: {
+  homeId: string
+  execId: string
+  afterSeq: number | null
+  channel: Channel<TranscriptEvent>
+}): Promise<void> {
+  return invoke<void>('exec_attach', {
+    homeId: options.homeId,
+    execId: options.execId,
+    afterSeq: options.afterSeq,
+    channel: options.channel,
+  })
+}
+
 // ── U6 执行派发（R-B）─────────────────────────────────────────────────────
 
 /** exec_start 成功返回（Rust ExecStartOutcome 的 camelCase 投影）。 */

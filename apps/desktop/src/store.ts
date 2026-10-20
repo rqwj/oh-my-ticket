@@ -35,9 +35,11 @@ import {
   agentsList,
   bindingsGet,
   bindingsGc,
+  execAttach,
   execKillOrphan,
   execStart,
   execStop,
+  execStopAll,
   execTranscriptTail,
   agentsDelete,
   omtCall,
@@ -454,6 +456,11 @@ export function useTreeStore() {
   const repullTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   // 已查看过的 Failed agent（选中即记入）：badge 重算时不复活
   const viewedFailedRef = useRef<Set<string>>(new Set())
+  // P-10：本会话已接上实时流的 execId（startDispatch 的 Channel 也算）——防重复 attach
+  const attachedRef = useRef<Set<string>>(new Set())
+  // review R2-9：派发进行中的计数（含续跑的就绪握手，最长 30s）——进行中不接回
+  // 实时流，否则 exec_start 返回后会出现第二个跟随者，事件全部显示两次
+  const dispatchingRef = useRef(0)
 
   const bumpTranscriptVersion = useCallback(() => {
     setState(s => ({ ...s, transcriptVersion: s.transcriptVersion + 1 }))
@@ -661,17 +668,27 @@ export function useTreeStore() {
         ingestTranscriptEvent(ev)
         options.onEvent?.(ev)
       }
-      const outcome = await execStart({
-        homeId: options.home.homeId,
-        homePath: options.home.path ?? '',
-        nodeId: options.nodeId,
-        harness: options.harness,
-        unattended: options.unattended,
-        model: options.model ?? null,
-        resumeSession: options.resumeSession ?? null,
-        agentId: options.agentId ?? null,
-        channel,
-      })
+      // review R2-9：派发进行中（就绪握手最长 30s）不计接回实时流——新 exec
+      // 的跟随者由 exec_start 建立；计数在 finally 归零
+      dispatchingRef.current += 1
+      let outcome: ExecStartOutcome
+      try {
+        outcome = await execStart({
+          homeId: options.home.homeId,
+          homePath: options.home.path ?? '',
+          nodeId: options.nodeId,
+          harness: options.harness,
+          unattended: options.unattended,
+          model: options.model ?? null,
+          resumeSession: options.resumeSession ?? null,
+          agentId: options.agentId ?? null,
+          channel,
+        })
+      } finally {
+        dispatchingRef.current -= 1
+      }
+      // P-10：startDispatch 的 Channel 即本会话的实时跟随者——记入防重复 attach
+      attachedRef.current.add(outcome.execId)
       // pull 契约：派发后拉 agents_list（防抖等 Rust 侧 ⑤ 落盘收敛）；
       // 绑定表重拉由 App 的派发成功回调统一触发（单一落点，避免双拉）
       scheduleAgentsRepull()
@@ -740,6 +757,42 @@ export function useTreeStore() {
       setState(s => ({ ...s, error: presentError(error) }))
     }
   }, [])
+
+  /** P-10：重启后接回仍在运行的 exec。afterSeq 取本窗口最后一个事件的 seq。 */
+  const attachTranscript = useCallback(
+    (execId: string, homeId: string) => {
+      if (attachedRef.current.has(execId)) return
+      // review R2-9：派发进行中（续跑的就绪握手最长 30s）先不接——新 exec 的
+      // 跟随者会由 exec_start 建立；其余 exec 在派发结束后的下一次列表重拉时再接
+      if (dispatchingRef.current > 0) return
+      attachedRef.current.add(execId)
+      const channel = new Channel<TranscriptEvent>()
+      channel.onmessage = ev => ingestTranscriptEvent(ev)
+      const existing = transcriptsRef.current.get(execId)
+      const last = existing && existing.length > 0 ? existing[existing.length - 1] : undefined
+      const afterSeq = last ? last.seq : null
+      void execAttach({ homeId, execId, afterSeq, channel }).catch(error => {
+        attachedRef.current.delete(execId)
+        setState(s => ({ ...s, error: presentError(error) }))
+      })
+    },
+    [ingestTranscriptEvent],
+  )
+
+  /** P-10 / review F14 / R2-7：停止当前 home 的全部运行中 exec，返回发出停止的
+   * 数量；失败返回 null（不能与「本来就没有运行中的」0 混淆）。 */
+  const stopAll = useCallback(async (): Promise<number | null> => {
+    const home = activeHomeRef.current
+    if (!home) return null
+    try {
+      const count = await execStopAll(home.homeId)
+      scheduleAgentsRepull()
+      return count
+    } catch (error) {
+      setState(s => ({ ...s, error: presentError(error) }))
+      return null
+    }
+  }, [scheduleAgentsRepull])
 
   const killOrphan = useCallback(
     async (agentId: string, execId: string) => {
@@ -1064,6 +1117,8 @@ export function useTreeStore() {
     killOrphan,
     ingestTranscriptEvent,
     loadHistoryTail,
+    attachTranscript,
+    stopAll,
     resumeAgent,
     createNode,
     deleteAgent,

@@ -182,6 +182,8 @@ export function App() {
                     eventsOf={store.transcriptWindow}
                     homeId={state.activeHome.homeId}
                     loadHistoryTail={store.loadHistoryTail}
+                    attachTranscript={store.attachTranscript}
+                    onStopAll={store.stopAll}
                     onSelectAgent={store.selectAgent}
                     onStopAgent={execId => void store.stopAgent(execId)}
                     onResumeAgent={store.resumeAgent}
