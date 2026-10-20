@@ -101,6 +101,8 @@ pub struct SpawnRequest {
     pub env_additions: BTreeMap<String, String>,
     /// MCP 桥接注入（U3）：spawn 时生效 env，终态时释放 workspace 注入
     pub mcp: McpInjection,
+    /// transcript 目录（= agent 目录，设计 §3.3）：jsonl / raw.log 写在这里。
+    pub transcript_dir: PathBuf,
 }
 
 /// 事件回调（tauri Channel 的 mpsc 替身）。
@@ -358,16 +360,21 @@ impl ExecutionManager {
         }
         // F-U2-8(b)：argv 进事件/日志前脱敏（raw.log 保留原始流供诊断）
         let sanitized_args = sanitize_args(&req.args);
-        let raw_log = runtime_dir
-            .join("transcripts")
-            .join(&req.home_id)
-            .join(format!("{}.raw.log", req.exec_id));
-        if let Some(dir) = raw_log.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| format!("create transcripts dir: {e}"))?;
-        }
+        // KD-E2：transcript 落 agent 目录（jsonl / raw.log / prompt 同处）
+        let raw_log = crate::layout::exec_file(
+            &req.transcript_dir,
+            &req.exec_id,
+            crate::layout::ExecFile::RawLog,
+        );
+        std::fs::create_dir_all(&req.transcript_dir)
+            .map_err(|e| format!("create transcript dir: {e}"))?;
         // F-U12-4：规范化事件日志——首行 header（F-U2-7 原始定义），随后
         // spawn_reader 逐行追加统一事件；argv 用脱敏值（secrets 纪律）。
-        let events_log = raw_log.with_file_name(format!("{}.jsonl", req.exec_id));
+        let events_log = crate::layout::exec_file(
+            &req.transcript_dir,
+            &req.exec_id,
+            crate::layout::ExecFile::Jsonl,
+        );
         {
             use std::io::Write as _;
             let header = serde_json::json!({
@@ -1235,13 +1242,19 @@ fn dispatch_chain(
         );
     // exec_id 提前生成：prompt 文件名、Agent 记录、spawn 三方共用
     let exec_id = format!("exec-{}", omt_harness::atomic_json::unique_suffix());
+    // KD-E2：agent 目录在链上提前确定（新 agent 的 id 由 execId 派生；续跑
+    // 用目标 agent 自己的目录）——prompt 文件与 transcript 都落在它里面。
+    let agent_id_for_paths = match target_agent_id {
+        Some(target) => target.to_string(),
+        None => crate::layout::new_agent_id(&exec_id),
+    };
+    let agent_dir = crate::layout::agent_dir(runtime_dir, home_id, &agent_id_for_paths)?;
     // F-ACC-6（验收 ENAMETOOLONG）：opencode 对位置参数 lstat 判文件附件，
     // 多行长 prompt 被当路径启动即炸。FileAttach 渠道把 prompt 落 per-exec
     // 文件（与 raw.log 同目录，无 secrets——desktop 模板 + run_id），argv 只
     // 留 `-f <path>` + 短指令。路径此处确定（compose/注册用），写盘在 ⑦ 后
     // （失败走补偿表）。
-    let prompt_file =
-        harness::prompt_file_path(runtime_dir, home_id, &exec_id, plan.prompt_channel);
+    let prompt_file = harness::prompt_file_path(&agent_dir, &exec_id, plan.prompt_channel);
     let args = harness::compose_launch_args(
         &plan,
         unattended,
@@ -1343,9 +1356,7 @@ fn dispatch_chain(
     if let Some(path) = &prompt_file {
         if let Some(dir) = path.parent() {
             if let Err(e) = std::fs::create_dir_all(dir) {
-                return Err(fail_agent_and_compensate(format!(
-                    "create transcripts dir: {e}"
-                )));
+                return Err(fail_agent_and_compensate(format!("create agent dir: {e}")));
             }
         }
         if let Err(e) = std::fs::write(path, &prompt) {
@@ -1368,6 +1379,7 @@ fn dispatch_chain(
         args,
         env_additions,
         mcp,
+        transcript_dir: agent_dir.clone(),
     };
     if let Err(err) = manager.spawn(runtime_dir, spawn_req, sink) {
         return Err(fail_agent_and_compensate(err));
@@ -1445,13 +1457,28 @@ pub fn exec_start_impl(
 /// `exec_transcript_tail` 的纯核心（测试注入 runtime 目录）。
 /// F-U12-4：优先读 `<execId>.jsonl`（规范化事件，逐行即事件——直接尾部
 /// 截取）；不存在（旧数据/未产出）回落 raw.log 嗅探路径。
+/// 迁移前的旧 transcript 目录（`<runtime>/transcripts/<home>/`，KD-E2 之前
+/// 落盘的数据）。仅剩回落用途：Task 5 迁移后新数据不再出现在这里；回放
+/// 面的回落测试也经此构造旧布局数据（旧路径知识只在本函数出现一次）。
+fn legacy_transcripts_dir(runtime_dir: &Path, home_id: &str) -> PathBuf {
+    runtime_dir.join("transcripts").join(home_id)
+}
+
 pub fn transcript_tail_from(
     runtime_dir: &Path,
     home_id: &str,
     exec_id: &str,
     max_lines: Option<usize>,
 ) -> Vec<serde_json::Value> {
-    let dir = runtime_dir.join("transcripts").join(home_id);
+    // KD-E2：新布局按 exec 定位 agent 目录；找不到（迁移前的旧数据）回落
+    // 旧的 transcripts/<home>/ 目录。
+    let dir = match crate::agents::find_exec_in_home(runtime_dir, home_id, exec_id) {
+        Ok(Some((agent, _))) => match crate::layout::agent_dir(runtime_dir, home_id, &agent.id) {
+            Ok(dir) => dir,
+            Err(_) => return Vec::new(),
+        },
+        _ => legacy_transcripts_dir(runtime_dir, home_id),
+    };
     let jsonl = dir.join(format!("{exec_id}.jsonl"));
     if let Ok(text) = std::fs::read_to_string(&jsonl) {
         let max = max_lines.unwrap_or(500).clamp(1, 5000);
@@ -1536,7 +1563,7 @@ pub fn reconcile_interrupted_execs_with(
         // 终态归档全缺）——捕获的 session id 还在 raw.log 首段流里，回填
         // 后该 agent 仍可续跑（上下文不因崩溃丢失）
         let backfill_session =
-            session_id_from_raw_log(runtime_dir, &t.home_id, &t.exec_id, &t.harness);
+            session_id_from_raw_log(runtime_dir, &t.home_id, &t.agent_id, &t.exec_id, &t.harness);
         let _ = agents::update_exec(runtime_dir, &t.home_id, &t.agent_id, &t.exec_id, |exec| {
             exec.reconciled = true;
             if exec.harness_session_id.is_none() {
@@ -1549,17 +1576,17 @@ pub fn reconcile_interrupted_execs_with(
 }
 
 /// 从 raw.log 流行回填 harness session id（pi/omp 的 session 事件在首行、
-/// opencode 任意行携带 sessionID）。读前 32 行足够。
+/// opencode 任意行携带 sessionID）。读前 32 行足够。KD-E2 后 raw.log 在
+/// agent 目录里。
 fn session_id_from_raw_log(
     runtime_dir: &Path,
     home_id: &str,
+    agent_id: &str,
     exec_id: &str,
     harness: &str,
 ) -> Option<String> {
-    let path = runtime_dir
-        .join("transcripts")
-        .join(home_id)
-        .join(format!("{exec_id}.raw.log"));
+    let dir = crate::layout::agent_dir(runtime_dir, home_id, agent_id).ok()?;
+    let path = crate::layout::exec_file(&dir, exec_id, crate::layout::ExecFile::RawLog);
     let text = std::fs::read_to_string(path).ok()?;
     for line in text.lines().take(32) {
         let body = line
@@ -1691,6 +1718,7 @@ mod tests {
                     args: vec![],
                     env_additions: BTreeMap::new(),
                     mcp: McpInjection::None,
+                    transcript_dir: runtime.join("agents").join("h_test").join("agent-kill"),
                 },
                 sink,
             )
@@ -1757,6 +1785,7 @@ mod tests {
                     args: vec![],
                     env_additions: BTreeMap::new(),
                     mcp: McpInjection::None,
+                    transcript_dir: runtime.join("agents").join("h_test").join("agent-boom"),
                 },
                 sink,
             )
@@ -1801,6 +1830,7 @@ mod tests {
                     args: vec![],
                     env_additions: BTreeMap::new(),
                     mcp: McpInjection::None,
+                    transcript_dir: runtime.join("agents").join("h_test").join("agent-leak"),
                 },
                 sink,
             )
@@ -1854,6 +1884,8 @@ mod tests {
                     args: vec![],
                     env_additions: BTreeMap::new(),
                     mcp: McpInjection::None,
+                    transcript_dir: crate::layout::agent_dir(&runtime, "h_test", &agent.id)
+                        .unwrap(),
                 },
                 sink,
             )
@@ -1863,11 +1895,8 @@ mod tests {
             panic!("应为 Failed：{terminal:?}");
         };
         assert!(detail.contains("起动窗"), "{detail}");
-        // agents.json 同步落了 Failed（F-U2-3：attach None）
-        let (file, _) = omt_harness::atomic_json::read_json::<crate::agents::AgentsFile>(
-            &runtime.join("agents").join("h_test").join("agents.json"),
-        )
-        .unwrap();
+        // agent.json 同步落了 Failed（F-U2-3：attach None）
+        let file = crate::agents::snapshot(&runtime, "h_test");
         assert_eq!(
             file.agents[0].status,
             crate::agents::AgentRecordStatus::Failed
@@ -1906,6 +1935,7 @@ mod tests {
                     args: vec![],
                     env_additions: BTreeMap::new(),
                     mcp: McpInjection::None,
+                    transcript_dir: runtime.join("agents").join("h_test").join("agent-sig"),
                 },
                 sink,
             )
@@ -1953,19 +1983,21 @@ mod tests {
             args: vec![],
             cwd: PathBuf::from("/"),
             started_at_epoch_ms: agents::now_epoch_ms(),
-            raw_log: runtime
-                .join("transcripts")
-                .join("h_test")
-                .join("exec-race.raw.log"),
+            raw_log: crate::layout::exec_file(
+                &crate::layout::agent_dir(&runtime, "h_test", &agent.id).unwrap(),
+                "exec-race",
+                crate::layout::ExecFile::RawLog,
+            ),
             runtime_dir: runtime.clone(),
             mcp: McpInjection::None,
             lease_release: None,
             usage_totals: std::sync::Mutex::new(UsageTotals::default()),
             harness_session_id: std::sync::Mutex::new(None),
-            events_log: runtime
-                .join("transcripts")
-                .join("h_test")
-                .join("exec-x.jsonl"),
+            events_log: crate::layout::exec_file(
+                &crate::layout::agent_dir(&runtime, "h_test", &agent.id).unwrap(),
+                "exec-race",
+                crate::layout::ExecFile::Jsonl,
+            ),
             started: Instant::now(),
             sink: Arc::new(|_| {}),
             seq: AtomicU64::new(0),
@@ -2023,17 +2055,22 @@ mod tests {
             args: vec![],
             cwd: PathBuf::from("/"),
             started_at_epoch_ms: agents::now_epoch_ms(),
-            raw_log: runtime.join("transcripts").join("h_test").join("x.raw.log"),
+            raw_log: crate::layout::exec_file(
+                &crate::layout::agent_dir(&runtime, "h_test", &agent.id).unwrap(),
+                "exec-sigkill",
+                crate::layout::ExecFile::RawLog,
+            ),
             runtime_dir: runtime.clone(),
             mcp: McpInjection::None,
             lease_release: None,
             started: Instant::now(),
             usage_totals: std::sync::Mutex::new(UsageTotals::default()),
             harness_session_id: std::sync::Mutex::new(None),
-            events_log: runtime
-                .join("transcripts")
-                .join("h_test")
-                .join("exec-x.jsonl"),
+            events_log: crate::layout::exec_file(
+                &crate::layout::agent_dir(&runtime, "h_test", &agent.id).unwrap(),
+                "exec-sigkill",
+                crate::layout::ExecFile::Jsonl,
+            ),
             sink: Arc::new(|_| {}),
             seq: AtomicU64::new(0),
             first_event_seen: AtomicBool::new(true),
@@ -2105,6 +2142,8 @@ mod tests {
                     args: vec![],
                     env_additions: BTreeMap::new(),
                     mcp: McpInjection::None,
+                    transcript_dir: crate::layout::agent_dir(&runtime, "h_test", &agent.id)
+                        .unwrap(),
                 },
                 sink,
             )
@@ -2133,13 +2172,21 @@ mod tests {
             elapsed >= Duration::from_millis(250) && elapsed < Duration::from_secs(8),
             "kill_all 应在 kill_grace 超时后返回：{elapsed:?}"
         );
-        // agents.json 已落 Killed(AppExit)/kill_reason=appexit
-        let (file, parse_failed) =
-            omt_harness::atomic_json::read_json::<crate::agents::AgentsFile>(
-                &runtime.join("agents").join("h_test").join("agents.json"),
-            )
-            .unwrap();
-        assert!(!parse_failed);
+        // agent 状态已落 Killed(AppExit)/kill_reason=appexit（snapshot 轮询，
+        // 消除断言与持久化写入之间的竞态）
+        let file = wait_for(
+            || {
+                let file = crate::agents::snapshot(&runtime, "h_test");
+                (file.agents.iter().any(|a| {
+                    a.execs
+                        .iter()
+                        .any(|e| e.kill_reason.as_deref() == Some("appexit"))
+                }))
+                .then_some(file)
+            },
+            Duration::from_secs(3),
+        )
+        .expect("agent 状态应在 3s 内落 Killed/appexit");
         assert_eq!(
             file.agents[0].status,
             crate::agents::AgentRecordStatus::Killed
@@ -2194,6 +2241,8 @@ mod tests {
                     args: vec![],
                     env_additions: BTreeMap::new(),
                     mcp: McpInjection::None,
+                    transcript_dir: crate::layout::agent_dir(&runtime, "h_test", &agent.id)
+                        .unwrap(),
                 },
                 sink,
             )
@@ -2240,6 +2289,7 @@ mod tests {
         )
         .unwrap();
         let script = write_script(dir.path(), "lease-exit", "exit 0");
+        let agent_dir = crate::layout::agent_dir(&runtime, "h_test", &agent.id).unwrap();
         let session = manager
             .spawn(
                 &runtime,
@@ -2255,6 +2305,7 @@ mod tests {
                     args: vec![],
                     env_additions: BTreeMap::new(),
                     mcp: McpInjection::None,
+                    transcript_dir: agent_dir,
                 },
                 Arc::new(|_| {}),
             )
@@ -2307,7 +2358,7 @@ mod tests {
                 &runtime,
                 SpawnRequest {
                     exec_id: "exec-usage".into(),
-                    agent_id: agent.id,
+                    agent_id: agent.id.clone(),
                     home_id: "h_test".into(),
                     home_path,
                     harness: "pi".into(),
@@ -2317,17 +2368,14 @@ mod tests {
                     args: vec![],
                     env_additions: BTreeMap::new(),
                     mcp: McpInjection::None,
+                    transcript_dir: crate::layout::agent_dir(&runtime, "h_test", &agent.id)
+                        .unwrap(),
                 },
                 Arc::new(|_| {}),
             )
             .unwrap();
         wait_for(|| session.terminal().map(|_| ()), Duration::from_secs(20)).expect("应到达终态");
-        let (file, parse_failed) =
-            omt_harness::atomic_json::read_json::<crate::agents::AgentsFile>(
-                &runtime.join("agents").join("h_test").join("agents.json"),
-            )
-            .unwrap();
-        assert!(!parse_failed);
+        let file = crate::agents::snapshot(&runtime, "h_test");
         let exec = &file.agents[0].execs[0];
         assert_eq!(exec.usage_tokens, Some(250), "按消息求和归档");
         assert!((exec.usage_cost.unwrap() - 0.03).abs() < 1e-9);
@@ -2369,7 +2417,7 @@ mod tests {
                 &runtime,
                 SpawnRequest {
                     exec_id: "exec-slow".into(),
-                    agent_id: agent.id,
+                    agent_id: agent.id.clone(),
                     home_id: "h_test".into(),
                     home_path,
                     harness: "pi".into(),
@@ -2379,25 +2427,23 @@ mod tests {
                     args: vec![],
                     env_additions: BTreeMap::new(),
                     mcp: McpInjection::None,
+                    transcript_dir: crate::layout::agent_dir(&runtime, "h_test", &agent.id)
+                        .unwrap(),
                 },
                 Arc::new(|_| std::thread::sleep(Duration::from_millis(700))),
             )
             .unwrap();
         wait_for(|| session.terminal().map(|_| ()), Duration::from_secs(30)).expect("应到达终态");
         // 刻意不 sleep：「terminal 发布即完整」是 F-BENCH-26(a) 的契约本身
-        let (file, _) = omt_harness::atomic_json::read_json::<crate::agents::AgentsFile>(
-            &runtime.join("agents").join("h_test").join("agents.json"),
-        )
-        .unwrap();
+        let file = crate::agents::snapshot(&runtime, "h_test");
         let exec = &file.agents[0].execs[0];
         assert_eq!(exec.usage_tokens, Some(250), "末条 message_end 不得漏记");
         assert_eq!(exec.usage_caliber.as_deref(), Some("message-sum"));
-        let jsonl = std::fs::read_to_string(
-            runtime
-                .join("transcripts")
-                .join("h_test")
-                .join("exec-slow.jsonl"),
-        )
+        let jsonl = std::fs::read_to_string(crate::layout::exec_file(
+            &crate::layout::agent_dir(&runtime, "h_test", &agent.id).unwrap(),
+            "exec-slow",
+            crate::layout::ExecFile::Jsonl,
+        ))
         .unwrap();
         let last_kind = jsonl
             .lines()
@@ -2435,6 +2481,7 @@ mod tests {
                     args: vec!["--api-key".to_string(), "sk-live123".to_string()],
                     env_additions: BTreeMap::new(),
                     mcp: McpInjection::None,
+                    transcript_dir: runtime.join("agents").join("h_test").join("agent-args"),
                 },
                 sink,
             )
@@ -2488,6 +2535,7 @@ mod tests {
                     args: vec![],
                     env_additions: BTreeMap::new(),
                     mcp: McpInjection::None,
+                    transcript_dir: runtime.join("agents").join("h_test").join("agent-envelope"),
                 },
                 sink,
             )
@@ -2653,6 +2701,7 @@ mod tests {
                 args: vec![],
                 env_additions: env,
                 mcp: McpInjection::None,
+                transcript_dir: runtime.join("agents").join("h_test").join("agent-env"),
             },
             sink.clone(),
         );
@@ -2683,6 +2732,7 @@ mod tests {
                     args: vec![],
                     env_additions: env,
                     mcp: McpInjection::None,
+                    transcript_dir: runtime.join("agents").join("h_test").join("agent-env"),
                 },
                 sink,
             )
@@ -2732,6 +2782,7 @@ mod tests {
                     args: vec![],
                     env_additions: BTreeMap::new(),
                     mcp: McpInjection::None,
+                    transcript_dir: runtime.join("agents").join("h_test").join("agent-slow"),
                 },
                 sink,
             )
@@ -2785,6 +2836,8 @@ mod tests {
                     args: vec![],
                     env_additions: BTreeMap::new(),
                     mcp: McpInjection::None,
+                    transcript_dir: crate::layout::agent_dir(&runtime, "h_test", &agent.id)
+                        .unwrap(),
                 },
                 sink,
             )
@@ -2796,25 +2849,21 @@ mod tests {
             Some(Terminal::Killed(KillReason::AppExit))
         ));
         // F-U2-12：kill_all 路径必须真正落盘（F-U2-1 修复的验收断言）。
-        // finish_terminal 先置 terminal 再写文件——用轮询读消除断言与持久化
-        // 写入之间的竞态（correctness 评审指出的 read-race）。
-        let agents_file = runtime.join("agents").join("h_test").join("agents.json");
+        // finish_terminal 先落账再置 terminal——用 snapshot 轮询读消除断言
+        // 与持久化写入之间的竞态（correctness 评审指出的 read-race）。
         let persisted = wait_for(
             || {
-                let (file, parse_failed) =
-                    omt_harness::atomic_json::read_json::<crate::agents::AgentsFile>(&agents_file)
-                        .unwrap_or_default();
-                (!parse_failed
-                    && file.agents.iter().any(|a| {
-                        a.execs
-                            .iter()
-                            .any(|e| e.kill_reason.as_deref() == Some("appexit"))
-                    }))
+                let file = crate::agents::snapshot(&runtime, "h_test");
+                (file.agents.iter().any(|a| {
+                    a.execs
+                        .iter()
+                        .any(|e| e.kill_reason.as_deref() == Some("appexit"))
+                }))
                 .then_some(file)
             },
             Duration::from_secs(3),
         );
-        let file = persisted.expect("agents.json 应在 3s 内落 Killed/appexit");
+        let file = persisted.expect("agent 状态应在 3s 内落 Killed/appexit");
         assert_eq!(
             file.agents[0].status,
             crate::agents::AgentRecordStatus::Killed
@@ -2888,6 +2937,7 @@ mod tests {
                 args: vec![],
                 env_additions: BTreeMap::new(),
                 mcp,
+                transcript_dir: runtime.join("agents").join("h_test").join("agent-mcp-fail"),
             },
             sink,
         );
@@ -3072,13 +3122,7 @@ mod tests {
     }
 
     fn read_agents_file(runtime: &Path) -> crate::agents::AgentsFile {
-        let (file, parse_failed) =
-            omt_harness::atomic_json::read_json::<crate::agents::AgentsFile>(
-                &runtime.join("agents").join("h_test").join("agents.json"),
-            )
-            .unwrap();
-        assert!(!parse_failed);
-        file
+        crate::agents::snapshot(runtime, "h_test")
     }
 
     #[test]
@@ -3129,12 +3173,11 @@ mod tests {
         assert_eq!(cancels.len(), 1, "应恰好一次补偿 cancel: {err}");
         assert_eq!(cancels[0]["runId"], "run-new-a");
         assert_eq!(cancels[0]["homeId"], "h_test");
-        // 不留 Agent 记录（agents/<home_id> 仍是被占据的文件）
+        // 不留 Agent 记录（agents/<home_id> 仍是被占据的文件：seq.json 与
+        // agent 目录都建不出来）
         assert!(!runtime.join("agents").join("h_test").is_dir());
-        assert!(!runtime
-            .join("agents")
-            .join("h_test")
-            .join("agents.json")
+        assert!(!crate::layout::seq_file(&runtime, "h_test")
+            .unwrap()
             .exists());
     }
 
@@ -3198,7 +3241,7 @@ mod tests {
             !serde_json::to_string(&file)
                 .unwrap()
                 .contains("persisted-secret"),
-            "agents.json 不得持久化 argv secret"
+            "agent 记录不得持久化 argv secret"
         );
         // 仅新建 run 被补偿 cancel
         let cancels = fake.cancel_params();
@@ -3209,13 +3252,14 @@ mod tests {
     #[test]
     fn dispatch_spawn_failure_marks_agent_failed_and_cancels_new_run() {
         // 补偿表 ⑧：spawn 同步失败 → Agent 转 Failed + 仅新建 run 被 cancel。
-        // 失败手法：runtime/transcripts 被普通文件占据（raw.log 父目录
-        // create_dir_all 必败）。prepare 须走通：opencode 注入只查 omt_path
-        // is_file → fake_omt 占位，workspace 语义保持完整。
+        // 失败手法：删除 workspace 根目录（home_path 的父目录）——spawn 入口的
+        // 「workspace 根不存在」硬校验必败。日志写在 agent 目录里，runtime
+        // 子树保持完整；prepare 须走通：opencode 注入只查 omt_path is_file →
+        // fake_omt 占位。
         let dir = tempfile::tempdir().unwrap();
         let program = write_script(dir.path(), "never-runs-c", "exit 0");
         let (runtime, home_path) = setup_dispatch_env(dir.path(), "opencode", &program);
-        std::fs::write(runtime.join("transcripts"), "occupied").unwrap();
+        std::fs::remove_dir_all(home_path.parent().unwrap()).unwrap();
 
         let fake = FakeDaemon::new(
             dispatch_node_get(serde_json::json!([])),
@@ -3233,8 +3277,8 @@ mod tests {
         );
         let err = result.expect_err("spawn 失败应使 dispatch_chain 失败");
         assert!(
-            err.contains("transcripts"),
-            "失败点应落在 spawn 步骤（raw.log 目录）: {err}"
+            err.contains("workspace 根不存在"),
+            "失败点应落在 spawn 步骤（workspace 根缺失）: {err}"
         );
 
         // Agent 已注册且转 Failed
@@ -3336,11 +3380,13 @@ mod tests {
         assert_eq!(outcome.run_id, "run-new-e");
         assert!(outcome.warnings.is_empty(), "{outcome:?}");
         // F-ACC-6：opencode 渠道 prompt 落 per-exec 文件（argv 避开
-        // ENAMETOOLONG），文件内容含替换后的 run id
-        let prompt_file = runtime
-            .join("transcripts")
-            .join("h_test")
-            .join(format!("{}.prompt.md", outcome.exec_id));
+        // ENAMETOOLONG），文件内容含替换后的 run id。KD-E2 后在 agent 目录里。
+        let agent_dir = crate::layout::agent_dir(&runtime, "h_test", &outcome.agent_id).unwrap();
+        let prompt_file = crate::layout::exec_file(
+            &agent_dir,
+            &outcome.exec_id,
+            crate::layout::ExecFile::Prompt,
+        );
         let prompt_body = std::fs::read_to_string(&prompt_file)
             .unwrap_or_else(|_| panic!("prompt 文件应存在: {}", prompt_file.display()));
         assert!(prompt_body.contains("run-new-e"), "{prompt_body}");
@@ -3374,10 +3420,8 @@ mod tests {
             "{terminal:?}"
         );
         // F-U12-4：规范化 jsonl——首行 header、含 session_start 与终态 exit
-        let jsonl = runtime
-            .join("transcripts")
-            .join("h_test")
-            .join(format!("{}.jsonl", outcome.exec_id));
+        let jsonl =
+            crate::layout::exec_file(&agent_dir, &outcome.exec_id, crate::layout::ExecFile::Jsonl);
         let text = std::fs::read_to_string(&jsonl).unwrap();
         let mut lines = text.lines();
         let header: serde_json::Value =
@@ -3443,7 +3487,7 @@ mod tests {
     fn transcript_tail_prefix_parse_shape() {
         let dir = tempfile::tempdir().unwrap();
         let runtime = dir.path().join("runtime");
-        let home_dir = runtime.join("transcripts").join("h_t");
+        let home_dir = legacy_transcripts_dir(&runtime, "h_t");
         std::fs::create_dir_all(&home_dir).unwrap();
         std::fs::write(
             home_dir.join("exec-t1.raw.log"),
@@ -3467,7 +3511,7 @@ mod tests {
     fn transcript_tail_prefers_normalized_jsonl() {
         let dir = tempfile::tempdir().unwrap();
         let runtime = dir.path().join("runtime");
-        let home_dir = runtime.join("transcripts").join("h_j");
+        let home_dir = legacy_transcripts_dir(&runtime, "h_j");
         std::fs::create_dir_all(&home_dir).unwrap();
         std::fs::write(
             home_dir.join("exec-j.jsonl"),
@@ -3532,7 +3576,7 @@ mod tests {
     fn transcript_tail_usage_per_message_not_snapshots() {
         let dir = tempfile::tempdir().unwrap();
         let runtime = dir.path().join("runtime");
-        let home_dir = runtime.join("transcripts").join("h_u");
+        let home_dir = legacy_transcripts_dir(&runtime, "h_u");
         std::fs::create_dir_all(&home_dir).unwrap();
         let snap = r#"{"type":"message_update","usage":{"totalTokens":13980,"cost":{"total":0.0419}},"assistantMessageEvent":{"type":"thinking_delta","delta":"x"}}"#;
         let m1 = r#"{"type":"message_end","message":{"role":"assistant","usage":{"totalTokens":13980,"cost":{"total":0.0419}}}}"#;
@@ -3634,10 +3678,12 @@ mod tests {
                 .any(|(m, p)| m == "run/control" && p["action"] == "retry"));
         }
         // F-U10-2：崩溃打断 finish_terminal 时 session id 从 raw.log 回填
-        let raw = runtime
-            .join("transcripts")
-            .join("h_test")
-            .join("exec-crash.raw.log");
+        //（KD-E2 后 raw.log 在 agent 目录里）
+        let raw = crate::layout::exec_file(
+            &crate::layout::agent_dir(&runtime, "h_test", &agent.id).unwrap(),
+            "exec-crash",
+            crate::layout::ExecFile::RawLog,
+        );
         std::fs::create_dir_all(raw.parent().unwrap()).unwrap();
         std::fs::write(
             &raw,

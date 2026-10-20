@@ -474,24 +474,11 @@ pub fn resolve_launch(runtime_dir: &Path, provider_id: &str) -> Result<LaunchPla
 }
 
 /// FileAttach 渠道的 per-exec prompt 文件路径（纯函数，无 IO）：
-/// `<runtime>/transcripts/<home>/<exec>.prompt.md`。非该渠道返回 None。
-/// 路径确定性——调用方先定路径（compose/Agent 记录用），写盘时机自定。
-pub fn prompt_file_path(
-    runtime_dir: &Path,
-    home_id: &str,
-    exec_id: &str,
-    channel: PromptChannel,
-) -> Option<PathBuf> {
-    if channel == PromptChannel::FileAttach {
-        Some(
-            runtime_dir
-                .join("transcripts")
-                .join(home_id)
-                .join(format!("{exec_id}.prompt.md")),
-        )
-    } else {
-        None
-    }
+/// `<dir>/<exec>.prompt.md`（KD-E2 后 dir = agent 目录）。非该渠道返回
+/// None。路径确定性——调用方先定路径（compose/Agent 记录用），写盘时机
+/// 自定。
+pub fn prompt_file_path(dir: &Path, exec_id: &str, channel: PromptChannel) -> Option<PathBuf> {
+    (channel == PromptChannel::FileAttach).then(|| dir.join(format!("{exec_id}.prompt.md")))
 }
 
 /// FileAttach 渠道的短指令：完整 DISPATCH_PROMPT 在附着文件里，argv 保持

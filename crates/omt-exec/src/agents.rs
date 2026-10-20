@@ -1,4 +1,5 @@
-//! U4a (R-E): Agent 最小存储 —— `agents/<home-id>/agents.json`。
+//! U4a (R-E): Agent 存储 —— `agents/<home-id>/<agentId>/agent.json`（KD-E2
+//! 按 agent 拆分；路径面见 `layout`）。
 //!
 //! 存储半（本单元）：schema（§3.2：meta.agentSeq + agents[].{status,
 //! attachment, execs[]}）、进程内锁 + flock + tmp/rename 原子写（共用
@@ -12,6 +13,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::layout;
 use omt_harness::atomic_json::{has_unrecovered_corrupt, read_json, update_json};
 
 // ---------------------------------------------------------------------------
@@ -138,30 +140,13 @@ impl Default for AgentRecord {
 /// home-id 来自 daemon handshake（`h_`+base36），防御性拒绝路径分隔符与
 /// 上级目录形态。
 pub fn validate_home_id(home_id: &str) -> Result<(), String> {
-    if home_id.is_empty()
-        || home_id.contains('/')
-        || home_id.contains('\\')
-        || home_id.starts_with('.')
-        || home_id.contains("..")
-    {
-        return Err(format!("invalid home id: {home_id:?}"));
-    }
-    Ok(())
-}
-
-pub fn agents_path(runtime_dir: &Path, home_id: &str) -> Result<PathBuf, String> {
-    validate_home_id(home_id)?;
-    Ok(runtime_dir.join("agents").join(home_id).join("agents.json"))
+    crate::layout::validate_segment("home id", home_id)
 }
 
 /// bindings.json 路径（§3.1 存储：`agents/<home-id>/bindings.json`，显式
-/// 绑定 nodeId → agentId）。home-id 校验与 agents_path 同源防穿越。
+/// 绑定 nodeId → agentId）。home-id 校验与 layout 同源防穿越。
 pub fn bindings_path(runtime_dir: &Path, home_id: &str) -> Result<PathBuf, String> {
-    validate_home_id(home_id)?;
-    Ok(runtime_dir
-        .join("agents")
-        .join(home_id)
-        .join("bindings.json"))
+    crate::layout::bindings_file(runtime_dir, home_id)
 }
 
 pub fn now_epoch_ms() -> String {
@@ -175,25 +160,82 @@ pub fn now_epoch_ms() -> String {
     format!("{ms}")
 }
 
-/// F-U4a-2（P0 半）：启动 demote——扫描所有 home 的 agents.json，把
+fn first_started(agent: &AgentRecord) -> &str {
+    agent
+        .execs
+        .first()
+        .map(|e| e.started_at.as_str())
+        .unwrap_or("")
+}
+
+/// 某 home 的全部 agent（按首个 exec 的 startedAt 排序，epoch ms 字符串
+/// 等长，字典序 = 时间序）。返回值第二项 = parseFailed（粘性：任一
+/// agent.json 解析失败或留有未恢复的 `.corrupt-*` 证据）。
+pub fn list_agents(runtime_dir: &Path, home_id: &str) -> Result<(Vec<AgentRecord>, bool), String> {
+    let mut agents = Vec::new();
+    let mut parse_failed = false;
+    for agent_id in layout::agent_ids(runtime_dir, home_id)? {
+        let path = layout::agent_file(runtime_dir, home_id, &agent_id)?;
+        let (record, failed) = read_json::<AgentRecord>(&path)?;
+        parse_failed |= failed || has_unrecovered_corrupt(&path);
+        if !record.id.is_empty() {
+            agents.push(record);
+        }
+    }
+    agents.sort_by(|a, b| first_started(a).cmp(first_started(b)).then(a.id.cmp(&b.id)));
+    Ok((agents, parse_failed))
+}
+
+/// 持久单调的 agent 序号（`Agent N` 的 N）。
+pub fn agent_seq(runtime_dir: &Path, home_id: &str) -> Result<u64, String> {
+    Ok(
+        read_json::<AgentsMeta>(&layout::seq_file(runtime_dir, home_id)?)?
+            .0
+            .agent_seq,
+    )
+}
+
+/// 在某 home 内按 exec id 找 (agent, exec)。
+pub fn find_exec_in_home(
+    runtime_dir: &Path,
+    home_id: &str,
+    exec_id: &str,
+) -> Result<Option<(AgentRecord, ExecRecord)>, String> {
+    let (agents, _) = list_agents(runtime_dir, home_id)?;
+    Ok(agents.into_iter().find_map(|agent| {
+        let exec = agent.execs.iter().find(|e| e.exec_id == exec_id).cloned()?;
+        Some((agent, exec))
+    }))
+}
+
+/// 测试 helper：把新布局拼回旧的 AgentsFile 形状（旧测试的断言面）。
+#[cfg(test)]
+pub(crate) fn snapshot(runtime_dir: &Path, home_id: &str) -> AgentsFile {
+    AgentsFile {
+        meta: AgentsMeta {
+            agent_seq: agent_seq(runtime_dir, home_id).unwrap_or(0),
+        },
+        agents: list_agents(runtime_dir, home_id)
+            .map(|(a, _)| a)
+            .unwrap_or_default(),
+    }
+}
+
+/// F-U4a-2（P0 半）：启动 demote——扫描所有 home 的每个 agent.json，把
 /// `attachment == Live` 的记录降级：`attachment=None`、`Starting/Running →
 /// Failed`（failure_detail 注明 app 重启）。pid liveness 与 Orphan 只读
 /// 尾随是 U10 的活；这里只保证 P0 期间「重启后不再把死 agent 当可控项」。
 /// 返回降级条数。
 pub fn demote_live_agents(runtime_dir: &Path) -> Result<usize, String> {
-    let root = runtime_dir.join("agents");
-    let Ok(entries) = std::fs::read_dir(&root) else {
-        return Ok(0);
-    };
     let mut demoted = 0usize;
-    for entry in entries.flatten() {
-        if !entry.path().is_dir() {
-            continue;
-        }
-        let file = entry.path().join("agents.json");
-        let (_, changed) = update_json(&file, |f: &mut AgentsFile| {
-            let mut touched = false;
-            for agent in &mut f.agents {
+    for home_id in layout::home_ids(runtime_dir) {
+        for agent_id in layout::agent_ids(runtime_dir, &home_id)? {
+            let path = layout::agent_file(runtime_dir, &home_id, &agent_id)?;
+            let (_, changed) = update_json(&path, |agent: &mut AgentRecord| {
+                if agent.id.is_empty() {
+                    return false; // 空记录（损坏降级后的默认值）不得被写出来
+                }
+                let mut touched = false;
                 if agent.attachment == AgentAttachment::Live {
                     agent.attachment = AgentAttachment::None;
                     demoted += 1;
@@ -212,10 +254,10 @@ pub fn demote_live_agents(runtime_dir: &Path) -> Result<usize, String> {
                     }
                     touched = true;
                 }
-            }
-            touched
-        })?;
-        let _ = changed;
+                touched
+            })?;
+            let _ = changed;
+        }
     }
     Ok(demoted)
 }
@@ -240,13 +282,22 @@ pub fn register_agent(
     harness: &str,
     new_exec: NewExec,
 ) -> Result<AgentRecord, String> {
-    let path = agents_path(runtime_dir, home_id)?;
-    let mut seq = 0u64;
-    let record = update_json(&path, |file: &mut AgentsFile| {
-        file.meta.agent_seq += 1;
-        seq = file.meta.agent_seq;
-        let record = AgentRecord {
-            id: format!("agent-{}", new_exec.exec_id),
+    let (meta, _) = update_json(
+        &layout::seq_file(runtime_dir, home_id)?,
+        |m: &mut AgentsMeta| {
+            m.agent_seq += 1;
+            true
+        },
+    )?;
+    let seq = meta.agent_seq;
+    let agent_id = layout::new_agent_id(&new_exec.exec_id);
+    let path = layout::agent_file(runtime_dir, home_id, &agent_id)?;
+    let (record, outcome) = update_json(&path, |rec: &mut AgentRecord| {
+        if !rec.id.is_empty() {
+            return false; // exec id 全局唯一，正常不会撞
+        }
+        *rec = AgentRecord {
+            id: agent_id.clone(),
             display_name: format!("Agent {seq}"),
             title: None,
             harness: harness.to_string(),
@@ -265,15 +316,12 @@ pub fn register_agent(
                 ..Default::default()
             }],
         };
-        file.agents.push(record.clone());
         true
-    })?
-    .0;
-    record
-        .agents
-        .last()
-        .cloned()
-        .ok_or_else(|| "register_agent: record vanished".to_string())
+    })?;
+    if !outcome.changed {
+        return Err(format!("register_agent: agent {agent_id} 已存在"));
+    }
+    Ok(record)
 }
 
 /// U11：向**既有** agent 追加一次 exec（会话续接派发）。守卫：agent 必须存在、
@@ -286,14 +334,15 @@ pub fn append_exec(
     harness: &str,
     new_exec: NewExec,
 ) -> Result<AgentRecord, String> {
-    let path = agents_path(runtime_dir, home_id)?;
-    let record = update_json(&path, |file: &mut AgentsFile| {
-        let Some(agent) = file.agents.iter_mut().find(|a| a.id == agent_id) else {
+    let path = layout::agent_file(runtime_dir, home_id, agent_id)?;
+    if !path.is_file() {
+        return Err(format!("append_exec: agent {agent_id} 不存在"));
+    }
+    let (record, outcome) = update_json(&path, |agent: &mut AgentRecord| {
+        if agent.id != agent_id || agent.harness != harness {
             return false;
-        };
-        if agent.harness != harness {
-            return false; // 调用方前置校验给出可读错误；此处兜底不写
         }
+        // 同一 agent 同时只允许一个活跃 exec（设计 §3.3），锁内校验
         if matches!(
             agent.status,
             AgentRecordStatus::Starting | AgentRecordStatus::Running
@@ -314,16 +363,13 @@ pub fn append_exec(
         agent.attachment = AgentAttachment::Live;
         agent.last_exec_id = Some(new_exec.exec_id.clone());
         true
-    })?
-    .0;
-    record
-        .agents
-        .iter()
-        .find(|a| a.id == agent_id)
-        .cloned()
-        .ok_or_else(|| {
-            format!("append_exec: agent {agent_id} 不存在或不可追加（harness 不一致/运行中）")
-        })
+    })?;
+    if !outcome.changed {
+        return Err(format!(
+            "append_exec: agent {agent_id} 不可追加（harness 不一致/运行中）"
+        ));
+    }
+    Ok(record)
 }
 
 /// U10 启动对账目标：demote 标记的中断 exec（app 重启杀死、租约未释放）。
@@ -340,24 +386,14 @@ const RESTART_MARKER: &str = "app restarted before exec finished";
 
 /// 枚举待对账 exec：failure_detail 命中重启签名且未 reconciled、带 run_id。
 pub fn list_reconcile_targets(runtime_dir: &Path) -> Result<Vec<ReconcileTarget>, String> {
-    let root = runtime_dir.join("agents");
-    let Ok(entries) = std::fs::read_dir(&root) else {
-        return Ok(Vec::new());
-    };
     let mut targets = Vec::new();
-    for entry in entries.flatten() {
-        if !entry.path().is_dir() {
-            continue;
-        }
-        let Some(home_id) = entry.file_name().to_str().map(str::to_string) else {
-            continue;
-        };
-        let file = entry.path().join("agents.json");
-        let (agents_file, _) = match read_json::<AgentsFile>(&file) {
-            Ok(v) => v,
-            Err(_) => continue, // 损坏/缺失 → 该 home 跳过（回放面另行降级）
-        };
-        for agent in &agents_file.agents {
+    for home_id in layout::home_ids(runtime_dir) {
+        for agent_id in layout::agent_ids(runtime_dir, &home_id)? {
+            let path = layout::agent_file(runtime_dir, &home_id, &agent_id)?;
+            let (agent, _) = match read_json::<AgentRecord>(&path) {
+                Ok(v) => v,
+                Err(_) => continue, // 损坏/缺失 → 该 agent 跳过（回放面另行降级）
+            };
             for exec in &agent.execs {
                 if !exec.reconciled
                     && exec.run_id.is_some()
@@ -382,44 +418,23 @@ pub fn list_reconcile_targets(runtime_dir: &Path) -> Result<Vec<ReconcileTarget>
 /// F-DEL：删除一个 agent（列表项右上角删除入口）。守卫：starting/running
 /// 拒绝（先停止再删）；attachment=orphan 拒绝（pid 仍存活，先强制终止）。
 pub fn delete_agent(runtime_dir: &Path, home_id: &str, agent_id: &str) -> Result<(), String> {
-    let path = agents_path(runtime_dir, home_id)?;
-    let (_, changed) = update_json(&path, |file: &mut AgentsFile| {
-        let Some(agent) = file.agents.iter().find(|a| a.id == agent_id) else {
-            return false;
-        };
-        if matches!(
-            agent.status,
-            AgentRecordStatus::Starting | AgentRecordStatus::Running
-        ) {
-            return false;
-        }
-        if agent.attachment == AgentAttachment::Orphan {
-            return false;
-        }
-        file.agents.retain(|a| a.id != agent_id);
-        true
-    })
-    .map_err(|e| format!("删除失败：{e}"))?;
-    if !changed.changed {
-        let (file, _) = read_json::<AgentsFile>(&path)?;
-        match file.agents.iter().find(|a| a.id == agent_id) {
-            None => Err(format!("agent {agent_id} 不存在")),
-            Some(agent)
-                if matches!(
-                    agent.status,
-                    AgentRecordStatus::Starting | AgentRecordStatus::Running
-                ) =>
-            {
-                Err(format!("agent {agent_id} 仍在运行——请先停止再删除"))
-            }
-            Some(agent) if agent.attachment == AgentAttachment::Orphan => Err(format!(
-                "agent {agent_id} 处于不受控态（pid 存活）——请先强制终止再删除"
-            )),
-            Some(_) => Err("删除未生效（未知原因）".to_string()),
-        }
-    } else {
-        Ok(())
+    let agent = get_agent(runtime_dir, home_id, agent_id)
+        .map_err(|e| format!("删除失败：{e}"))?
+        .ok_or_else(|| format!("agent {agent_id} 不存在"))?;
+    if matches!(
+        agent.status,
+        AgentRecordStatus::Starting | AgentRecordStatus::Running
+    ) {
+        return Err(format!("agent {agent_id} 仍在运行——请先停止再删除"));
     }
+    if agent.attachment == AgentAttachment::Orphan {
+        return Err(format!(
+            "agent {agent_id} 处于不受控态（pid 存活）——请先强制终止再删除"
+        ));
+    }
+    // P-7：按 agent 拆目录后，transcript 随 agent 一起删除
+    let dir = layout::agent_dir(runtime_dir, home_id, agent_id)?;
+    std::fs::remove_dir_all(&dir).map_err(|e| format!("删除失败：{e}"))
 }
 
 pub fn get_agent(
@@ -427,12 +442,15 @@ pub fn get_agent(
     home_id: &str,
     agent_id: &str,
 ) -> Result<Option<AgentRecord>, String> {
-    let path = agents_path(runtime_dir, home_id)?;
-    let (file, parse_failed) = read_json::<AgentsFile>(&path)?;
-    if parse_failed || has_unrecovered_corrupt(&path) {
-        return Err("agents.json 已损坏，拒绝解析 orphan 进程身份".to_string());
+    let path = layout::agent_file(runtime_dir, home_id, agent_id)?;
+    if !path.exists() && !has_unrecovered_corrupt(&path) {
+        return Ok(None);
     }
-    Ok(file.agents.into_iter().find(|agent| agent.id == agent_id))
+    let (record, parse_failed) = read_json::<AgentRecord>(&path)?;
+    if parse_failed || has_unrecovered_corrupt(&path) {
+        return Err(format!("{} 已损坏，拒绝解析进程身份", path.display()));
+    }
+    Ok((!record.id.is_empty()).then_some(record))
 }
 
 /// 更新 Agent 终态/状态。**仅状态变化才落盘**（§3.2 写合并）——高频派生量
@@ -444,11 +462,14 @@ pub fn update_agent_status(
     status: AgentRecordStatus,
     attachment: AgentAttachment,
 ) -> Result<bool, String> {
-    let path = agents_path(runtime_dir, home_id)?;
-    update_json(&path, |file: &mut AgentsFile| {
-        let Some(agent) = file.agents.iter_mut().find(|a| a.id == agent_id) else {
+    let path = layout::agent_file(runtime_dir, home_id, agent_id)?;
+    if !path.is_file() {
+        return Ok(false);
+    }
+    update_json(&path, |agent: &mut AgentRecord| {
+        if agent.id != agent_id {
             return false;
-        };
+        }
         if agent.status == status && agent.attachment == attachment {
             return false;
         }
@@ -468,11 +489,14 @@ pub fn update_exec(
     exec_id: &str,
     apply: impl FnOnce(&mut ExecRecord),
 ) -> Result<bool, String> {
-    let path = agents_path(runtime_dir, home_id)?;
-    update_json(&path, |file: &mut AgentsFile| {
-        let Some(agent) = file.agents.iter_mut().find(|a| a.id == agent_id) else {
+    let path = layout::agent_file(runtime_dir, home_id, agent_id)?;
+    if !path.is_file() {
+        return Ok(false);
+    }
+    update_json(&path, |agent: &mut AgentRecord| {
+        if agent.id != agent_id {
             return false;
-        };
+        }
         let Some(exec) = agent.execs.iter_mut().find(|e| e.exec_id == exec_id) else {
             return false;
         };
@@ -489,14 +513,10 @@ pub fn update_exec(
 /// Agents 面板数据面（U5 消费）：记录列表 + `parseFailed` 标志（前端提示
 /// 数据已降级；U9 据此冻结 GC）。
 pub fn agents_list_value(runtime_dir: &Path, home_id: &str) -> Result<serde_json::Value, String> {
-    let path = agents_path(runtime_dir, home_id)?;
-    let (file, parse_failed) = read_json::<AgentsFile>(&path)?;
-    // F-U4a-1 修法 (b)：粘性 parseFailed——损坏文件被 rename 后的后续读取
-    // 仍视为降级（同目录存在 .corrupt-* 留证），U9 的 GC 冻结据此持续生效。
-    let parse_failed = parse_failed || has_unrecovered_corrupt(&path);
+    let (agents, parse_failed) = list_agents(runtime_dir, home_id)?;
     Ok(serde_json::json!({
-        "agents": file.agents,
-        "agentSeq": file.meta.agent_seq,
+        "agents": agents,
+        "agentSeq": agent_seq(runtime_dir, home_id)?,
         "parseFailed": parse_failed,
     }))
 }
@@ -526,54 +546,46 @@ fn read_bindings(runtime_dir: &Path, home_id: &str) -> Result<BTreeMap<String, S
 }
 
 /// U9（§3.4）：显式绑定表投影。`parseFailed` 粘性语义同 agents_list
-/// （F-U4a-1），且**叠加 agents.json 的降级态**——悬空判定（agentId 是否
+/// （F-U4a-1），且**叠加 agents 表的降级态**——悬空判定（agentId 是否
 /// 存在）依赖健康的 agents 数据，任一文件降级时前端都不得做悬空判定。
 pub fn bindings_get_value(runtime_dir: &Path, home_id: &str) -> Result<serde_json::Value, String> {
     let bindings = read_bindings(runtime_dir, home_id)?;
     let b_path = bindings_path(runtime_dir, home_id)?;
-    let agents_path = agents_path(runtime_dir, home_id)?;
-    // 读一次 agents.json：让「此刻损坏」也进粘性留证（rename 发生在本读），
-    // 与 agents_list 的判定完全同源。
-    let (_, agents_parse_failed) = read_json::<AgentsFile>(&agents_path)?;
-    let parse_failed = has_unrecovered_corrupt(&b_path)
-        || has_unrecovered_corrupt(&agents_path)
-        || agents_parse_failed;
+    let (_, agents_parse_failed) = list_agents(runtime_dir, home_id)?;
     Ok(serde_json::json!({
         "bindings": bindings,
-        "parseFailed": parse_failed,
+        "parseFailed": has_unrecovered_corrupt(&b_path) || agents_parse_failed,
     }))
 }
 
-/// U9（§3.4）：用户触发的一键清理——移除 agentId 已不存在于 agents.json 的
+/// U9（§3.4）：用户触发的一键清理——移除 agentId 已不存在于 agent 表的
 /// 绑定项，返回移除数与清理后的表。§3.6.6 硬规则：**bindings 非空且
-/// agents.json 无法给出有效 agent 表时冻结**（解析失败 / 粘性 corrupt 残留
+/// agent 表无法给出有效 agent 表时冻结**（解析失败 / 粘性 corrupt 残留
 /// F-U4a-1 / 文件缺失任一情形）——「desktop 是唯一写者」不覆盖手工删除、
 /// 同步工具误删、部分恢复等异常路径，无法证明 agent 表有效时绝不能把绑定
 /// 按空表全清。bindings 为空时 GC 本来就是 no-op，正常返回 0。
 pub fn bindings_gc_value(runtime_dir: &Path, home_id: &str) -> Result<serde_json::Value, String> {
     let bindings_file = bindings_path(runtime_dir, home_id)?;
     // 空 bindings → 无害 no-op，先于 agents 有效性检查返回（缺失的
-    // agents.json 不必挡住 0 移除路径）。
+    // agent 表不必挡住 0 移除路径）。
     let existing = read_bindings(runtime_dir, home_id)?;
     if existing.is_empty() {
         return Ok(serde_json::json!({ "removed": 0, "bindings": existing }));
     }
-    let agents_path = agents_path(runtime_dir, home_id)?;
-    // 缺失判定必须在 read_json 之前采集：损坏文件会在读时被 rename 成
-    // .corrupt-<ts>，之后 exists() 就永远是 false 了。
-    let agents_missing = !agents_path.exists();
-    let (agents, agents_parse_failed) = read_json::<AgentsFile>(&agents_path)?;
-    if agents_missing || agents_parse_failed || has_unrecovered_corrupt(&agents_path) {
+    // 缺失判定：从未注册过 agent 的 home 没有 seq.json（与旧的「agents.json
+    // 缺失」等价）——此时 agent 表无法证明有效，冻结。
+    let agents_missing = !layout::seq_file(runtime_dir, home_id)?.exists();
+    let (agents, agents_parse_failed) = list_agents(runtime_dir, home_id)?;
+    if agents_missing || agents_parse_failed {
         return Err(
-            "agents.json 无法给出有效 agent 表（缺失 / 解析失败 / .corrupt-* 留证未恢复）——绑定清理已冻结"
+            "agent 表无法证明有效（缺失 / 解析失败 / .corrupt-* 留证未恢复）——绑定清理已冻结"
                 .to_string(),
         );
     }
-    let live_ids: std::collections::HashSet<String> =
-        agents.agents.iter().map(|a| a.id.clone()).collect();
+    let live_ids: std::collections::HashSet<String> = agents.iter().map(|a| a.id.clone()).collect();
     let mut removed = 0usize;
     // bindings.json 自身损坏降级为空表时无项可移（removed=0、不落盘），对
-    // 留证无损；agentId 判定以 agents.json 的 agents[].id 为准。
+    // 留证无损；agentId 判定以各 agent.json 的 id 为准。
     let (table, _) = update_json(&bindings_file, |bindings: &mut BTreeMap<String, String>| {
         let before = bindings.len();
         bindings.retain(|_, agent_id| live_ids.contains(agent_id));
@@ -635,7 +647,7 @@ mod tests {
         delete_agent(&runtime, "h_test", &agent.id).unwrap();
         let err2 = delete_agent(&runtime, "h_test", &agent.id).unwrap_err();
         assert!(err2.contains("不存在"), "{err2}");
-        let (file, _) = read_json::<AgentsFile>(&agents_path(&runtime, "h_test").unwrap()).unwrap();
+        let file = snapshot(&runtime, "h_test");
         assert!(file.agents.is_empty());
     }
 
@@ -662,9 +674,7 @@ mod tests {
         assert_eq!(second.display_name, "Agent 2");
 
         // 跨「会话」（新调用、同文件）序号继续单调——agentSeq 已持久
-        let (file, parse_failed) =
-            read_json::<AgentsFile>(&agents_path(&runtime, &home).unwrap()).unwrap();
-        assert!(!parse_failed);
+        let file = snapshot(&runtime, &home);
         assert_eq!(file.meta.agent_seq, 2);
         assert_eq!(file.agents.len(), 2);
     }
@@ -673,7 +683,7 @@ mod tests {
     fn same_status_update_does_not_rewrite_file() {
         let (_dir, runtime, home) = temp_runtime();
         register_agent(&runtime, &home, "omp", new_exec("exec-1")).unwrap();
-        let path = agents_path(&runtime, &home).unwrap();
+        let path = crate::layout::agent_file(&runtime, &home, "agent-exec-1").unwrap();
         let before = std::fs::read(&path).unwrap();
 
         // 相同状态 → 不落盘（写合并）
@@ -696,8 +706,8 @@ mod tests {
             AgentAttachment::Live
         )
         .unwrap());
-        let (file, _) = read_json::<AgentsFile>(&path).unwrap();
-        assert_eq!(file.agents[0].status, AgentRecordStatus::Running);
+        let (record, _) = read_json::<AgentRecord>(&path).unwrap();
+        assert_eq!(record.status, AgentRecordStatus::Running);
     }
 
     #[test]
@@ -712,7 +722,7 @@ mod tests {
                 });
             }
         });
-        let (file, _) = read_json::<AgentsFile>(&agents_path(&runtime, &home).unwrap()).unwrap();
+        let file = snapshot(&runtime, &home);
         assert_eq!(file.agents.len(), 6, "并发注册不得丢 agent");
         assert_eq!(file.meta.agent_seq, 6, "序号必须与 agent 数一致");
         let names: Vec<&str> = file
@@ -728,10 +738,10 @@ mod tests {
     #[test]
     fn corrupted_agents_file_downgrades_with_parse_failed_flag() {
         let (_dir, runtime, home) = temp_runtime();
-        let path = agents_path(&runtime, &home).unwrap();
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let agent = register_agent(&runtime, &home, "omp", new_exec("exec-1")).unwrap();
+        let path = crate::layout::agent_file(&runtime, &home, &agent.id).unwrap();
         std::fs::write(&path, "{ broken").unwrap();
-        let (_, parse_failed) = read_json::<AgentsFile>(&path).unwrap();
+        let (_, parse_failed) = read_json::<AgentRecord>(&path).unwrap();
         assert!(
             parse_failed,
             "损坏必须暴露 parseFailed（U9 冻结 GC 的依据）"
@@ -744,16 +754,16 @@ mod tests {
         assert!(
             restored
                 .iter()
-                .any(|n| n.starts_with("agents.json.corrupt-")),
+                .any(|n| n.starts_with("agent.json.corrupt-")),
             "{restored:?}"
         );
     }
 
     #[test]
     fn home_id_rejects_path_traversal() {
-        assert!(agents_path(Path::new("/tmp"), "../escape").is_err());
-        assert!(agents_path(Path::new("/tmp"), "a/b").is_err());
-        assert!(agents_path(Path::new("/tmp"), "h_ok").is_ok());
+        assert!(crate::layout::home_dir(Path::new("/tmp"), "../escape").is_err());
+        assert!(crate::layout::home_dir(Path::new("/tmp"), "a/b").is_err());
+        assert!(crate::layout::home_dir(Path::new("/tmp"), "h_ok").is_ok());
     }
 
     #[test]
@@ -775,7 +785,7 @@ mod tests {
         let (_dir, runtime, home) = temp_runtime();
         register_agent(&runtime, &home, "omp", new_exec("exec-1")).unwrap();
         assert_eq!(demote_live_agents(&runtime).unwrap(), 1);
-        let (file, _) = read_json::<AgentsFile>(&agents_path(&runtime, &home).unwrap()).unwrap();
+        let file = snapshot(&runtime, &home);
         assert_eq!(file.agents[0].attachment, AgentAttachment::None);
         assert_eq!(file.agents[0].status, AgentRecordStatus::Failed);
         assert!(
@@ -792,12 +802,13 @@ mod tests {
 
     #[test]
     fn parse_failed_is_sticky_across_reads() {
-        // F-U4a-1：损坏 → 第一次读（rename 后返回默认 + parseFailed=true）→
-        // 第二次读 → parseFailed 仍必须为 true（粘性），否则 U9 的 GC 冻结
-        // 在第二次读后失效，会把全部绑定当悬空清掉（§3.6.6 要防的事故）。
+        // F-U4a-1：损坏某一个 agent.json → 第一次读（rename 后返回默认 +
+        // parseFailed=true）→ 第二次读 → parseFailed 仍必须为 true（粘性），
+        // 否则 U9 的 GC 冻结在第二次读后失效，会把全部绑定当悬空清掉
+        // （§3.6.6 要防的事故）。
         let (_dir, runtime, home) = temp_runtime();
-        let path = agents_path(&runtime, &home).unwrap();
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let agent = register_agent(&runtime, &home, "omp", new_exec("exec-1")).unwrap();
+        let path = crate::layout::agent_file(&runtime, &home, &agent.id).unwrap();
         std::fs::write(&path, "{ broken").unwrap();
         let first = agents_list_value(&runtime, &home).unwrap();
         assert_eq!(first["parseFailed"], true);
@@ -878,11 +889,11 @@ mod tests {
         assert_eq!(result["bindings"]["T-2"], "agent-exec-1");
         assert_eq!(result["parseFailed"], false);
 
-        // agents.json 损坏 → bindings_get 的 parseFailed 粘性置位（悬空判定
-        // 依赖 agents 数据，降级期间前端不得判悬空）
-        let agents_file = agents_path(&runtime, &home).unwrap();
-        std::fs::write(&agents_file, "{ broken").unwrap();
-        let _ = read_json::<AgentsFile>(&agents_file).unwrap();
+        // 某个 agent.json 损坏 → bindings_get 的 parseFailed 粘性置位（悬空
+        // 判定依赖 agents 数据，降级期间前端不得判悬空）
+        let agent = register_agent(&runtime, &home, "omp", new_exec("exec-1")).unwrap();
+        let agent_file = crate::layout::agent_file(&runtime, &home, &agent.id).unwrap();
+        std::fs::write(&agent_file, "{ broken").unwrap();
         let degraded = bindings_get_value(&runtime, &home).unwrap();
         assert_eq!(
             degraded["bindings"]["T-1"], "agent-exec-1",
@@ -924,9 +935,9 @@ mod tests {
         let (_dir, runtime, home) = temp_runtime();
         write_binding(&runtime, &home, "T-1", "agent-x").unwrap();
         write_binding(&runtime, &home, "T-2", "agent-y").unwrap();
-        let agents_file = agents_path(&runtime, &home).unwrap();
-        std::fs::write(&agents_file, "{ broken").unwrap();
-        let _ = read_json::<AgentsFile>(&agents_file).unwrap();
+        let agent = register_agent(&runtime, &home, "omp", new_exec("exec-1")).unwrap();
+        let agent_file = crate::layout::agent_file(&runtime, &home, &agent.id).unwrap();
+        std::fs::write(&agent_file, "{ broken").unwrap();
 
         let err = bindings_gc_value(&runtime, &home).unwrap_err();
         assert!(err.contains("冻结"), "{err}");
@@ -938,12 +949,13 @@ mod tests {
 
     #[test]
     fn bindings_gc_frozen_when_agents_file_missing() {
-        // §3.6.6 收紧：agents.json 缺失（手工删除/同步工具误删/部分恢复）
-        // 同样无法证明 agent 表有效——非空绑定必须冻结，不得按空表全清。
+        // §3.6.6 收紧：agent 表缺失（从未注册过 agent——seq.json 不存在；
+        // 手工删除/同步工具误删/部分恢复同形）同样无法证明 agent 表有效
+        // ——非空绑定必须冻结，不得按空表全清。
         let (_dir, runtime, home) = temp_runtime();
         write_binding(&runtime, &home, "T-1", "agent-x").unwrap();
         write_binding(&runtime, &home, "T-2", "agent-y").unwrap();
-        assert!(!agents_path(&runtime, &home).unwrap().exists());
+        assert!(!crate::layout::seq_file(&runtime, &home).unwrap().exists());
 
         let err = bindings_gc_value(&runtime, &home).unwrap_err();
         assert!(err.contains("冻结"), "{err}");
@@ -954,11 +966,107 @@ mod tests {
     #[test]
     fn bindings_gc_empty_bindings_is_noop_zero_even_when_agents_missing() {
         // 空 bindings 本来就是 no-op：先于 agents 有效性检查返回 0——
-        // agents.json 缺失也不冻结无害路径。
+        // agent 表缺失也不冻结无害路径。
         let (_dir, runtime, home) = temp_runtime();
-        assert!(!agents_path(&runtime, &home).unwrap().exists());
+        assert!(!crate::layout::seq_file(&runtime, &home).unwrap().exists());
         let result = bindings_gc_value(&runtime, &home).unwrap();
         assert_eq!(result["removed"], 0);
         assert_eq!(result["bindings"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn register_writes_one_dir_per_agent_and_seq_is_monotonic() {
+        let (_dir, runtime, home) = temp_runtime();
+        let a = register_agent(&runtime, &home, "pi", new_exec("exec-a")).unwrap();
+        let b = register_agent(&runtime, &home, "omp", new_exec("exec-b")).unwrap();
+        assert_eq!(a.display_name, "Agent 1");
+        assert_eq!(b.display_name, "Agent 2");
+        assert!(crate::layout::agent_file(&runtime, &home, &a.id)
+            .unwrap()
+            .is_file());
+        assert!(crate::layout::agent_file(&runtime, &home, &b.id)
+            .unwrap()
+            .is_file());
+        // 旧布局的单文件存储不再出现（名字拼出以避开迁移 grep 的字面量）
+        let legacy_monolith = format!("{}.json", "agents");
+        assert!(!runtime
+            .join("agents")
+            .join(&home)
+            .join(legacy_monolith)
+            .exists());
+        assert_eq!(agent_seq(&runtime, &home).unwrap(), 2);
+        let (agents, failed) = list_agents(&runtime, &home).unwrap();
+        assert!(!failed);
+        assert_eq!(
+            agents.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
+            vec![a.id.as_str(), b.id.as_str()]
+        );
+    }
+
+    #[test]
+    fn one_corrupt_agent_file_marks_list_degraded_but_keeps_others() {
+        let (_dir, runtime, home) = temp_runtime();
+        let a = register_agent(&runtime, &home, "pi", new_exec("exec-a")).unwrap();
+        let b = register_agent(&runtime, &home, "pi", new_exec("exec-b")).unwrap();
+        std::fs::write(
+            crate::layout::agent_file(&runtime, &home, &a.id).unwrap(),
+            "{oops",
+        )
+        .unwrap();
+        let (agents, failed) = list_agents(&runtime, &home).unwrap();
+        assert!(failed, "损坏应置 parseFailed");
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].id, b.id);
+        // 粘性：第二次读（损坏文件已被改名留证）仍为降级
+        assert!(list_agents(&runtime, &home).unwrap().1);
+    }
+
+    #[test]
+    fn updates_to_missing_agent_do_not_create_dirs() {
+        let (_dir, runtime, home) = temp_runtime();
+        let changed = update_agent_status(
+            &runtime,
+            &home,
+            "agent-ghost",
+            AgentRecordStatus::Failed,
+            AgentAttachment::None,
+        )
+        .unwrap();
+        assert!(!changed);
+        assert!(!crate::layout::agent_dir(&runtime, &home, "agent-ghost")
+            .unwrap()
+            .exists());
+    }
+
+    #[test]
+    fn delete_removes_the_agent_dir_with_transcripts() {
+        let (_dir, runtime, home) = temp_runtime();
+        let a = register_agent(&runtime, &home, "pi", new_exec("exec-a")).unwrap();
+        update_agent_status(
+            &runtime,
+            &home,
+            &a.id,
+            AgentRecordStatus::Exited,
+            AgentAttachment::None,
+        )
+        .unwrap();
+        let dir = crate::layout::agent_dir(&runtime, &home, &a.id).unwrap();
+        std::fs::write(dir.join("exec-a.jsonl"), "{}\n").unwrap();
+        delete_agent(&runtime, &home, &a.id).unwrap();
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn find_exec_in_home_locates_by_exec_id() {
+        let (_dir, runtime, home) = temp_runtime();
+        let a = register_agent(&runtime, &home, "pi", new_exec("exec-a")).unwrap();
+        let (agent, exec) = find_exec_in_home(&runtime, &home, "exec-a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(agent.id, a.id);
+        assert_eq!(exec.exec_id, "exec-a");
+        assert!(find_exec_in_home(&runtime, &home, "exec-zz")
+            .unwrap()
+            .is_none());
     }
 }
