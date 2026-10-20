@@ -162,7 +162,10 @@ fn parse_opencode(ev: &serde_json::Value) -> Vec<serde_json::Value> {
                 return Vec::new();
             }
             vec![serde_json::json!({
-                "kind": "usage", "scope": "cumulative",
+                // F-BENCH-19：opencode 的 step_finish 也是**逐步**计（语料
+                // 分解实证：每步 total = 该步 input+output+reasoning+cache，
+                // 4 步相加 98225 而非末值 25460；免费档 cost 恒 0 曾掩盖）
+                "kind": "usage", "scope": "message",
                 "tokens": tokens, "cost": cost,
             })]
         }
@@ -300,7 +303,7 @@ mod tests {
         assert_eq!(
             parse_line("opencode", step),
             vec![
-                serde_json::json!({ "kind": "usage", "scope": "cumulative", "tokens": 17137u64, "cost": 0.0 })
+                serde_json::json!({ "kind": "usage", "scope": "message", "tokens": 17137u64, "cost": 0.0 })
             ]
         );
 
@@ -432,11 +435,11 @@ mod tests {
         );
     }
 
-    /// F-BENCH-14/17：usage 语义——message_end 每条消息一个（scope=message），
-    /// turn_end/agent_end 同值不重复提取，message_update 快照不提取，
-    /// opencode step_finish 是会话累计（scope=cumulative）。
+    /// F-BENCH-14/17/19：usage 语义——三家全是**每步/每条消息各自计**
+    /// （scope=message，exec 总量求和）；turn_end/agent_end 同值重复与
+    /// message_update 流式快照均不提取。
     #[test]
-    fn usage_scopes_message_end_vs_cumulative() {
+    fn usage_scopes_message_per_step() {
         let msg_end = r#"{"type":"message_end","message":{"role":"assistant","usage":{"totalTokens":13134,"cost":{"total":0.009486}}}}"#;
         assert_eq!(
             parse_line("pi", msg_end),
@@ -453,12 +456,12 @@ mod tests {
         // 非 assistant / 无 usage 的 message_end：零产出
         let plain = r#"{"type":"message_end","message":{"role":"system"}}"#;
         assert!(parse_line("pi", plain).is_empty());
-        // opencode step_finish：cumulative
+        // opencode step_finish：逐步计（F-BENCH-19——分解实证后同 pi 求和）
         let step = r#"{"type":"step_finish","part":{"type":"step-finish","tokens":{"total":17137},"cost":0}}"#;
         assert_eq!(
             parse_line("opencode", step),
             vec![serde_json::json!({
-                "kind": "usage", "scope": "cumulative", "tokens": 17137u64, "cost": 0.0
+                "kind": "usage", "scope": "message", "tokens": 17137u64, "cost": 0.0
             })]
         );
     }

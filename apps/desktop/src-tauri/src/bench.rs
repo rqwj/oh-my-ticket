@@ -59,6 +59,19 @@ pub fn analyze_jsonl(path: &Path) -> Option<ExecMetrics> {
     let mut errors = 0usize;
     let mut outcome = None;
 
+    // F-BENCH-19：优先重放同目录 raw.log（harness 原始 stdout 全量）——
+    // 当前 adapter 的产出才是事实源；jsonl 事件（采集时 adapter 产物，
+    // 含旧口径 usage）仅作回落。
+    // 语料目录的原始流文件名固定为 raw.log（F-BENCH-19）；真实 transcripts
+    // 目录是 <execId>.raw.log——两种命名都查
+    let raw_log = path.with_file_name(format!("{exec_id}.raw.log"));
+    let raw_log = if raw_log.is_file() {
+        raw_log
+    } else {
+        path.with_file_name("raw.log")
+    };
+    let has_raw_log = raw_log.is_file();
+
     for line in text.lines() {
         let Ok(ev) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
@@ -139,6 +152,33 @@ pub fn analyze_jsonl(path: &Path) -> Option<ExecMetrics> {
         if model.is_none() {
             if let Some(m) = ev["model"].as_str() {
                 model = Some(m.to_string());
+            }
+        }
+    }
+    // F-BENCH-19：raw.log 存在时全量重放（harness 原始 stdout）——当前
+    // adapter 的 usage 产出覆盖 jsonl 记录值（后者是采集时口径）
+    if has_raw_log {
+        if let Ok(raw_text) = std::fs::read_to_string(&raw_log) {
+            msg_tokens = 0;
+            msg_cost = 0.0;
+            cumulative = None;
+            for line in raw_text.lines() {
+                for part in crate::adapters::parse_line_auto(line) {
+                    if part["kind"] == "usage" {
+                        match part["scope"].as_str() {
+                            Some("message") => {
+                                msg_tokens += part["tokens"].as_u64().unwrap_or(0);
+                                msg_cost += part["cost"].as_f64().unwrap_or(0.0);
+                            }
+                            _ => {
+                                cumulative = Some((
+                                    part["tokens"].as_u64().unwrap_or(0),
+                                    part["cost"].as_f64(),
+                                ))
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -240,6 +280,8 @@ mod tests {
         // 3-call 收官轮（exec-50001-5）：调用数与发现开销双契约
         assert_eq!(m.tool_calls, 3, "{m:?}");
         assert_eq!(m.discovery_overhead, 0, "{m:?}");
+        // F-BENCH-19：opencode 也逐步计——4 步相加 98225（免费档 cost 0）
+        assert_eq!(m.tokens, Some(98225), "{m:?}");
     }
 
     /// 语料回放：adapters 对历史版本流仍能解析（经 analyzer 的 kind 统计间接
@@ -273,7 +315,11 @@ mod tests {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
-            if !(name.ends_with(".jsonl") || name == "help.txt" || name == "models.txt") {
+            if !(name.ends_with(".jsonl")
+                || name.ends_with(".log")
+                || name == "help.txt"
+                || name == "models.txt")
+            {
                 continue;
             }
             let text = std::fs::read_to_string(&entry).unwrap_or_default();

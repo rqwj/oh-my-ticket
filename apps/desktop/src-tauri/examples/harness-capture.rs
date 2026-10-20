@@ -80,7 +80,7 @@ fn capture(bin: &std::path::Path, args: &[&str]) -> String {
     let mut child = std::process::Command::new(bin)
         .args(args)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .stdin(std::process::Stdio::null())
         .spawn()
         .unwrap_or_else(|e| panic!("执行 {} {:?} 失败: {e}", bin.display(), args));
@@ -103,8 +103,12 @@ fn capture(bin: &std::path::Path, args: &[&str]) -> String {
         }
     };
     let mut out = String::new();
+    let mut err = String::new();
     if let Some(mut p) = child.stdout.take() {
         let _ = p.read_to_string(&mut out);
+    }
+    if let Some(mut p) = child.stderr.take() {
+        let _ = p.read_to_string(&mut err);
     }
     assert!(
         status.map(|s| s.success()).unwrap_or(false),
@@ -112,7 +116,11 @@ fn capture(bin: &std::path::Path, args: &[&str]) -> String {
         bin,
         args
     );
-    out
+    if out.trim().is_empty() {
+        err
+    } else {
+        out
+    }
 }
 
 /// 输出归一（二轮评审 B）：HOME → __HOME__ 让跨机器 diff 稳定。

@@ -3492,6 +3492,36 @@ mod tests {
         );
     }
 
+    /// F-BENCH-20：UsageTotals 累计与合计的直接单测（三形态）。
+    #[test]
+    fn usage_totals_accumulates_by_scope() {
+        // message 求和
+        let mut t = UsageTotals::default();
+        for (tok, cost) in [
+            (11738, 0.0349),
+            (13134, 0.0095),
+            (13359, 0.0078),
+            (14109, 0.0092),
+        ] {
+            t.record(&serde_json::json!({ "kind": "usage", "scope": "message", "tokens": tok, "cost": cost }));
+        }
+        assert_eq!(t.final_totals(), Some((52340, Some(0.0614))));
+        // cumulative 取末值（历史事件兼容面）
+        let mut c = UsageTotals::default();
+        c.record(&serde_json::json!({ "kind": "usage", "scope": "cumulative", "tokens": 100, "cost": 0.5 }));
+        c.record(&serde_json::json!({ "kind": "usage", "scope": "cumulative", "tokens": 300, "cost": 1.5 }));
+        assert_eq!(c.final_totals(), Some((300, Some(1.5))));
+        // 混合：cumulative 覆盖 message 求和（opencode 历史卷混 pi 事件的防御）
+        let mut m = UsageTotals::default();
+        m.record(
+            &serde_json::json!({ "kind": "usage", "scope": "message", "tokens": 50, "cost": 0.1 }),
+        );
+        m.record(&serde_json::json!({ "kind": "usage", "scope": "cumulative", "tokens": 70, "cost": 0.2 }));
+        assert_eq!(m.final_totals(), Some((70, Some(0.2))));
+        // 空 → None
+        assert_eq!(UsageTotals::default().final_totals(), None);
+    }
+
     /// F-BENCH-14：usage 语义——message_update 流式快照零产出（刷屏源根除），
     /// message_end 每条消息恰好一个事件；tail 原样呈现全部。
     #[test]
