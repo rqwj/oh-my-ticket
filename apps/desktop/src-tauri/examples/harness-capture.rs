@@ -84,6 +84,23 @@ fn capture(bin: &std::path::Path, args: &[&str]) -> String {
         .stdin(std::process::Stdio::null())
         .spawn()
         .unwrap_or_else(|e| panic!("执行 {} {:?} 失败: {e}", bin.display(), args));
+    // F-BENCH-21：读线程必须在等待退出**之前**启动——两路管道各 ~64KB，
+    // 退出后才读，大输出（omp --help 已 16KB，模型列表增长后更大）会让
+    // 子进程卡在 write，30s 后被误判超时（与探针 run_with_timeout 同款）
+    let out_handle = child.stdout.take().map(|mut p| {
+        std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = p.read_to_string(&mut s);
+            s
+        })
+    });
+    let err_handle = child.stderr.take().map(|mut p| {
+        std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = p.read_to_string(&mut s);
+            s
+        })
+    });
     let deadline = Instant::now() + CMD_TIMEOUT;
     let status = loop {
         match child.try_wait() {
@@ -102,14 +119,8 @@ fn capture(bin: &std::path::Path, args: &[&str]) -> String {
             Err(e) => panic!("wait 失败: {e}"),
         }
     };
-    let mut out = String::new();
-    let mut err = String::new();
-    if let Some(mut p) = child.stdout.take() {
-        let _ = p.read_to_string(&mut out);
-    }
-    if let Some(mut p) = child.stderr.take() {
-        let _ = p.read_to_string(&mut err);
-    }
+    let out = out_handle.and_then(|h| h.join().ok()).unwrap_or_default();
+    let err = err_handle.and_then(|h| h.join().ok()).unwrap_or_default();
     assert!(
         status.map(|s| s.success()).unwrap_or(false),
         "{:?} {:?} 退出非零",
@@ -123,13 +134,22 @@ fn capture(bin: &std::path::Path, args: &[&str]) -> String {
     }
 }
 
-/// 输出归一（二轮评审 B）：HOME → __HOME__ 让跨机器 diff 稳定。
+/// 输出归一（二轮评审 B + F-BENCH-24）：HOME → __HOME__、ISO 时间戳 →
+/// __TS__、mcp:<pid> → mcp:__PID__——跨机器 diff 稳定，且不泄真实时间/
+/// pid（占位符与语料既有约定一致；到分钟精度即覆盖全部已知形态）。
 fn normalize(text: &str) -> String {
     let mut s = text.to_string();
     if let Ok(home) = std::env::var("HOME") {
         s = s.replace(&home, "__HOME__");
     }
-    s
+    let iso = regex::Regex::new(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?",
+    )
+    .unwrap();
+    let mcp_pid = regex::Regex::new(r"mcp:\d+").unwrap();
+    mcp_pid
+        .replace_all(&iso.replace_all(&s, "__TS__"), "mcp:__PID__")
+        .into_owned()
 }
 
 fn today() -> String {

@@ -9,14 +9,14 @@
 //!
 //! 语料采集（harness-capture）在同目录 example。
 
-use oh_my_ticket_desktop_lib::{descriptor_of, which_binary};
+use oh_my_ticket_desktop_lib::{descriptor_of, which_binary, REGISTRY};
 use std::io::Read;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 fn all_providers() -> Vec<&'static str> {
     // F-BENCH-21：从 REGISTRY 遍历——新增 provider 探针自动覆盖
-    ["opencode", "omp", "pi"].to_vec()
+    REGISTRY.iter().map(|d| d.id).collect()
 }
 const CMD_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -82,11 +82,13 @@ fn resolve_binary(provider: &str) -> PathBuf {
 #[ignore = "requires locally installed harnesses (design §5 CI boundary)"]
 fn probe_flag_surface_executable() {
     for provider in all_providers() {
+        let d = descriptor_of(provider).expect("provider");
         let bin = resolve_binary(provider);
-        let (ok, out, err) = run_with_timeout(&bin, &["--version"]);
+        let args = d.probe_args;
+        let (ok, out, err) = run_with_timeout(&bin, args);
         assert!(
             ok && !out.trim().is_empty(),
-            "[red] {provider}: --version 失败或空（flag 漂移 / 超时 30s？）stderr={}",
+            "[red] {provider}: {args:?} 失败或空（flag 漂移 / 超时 30s？） stderr={}",
             err.chars().take(200).collect::<String>()
         );
     }

@@ -2178,8 +2178,12 @@ mod tests {
             DEFAULT_MAX_DURATION,
             Duration::from_millis(300),
         );
-        let script = write_script(dir.path(), "stubborn2", "trap '' TERM\nsleep 30\n");
-        let (tx, _rx) = mpsc::channel();
+        let script = write_script(
+            dir.path(),
+            "stubborn2",
+            "trap '' TERM\necho READY\nsleep 30\n",
+        );
+        let (tx, rx) = mpsc::channel();
         let sink: EventSink = Arc::new(move |v| {
             let _ = tx.send(v);
         });
@@ -2216,6 +2220,18 @@ mod tests {
                 sink,
             )
             .unwrap();
+        // F-BENCH-22：READY 屏障——trap 装好才 kill。现写脚本首跑的 exec
+        // 评估停顿（实测退化态可至 9s+）意味着「spawn 返回 ≠ 子进程已起」，
+        // kill 撞上未装 trap 的窗口时 kill_reason 落不上（曾间歇红）
+        let saw_ready = wait_for(
+            || match rx.try_recv() {
+                Ok(ev) if ev["text"].as_str() == Some("READY") => Some(()),
+                _ => None,
+            },
+            Duration::from_secs(20),
+        );
+        assert!(saw_ready.is_some(), "READY 屏障应到达");
+
         let started = Instant::now();
         manager.kill_all(KillReason::AppExit);
         let elapsed = started.elapsed();

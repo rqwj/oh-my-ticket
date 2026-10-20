@@ -795,12 +795,14 @@ pub fn harness_open_login(harness: String) -> Result<serde_json::Value, String> 
 
 fn probe_descriptor(detected: Option<&Path>, d: &HarnessDescriptor) -> Option<String> {
     detected.and_then(|path| {
-        // 多线程进程里 fork→exec 偶发子进程卡死（exec 前的库锁），全量测试
-        // 并行（子进程型测试增多）会放大 2s 窗口误判——超时重试兜底
-        //（三次：满并行负载下两次仍偶发饿死，实测三投稳定）。
+        // F-BENCH-22（真因回填）：首次 exec「刚落盘的可执行文件」在 macOS
+        // 有系统级评估停顿（实测退化态 p50 6.3s / worst 9.3s；重复 exec 或
+        // sh 以数据方式读同文件仅 ~15-40ms；spawn 本身不报错——ETXTBSY
+        // 推断已被插桩证伪）。梯子：首试 2s 快速否决 TUI 挂起（F1 语义），
+        // 后续 6s×2 覆盖评估停顿窗口——旧 2s×3 梯子在停顿 >6s 时全灭。
         probe_version(path, d.probe_args, 2)
-            .or_else(|| probe_version(path, d.probe_args, 2))
-            .or_else(|| probe_version(path, d.probe_args, 2))
+            .or_else(|| probe_version(path, d.probe_args, 6))
+            .or_else(|| probe_version(path, d.probe_args, 6))
     })
 }
 
@@ -1070,17 +1072,19 @@ mod tests {
         std::fs::write(&good, "#!/bin/sh\necho v1.2.3\n").unwrap();
         std::fs::set_permissions(&good, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(
-            probe_version(&good, &["--version"], 5).as_deref(),
+            // F-BENCH-22：现写脚本首跑有 exec 评估停顿（退化态实测 worst
+            // 9.3s）——预算须远超停顿窗口；hanging 相位单独计时
+            probe_version(&good, &["--version"], 20).as_deref(),
             Some("v1.2.3")
         );
 
         let hanging = dir.path().join("hanging");
         std::fs::write(&hanging, "#!/bin/sh\nsleep 30\n").unwrap();
         std::fs::set_permissions(&hanging, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let started = std::time::Instant::now();
+        let hang_started = std::time::Instant::now();
         assert_eq!(probe_version(&hanging, &["--version"], 1), None);
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
+            hang_started.elapsed() < std::time::Duration::from_secs(10),
             "探针必须在超时后返回而不是永久挂起"
         );
     }

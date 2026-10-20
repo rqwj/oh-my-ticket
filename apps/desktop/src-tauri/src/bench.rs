@@ -62,14 +62,10 @@ pub fn analyze_jsonl(path: &Path) -> Option<ExecMetrics> {
     // F-BENCH-19：优先重放同目录 raw.log（harness 原始 stdout 全量）——
     // 当前 adapter 的产出才是事实源；jsonl 事件（采集时 adapter 产物，
     // 含旧口径 usage）仅作回落。
-    // 语料目录的原始流文件名固定为 raw.log（F-BENCH-19）；真实 transcripts
-    // 目录是 <execId>.raw.log——两种命名都查
+    // F-BENCH-23：重放源与 jsonl 同名成对（<stem>.raw.log，与 executor 的
+    // <execId>.raw.log 命名一致）——曾有目录级 raw.log 回退，同目录多卷会
+    // 串用别卷的用量（omp synthetic 卷拿到 smoke 的 42430），已删。
     let raw_log = path.with_file_name(format!("{exec_id}.raw.log"));
-    let raw_log = if raw_log.is_file() {
-        raw_log
-    } else {
-        path.with_file_name("raw.log")
-    };
     let has_raw_log = raw_log.is_file();
 
     for line in text.lines() {
@@ -302,12 +298,31 @@ mod tests {
         }
     }
 
-    /// 归一化不变量（F-BENCH-8 扩面）：三家全部 jsonl + help/models——
-    /// 不得含本机路径 / 真实 session id / 验收环境名。
+    /// 归一化不变量（F-BENCH-8 扩面 + F-BENCH-24 防回退）：三家全部
+    /// jsonl + raw.log + help/models——不得含本机路径 / 真实 session id /
+    /// 验收环境名 / 内嵌 ISO 时间戳 / 真实 pid。
     #[test]
     fn fixtures_are_normalized() {
         let root =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../fixtures/harness");
+        // F-BENCH-18/23：每家语料的必需文件清单——raw.log 与 jsonl 同名成对
+        // （<stem>.raw.log）。raw.log 曾被 .gitignore 的 *.log 吞掉（本机绿、
+        // 干净 clone 红），缺一即红，不再只靠数量下限。
+        for (p, v) in [("pi", "1.3.0"), ("omp", "18.12.2"), ("opencode", "1.18.32")] {
+            for f in [
+                "version.txt",
+                "help.txt",
+                "models.txt",
+                "meta.json",
+                "stream-smoke-hello.jsonl",
+                "stream-smoke-hello.raw.log",
+            ] {
+                let path = root.join(p).join(v).join(f);
+                assert!(path.is_file(), "语料缺文件: {}", path.display());
+            }
+        }
+        let iso = regex::Regex::new(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}").unwrap();
+        let mcp_pid = regex::Regex::new(r"mcp:\d+").unwrap();
         let mut checked = 0;
         for entry in walk(&root) {
             let name = entry
@@ -338,9 +353,18 @@ mod tests {
                 "{} 残留真实 session id 前缀",
                 entry.display()
             );
+            // F-BENCH-24：占位符之外的 ISO 时间戳 / mcp:<pid> 必须为零
+            //（曾整批漏过 170 处 ISO 与 3 个真实 pid）
+            assert!(!iso.is_match(&text), "{} 残留 ISO 时间戳", entry.display());
+            assert!(
+                !mcp_pid.is_match(&text),
+                "{} 残留 mcp:<pid>",
+                entry.display()
+            );
             checked += 1;
         }
-        assert!(checked >= 9, "应覆盖三家全部语料文件，实际 {checked}");
+        // 3 家 ×（smoke.jsonl + raw.log + help.txt + models.txt）+ omp synthetic = 13
+        assert!(checked >= 13, "应覆盖三家全部语料文件，实际 {checked}");
     }
 
     fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
@@ -388,8 +412,8 @@ mod tests {
     #[test]
     fn raw_log_replay_matches_recorded_events() {
         for (p, v) in [("pi", "1.3.0"), ("omp", "18.12.2"), ("opencode", "1.18.32")] {
-            let raw_text = std::fs::read_to_string(fixture(p, v, "raw.log"))
-                .unwrap_or_else(|_| panic!("{p} raw.log 应存在"));
+            let raw_text = std::fs::read_to_string(fixture(p, v, "stream-smoke-hello.raw.log"))
+                .unwrap_or_else(|_| panic!("{p} stream-smoke-hello.raw.log 应存在"));
             let jsonl_text =
                 std::fs::read_to_string(fixture(p, v, "stream-smoke-hello.jsonl")).unwrap();
 

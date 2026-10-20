@@ -1,7 +1,0 @@
-# F-BENCH-22：测试默认参数——限制并发线程（16 核满并行时计时类测试
-# 互相饿死，实测 --test-threads=4 连续零失败；CI 与本地统一走此配置）。
-# cargo 原生不支持 per-profile test-threads，故以 config 环境变量锚定，
-# CI workflow 与开发者都应使用 `cargo test`（本配置对 test target 生效
-# 需要 cargo 1.72+ 的 env 段——不可用时显式传 -- --test-threads=4）。
-[env]
-RUST_TEST_THREADS = "4"

@@ -1,0 +1,10 @@
+# F-BENCH-22（真因回填）：flake 根因既不是计时饿死也不是 ETXTBSY，而是
+# macOS 对「首次 exec 刚落盘的可执行文件」的系统评估停顿——实测退化态
+# p50 6.3s / worst 9.3s（重复 exec 或 sh 把脚本当数据读仅 ~15-40ms；插桩
+# 证实 spawn 本身从不报错）。测试里的假 harness 脚本全是现写的，1-5s 级
+# 断言预算在该停顿窗口内必挂。限并发显著降低同时撞上停顿的概率；探针侧
+# 另有预算放宽（harness.rs 探针梯子 2/6/6s、测试预算 20s）。
+# 必须放在仓库根：cargo 只从当前工作目录向上查找本文件，CI 的
+# `cargo test --workspace` 在根目录执行，apps/desktop/src-tauri/ 下不生效。
+[env]
+RUST_TEST_THREADS = "4"

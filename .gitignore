@@ -24,8 +24,9 @@ lib/
 
 # Logs
 *.log
-# F-BENCH-18：语料库的原始流（历史版本回放的事实源）必须入库
-!fixtures/harness/**/raw.log
+# F-BENCH-18/23：语料库的原始流（历史版本回放的事实源）必须入库——
+# 与配对 jsonl 同名（<stem>.raw.log）
+!fixtures/harness/**/*.raw.log
 
 # Personal UI preference state (saved tree filters, STORY-0023)
 .omt/
