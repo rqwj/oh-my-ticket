@@ -568,3 +568,7 @@ body {
   font-size: 12px;
   opacity: 0.8;
 }
+/* review F8（P-10）：失败说明（describeFailure 的展示文案）用危险色 */
+.agent-failure {
+  color: var(--danger, #cf222e);
+}

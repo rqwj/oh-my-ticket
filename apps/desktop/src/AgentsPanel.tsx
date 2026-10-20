@@ -1,8 +1,9 @@
 /**
  * U5 (R-E): Agents 面板 —— agent 列表（运行中 + 历史，跨重启保留）+
  * 选中 agent 的 TranscriptView。列表按 status 分组（Running/Starting 在
- * 前，Exited/Failed/Killed 次之）；Orphan 行带「不受控·只读」角标：只读
- * 尾随、不可 exec_stop，仅提供「强制 kill pid」（§3.2）。
+ * 前，Exited/Failed/Killed 次之）；Orphan 行带「不受控·只读」角标：执行
+ * 进程已丢失、harness 仍活，只能强制终止，不可 exec_stop，仅提供「强制
+ * kill pid」（§3.2）。
  *
  * run item 统计走 run/get 单 run 拉取（§四：不挂 run/list 全量刷新），
  * 按 runId 缓存避免重复拉取；claimed 判定 =
@@ -12,7 +13,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { omtCall, type TranscriptEvent } from './bridge'
 import type { AgentRecord, ExecRecord, OmtNode, RunDetail, RunItemView } from './types'
 import { claimedCountForExec, danglingBindingsOf, nodeTitlesById } from './store'
-import { agentDisplayName, ConfirmStopAllButton, ConfirmStopButton } from './agentUi'
+import { agentDisplayName, ConfirmStopAllButton, ConfirmStopButton, describeFailure } from './agentUi'
 import { TranscriptView } from './TranscriptView'
 import { DeleteIcon } from './icons'
 
@@ -353,7 +354,10 @@ export function AgentsPanel({
           <span className="agent-name">{agentDisplayName(agent)}</span>
           <span className={`chip agent-status st-${agent.status}`}>{agent.status}</span>
           {agent.attachment === 'orphan' && (
-            <span className="orphan-badge" title="重启后 pid 仍存活：只读尾随，不可受控终止">
+            <span
+              className="orphan-badge"
+              title="执行进程已丢失，harness 进程仍在运行：不会再有新输出，只能强制终止"
+            >
               不受控·只读
             </span>
           )}
@@ -392,6 +396,11 @@ export function AgentsPanel({
           <span className="mono">{agent.harness}</span>
           {nodeTitle && <span className="node-title">· {nodeTitle}</span>}
           {stat && <span className="run-progress">完成 {stat.done} / 失败 {stat.failed}</span>}
+          {agent.status === 'failed' && exec?.failureDetail && (
+            <span className="agent-failure" title={exec.failureDetail}>
+              {describeFailure(exec.failureDetail)}
+            </span>
+          )}
           {agent.status === 'exited' && stat && claimed === 0 && (
             <span className="agent-unclaimed">未认领任何项</span>
           )}
@@ -418,7 +427,7 @@ export function AgentsPanel({
         {stopAllNotice && <p className="agents-notice">{stopAllNotice}</p>}
         {groups.active.length > 0 && <p className="agents-group-label">运行中</p>}
         {groups.active.map(renderRow)}
-        {groups.orphan.length > 0 && <p className="agents-group-label">不受控（重启遗留）</p>}
+        {groups.orphan.length > 0 && <p className="agents-group-label">不受控（执行进程已丢失）</p>}
         {groups.orphan.map(renderRow)}
         {groups.finished.length > 0 && <p className="agents-group-label">已结束</p>}
         {groups.finished.map(renderRow)}
@@ -470,9 +479,7 @@ export function AgentsPanel({
             <p className="trust-gate-popup-title">
               删除 {agentDisplayName(deleteTarget)}（{deleteTarget.harness}）？
             </p>
-            <p className="hm-hint">
-              将移除该 agent 的记录与执行历史（transcript 文件保留在磁盘）。此操作不可恢复。
-            </p>
+            <p className="hm-hint">将删除该 agent 的记录、执行历史和 transcript 文件。此操作不可恢复。</p>
             {deleteError && <p className="error-banner">{deleteError}</p>}
             <div className="chip-row">
               <button

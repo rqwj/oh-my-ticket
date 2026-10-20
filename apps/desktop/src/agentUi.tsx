@@ -129,3 +129,17 @@ export function ConfirmStopAllButton({
     </span>
   )
 }
+
+/**
+ * review F8（P-10）：失败详情的展示文案。已知的内部标记（omt-exec 的
+ * `SHIM_LOST_MARKER` 与重启对账标记）映射为可读说明，其余截断原文。
+ */
+export function describeFailure(detail: string): string {
+  if (detail === 'exec shim exited before finishing') {
+    return '执行进程异常退出（运行项会在对账时释放，可续跑）'
+  }
+  if (detail === 'app restarted before exec finished') {
+    return '应用重启时执行被中断（运行项会在对账时释放，可续跑）'
+  }
+  return detail.length > 120 ? `${detail.slice(0, 120)}…` : detail
+}

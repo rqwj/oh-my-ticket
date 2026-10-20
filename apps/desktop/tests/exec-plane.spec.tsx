@@ -147,6 +147,20 @@ describe('exec plane P-10', () => {
     expect(screen.queryByRole('button', { name: '停止全部' })).toBeNull()
   })
 
+  it('explains a failed agent whose shim was lost', () => {
+    const failed = agent({ status: 'failed', attachment: 'none' })
+    failed.execs[0].failureDetail = 'exec shim exited before finishing'
+    renderPanel({ agents: [failed] })
+    expect(screen.getAllByText(/执行进程异常退出/).length).toBeGreaterThan(0)
+  })
+
+  it('orphan badge no longer promises a live tail', () => {
+    renderPanel({ agents: [agent({ status: 'failed', attachment: 'orphan' })] })
+    const badge = screen.getByText('不受控·只读')
+    expect(badge.getAttribute('title')).toMatch(/不会再有新输出/)
+    expect(screen.queryByText('不受控（重启遗留）')).toBeNull()
+  })
+
   it('renders without the new props (existing callers unaffected)', () => {
     renderPanel()
     expect(screen.queryByRole('button', { name: '停止全部' })).toBeNull()
