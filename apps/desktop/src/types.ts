@@ -135,6 +135,11 @@ export interface ExecRecord {
   /** Rust-captured process identity; never accepted from the renderer for kill authorization. */
   pid: number | null
   processStartId: string | null
+  /** exec-shim 进程身份（Rust 侧写入，仅展示/诊断；停止授权不信任 renderer） */
+  shimPid?: number | null
+  shimStartId?: string | null
+  /** shim 收尾时租约释放失败、待对账重试 */
+  leaseReleasePending?: boolean
 }
 
 export interface AgentRecord {

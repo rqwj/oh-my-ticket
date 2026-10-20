@@ -99,6 +99,15 @@ pub struct ExecRecord {
     /// exec 释放过 daemon 租约后置 true，避免重复对账）。
     #[serde(default)]
     pub reconciled: bool,
+    /// exec-shim 进程 pid 与内核起始标识（设计 §3.2：停止 / 存活检查先校验
+    /// 起始标识，防 pid 复用）。由 launcher 在拉起 shim 后写入。
+    #[serde(default)]
+    pub shim_pid: Option<u32>,
+    #[serde(default)]
+    pub shim_start_id: Option<String>,
+    /// shim 收尾时租约释放失败（daemon 不可达等）——留给下次对账重试（设计 §5）。
+    #[serde(default)]
+    pub lease_release_pending: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -384,6 +393,9 @@ pub struct ReconcileTarget {
 /// demote 签名（与 demote_live_agents 写入的 failure_detail 字面量一致）。
 const RESTART_MARKER: &str = "app restarted before exec finished";
 
+/// shim 在 exec 结束前消失（崩溃 / 被 KILL）的对账签名（P-8）。
+pub const SHIM_LOST_MARKER: &str = "exec shim exited before finishing";
+
 /// 枚举待对账 exec：failure_detail 命中重启签名且未 reconciled、带 run_id。
 pub fn list_reconcile_targets(runtime_dir: &Path) -> Result<Vec<ReconcileTarget>, String> {
     let mut targets = Vec::new();
@@ -397,7 +409,11 @@ pub fn list_reconcile_targets(runtime_dir: &Path) -> Result<Vec<ReconcileTarget>
             for exec in &agent.execs {
                 if !exec.reconciled
                     && exec.run_id.is_some()
-                    && exec.failure_detail.as_deref() == Some(RESTART_MARKER)
+                    && (exec.lease_release_pending
+                        || matches!(
+                            exec.failure_detail.as_deref(),
+                            Some(RESTART_MARKER) | Some(SHIM_LOST_MARKER)
+                        ))
                 {
                     targets.push(ReconcileTarget {
                         home_id: home_id.clone(),

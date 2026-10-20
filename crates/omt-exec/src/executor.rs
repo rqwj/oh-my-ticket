@@ -1550,7 +1550,10 @@ pub fn transcript_tail_from(
 
 /// U10 启动对账：对 demote 标记的中断 exec（app 重启杀死、daemon 侧租约
 /// 未释放——run item 卡 running、run 卡死）执行 §3.3 释放序列（admin
-/// report failed + retry 回 pending），随后置 reconciled 幂等标记。
+/// report failed + retry 回 pending）。**只有释放成功才**置 `reconciled`
+/// 并清掉 `lease_release_pending`；释放失败则保留为对账目标，留给下一次
+/// 对账（review F10——desktop 只在建立第一个会话时对账一次，那时
+/// workspace home 往往还没声明，所以这次很容易失败）。
 /// 返回处理的 exec 数。rpc seam 供测试注入。
 pub fn reconcile_interrupted_execs_with(
     rpc: &dyn Fn(&str, serde_json::Value) -> Result<serde_json::Value, String>,
@@ -1562,22 +1565,33 @@ pub fn reconcile_interrupted_execs_with(
     };
     let mut handled = 0usize;
     for t in &targets {
-        // Task 8 起「只在 Ok 时标记 reconciled」；本 Task 保持原有行为。
-        let _ = release_items_for_exec(rpc, &t.home_id, &t.run_id, &t.exec_id);
-        // F-U10-2：强退可能连同步收口都打断（finish_terminal 未及运行，
-        // 终态归档全缺）——捕获的 session id 还在 raw.log 首段流里，回填
-        // 后该 agent 仍可续跑（上下文不因崩溃丢失）
-        let backfill_session =
-            session_id_from_raw_log(runtime_dir, &t.home_id, &t.agent_id, &t.exec_id, &t.harness);
-        let _ = agents::update_exec(runtime_dir, &t.home_id, &t.agent_id, &t.exec_id, |exec| {
-            exec.reconciled = true;
-            if exec.harness_session_id.is_none() {
-                exec.harness_session_id = backfill_session.clone();
-            }
-        });
+        if let Err(err) = release_items_for_exec(rpc, &t.home_id, &t.run_id, &t.exec_id) {
+            eprintln!(
+                "对账：exec {} 租约释放失败（{err}），保留为对账目标",
+                t.exec_id
+            );
+            continue;
+        }
+        mark_reconciled(runtime_dir, t);
         handled += 1;
     }
     handled
+}
+
+/// 租约已释放：置 reconciled、清待对账标记，并从 raw.log 回填 session id。
+/// F-U10-2：强退可能连同步收口都打断（finish_terminal 未及运行，终态归档
+/// 全缺）——捕获的 session id 还在 raw.log 首段流里，回填后该 agent 仍可
+/// 续跑（上下文不因崩溃丢失）。Task 10 的 shim 路径对账复用。
+pub(crate) fn mark_reconciled(runtime_dir: &Path, t: &agents::ReconcileTarget) {
+    let backfill_session =
+        session_id_from_raw_log(runtime_dir, &t.home_id, &t.agent_id, &t.exec_id, &t.harness);
+    let _ = agents::update_exec(runtime_dir, &t.home_id, &t.agent_id, &t.exec_id, |exec| {
+        exec.reconciled = true;
+        exec.lease_release_pending = false;
+        if exec.harness_session_id.is_none() {
+            exec.harness_session_id = backfill_session.clone();
+        }
+    });
 }
 
 /// 从 raw.log 流行回填 harness session id（pi/omp 的 session 事件在首行、
@@ -3723,6 +3737,47 @@ mod tests {
             .find(|e| e.exec_id == "exec-crash")
             .unwrap();
         assert!(exec.reconciled, "幂等标记已落盘");
+    }
+
+    /// review F10：释放失败不得标记 reconciled，也不得清掉待对账标记。
+    #[test]
+    fn reconcile_keeps_target_when_release_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = dir.path();
+        let agent = crate::agents::register_agent(
+            rt,
+            "h_t",
+            "pi",
+            crate::agents::NewExec {
+                exec_id: "exec-r".into(),
+                node_id: None,
+                run_id: Some("RUN-1".into()),
+                binary_path: None,
+                binary_args: vec![],
+                model: None,
+            },
+        )
+        .unwrap();
+        crate::agents::update_exec(rt, "h_t", &agent.id, "exec-r", |e| {
+            e.lease_release_pending = true
+        })
+        .unwrap();
+        let failing = |_: &str, _: serde_json::Value| -> Result<serde_json::Value, String> {
+            Err("home not opened".into())
+        };
+        assert_eq!(reconcile_interrupted_execs_with(&failing, rt), 0);
+        assert_eq!(
+            crate::agents::list_reconcile_targets(rt).unwrap().len(),
+            1,
+            "失败后仍是对账目标"
+        );
+        let ok = |_: &str, _: serde_json::Value| -> Result<serde_json::Value, String> {
+            Ok(serde_json::json!({ "items": [] }))
+        };
+        assert_eq!(reconcile_interrupted_execs_with(&ok, rt), 1);
+        assert!(crate::agents::list_reconcile_targets(rt)
+            .unwrap()
+            .is_empty());
     }
 
     /// U11：端到端——opencode 假 binary 输出带 sessionID 的 JSON 行 →
