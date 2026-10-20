@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 omt-client = { path = "../../../crates/omt-client" }
+omt-exec = { path = "../../../crates/omt-exec" }
 omt-harness = { path = "../../../crates/omt-harness" }
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
@@ -23,10 +24,6 @@ tauri-plugin-single-instance = "2"
 libc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-# F-U3-5: stable content hashing for the omp MCP injection's persisted
-# workspace/content digests — DefaultHasher's algorithm is not guaranteed
-# stable across Rust versions.
-sha2 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

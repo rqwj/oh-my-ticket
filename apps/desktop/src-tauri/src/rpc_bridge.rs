@@ -206,8 +206,8 @@ fn with_session<R>(
             if !RECONCILED_ONCE.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 let reconciler = crate::state::SharedSession(shared.0.clone());
                 std::thread::spawn(move || {
-                    crate::executor::reconcile_interrupted_execs(
-                        &reconciler,
+                    omt_exec::executor::reconcile_interrupted_execs(
+                        &crate::executor::rpc_of(&reconciler),
                         &daemon::runtime_dir(),
                     );
                 });

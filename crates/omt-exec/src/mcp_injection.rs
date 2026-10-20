@@ -55,7 +55,6 @@ use std::sync::Mutex;
 
 use sha2::{Digest, Sha256};
 
-use crate::daemon;
 use omt_harness::atomic_json::OpenOptionsUnix;
 
 /// 项目级 MCP 注入的 per-provider 参数。omp 的目录与条目形状是**已持久化
@@ -63,7 +62,7 @@ use omt_harness::atomic_json::OpenOptionsUnix;
 /// 字节不得变动；pi 走独立命名空间与实测条目形状（`pi mcp add -l` 实测：
 /// 无 `type` 字段）。
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct ProjectSpec {
+pub struct ProjectSpec {
     /// `runtime/harness/<ns>-injection` 与 `runtime/harness/<ns>-launchers`
     pub ns: &'static str,
     /// workspace 配置相对路径
@@ -551,31 +550,10 @@ fn release_project(
     finalize_release(runtime_dir, &state_dir, workspace_root, &state, spec)
 }
 
-/// 注入准备：sidecar 预检 + 按 provider 分派。任何失败=派发失败（绝不
-/// spawn 无 MCP 的 harness）。`persistent` 供 U7 设置项透传。
+/// 注入准备：sidecar 预检 + 按 provider 分派。任何失败 = 派发失败（绝不
+/// spawn 无 MCP 的 harness）。`omt_path` 是 MCP 桥二进制（桌面端 sidecar
+/// 或 shim 自身所在目录的 `omt`）；`persistent` 供 U7 设置项透传。
 pub fn prepare(
-    runtime_dir: &Path,
-    workspace_root: &Path,
-    provider_id: &str,
-    exec_id: &str,
-    persistent: bool,
-) -> Result<McpInjection, String> {
-    let omt_path = daemon::omt_sidecar_path()?;
-    prepare_with(
-        &omt_path,
-        runtime_dir,
-        workspace_root,
-        provider_id,
-        exec_id,
-        persistent,
-    )
-}
-
-/// `pub(crate)`（not just `#[cfg(test)]`) so other modules' tests can drive
-/// the real prepare path with an injectable `omt_path`, instead of hand-
-/// building a `McpInjection` that bypasses the `launchers` bookkeeping
-/// (F-U3-12) — see `executor::tests::spawn_failure_releases_mcp_injection`.
-pub(crate) fn prepare_with(
     omt_path: &Path,
     runtime_dir: &Path,
     workspace_root: &Path,
@@ -757,7 +735,7 @@ mod tests {
     #[test]
     fn sidecar_missing_is_rejected_with_path() {
         let rig = rig();
-        let err = prepare_with(
+        let err = prepare(
             Path::new("/definitely/not/here/omt"),
             &rig.runtime,
             &rig.workspace,
@@ -772,7 +750,7 @@ mod tests {
     #[test]
     fn opencode_injection_is_env_only() {
         let rig = rig();
-        let injection = prepare_with(
+        let injection = prepare(
             &rig.fake_omt,
             &rig.runtime,
             &rig.workspace,
@@ -801,7 +779,7 @@ mod tests {
             r#"{ "mcpServers": { "user-server": { "type": "stdio", "command": "u" } } }"#,
         )
         .unwrap();
-        let injection = prepare_with(
+        let injection = prepare(
             &rig.fake_omt,
             &rig.runtime,
             &rig.workspace,
@@ -830,7 +808,7 @@ mod tests {
     #[test]
     fn omp_fresh_workspace_file_removed_on_release() {
         let rig = rig();
-        let injection = prepare_with(
+        let injection = prepare(
             &rig.fake_omt,
             &rig.runtime,
             &rig.workspace,
@@ -849,7 +827,7 @@ mod tests {
         let rig = rig();
         std::fs::create_dir_all(rig.workspace.join(".omp")).unwrap();
         std::fs::write(OMP_SPEC.workspace_file(&rig.workspace), "{}").unwrap();
-        let first = prepare_with(
+        let first = prepare(
             &rig.fake_omt,
             &rig.runtime,
             &rig.workspace,
@@ -858,7 +836,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let second = prepare_with(
+        let second = prepare(
             &rig.fake_omt,
             &rig.runtime,
             &rig.workspace,
@@ -895,7 +873,7 @@ mod tests {
         let rig = rig();
         std::fs::create_dir_all(rig.workspace.join(".omp")).unwrap();
         std::fs::write(OMP_SPEC.workspace_file(&rig.workspace), "{}").unwrap();
-        let first = prepare_with(
+        let first = prepare(
             &rig.fake_omt,
             &rig.runtime,
             &rig.workspace,
@@ -904,7 +882,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let _second = prepare_with(
+        let _second = prepare(
             &rig.fake_omt,
             &rig.runtime,
             &rig.workspace,
@@ -933,7 +911,7 @@ mod tests {
         let rig = rig();
         std::fs::create_dir_all(rig.workspace.join(".omp")).unwrap();
         std::fs::write(OMP_SPEC.workspace_file(&rig.workspace), "{}").unwrap();
-        let injection = prepare_with(
+        let injection = prepare(
             &rig.fake_omt,
             &rig.runtime,
             &rig.workspace,
@@ -970,7 +948,7 @@ mod tests {
             r#"{"mcpServers":{"user-server":{"type":"stdio","command":"u"}}}"#,
         )
         .unwrap();
-        let injection = prepare_with(
+        let injection = prepare(
             &rig.fake_omt,
             &rig.runtime,
             &rig.workspace,
@@ -1002,7 +980,7 @@ mod tests {
         let rig = rig();
         std::fs::create_dir_all(rig.workspace.join(".omp")).unwrap();
         std::fs::write(OMP_SPEC.workspace_file(&rig.workspace), "{}").unwrap();
-        let first = prepare_with(
+        let first = prepare(
             &rig.fake_omt,
             &rig.runtime,
             &rig.workspace,
@@ -1020,7 +998,7 @@ mod tests {
             serde_json::to_string_pretty(&root).unwrap(),
         )
         .unwrap();
-        let second = prepare_with(
+        let second = prepare(
             &rig.fake_omt,
             &rig.runtime,
             &rig.workspace,
@@ -1043,7 +1021,7 @@ mod tests {
     fn omp_persistent_and_non_persistent_do_not_clobber_each_other() {
         let rig = rig();
         // 先建立 persistent 注入
-        let persistent = prepare_with(
+        let persistent = prepare(
             &rig.fake_omt,
             &rig.runtime,
             &rig.workspace,
@@ -1060,7 +1038,7 @@ mod tests {
             }
         ));
         // 再来一次非 persistent 派发（不同 exec）：会临时覆盖 omt 条目
-        let scoped = prepare_with(
+        let scoped = prepare(
             &rig.fake_omt,
             &rig.runtime,
             &rig.workspace,
@@ -1092,7 +1070,7 @@ mod tests {
         std::fs::create_dir_all(rig.workspace.join(".omp")).unwrap();
         std::fs::write(OMP_SPEC.workspace_file(&rig.workspace), "{}").unwrap();
         // prepare 后不 release（模拟 crash）
-        prepare_with(
+        prepare(
             &rig.fake_omt,
             &rig.runtime,
             &rig.workspace,
@@ -1118,7 +1096,7 @@ mod tests {
         let rig = rig();
         std::fs::create_dir_all(rig.workspace.join(".omp")).unwrap();
         std::fs::write(OMP_SPEC.workspace_file(&rig.workspace), "{}").unwrap();
-        prepare_with(
+        prepare(
             &rig.fake_omt,
             &rig.runtime,
             &rig.workspace,
@@ -1198,7 +1176,7 @@ mod tests {
         )
         .unwrap();
 
-        let injection = prepare_with(
+        let injection = prepare(
             &rig.fake_omt,
             &rig.runtime,
             &rig.workspace,
@@ -1223,7 +1201,7 @@ mod tests {
     #[test]
     fn omp_persistent_mode_merges_without_state() {
         let rig = rig();
-        let injection = prepare_with(
+        let injection = prepare(
             &rig.fake_omt,
             &rig.runtime,
             &rig.workspace,
@@ -1256,7 +1234,7 @@ mod tests {
         // F-U3-18 回归测试：sweep 曾经在**每次**启动（不只 crash 后）无条件
         // 清空整个 launcher 目录，persistent.sh 一并被删。
         let rig = rig();
-        let persistent = prepare_with(
+        let persistent = prepare(
             &rig.fake_omt,
             &rig.runtime,
             &rig.workspace,
@@ -1290,7 +1268,7 @@ mod tests {
     #[test]
     fn unknown_provider_rejected() {
         let rig = rig();
-        assert!(prepare_with(
+        assert!(prepare(
             &rig.fake_omt,
             &rig.runtime,
             &rig.workspace,
@@ -1307,7 +1285,7 @@ mod tests {
     #[test]
     fn pi_injection_roundtrip_shape_and_namespace() {
         let rig = rig();
-        let inject = prepare_with(
+        let inject = prepare(
             &rig.fake_omt,
             &rig.runtime,
             &rig.workspace,
@@ -1343,7 +1321,7 @@ mod tests {
             .join(workspace_hash(&rig.workspace))
             .is_dir());
         // omp 同 workspace 并行 prepare → 各自 refcount 独立
-        let _omp_inject = prepare_with(
+        let _omp_inject = prepare(
             &rig.fake_omt,
             &rig.runtime,
             &rig.workspace,
@@ -1385,7 +1363,7 @@ mod tests {
     #[test]
     fn pi_crash_residue_is_swept() {
         let rig = rig();
-        let _ = prepare_with(
+        let _ = prepare(
             &rig.fake_omt,
             &rig.runtime,
             &rig.workspace,

@@ -2619,10 +2619,10 @@ version = "0.6.6"
 dependencies = [
  "libc",
  "omt-client",
+ "omt-exec",
  "omt-harness",
  "serde",
  "serde_json",
- "sha2",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
@@ -2661,6 +2661,19 @@ dependencies = [
  "omt-contracts",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "omt-exec"
+version = "0.6.6"
+dependencies = [
+ "libc",
+ "omt-client",
+ "omt-harness",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]

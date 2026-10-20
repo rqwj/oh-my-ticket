@@ -79,13 +79,14 @@ impl SharedSession {
     }
 }
 
-/// U2: 所有执行会话的持有者（照 SharedSession 模式 manage）。构造即执行
-/// 启动 demote（F-U4a-2：重启后 Live 记录不再可控）。
-pub struct ExecutionState(pub crate::executor::ExecutionManager);
+/// U2: 所有执行会话的持有者（照 SharedSession 模式 manage）。构造时执行
+/// 启动清扫（F-U4a-2 demote + MCP 残留 sweep）。
+pub struct ExecutionState(pub omt_exec::executor::ExecutionManager);
 
 impl ExecutionState {
     pub fn new() -> Self {
-        Self(crate::executor::ExecutionManager::new())
+        omt_exec::executor::startup_housekeeping(&daemon::runtime_dir());
+        Self(omt_exec::executor::ExecutionManager::new())
     }
 }
 

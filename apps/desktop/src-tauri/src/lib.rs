@@ -6,13 +6,8 @@
 
 mod agents;
 mod daemon;
-// U2 内核先于 U4 exec_start 接线落地——spawn 侧 API 在 U4 前是死代码
-#[allow(dead_code)]
 mod executor;
 mod harness;
-// MCP 注入的 omp 路径在 U4 派发链接线前是死代码
-#[allow(dead_code)]
-mod mcp_injection;
 mod rpc_bridge;
 mod state;
 
@@ -81,7 +76,7 @@ pub fn run() {
             // SIGTERM → 有界等待（≤ KILL_GRACE+2s）等待线程落盘 → 超时则
             // SIGKILL 并由本路径直接 finish_terminal 落盘。
             if let tauri::RunEvent::ExitRequested { .. } = event {
-                use crate::executor::KillReason;
+                use omt_exec::executor::KillReason;
                 app.state::<ExecutionState>()
                     .0
                     .kill_all(KillReason::AppExit);
