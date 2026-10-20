@@ -916,6 +916,8 @@ fn finish_terminal(session: &ExecSession, terminal: &Terminal) {
             if let Some((tokens, cost)) = final_usage {
                 exec.usage_tokens = Some(tokens);
                 exec.usage_cost = cost;
+                // F-BENCH-20：口径自描述——旧记录（da9c376 前）无此字段
+                exec.usage_caliber = Some("message-sum".into());
             }
         },
     );
@@ -1849,7 +1851,9 @@ mod tests {
         let runtime = dir.path().join("runtime");
         let home_path = dir.path().join("ws").join(".omt");
         std::fs::create_dir_all(&home_path).unwrap();
-        let manager = ExecutionManager::with_limits(Duration::from_secs(10), DEFAULT_MAX_DURATION);
+        // F-BENCH-22：startup 窗口须覆盖现写脚本首跑的 exec 评估停顿
+        //（退化态实测可至 9s+），10s 会把停顿误分类为启动超时
+        let manager = ExecutionManager::with_limits(Duration::from_secs(30), DEFAULT_MAX_DURATION);
         let script = write_script(dir.path(), "boom", "exit 1");
         let (tx, _rx) = mpsc::channel();
         let sink: EventSink = Arc::new(move |v| {
@@ -1874,7 +1878,7 @@ mod tests {
                 sink,
             )
             .unwrap();
-        let terminal = wait_for(|| session.terminal(), Duration::from_secs(15));
+        let terminal = wait_for(|| session.terminal(), Duration::from_secs(30));
         assert!(
             matches!(terminal, Some(Terminal::Failed(_))),
             "{terminal:?}"
@@ -1918,7 +1922,7 @@ mod tests {
                 sink,
             )
             .unwrap();
-        let terminal = wait_for(|| session.terminal(), Duration::from_secs(15));
+        let terminal = wait_for(|| session.terminal(), Duration::from_secs(30));
         assert!(
             matches!(terminal, Some(Terminal::Exited(3))),
             "{terminal:?}"
@@ -1971,7 +1975,7 @@ mod tests {
                 sink,
             )
             .unwrap();
-        let terminal = wait_for(|| session.terminal(), Duration::from_secs(15));
+        let terminal = wait_for(|| session.terminal(), Duration::from_secs(30));
         let Some(Terminal::Failed(detail)) = terminal else {
             panic!("应为 Failed：{terminal:?}");
         };
@@ -2023,7 +2027,7 @@ mod tests {
                 sink,
             )
             .unwrap();
-        let terminal = wait_for(|| session.terminal(), Duration::from_secs(15));
+        let terminal = wait_for(|| session.terminal(), Duration::from_secs(30));
         assert!(
             matches!(&terminal, Some(Terminal::Killed(KillReason::External(9)))),
             "{terminal:?}"
@@ -2402,6 +2406,66 @@ mod tests {
         assert!(lease_rx.try_recv().is_err(), "幂等终态不得重复释放租约");
     }
 
+    /// F-BENCH-20：终态归档的 usage 必须带口径标记——两条 message_end
+    /// 求和入档 + usageCaliber="message-sum"（旧记录无此字段 = 末条口径）。
+    #[test]
+    fn terminal_archives_usage_with_caliber() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        let home_path = dir.path().join("ws").join(".omt");
+        std::fs::create_dir_all(&home_path).unwrap();
+        let manager = ExecutionManager::with_limits(STARTUP_WINDOW, DEFAULT_MAX_DURATION);
+        // 假 pi 流：两条 message_end（100/$0.01 + 150/$0.02）→ 求和 250/$0.03
+        let script = write_script(
+            dir.path(),
+            "usage-pi",
+            "echo '{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"usage\":{\"totalTokens\":100,\"cost\":{\"total\":0.01}}}}'\necho '{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"usage\":{\"totalTokens\":150,\"cost\":{\"total\":0.02}}}}'",
+        );
+        let agent = agents::register_agent(
+            &runtime,
+            "h_test",
+            "pi",
+            NewExec {
+                exec_id: "exec-usage".into(),
+                node_id: None,
+                run_id: None,
+                binary_path: None,
+                binary_args: vec![],
+                model: None,
+            },
+        )
+        .unwrap();
+        let session = manager
+            .spawn(
+                &runtime,
+                SpawnRequest {
+                    exec_id: "exec-usage".into(),
+                    agent_id: agent.id,
+                    home_id: "h_test".into(),
+                    home_path,
+                    harness: "pi".into(),
+                    node_id: None,
+                    run_id: None,
+                    program: script,
+                    args: vec![],
+                    env_additions: BTreeMap::new(),
+                    mcp: McpInjection::None,
+                },
+                Arc::new(|_| {}),
+            )
+            .unwrap();
+        wait_for(|| session.terminal().map(|_| ()), Duration::from_secs(20)).expect("应到达终态");
+        let (file, parse_failed) = crate::atomic_json::read_json::<crate::agents::AgentsFile>(
+            &runtime.join("agents").join("h_test").join("agents.json"),
+        )
+        .unwrap();
+        assert!(!parse_failed);
+        let exec = &file.agents[0].execs[0];
+        assert_eq!(exec.usage_tokens, Some(250), "按消息求和归档");
+        assert!((exec.usage_cost.unwrap() - 0.03).abs() < 1e-9);
+        assert_eq!(exec.usage_caliber.as_deref(), Some("message-sum"));
+    }
+
     #[test]
     fn sanitize_args_redacts_key_value_flags() {
         let args = vec![
@@ -2506,7 +2570,7 @@ mod tests {
                 sink,
             )
             .unwrap();
-        let terminal = wait_for(|| session.terminal(), Duration::from_secs(15));
+        let terminal = wait_for(|| session.terminal(), Duration::from_secs(30));
         assert!(
             matches!(terminal, Some(Terminal::Exited(0))),
             "{terminal:?}"
@@ -2750,7 +2814,7 @@ mod tests {
                 sink,
             )
             .unwrap();
-        let terminal = wait_for(|| session.terminal(), Duration::from_secs(10));
+        let terminal = wait_for(|| session.terminal(), Duration::from_secs(30));
         assert!(
             matches!(&terminal, Some(Terminal::Killed(KillReason::MaxDuration))),
             "{terminal:?}"
@@ -2804,7 +2868,7 @@ mod tests {
             )
             .unwrap();
         manager.kill_all(KillReason::AppExit);
-        let terminal = wait_for(|| session.terminal(), Duration::from_secs(10));
+        let terminal = wait_for(|| session.terminal(), Duration::from_secs(30));
         assert!(matches!(
             terminal,
             Some(Terminal::Killed(KillReason::AppExit))
@@ -3380,7 +3444,7 @@ mod tests {
         }
         // 收割子进程（脚本 exit 0 → Exited），不留给分离的等待线程
         let session = manager.get(&outcome.exec_id).expect("session 应已注册");
-        let terminal = wait_for(|| session.terminal(), Duration::from_secs(15));
+        let terminal = wait_for(|| session.terminal(), Duration::from_secs(30));
         assert!(
             matches!(terminal, Some(Terminal::Exited(0))),
             "{terminal:?}"
@@ -3723,7 +3787,7 @@ exit 0"#,
         )
         .expect("全链应成功");
         let session = manager.get(&outcome.exec_id).unwrap();
-        let terminal = wait_for(|| session.terminal(), Duration::from_secs(15));
+        let terminal = wait_for(|| session.terminal(), Duration::from_secs(30));
         assert!(terminal.is_some());
         let file = read_agents_file(&runtime);
         let exec = file.agents[0]
@@ -3830,7 +3894,7 @@ exit 0"#,
         assert_eq!(file.agents.len(), 1);
         assert_eq!(file.agents[0].execs.len(), 2, "历史 + 新 exec");
         let session = manager.get(&outcome.exec_id).unwrap();
-        let _ = wait_for(|| session.terminal(), Duration::from_secs(15));
+        let _ = wait_for(|| session.terminal(), Duration::from_secs(30));
     }
 
     /// 验收回归同源第三处：run/get item 的执行器字段是 `executorActor`

@@ -790,7 +790,7 @@ pub fn harness_open_login(harness: String) -> Result<serde_json::Value, String> 
 }
 
 // ---------------------------------------------------------------------------
-// tauri commands（设置页数据面；探测可能各至 2s，必须 async）
+// tauri commands（设置页数据面；三家并行探测、单家梯子最长 14s，必须 async）
 // ---------------------------------------------------------------------------
 
 fn probe_descriptor(detected: Option<&Path>, d: &HarnessDescriptor) -> Option<String> {
@@ -798,8 +798,10 @@ fn probe_descriptor(detected: Option<&Path>, d: &HarnessDescriptor) -> Option<St
         // F-BENCH-22（真因回填）：首次 exec「刚落盘的可执行文件」在 macOS
         // 有系统级评估停顿（实测退化态 p50 6.3s / worst 9.3s；重复 exec 或
         // sh 以数据方式读同文件仅 ~15-40ms；spawn 本身不报错——ETXTBSY
-        // 推断已被插桩证伪）。梯子：首试 2s 快速否决 TUI 挂起（F1 语义），
-        // 后续 6s×2 覆盖评估停顿窗口——旧 2s×3 梯子在停顿 >6s 时全灭。
+        // 推断已被插桩证伪）。梯子 2/6/6 覆盖停顿窗口（旧 2s×3 在停顿 >6s
+        // 时全灭）。代价（§33）：挂起型 binary（flag 写错起 TUI）判「无版本」
+        // 要等满全梯 6→14s——没有「首试快否决」；由设置页并行探测
+        // （F-BENCH-25 probe_all）补偿，墙钟 = 最慢一家。
         probe_version(path, d.probe_args, 2)
             .or_else(|| probe_version(path, d.probe_args, 6))
             .or_else(|| probe_version(path, d.probe_args, 6))
@@ -870,15 +872,31 @@ fn harness_entry(d: &HarnessDescriptor, cfg: Option<&HarnessUserConfig>) -> serd
     })
 }
 
+/// 对全部 REGISTRY 条目并行求值（F-BENCH-25）：探测是 spawn+等待的 I/O
+/// 等待，顺序执行会把各家的探针梯子叠加——梯子放宽到 2/6/6s 后，一个
+/// 挂住的 binary 单家最坏 14s，顺序三家 = 42s，并行墙钟 = 最慢一家。
+/// 输出保持 REGISTRY 顺序；共享数据（configs）以只读引用进入。
+fn probe_all<T: Send>(
+    f: impl Fn(&'static HarnessDescriptor) -> T + Sync,
+) -> Result<Vec<T>, String> {
+    std::thread::scope(|s| {
+        let f = &f;
+        let handles: Vec<_> = REGISTRY.iter().map(|d| s.spawn(move || f(d))).collect();
+        REGISTRY
+            .iter()
+            .zip(handles)
+            .map(|(d, h)| h.join().map_err(|_| format!("probe {} panicked", d.id)))
+            .collect()
+    })
+}
+
 /// 设置页 Harnesses tab 的数据面：类型表 × 探测 × 用户配置投影。
+///（三家并行探测——最坏 = 最慢单家而非叠加；仍 async：单家梯子最长 14s）
 #[tauri::command(async)]
 pub fn harness_list() -> Result<serde_json::Value, String> {
     let runtime_dir = daemon::runtime_dir();
     let configs = load_configs(&runtime_dir);
-    let harnesses: Vec<serde_json::Value> = REGISTRY
-        .iter()
-        .map(|d| harness_entry(d, configs.get(d.id)))
-        .collect();
+    let harnesses = probe_all(|d| harness_entry(d, configs.get(d.id)))?;
     Ok(serde_json::json!({ "harnesses": harnesses }))
 }
 
@@ -901,6 +919,28 @@ pub fn harness_config_set(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F-BENCH-25：三家并行——顺序执行 ≥ 3×600ms，并行 ≈ 600ms。纯线程
+    /// sleep（无进程 spawn），不受 exec 评估停顿影响
+    #[test]
+    fn probe_all_runs_entries_concurrently() {
+        let started = std::time::Instant::now();
+        let out = probe_all(|d| {
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            d.id
+        })
+        .unwrap();
+        assert_eq!(
+            out,
+            REGISTRY.iter().map(|d| d.id).collect::<Vec<_>>(),
+            "输出必须保持 REGISTRY 顺序"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(1500),
+            "顺序执行 ≥1800ms，并行应 ~600ms：{:?}",
+            started.elapsed()
+        );
+    }
 
     #[test]
     fn env_validation_rejects_reserved_and_illegal_keys() {

@@ -84,6 +84,11 @@ pub struct ExecRecord {
     /// 最终快照）——成本承接的第一层落盘。
     pub usage_tokens: Option<u64>,
     pub usage_cost: Option<f64>,
+    /// F-BENCH-20：usage 归档口径。Some("message-sum") = 按消息/步求和
+    /// （da9c376 起）；None = 旧口径（只含最后一条消息的 usage，少报）——
+    /// 历史记录未重算，消费方须按 None 区分展示。
+    #[serde(default)]
+    pub usage_caliber: Option<String>,
     /// 本次派发选用的模型（F-VIEW3：续跑列表展示）。
     #[serde(default)]
     pub model: Option<String>,
@@ -605,6 +610,16 @@ fn bindings_gc_in(runtime_dir: &Path, home_id: &str) -> Result<serde_json::Value
 #[allow(dead_code)]
 mod tests {
     use super::*;
+
+    /// F-BENCH-20：da9c376 之前归档的记录没有 usageCaliber——必须可读，
+    /// 且 usage_caliber 反序列化为 None（= 旧口径：只含末条消息，少报）。
+    #[test]
+    fn legacy_exec_record_without_usage_caliber_deserializes() {
+        let json = r#"{"execId":"exec-old","nodeId":null,"runId":null,"startedAt":"1","exitCode":0,"killReason":null,"failureDetail":null,"harnessSessionId":null,"transcriptFile":null,"binaryPath":null,"binaryArgs":[],"pid":null,"processStartId":null,"usageTokens":13980,"usageCost":0.0419}"#;
+        let rec: ExecRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(rec.usage_tokens, Some(13980));
+        assert_eq!(rec.usage_caliber, None, "旧记录无口径标记");
+    }
 
     fn temp_runtime() -> (tempfile::TempDir, PathBuf, String) {
         let dir = tempfile::tempdir().unwrap();
