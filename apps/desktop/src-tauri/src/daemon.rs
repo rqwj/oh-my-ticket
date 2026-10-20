@@ -142,30 +142,10 @@ pub fn is_daemon_gone(problem_message: &str, problem_code: &str) -> bool {
 /// `<runtime-dir>/admin-grants.json` atomically (tmp + rename); all other
 /// principal entries are preserved verbatim, only desktop-kind entries
 /// are collapsed to the one current principal.
+/// 写入经 omt_exec::grants 加锁。
 pub fn register_admin_grant(dir: &Path, principal_id: &str) -> Result<(), String> {
-    let path = dir.join("admin-grants.json");
-    let mut principals: Vec<String> = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        .and_then(|value| {
-            value
-                .get("principalIds")
-                .and_then(|ids| ids.as_array())
-                .map(|ids| {
-                    ids.iter()
-                        .filter_map(|id| id.as_str().map(str::to_string))
-                        .collect()
-                })
-        })
-        .unwrap_or_default();
-    // Drop every desktop entry (stale pids included), keep everything else.
-    principals.retain(|id| !id.starts_with("desktop:"));
-    principals.push(principal_id.to_string());
-    let body = serde_json::json!({ "schemaVersion": 1, "principalIds": principals }).to_string();
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, body).map_err(|err| format!("write grants tmp: {err}"))?;
-    std::fs::rename(&tmp, &path).map_err(|err| format!("rename grants: {err}"))?;
-    Ok(())
+    // P-1：与 exec-shim 的临时授权共用同一把 flock，避免并发覆盖
+    omt_exec::grants::register_replacing_prefix(dir, "desktop:", principal_id)
 }
 
 /// Current status projection (settings page).

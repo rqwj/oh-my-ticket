@@ -2696,6 +2696,7 @@ dependencies = [
  "omt-client",
  "omt-contracts",
  "omt-domain",
+ "omt-exec",
  "omt-storage",
  "rusqlite",
  "serde",

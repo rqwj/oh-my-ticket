@@ -34,3 +34,4 @@ rusqlite = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+omt-exec = { path = "../omt-exec" }
