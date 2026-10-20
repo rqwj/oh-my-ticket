@@ -674,6 +674,11 @@ impl ExecutionManager {
 /// 桌面端启动时的一次性清扫（原 ExecutionManager::new 的副作用）：demote
 /// 上次运行遗留的 Live 记录 + omp/pi 注入的崩溃残留。Task 10 改为启动对账。
 pub fn startup_housekeeping(runtime_dir: &Path) {
+    match crate::migrate::migrate_legacy(runtime_dir) {
+        Ok(r) if r.homes > 0 || !r.skipped_corrupt.is_empty() => eprintln!("存储迁移：{r:?}"),
+        Err(err) => eprintln!("存储迁移失败：{err}（下次启动重试）"),
+        _ => {}
+    }
     match agents::demote_live_agents(runtime_dir) {
         Ok(n) if n > 0 => eprintln!("启动 demote：{n} 个 Live agent 已降级（app 重启）"),
         Err(err) => eprintln!("启动 demote 失败：{err}"),

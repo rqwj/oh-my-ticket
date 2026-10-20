@@ -5,3 +5,4 @@ pub mod agents;
 pub mod executor;
 pub mod layout;
 pub mod mcp_injection;
+pub mod migrate;
