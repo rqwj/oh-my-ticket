@@ -1678,6 +1678,24 @@ F-BENCH-13 查证结论：4e960a2 提交说明声称的探针/capture/lib 改动
 
 **建议**：F-EXEC-14、15 都是小改动，修完后本轮即可收口。F-EXEC-14 中「对账跳过 shim 仍存活的 exec」这一条同时解决删不掉的陷阱和双重释放，优先级最高。其余 P3 放到手工验收（含 §40/§42 追加的验收项）之后。
 
+### §44. §43 修复（2026-10-21，c72830c）
+
+**F-EXEC-14**（四项修法全部落地，先红后绿）：
+- ① 删除守卫与 `list_reconcile_targets` 精确同谓词（`run_id.is_some() && !reconciled && (pending ‖ markers)`）——reconciled=true 的 pending 僵尸记录恢复可删；
+- ② `finish_terminal` 的 Err 回写与 finalize 预置在 `exec.reconciled` 已真时不再置 pending；
+- ③ 两条对账路径（`reconcile_with_connector` / `reconcile_interrupted_execs_with`）跳过 shim 身份仍存活的 target（不标记、留给 shim 自己收尾）——双重释放窗口与「误伤其他 exec 刚认领的 item」同源消除；
+- ④ `agents_delete` 增 `force`（只绕过租约守卫，Starting/Running/Orphan 仍拦）；前端两级确认「放弃租约并删除」接线 + 2 个 vitest。
+- 回归测试：僵尸可删 / Err 不重置 pending / 存活 shim 被跳过×2 / force 绕过租约但不绕过运行守卫。
+
+**F-EXEC-15**：connect（enroll+declare）移回 `run_bounded` 计时内；授权改为计时段**之前**以确定性 principal `cli:<pid>` 预建（TempGrant 本地文件 IO，非阻塞源），Ok/Err/超时三种结局都 drop——慢连接测试把 ~130s 场景钉回有界（变异验证：connect 挪回外面则测试红）。`admin_rpc_prepared` 校验握手 principal 与预期一致。
+
+**§43 P3**：
+- STOP/退出分支不再提前清 `DIALOG_OPEN`（停止进行中再按 ⌘Q 不叠框；只有回到正常运行的分支清零）——手工验收矩阵追加「选『全部停止后退出』后立即再按 ⌘Q」；
+- 停止失败明细带 agent 名（`agent <id>: <err>`），面板全败/部分失败都显示具体是谁（截断前 2 + 等 N 个）；全败路径也 `scheduleAgentsRepull`；
+- 3 个不钉改动的 store 用例：2 个重写为在旧 store（0310069 形态）上实测会红（含相邻段 null 断言），invoke-拒收那个标注为行为守卫（旧代码同形，非回归钉子）。
+
+**验证**：workspace 380 ×3 全绿（374 + 6 新 Rust）；前端 155（+7）、tsc/build 干净；clippy/fmt 干净；nm daemon=0。
+
 ### 残留状态核查（第二轮验收后）
 
 失败尝试在 daemon 侧已成功创建 RUN-0001（pending，持有 TICKET-0001，无执行器），EPIC-0001/TICKET-0001 被 node/execute 标为 in_progress。重试无需清理：ensure-run 复用路径按 pending → start 正常接管（已实测 run-get 确认）。
