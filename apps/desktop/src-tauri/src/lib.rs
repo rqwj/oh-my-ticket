@@ -192,8 +192,21 @@ pub fn run() {
                         match choice.as_str() {
                             KEEP => {}
                             STOP => {
+                                // F-EXEC-3：逐 home 停止，单个失败不吞掉其余
+                                // ——错误如实记录（§39 最小诚实版：至少留下
+                                // 可诊断的日志；退出前再弹一次提示属设计
+                                // 选择，见跟进备注）。
                                 for home_id in omt_exec::layout::home_ids(&runtime_dir) {
-                                    let _ = omt_exec::control::stop_all(&runtime_dir, &home_id);
+                                    match omt_exec::control::stop_all(&runtime_dir, &home_id) {
+                                        Ok(outcome) if outcome.errors.is_empty() => {}
+                                        Ok(outcome) => eprintln!(
+                                            "退出停止（home {home_id}）部分失败：{}",
+                                            outcome.errors.join("；")
+                                        ),
+                                        Err(err) => {
+                                            eprintln!("退出停止（home {home_id}）失败：{err}")
+                                        }
+                                    }
                                 }
                             }
                             _ => return, // 取消 / Esc / 关闭对话框：不退出

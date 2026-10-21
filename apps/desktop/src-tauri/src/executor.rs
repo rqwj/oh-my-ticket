@@ -102,9 +102,19 @@ pub fn exec_stop(exec_id: String) -> Result<(), String> {
 }
 
 /// P-10：停止当前 home 的全部运行中 exec（替代旧的「桌面退出即终止」）。
+/// F-EXEC-3：单个失败不中止其余——返回实际发出信号的数量（TS 契约
+/// `Promise<number>` 不变），失败明细记 stderr（UI 已有结果提示条）。
 #[tauri::command(async)]
 pub fn exec_stop_all(home_id: String) -> Result<usize, String> {
-    omt_exec::control::stop_all(&daemon::runtime_dir(), &home_id)
+    let outcome = omt_exec::control::stop_all(&daemon::runtime_dir(), &home_id)?;
+    if !outcome.errors.is_empty() {
+        eprintln!(
+            "exec_stop_all（home {home_id}）：{} 个 agent 停止失败：{}",
+            outcome.errors.len(),
+            outcome.errors.join("；")
+        );
+    }
+    Ok(outcome.signaled_count)
 }
 
 /// P-10：重新接上仍在运行的 exec 的实时流（桌面重启后 shim 仍在跑）。
