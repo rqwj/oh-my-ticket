@@ -1227,6 +1227,13 @@ pub(crate) fn dispatch_daemon_side(
             {
                 return Err(format!("目标 agent {target} 仍在运行，拒绝并发派发"));
             }
+            // F-EXEC-5：orphan（不受控、pid 仍存活）不可作为续跑目标——append
+            // 会把 attachment 覆盖回 Live，丢失 orphan 追踪。
+            Some(agent) if agent.attachment == AgentAttachment::Orphan => {
+                return Err(format!(
+                    "目标 agent {target} 处于不受控态（pid 存活）——请先强制终止再续跑"
+                ));
+            }
             Some(_) => {}
             None => return Err(format!("目标 agent {target} 不存在（可能已被清理）")),
         }
@@ -3030,6 +3037,65 @@ mod tests {
         assert_eq!(cancels[0]["runId"], "run-new-c");
     }
 
+    /// F-EXEC-4：旧版 omt 二进制不认识 exec-shim verb——忽略参数直接退出 0，
+    /// 不会落任何终态（新 shim 的错误臂会标 Failed，这里刻意绕开）。就绪握手
+    /// 的「shim 已死且无人收尾」分支必须自己走补偿表：Agent 转 Failed +
+    /// failure_detail 落档 + cancel 新建 run（修复前只补 run，Agent 永远停在
+    /// Starting，且 run 的租约视角与 agent 状态漂移）。
+    #[test]
+    fn launch_old_omt_bin_that_ignores_exec_shim_marks_agent_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = write_script(dir.path(), "never-runs-f", "exit 0");
+        let (runtime, home_path) = setup_dispatch_env(dir.path(), "opencode", &program);
+        // 冒充旧版 omt：忽略 exec-shim verb，直接退出 0
+        let old_omt = write_script(dir.path(), "old-omt", "exit 0");
+
+        let fake = FakeDaemon::new(
+            dispatch_node_get(serde_json::json!([])),
+            dispatch_run_get("pending"),
+            "run-new-f",
+        );
+        let rpc = |method: &str, params: serde_json::Value| fake.rpc(method, params);
+
+        let err = crate::launch::start(
+            &rpc,
+            &crate::launch::LaunchRequest {
+                runtime_dir: &runtime,
+                omt_bin: &old_omt,
+                home_id: "h_test",
+                home_path: &home_path,
+                node_id: "t1",
+                harness: "opencode",
+                unattended: false,
+                model: None,
+                resume_session: None,
+                target_agent_id: None,
+                max_duration: DEFAULT_MAX_DURATION,
+            },
+        )
+        .expect_err("shim 退出且未标 Failed 应使 launch 同步失败");
+        assert!(err.contains("exec-shim"), "失败点应在就绪握手: {err}");
+
+        // launcher 必须补上终态（修复前停留在 Starting）
+        let file = read_agents_file(&runtime);
+        assert_eq!(file.agents.len(), 1);
+        assert_eq!(
+            file.agents[0].status,
+            AgentRecordStatus::Failed,
+            "无人收尾时 launcher 必须把 Agent 落成 Failed"
+        );
+        assert_eq!(file.agents[0].attachment, AgentAttachment::None);
+        assert_eq!(
+            file.agents[0].execs[0].failure_detail.as_deref(),
+            Some(err.as_str()),
+            "failure_detail 应落档且与返回错误一致"
+        );
+        // 新建 run 仍被补偿 cancel（既有行为不得回退）
+        let cancels = fake.cancel_params();
+        assert_eq!(cancels.len(), 1);
+        assert_eq!(cancels[0]["runId"], "run-new-f");
+    }
+
     #[test]
     fn dispatch_reused_run_is_never_cancelled_on_later_failure() {
         // run_was_newly_created=false 门：复用已有 run（node/get 返回 runs
@@ -3609,6 +3675,69 @@ mod tests {
         let file = read_agents_file(&runtime);
         assert_eq!(file.agents.len(), 1);
         assert_eq!(file.agents[0].execs.len(), 2, "历史 + 新 exec");
+    }
+
+    /// F-EXEC-5(b)：orphan（不受控、pid 存活）不可作为续跑目标——派发侧的
+    /// 目标 agent 守卫必须在 append_exec 之前拒绝（append 会把 attachment
+    /// 覆盖回 Live，丢失 orphan 追踪）。错误须可行动：先强制终止再续跑。
+    #[test]
+    fn dispatch_rejects_orphan_target_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = write_script(dir.path(), "target-orphan", "exit 0");
+        let (runtime, _home_path) = setup_dispatch_env(dir.path(), "opencode", &program);
+        let agent = agents::register_agent(
+            &runtime,
+            "h_test",
+            "opencode",
+            agents::NewExec {
+                exec_id: "exec-orphan-old".into(),
+                node_id: None,
+                run_id: None,
+                binary_path: None,
+                binary_args: vec![],
+                model: None,
+            },
+        )
+        .unwrap();
+        // reconcile 落出的 orphan 形态：Failed + Orphan（shim 已死、harness 仍活）
+        agents::update_agent_status(
+            &runtime,
+            "h_test",
+            &agent.id,
+            agents::AgentRecordStatus::Failed,
+            agents::AgentAttachment::Orphan,
+        )
+        .unwrap();
+
+        let fake = FakeDaemon::new(
+            dispatch_node_get(serde_json::json!([])),
+            dispatch_run_get("pending"),
+            "run-orphan",
+        );
+        let rpc = |m: &str, p: serde_json::Value| fake.rpc(m, p);
+
+        let err = dispatch_daemon_side(
+            &rpc,
+            &runtime,
+            "h_test",
+            "t1",
+            "opencode",
+            false,
+            None,
+            None,
+            Some(&agent.id),
+        )
+        .unwrap_err();
+        assert!(err.contains("不受控"), "{err}");
+        assert!(err.contains("强制终止"), "{err}");
+
+        // 记录不被改写：仍是 Orphan、无追加 exec（守卫拒绝语义与既有
+        // harness 不一致/运行中守卫一致：⑤ 之前的链上步骤不回滚）
+        let after = agents::get_agent(&runtime, "h_test", &agent.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.attachment, AgentAttachment::Orphan);
+        assert_eq!(after.execs.len(), 1, "不得追加 exec");
     }
 
     /// 验收回归同源第三处：run/get item 的执行器字段是 `executorActor`

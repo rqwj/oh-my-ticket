@@ -11,9 +11,7 @@ use omt_harness::atomic_json::OpenOptionsUnix;
 use omt_harness::harness;
 
 use crate::agents::{self, AgentRecordStatus};
-use crate::executor::{
-    compensate_new_run, dispatch_daemon_side, fail_and_compensate, DaemonRpc, ExecStartOutcome,
-};
+use crate::executor::{dispatch_daemon_side, fail_and_compensate, DaemonRpc, ExecStartOutcome};
 use crate::layout::{self, ExecFile};
 use crate::spec::{LaunchSpec, SPEC_SCHEMA_VERSION};
 
@@ -141,10 +139,13 @@ pub fn start(rpc: DaemonRpc<'_>, req: &LaunchRequest<'_>) -> Result<ExecStartOut
     ) {
         Ready::Spawned => {}
         Ready::Failed(detail) => {
-            // shim 自己已把 Agent 落成 Failed（failure_detail 在），这里只补
-            // 偿 run——不重复走 fail_and_compensate。
-            compensate_new_run(rpc, home_id, &plan.run_id, plan.run_was_newly_created);
-            return Err(detail);
+            // F-EXEC-4：Failed 有两个子来源——shim 的错误臂已把 Agent 落成
+            // Failed（failure_detail 在），或 shim 未及收尾就消失（旧版 omt
+            // 不认识 exec-shim verb、参数解析失败、panic——后者无人写终态）。
+            // 统一走 fail_and_compensate：幂等——已 Failed 时 failure_detail
+            // 不覆盖、状态无变化不落盘（与原先「只补 run」行为等价）；未
+            // Failed 时补齐终态 + cancel 本次新建 run。
+            return Err(compensate(detail));
         }
         Ready::Timeout => warnings.push(format!(
             "exec-shim {}s 内未拉起 harness，执行仍在进行——稍后在 Agents 面板查看",

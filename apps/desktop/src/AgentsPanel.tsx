@@ -454,9 +454,12 @@ export function AgentsPanel({
             }
             onResumeAgent={
               // U10：空闲（非 running/starting）且最新 exec 带 ticket 才可续跑；
+              // F-EXEC-5：orphan（不受控、pid 存活）不可续跑——服务端守卫
+              // 拒绝，UI 直接不给入口（改指路强制终止，见 TranscriptView）；
               // 结果就地报错（harness 未启用/未做知情确认/守卫拒绝等）
               selected.status !== 'running' &&
               selected.status !== 'starting' &&
+              selected.attachment !== 'orphan' &&
               selectedExec.nodeId
                 ? async () => {
                     setResumeError(null)

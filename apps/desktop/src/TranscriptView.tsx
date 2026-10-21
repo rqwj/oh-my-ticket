@@ -410,7 +410,18 @@ export function TranscriptView({
           Raw
         </button>
         <span className="row-spacer" />
-        {!live && onResumeAgent && (
+        {/* F-EXEC-5：orphan（不受控、pid 存活）不可续跑——append 会把
+            attachment 覆盖回 Live 丢失追踪；指路「请先强制终止」（入口在
+            左侧列表行的「强制终止」按钮）。 */}
+        {!live && agent.attachment === 'orphan' && (
+          <span
+            className="orphan-badge"
+            title="执行进程已丢失、harness 仍在运行：请先在列表中强制终止该 agent，再重新派发"
+          >
+            续跑不可用·请先强制终止
+          </span>
+        )}
+        {!live && onResumeAgent && agent.attachment !== 'orphan' && (
           <button
             className="chip"
             onClick={onResumeAgent}

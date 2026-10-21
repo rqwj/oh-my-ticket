@@ -306,8 +306,10 @@ pub fn register_agent(
 }
 
 /// U11：向**既有** agent 追加一次 exec（会话续接派发）。守卫：agent 必须存在、
-/// harness 与 provider 一致、状态非 starting/running（弹窗只列空闲 agent，
-/// 这里是服务端硬校验——renderer 不可信）。成功返回更新后的 agent 记录。
+/// harness 与 provider 一致、状态非 starting/running、attachment 非 orphan
+/// （F-EXEC-5：orphan 的 pid 仍存活，追加会把 attachment 覆盖回 Live、丢失
+/// orphan 追踪——先强制终止）。弹窗只列空闲 agent，这里是服务端硬校验
+/// ——renderer 不可信。成功返回更新后的 agent 记录。
 pub fn append_exec(
     runtime_dir: &Path,
     home_id: &str,
@@ -319,6 +321,8 @@ pub fn append_exec(
     if !path.is_file() {
         return Err(format!("append_exec: agent {agent_id} 不存在"));
     }
+    // update_json 的闭包无法带出错误原因——锁内标记、锁外成文
+    let mut orphan_rejected = false;
     let (record, outcome) = update_json(&path, |agent: &mut AgentRecord| {
         if agent.id != agent_id || agent.harness != harness {
             return false;
@@ -328,6 +332,10 @@ pub fn append_exec(
             agent.status,
             AgentRecordStatus::Starting | AgentRecordStatus::Running
         ) {
+            return false;
+        }
+        if agent.attachment == AgentAttachment::Orphan {
+            orphan_rejected = true;
             return false;
         }
         agent.execs.push(ExecRecord {
@@ -346,6 +354,11 @@ pub fn append_exec(
         true
     })?;
     if !outcome.changed {
+        if orphan_rejected {
+            return Err(format!(
+                "append_exec: agent {agent_id} 处于不受控态（pid 存活）——请先强制终止再续跑"
+            ));
+        }
         return Err(format!(
             "append_exec: agent {agent_id} 不可追加（harness 不一致/运行中）"
         ));
@@ -1147,5 +1160,44 @@ mod tests {
         assert!(find_exec_in_home(&runtime, &home, "exec-zz")
             .unwrap()
             .is_none());
+    }
+
+    /// F-EXEC-5(a)：orphan（不受控、pid 仍存活）不可续跑——锁内拒绝且记录
+    /// 原样（attachment 不被覆盖回 Live、不追加 exec）；错误可行动（先强制
+    /// 终止）。非 orphan 的 Failed agent 仍可正常追加（守卫只挡 orphan）。
+    #[test]
+    fn append_exec_rejects_orphan_and_keeps_record_intact() {
+        let (_dir, runtime, home) = temp_runtime();
+        let a = register_agent(&runtime, &home, "pi", new_exec("exec-a")).unwrap();
+        update_agent_status(
+            &runtime,
+            &home,
+            &a.id,
+            AgentRecordStatus::Failed,
+            AgentAttachment::Orphan,
+        )
+        .unwrap();
+
+        let err = append_exec(&runtime, &home, &a.id, "pi", new_exec("exec-a2")).unwrap_err();
+        assert!(err.contains("不受控"), "{err}");
+        assert!(err.contains("强制终止"), "{err}");
+
+        let after = get_agent(&runtime, &home, &a.id).unwrap().unwrap();
+        assert_eq!(after.attachment, AgentAttachment::Orphan, "attachment 不变");
+        assert_eq!(after.status, AgentRecordStatus::Failed);
+        assert_eq!(after.execs.len(), 1, "不得追加 exec");
+
+        // 回归：解除 orphan（强制终止后的形态）即可续跑
+        update_agent_status(
+            &runtime,
+            &home,
+            &a.id,
+            AgentRecordStatus::Failed,
+            AgentAttachment::None,
+        )
+        .unwrap();
+        let resumed = append_exec(&runtime, &home, &a.id, "pi", new_exec("exec-a3")).unwrap();
+        assert_eq!(resumed.execs.len(), 2);
+        assert_eq!(resumed.attachment, AgentAttachment::Live);
     }
 }

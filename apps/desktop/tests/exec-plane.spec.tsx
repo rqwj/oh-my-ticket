@@ -161,6 +161,18 @@ describe('exec plane P-10', () => {
     expect(screen.queryByText('不受控（重启遗留）')).toBeNull()
   })
 
+  /** F-EXEC-5(c)：orphan agent 不可续跑——隐藏「继续执行」，改为指路
+   * 「请先强制终止」（append 会把 attachment 覆盖回 Live，丢失 orphan 追踪）。 */
+  it('orphan agent has no resume button and points to force-kill instead', () => {
+    const orphan = agent({ status: 'failed', attachment: 'orphan' })
+    orphan.execs[0].nodeId = 'TICKET-9' // 旧判据（非运行中 + 有 ticket）本会放行续跑
+    const resume = vi.fn()
+    renderPanel({ agents: [orphan], onResumeAgent: resume })
+    expect(screen.queryByRole('button', { name: '继续执行' })).toBeNull()
+    expect(screen.getAllByText(/请先强制终止/).length).toBeGreaterThan(0)
+    expect(resume).not.toHaveBeenCalled()
+  })
+
   it('renders without the new props (existing callers unaffected)', () => {
     renderPanel()
     expect(screen.queryByRole('button', { name: '停止全部' })).toBeNull()

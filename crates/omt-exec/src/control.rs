@@ -103,42 +103,85 @@ pub fn exec_id_live(runtime_dir: &Path, exec_id: &str) -> bool {
         if is_active(&loc.agent) && (shim_alive(&loc.exec) || within_launch_grace(&loc.exec)))
 }
 
-/// 停止（幂等）：未知 / 已终态 → Ok；shim 存活 → SIGTERM；shim 已死 → 对账收尾。
-pub fn stop_exec(runtime_dir: &Path, exec_id: &str) -> Result<(), String> {
-    let Some(loc) = find_exec(runtime_dir, exec_id)? else {
-        return Ok(());
-    };
-    if !is_active(&loc.agent) || loc.agent.last_exec_id.as_deref() != Some(exec_id) {
-        return Ok(());
-    }
-    if shim_alive(&loc.exec) {
-        let pid = i32::try_from(loc.exec.shim_pid.unwrap_or(0))
-            .map_err(|_| "shim pid 越界".to_string())?;
-        // SAFETY: 起始标识刚校验过，pid 指向的仍是我们的 shim
-        let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
-        if rc != 0 {
-            return Err(format!(
-                "kill({pid}, SIGTERM): {}",
-                std::io::Error::last_os_error()
-            ));
+/// 向 shim 发 SIGTERM（F-EXEC-3 抽出的信号原语）。ESRCH = shim 在存活检查
+/// 与发信号之间死亡——目标已停止，按 stop 的幂等语义视为成功；其余错误
+/// （EPERM 等）如实上报。
+fn signal_shim(pid: u32) -> Result<(), String> {
+    let pid_i = i32::try_from(pid).map_err(|_| "shim pid 越界".to_string())?;
+    // SAFETY: 仅发送信号；pid 来自已通过内核起始标识校验的持久化记录
+    let rc = unsafe { libc::kill(pid_i, libc::SIGTERM) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(()); // 竞态窗口：目标刚消失——已停止
         }
-        return Ok(());
+        return Err(format!("kill({pid_i}, SIGTERM): {err}"));
     }
-    reconcile_agent(runtime_dir, &loc.home_id, &loc.agent);
     Ok(())
 }
 
-/// 停止某 home 的全部活跃 exec，返回发出停止的数量（P-10「停止全部」）。
-pub fn stop_all(runtime_dir: &Path, home_id: &str) -> Result<usize, String> {
-    let (agents, _) = agents::list_agents(runtime_dir, home_id)?;
-    let mut count = 0;
-    for agent in agents.iter().filter(|a| is_active(a)) {
-        if let Some(exec) = latest_exec(agent) {
-            stop_exec(runtime_dir, &exec.exec_id)?;
-            count += 1;
+/// 停止（幂等）：未知 / 已终态 → Ok；shim 存活 → SIGTERM；shim 已死 → 对账收尾。
+pub fn stop_exec(runtime_dir: &Path, exec_id: &str) -> Result<(), String> {
+    stop_exec_signaled(runtime_dir, exec_id).map(|_| ())
+}
+
+/// stop_exec 的内芯：Ok(true) = 已向目标的 shim 发出停止（含 ESRCH 竞态——
+/// 目标在存活检查与信号之间消失，同样算已停止）；Ok(false) = 无需发信号
+/// （未知 exec / 非活跃或非最新 / shim 已死走对账收尾——没有信号发出，
+/// 不计入 stop_all 的 signaled_count）。
+fn stop_exec_signaled(runtime_dir: &Path, exec_id: &str) -> Result<bool, String> {
+    let Some(loc) = find_exec(runtime_dir, exec_id)? else {
+        return Ok(false);
+    };
+    if !is_active(&loc.agent) || loc.agent.last_exec_id.as_deref() != Some(exec_id) {
+        return Ok(false);
+    }
+    if shim_alive(&loc.exec) {
+        signal_shim(loc.exec.shim_pid.unwrap_or(0))?;
+        return Ok(true);
+    }
+    reconcile_agent(runtime_dir, &loc.home_id, &loc.agent);
+    Ok(false)
+}
+
+/// stop_all 的结果（F-EXEC-3）：实际发出停止信号的数量 + 逐 agent 收集的
+/// 错误（单个失败不中止其余）。signaled_count 只计真正发了信号的 exec——
+/// ESRCH 竞态（目标刚消失）计入；shim 已死走对账收尾的不计（没有信号
+/// 发出，agent 被标 Failed 而非被停止）。
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct StopAllOutcome {
+    pub signaled_count: usize,
+    pub errors: Vec<String>,
+}
+
+/// 停止某 home 的全部活跃 exec（P-10「停止全部」）。F-EXEC-3：逐 agent 处
+/// 理——单个失败（记录损坏、信号失败等）收集进 errors 继续下一个，不再
+/// 首错即中止。逐 agent 现读持久化记录（get_agent，与 kill_orphan 同一的
+/// 身份安全读）：list_agents 对损坏记录是降级跳过，而这里要发信号，必须
+/// 显式暴露「记录损坏、无法安全定位进程」的失败。
+pub fn stop_all(runtime_dir: &Path, home_id: &str) -> Result<StopAllOutcome, String> {
+    let mut outcome = StopAllOutcome::default();
+    for agent_id in layout::agent_ids(runtime_dir, home_id)? {
+        let agent = match agents::get_agent(runtime_dir, home_id, &agent_id) {
+            Ok(Some(agent)) => agent,
+            Ok(None) => continue,
+            Err(err) => {
+                outcome.errors.push(format!("agent {agent_id}: {err}"));
+                continue;
+            }
+        };
+        if !is_active(&agent) {
+            continue;
+        }
+        let Some(exec) = latest_exec(&agent) else {
+            continue;
+        };
+        match stop_exec_signaled(runtime_dir, &exec.exec_id) {
+            Ok(signaled) => outcome.signaled_count += usize::from(signaled),
+            Err(err) => outcome.errors.push(format!("exec {}: {err}", exec.exec_id)),
         }
     }
-    Ok(count)
+    Ok(outcome)
 }
 
 /// 单个活跃 agent 的对账（P-8）。返回是否改成了终态。
@@ -357,5 +400,82 @@ mod tests {
         let status = child.wait().unwrap();
         use std::os::unix::process::ExitStatusExt;
         assert_eq!(status.signal(), Some(libc::SIGTERM));
+    }
+
+    /// F-EXEC-3：shim 在存活检查与发信号之间死亡 → kill 得 ESRCH → 视为已
+    /// 停止（幂等）。spawn+kill+wait 收割后的 pid 不复存在，kill 必得 ESRCH。
+    #[test]
+    fn signal_shim_maps_esrch_to_success() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        let _ = child.wait(); // 收割——僵尸不复存在，后续 kill 得 ESRCH
+        signal_shim(pid).expect("ESRCH 应映射为成功（目标已停止）");
+    }
+
+    /// F-EXEC-3：单个 agent 的记录损坏（get_agent 拒绝解析进程身份——发信号
+    /// 前必须能安全定位进程）不得中止其余 agent 的停止；计数只含真正发了
+    /// 信号的 exec。
+    #[test]
+    fn stop_all_continues_past_errors_and_counts_only_signaled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = tmp.path();
+        // agent-a：活跃 + 存活 shim（真 sleep 进程）——应被发信号并计数
+        let good = reg(rt, "exec-good");
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let start = crate::executor::process_start_identity(child.id()).unwrap();
+        update_exec(rt, "h_t", &good, "exec-good", |e| {
+            e.shim_pid = Some(child.id());
+            e.shim_start_id = Some(start);
+        })
+        .unwrap();
+        // agent-b：同样活跃，但 agent.json 损坏 → 停止路径报错（不安全，不
+        // 得静默跳过——shim 可能在跑）
+        let bad = reg(rt, "exec-bad");
+        std::fs::write(
+            crate::layout::agent_file(rt, "h_t", &bad).unwrap(),
+            "{ broken",
+        )
+        .unwrap();
+
+        let outcome = stop_all(rt, "h_t").unwrap();
+        assert_eq!(
+            outcome.signaled_count, 1,
+            "健康的 agent 仍被停止: {outcome:?}"
+        );
+        assert_eq!(outcome.errors.len(), 1, "损坏记录报错但不中止: {outcome:?}");
+        assert!(outcome.errors[0].contains(&bad), "{}", outcome.errors[0]);
+
+        // 发出的信号确实送达（SIGTERM）
+        let status = child.wait().unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
+    }
+
+    /// F-EXEC-3 计数语义：shim 已死的活跃 agent 走对账收尾（标 Failed），
+    /// 没有信号发出——不计入 signaled_count。
+    #[test]
+    fn stop_all_does_not_count_reconciled_dead_shims() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = tmp.path();
+        let dead = reg(rt, "exec-deadshim");
+        update_exec(rt, "h_t", &dead, "exec-deadshim", |e| {
+            e.shim_pid = Some(u32::MAX);
+            e.shim_start_id = Some("macos:0:0".into()); // 身份不匹配 → shim 已死
+        })
+        .unwrap();
+        backdate(rt, &dead, "exec-deadshim");
+
+        let outcome = stop_all(rt, "h_t").unwrap();
+        assert_eq!(outcome.signaled_count, 0, "{outcome:?}");
+        assert!(outcome.errors.is_empty(), "{outcome:?}");
+        let a = crate::agents::get_agent(rt, "h_t", &dead).unwrap().unwrap();
+        assert_eq!(a.status, AgentRecordStatus::Failed, "对账收尾仍生效");
     }
 }
