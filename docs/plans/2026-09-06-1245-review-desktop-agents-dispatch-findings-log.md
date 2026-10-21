@@ -1539,6 +1539,20 @@ F-BENCH-13 查证结论：4e960a2 提交说明声称的探针/capture/lib 改动
 5. F-EXEC-2、6、7。
 6. P3 在手工验收（14 项）之后择机处理。
 
+### §40. F-EXEC-1..11 修复（2026-10-21，按 §39 建议顺序）
+
+全部 P1+P2 共 11 条修复，五个提交（TDD，每条先红后绿；工作区逐批全绿后提交）：
+
+- **F-EXEC-1**（e292202）：`list_agents` 在 home 级 `agents.json` 仍在或存在未恢复损坏留证时报降级——三场景（A/A2/A3）下 `bindings_gc` 保持冻结，完全迁移后的 home 不受影响（3 个新测试，含 reviewer 复现场景）。
+- **F-EXEC-4/5/3**（58f14d9 + 漏提交补 8ca92b6）：`wait_ready` 死 shim 分支走完整 `fail_and_compensate`（对自标记 Failed 幂等）；`append_exec` 与派发目标守卫拒绝 Orphan、前端对 orphan 隐藏续跑并提示「请先强制终止」；`stop_all` ESRCH 视为成功、逐 agent 续错（返回 `StopAllOutcome`，只计真实发信号数），退出 STOP 分支如实记录错误。
+- **F-EXEC-11/10**（cd332d1）：`finalize_agent_exec` 单事务写 agent 状态/attachment + exec 终态字段（确定性轮询测试修复前 0/20、修复后 20/20；原 e2e 缝隙钉死）；DaemonLink 自建连接设 30s 读写超时（`from_stream`，零改 omt-client）、shim 租约释放全程有界（超时 → `lease_release_pending` 后照常收尾）、keepalive join 有界。
+- **F-EXEC-8/9**（3d692bf）：迁移改 `fs::read`+`from_slice`（非 UTF-8 归入 skipped_corrupt），逐 home 错误记入 `MigrationReport.failed` 并继续（仅全局锁失败中止）；`delete_agent` 持 agent.json 伴生 flock 锁内复核（锁下不调 `read_json`），目录改名 `.trash-<id>-<ts>` 后再删——与 `append_exec` 原子互斥（阻塞式竞态测试钉死）。
+- **F-EXEC-2/6/7**（bbdc194）：shim 第一动作写自身 pid+start-id（launcher 写失败自愈）；launcher 身份写入改关键路径（重试一次，失败 SIGTERM shim + 补偿），`wait_ready` 视 start-id 缺失为未知而非死亡；窗口关闭（CloseRequested）有运行中 exec 时弹三按钮确认（KEEP=隐藏窗口后台继续，dock Reopen 恢复；STOP=停全部后退出；取消=保持），ExitRequested 仅对显式退出确认（code:None 直通）；派发把 resolve_launch/目标守卫挪到建 run 之前，③ 之后全部失败路径补偿（control-start 拒绝、paused 状态两测试钉死）。
+
+**验证**：fmt/clippy `-D warnings` 干净；workspace 366 passed ×3 全绿（343 基线 + 23 个新回归测试）；前端 141、tsc 干净；`nm` daemon=0 / cli=4037（KD-E9 保持）。
+
+**遗留**：§39 P3 清单未动（按建议留手工验收后）；F-EXEC-6 的 tauri 事件胶合无单测——手工验收矩阵追加五项：有 exec 时关窗三分支、KEEP 隐藏后 dock 点击恢复、⌘Q 仍确认、无 exec 关窗直接退出、第二实例聚焦恢复。quit-STOP 失败「再弹一次提示」为设计选择未做（现版 eprintln 留痕）。
+
 ### 残留状态核查（第二轮验收后）
 
 失败尝试在 daemon 侧已成功创建 RUN-0001（pending，持有 TICKET-0001，无执行器），EPIC-0001/TICKET-0001 被 node/execute 标为 in_progress。重试无需清理：ensure-run 复用路径按 pending → start 正常接管（已实测 run-get 确认）。
