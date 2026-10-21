@@ -607,7 +607,9 @@ impl ExecutionManager {
 /// MCP 注入残留（跳过仍在运行的 exec）。
 pub fn startup_housekeeping(runtime_dir: &Path) {
     match crate::migrate::migrate_legacy(runtime_dir) {
-        Ok(r) if r.homes > 0 || !r.skipped_corrupt.is_empty() => eprintln!("存储迁移：{r:?}"),
+        Ok(r) if r.homes > 0 || !r.skipped_corrupt.is_empty() || !r.failed.is_empty() => {
+            eprintln!("存储迁移：{r:?}")
+        }
         Err(err) => eprintln!("存储迁移失败：{err}（下次启动重试）"),
         _ => {}
     }

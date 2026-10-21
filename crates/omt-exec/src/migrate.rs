@@ -15,6 +15,10 @@ pub struct MigrationReport {
     pub files_moved: usize,
     /// 旧 agents.json 无法解析的 home（原地保留，待人工处理）。
     pub skipped_corrupt: Vec<String>,
+    /// 迁移中途硬错误（IO 失败等）的 home：错误已记录、跳过，其余 home
+    /// 继续迁移；旧文件未改名，下次启动自动重试（F-EXEC-8：单个坏 home
+    /// 不得永久阻断全部迁移）。
+    pub failed: Vec<String>,
 }
 
 const LEGACY_FILE: &str = "agents.json";
@@ -40,8 +44,14 @@ pub fn migrate_legacy(runtime_dir: &Path) -> Result<MigrationReport, String> {
         &runtime_dir.join("agents").join(".migrate"),
         LOCK_ACQUIRE_TIMEOUT,
     )?;
+    // F-EXEC-8：单 home 的硬错误（IO 失败等）记进报告后继续下一个 home
+    // ——`?` 穿透会让一个坏 home 拖停所有 home 且每次启动重复失败。只有
+    // 全局锁获取失败才返回 Err（上面已 `?`）。
     for home_id in pending {
-        migrate_home(runtime_dir, &home_id, &mut report)?;
+        if let Err(err) = migrate_home(runtime_dir, &home_id, &mut report) {
+            eprintln!("迁移 home {home_id} 失败：{err}（跳过，下次启动重试）");
+            report.failed.push(home_id);
+        }
     }
     Ok(report)
 }
@@ -56,9 +66,12 @@ fn migrate_home(
     if !legacy.is_file() {
         return Ok(()); // 另一个进程刚迁完
     }
-    // 不经 read_json：损坏时不改名留证，原地保留给人工
-    let text = std::fs::read_to_string(&legacy).map_err(|e| format!("read legacy: {e}"))?;
-    let Ok(file) = serde_json::from_str::<AgentsFile>(&text) else {
+    // 不经 read_json：损坏时不改名留证，原地保留给人工。F-EXEC-8：按字节
+    // 读 + from_slice——非 UTF-8 也归入「解析失败 → skipped_corrupt」，
+    // 不再是硬错（read_to_string 遇非 UTF-8 直接 Err，会把该 home 以及
+    // 后续所有 home 的迁移永久卡死）。
+    let bytes = std::fs::read(&legacy).map_err(|e| format!("read legacy: {e}"))?;
+    let Ok(file) = serde_json::from_slice::<AgentsFile>(&bytes) else {
         report.skipped_corrupt.push(home_id.to_string());
         return Ok(());
     };
@@ -111,7 +124,7 @@ mod tests {
     use super::*;
     use crate::agents::{AgentRecord, AgentRecordStatus, AgentsFile, AgentsMeta, ExecRecord};
 
-    fn legacy_home(runtime: &std::path::Path) {
+    fn legacy_home(runtime: &std::path::Path, home_id: &str) {
         let file = AgentsFile {
             meta: AgentsMeta { agent_seq: 7 },
             agents: vec![AgentRecord {
@@ -128,14 +141,14 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let home = runtime.join("agents").join("h_a");
+        let home = runtime.join("agents").join(home_id);
         std::fs::create_dir_all(&home).unwrap();
         std::fs::write(
             home.join("agents.json"),
             serde_json::to_string(&file).unwrap(),
         )
         .unwrap();
-        let tr = runtime.join("transcripts").join("h_a");
+        let tr = runtime.join("transcripts").join(home_id);
         std::fs::create_dir_all(&tr).unwrap();
         std::fs::write(tr.join("exec-1.jsonl"), "{\"kind\":\"session_header\"}\n").unwrap();
         std::fs::write(tr.join("exec-1.raw.log"), "[stdout] hi\n").unwrap();
@@ -144,7 +157,7 @@ mod tests {
     #[test]
     fn migrates_records_and_transcripts_then_marks_legacy_file() {
         let tmp = tempfile::tempdir().unwrap();
-        legacy_home(tmp.path());
+        legacy_home(tmp.path(), "h_a");
         let report = migrate_legacy(tmp.path()).unwrap();
         assert_eq!((report.homes, report.agents, report.files_moved), (1, 1, 2));
         let dir = crate::layout::agent_dir(tmp.path(), "h_a", "agent-exec-1").unwrap();
@@ -163,7 +176,7 @@ mod tests {
     #[test]
     fn rerun_is_a_noop_and_interrupted_run_resumes() {
         let tmp = tempfile::tempdir().unwrap();
-        legacy_home(tmp.path());
+        legacy_home(tmp.path(), "h_a");
         // 模拟中断：agent.json 已写、transcript 尚未移动、旧文件仍在
         let dir = crate::layout::agent_dir(tmp.path(), "h_a", "agent-exec-1").unwrap();
         std::fs::create_dir_all(&dir).unwrap();
@@ -190,10 +203,82 @@ mod tests {
         std::fs::write(home.join("agents.json"), "{oops").unwrap();
         let report = migrate_legacy(tmp.path()).unwrap();
         assert_eq!(report.skipped_corrupt, vec!["h_bad".to_string()]);
+        assert!(report.failed.is_empty());
         assert!(
             home.join("agents.json").is_file(),
             "损坏文件留原地等人工处理"
         );
+    }
+
+    /// F-EXEC-8(a)：非 UTF-8 的旧文件必须归入 skipped_corrupt（与损坏同
+    /// 语义，原地保留待人工），且**不得中止其余 home 的迁移**——旧的
+    /// `read_to_string` 在此处直接报错，整个 migrate_legacy 返回 Err。
+    #[test]
+    fn non_utf8_legacy_is_skipped_corrupt_and_other_homes_still_migrate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bad = tmp.path().join("agents").join("h_a");
+        std::fs::create_dir_all(&bad).unwrap();
+        // 合法 JSON 骨架里掺非 UTF-8 字节：read_to_string / from_str 必败，
+        // from_slice 也无法解析——按损坏跳过而非硬错。
+        std::fs::write(bad.join("agents.json"), [0x7b, 0x22, 0xFF, 0xFE, 0x7d]).unwrap();
+        legacy_home(tmp.path(), "h_b");
+
+        let report = migrate_legacy(tmp.path()).unwrap();
+
+        assert_eq!(report.skipped_corrupt, vec!["h_a".to_string()]);
+        assert!(report.failed.is_empty(), "非 UTF-8 是损坏跳过，不是硬错误");
+        assert_eq!(report.homes, 1, "h_b 必须照常迁移，不被 h_a 拖停");
+        assert!(
+            bad.join("agents.json").is_file(),
+            "非 UTF-8 文件留原地待人工"
+        );
+        let migrated = crate::layout::agent_dir(tmp.path(), "h_b", "agent-exec-1").unwrap();
+        assert!(migrated.join("agent.json").is_file());
+        assert!(
+            !tmp.path()
+                .join("agents")
+                .join("h_b")
+                .join("agents.json")
+                .exists(),
+            "h_b 的旧文件必须已改名 .migrated"
+        );
+    }
+
+    /// F-EXEC-8(b)：某 home 迁移中途的硬错误（IO 失败）记进报告后**继续
+    /// 迁移其余 home**——旧的 `migrate_home(...)?` 遇错即返回，h_a 永远
+    /// 迁不过去且每次启动都拖停后面的 home。
+    ///
+    /// 确定性 IO 错误模拟：把 h_a 的 `seq.json` 路径占用为**目录**——
+    /// migrate_home 里对 seq.json 的 `update_json` 在写回时执行
+    /// `rename(tmp 文件, seq.json)`，对目录路径的 rename 确定性报
+    /// EISDIR/ENOTDIR。旧文件未改名，下次启动自动重试（幂等语义不变）。
+    #[test]
+    fn hard_error_in_one_home_is_recorded_and_migration_continues() {
+        let tmp = tempfile::tempdir().unwrap();
+        legacy_home(tmp.path(), "h_a");
+        let h_a = tmp.path().join("agents").join("h_a");
+        std::fs::create_dir_all(h_a.join("seq.json")).unwrap(); // 占位目录
+        legacy_home(tmp.path(), "h_b");
+
+        let report = migrate_legacy(tmp.path()).unwrap();
+
+        assert_eq!(
+            report.failed,
+            vec!["h_a".to_string()],
+            "硬错误进报告而非中断"
+        );
+        assert!(report.skipped_corrupt.is_empty());
+        assert_eq!(report.homes, 1, "h_b 必须照常迁移");
+        assert!(
+            h_a.join("agents.json").is_file(),
+            "硬错误的 home 旧文件保留，下次启动重试"
+        );
+        let migrated = crate::layout::agent_dir(tmp.path(), "h_b", "agent-exec-1").unwrap();
+        assert!(
+            migrated.join("agent.json").is_file(),
+            "h_b 的 agent 记录必须已落盘"
+        );
+        assert!(migrated.join("exec-1.jsonl").is_file());
     }
 
     #[test]

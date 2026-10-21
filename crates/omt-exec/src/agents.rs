@@ -14,7 +14,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::layout;
-use omt_harness::atomic_json::{has_unrecovered_corrupt, read_json, update_json};
+use omt_harness::atomic_json::{
+    has_unrecovered_corrupt, lock_exclusive, read_json, update_json, LOCK_ACQUIRE_TIMEOUT,
+};
 
 // ---------------------------------------------------------------------------
 // 持久化 schema（§3.2；camelCase 落盘）
@@ -416,28 +418,6 @@ pub fn list_reconcile_targets(runtime_dir: &Path) -> Result<Vec<ReconcileTarget>
 
 /// 按持久化身份读取单个 agent。Orphan 管理命令用此函数在 Rust 侧完成
 /// home/agent/exec 归属校验，避免 renderer 直接提供可被滥用的 pid。
-/// F-DEL：删除一个 agent（列表项右上角删除入口）。守卫：starting/running
-/// 拒绝（先停止再删）；attachment=orphan 拒绝（pid 仍存活，先强制终止）。
-pub fn delete_agent(runtime_dir: &Path, home_id: &str, agent_id: &str) -> Result<(), String> {
-    let agent = get_agent(runtime_dir, home_id, agent_id)
-        .map_err(|e| format!("删除失败：{e}"))?
-        .ok_or_else(|| format!("agent {agent_id} 不存在"))?;
-    if matches!(
-        agent.status,
-        AgentRecordStatus::Starting | AgentRecordStatus::Running
-    ) {
-        return Err(format!("agent {agent_id} 仍在运行——请先停止再删除"));
-    }
-    if agent.attachment == AgentAttachment::Orphan {
-        return Err(format!(
-            "agent {agent_id} 处于不受控态（pid 存活）——请先强制终止再删除"
-        ));
-    }
-    // P-7：按 agent 拆目录后，transcript 随 agent 一起删除
-    let dir = layout::agent_dir(runtime_dir, home_id, agent_id)?;
-    std::fs::remove_dir_all(&dir).map_err(|e| format!("删除失败：{e}"))
-}
-
 pub fn get_agent(
     runtime_dir: &Path,
     home_id: &str,
@@ -452,6 +432,79 @@ pub fn get_agent(
         return Err(format!("{} 已损坏，拒绝解析进程身份", path.display()));
     }
     Ok((!record.id.is_empty()).then_some(record))
+}
+
+/// F-DEL：删除一个 agent（列表项右上角删除入口）。守卫：starting/running
+/// 拒绝（先停止再删）；attachment=orphan 拒绝（pid 仍存活，先强制终止）。
+///
+/// F-EXEC-9：检查与删除必须在**同一把** agent.json companion flock 内完成
+/// （append_exec / update_json 经 update_json 持的正是这把锁）——旧的
+/// 「无锁 get_agent + remove_dir_all」与并发 append_exec 竞态时会把新 exec
+/// 刚写入的记录/spec 一起删掉，此后的 update_* 因文件不存在全成 no-op，
+/// 租约永不释放。锁内复核用 `fs::read` + `from_slice` 直接读字节：**不能**
+/// 调 read_json——损坏路径会再取同一把 flock，空等 10s（§39）。消失以
+/// 「改名为点前缀的 `.trash-<agentId>-<ts>`」达成（`subdirs()` 跳过点前缀，
+/// 对列表瞬间不可见），改名后仍在锁内 best-effort 移除；移除失败只留下对
+/// 列表隐形的 .trash 残留，不报错。
+pub fn delete_agent(runtime_dir: &Path, home_id: &str, agent_id: &str) -> Result<(), String> {
+    let agent_file = layout::agent_file(runtime_dir, home_id, agent_id)?;
+    if !agent_file.is_file() {
+        return Err(format!("agent {agent_id} 不存在"));
+    }
+    let _guard = lock_exclusive(&agent_file, LOCK_ACQUIRE_TIMEOUT)?;
+    // 锁内复核：文件可能已被并发删除赢走，或损坏（含粘性留证）——后者拒绝
+    // 删除，与 get_agent 的语义一致（无法证明进程身份就不动它）。
+    let corrupt = has_unrecovered_corrupt(&agent_file);
+    let corrupt_err = || {
+        format!(
+            "删除失败：{} 已损坏，拒绝解析进程身份",
+            agent_file.display()
+        )
+    };
+    let record = match std::fs::read(&agent_file) {
+        Ok(bytes) => match serde_json::from_slice::<AgentRecord>(&bytes) {
+            Ok(record) => record,
+            Err(_) => return Err(corrupt_err()),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if corrupt {
+                return Err(corrupt_err());
+            }
+            return Err(format!("agent {agent_id} 不存在"));
+        }
+        Err(e) => return Err(format!("删除失败：read agent.json: {e}")),
+    };
+    if corrupt {
+        return Err(corrupt_err());
+    }
+    if record.id != agent_id {
+        return Err(format!("agent {agent_id} 不存在"));
+    }
+    if matches!(
+        record.status,
+        AgentRecordStatus::Starting | AgentRecordStatus::Running
+    ) {
+        return Err(format!("agent {agent_id} 仍在运行——请先停止再删除"));
+    }
+    if record.attachment == AgentAttachment::Orphan {
+        return Err(format!(
+            "agent {agent_id} 处于不受控态（pid 存活）——请先强制终止再删除"
+        ));
+    }
+    // P-7：按 agent 拆目录后，transcript 随 agent 一起删除。改名仍在锁内：
+    // append_exec 在锁的另一侧只会看到「文件不存在」，不会写进将删的目录。
+    let dir = layout::agent_dir(runtime_dir, home_id, agent_id)?;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or_default();
+    let parent = dir
+        .parent()
+        .ok_or_else(|| format!("删除失败：invalid agent dir {}", dir.display()))?;
+    let trash = parent.join(format!(".trash-{agent_id}-{ts}"));
+    std::fs::rename(&dir, &trash).map_err(|e| format!("删除失败：rename: {e}"))?;
+    let _ = std::fs::remove_dir_all(&trash); // best-effort；失败留隐形残留
+    Ok(())
 }
 
 /// 更新 Agent 终态/状态。**仅状态变化才落盘**（§3.2 写合并）——高频派生量
@@ -1181,6 +1234,103 @@ mod tests {
         std::fs::write(dir.join("exec-a.jsonl"), "{}\n").unwrap();
         delete_agent(&runtime, &home, &a.id).unwrap();
         assert!(!dir.exists());
+    }
+
+    /// F-EXEC-9 竞态的确定性复现（互斥验证）：测试线程先持有 agent.json 的
+    /// companion flock（append_exec / update_json 走的**同一把锁**），期间
+    /// 调 delete_agent——它必须阻塞等锁，而不是绕过锁直接删。旧的「无锁
+    /// get_agent + remove_dir_all」会立刻把目录删掉：并发 append_exec 正在
+    /// 锁内写回的新 exec 记录/spec 一并被删，后续 update_* 全成 no-op、
+    /// 租约永不释放。锁释放后删除完成、目录消失。
+    #[test]
+    fn delete_agent_blocks_on_agent_file_lock_instead_of_deleting() {
+        let (_dir, runtime, home) = temp_runtime();
+        let a = register_agent(&runtime, &home, "pi", new_exec("exec-race")).unwrap();
+        update_agent_status(
+            &runtime,
+            &home,
+            &a.id,
+            AgentRecordStatus::Exited,
+            AgentAttachment::None,
+        )
+        .unwrap();
+        let agent_file = crate::layout::agent_file(&runtime, &home, &a.id).unwrap();
+        let dir = crate::layout::agent_dir(&runtime, &home, &a.id).unwrap();
+
+        let _held = omt_harness::atomic_json::lock_exclusive(
+            &agent_file,
+            omt_harness::atomic_json::LOCK_ACQUIRE_TIMEOUT,
+        )
+        .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let rt = runtime.clone();
+        let h = home.clone();
+        let id = a.id.clone();
+        let worker = std::thread::spawn(move || {
+            let _ = tx.send(delete_agent(&rt, &h, &id));
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            dir.exists(),
+            "锁被持有时 delete_agent 不得删除（检查+删除必须对 append_exec 原子）"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "锁被持有时 delete_agent 不得已完成（必须阻塞在 flock 上）"
+        );
+
+        drop(_held);
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(Ok(())) => {}
+            other => panic!("锁释放后 delete_agent 必须 promptly 完成: {other:?}"),
+        }
+        worker.join().unwrap();
+        assert!(!dir.exists(), "删除完成后目录必须消失");
+        let (agents, _) = list_agents(&runtime, &home).unwrap();
+        assert!(
+            agents.is_empty(),
+            "删除后列表不得残留（含 .trash 改名清理）"
+        );
+        let home_dir = crate::layout::home_dir(&runtime, &home).unwrap();
+        let trash: Vec<String> = std::fs::read_dir(&home_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with(".trash-"))
+            .collect();
+        assert!(
+            trash.is_empty(),
+            "best-effort 清理后不应残留 .trash-*: {trash:?}"
+        );
+    }
+
+    /// F-EXEC-9 功能面：对已结束 agent 的删除（锁内复核 + 改名 .trash-* +
+    /// 移除）完成后，随后的续跑必须报「不存在」——而不是把新 exec 的记录/
+    /// spec 写进已删除目录（回写变 no-op、对账找不到、租约永不释放）。
+    #[test]
+    fn delete_then_append_errors_instead_of_writing_into_deleted_dir() {
+        let (_dir, runtime, home) = temp_runtime();
+        let a = register_agent(&runtime, &home, "pi", new_exec("exec-d1")).unwrap();
+        update_agent_status(
+            &runtime,
+            &home,
+            &a.id,
+            AgentRecordStatus::Exited,
+            AgentAttachment::None,
+        )
+        .unwrap();
+        let dir = crate::layout::agent_dir(&runtime, &home, &a.id).unwrap();
+        std::fs::write(dir.join("exec-d1.jsonl"), "{}\n").unwrap();
+
+        delete_agent(&runtime, &home, &a.id).unwrap();
+        assert!(!dir.exists(), "目录（含 transcript）必须消失");
+
+        let err = append_exec(&runtime, &home, &a.id, "pi", new_exec("exec-d2")).unwrap_err();
+        assert!(err.contains("不存在"), "{err}");
+        assert!(!dir.exists(), "失败的续跑不得复活目录");
+        let (agents, _) = list_agents(&runtime, &home).unwrap();
+        assert!(agents.is_empty());
     }
 
     #[test]
