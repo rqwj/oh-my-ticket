@@ -34,17 +34,19 @@ branch: feat/desktop-agents-dispatch
 | F-BENCH-24 | P3 | gated_auto | BENCH | `fixtures/harness/*/raw.log` / `bench.rs::fixtures_are_normalized` | 55a8e55 提交说明称「时间戳已清洗」「覆盖下限 ≥12」，实际 raw.log 仍有 170 处内嵌 ISO 时间戳（omp 100 / opencode 10 / pi 60，与 §30 计数相同），测试下限仍是 `checked >= 9`，归一化测试也不检查时间戳；另含 `mcp:93364` 这类真实 pid（§31） | fixed(2b8e036)：288 处 ISO + 87 处 pid 清洗（行级解析一致性保持）、防回退断言 + 下限 13、capture normalize() 生成侧补齐、meta.json 说明如实化（§32） | — |
 | F-BENCH-25 | P3→P2 | gated_auto | 设置页 / 探针 | `harness.rs::probe_descriptor` / `harness_list` | 探针梯子 2/6/6s 后，挂起型 binary（flag 写错起 TUI）每家最长 14s（原 6s）；`harness_list` 按 REGISTRY 串行探测，三家都挂时设置页约 42s 才出结果。注释「首试保 TUI 快否决」不成立——首试超时后仍会再等 12s。可改为各 provider 并行探测，或在 UI 先返回 pending 再回填版本（§33） | fixed(e87a99a)：probe_all 并行探测（保序，墙钟 = 最慢一家）+ 并行性测试；不实注释已改写（挂起判定 6→14s 如实记录，由并行补偿）；根配置线程上限注释改为「冗余保险」定位（§34） | — |
 | F-BENCH-26 | P2 | gated_auto | U2/U12 | `executor.rs::finish_terminal` / 等待线程 `:640-670` | **终态先于落账发布**：(a) `finish_terminal` 第一步就写 `terminal`，之后才算 usage、写 agents.json、写 session id、追加 exit 行——轮询 `terminal()` 的一方会读到半成品；(b) reader 线程在 `finish_terminal` **之后**才 join，等待线程只等「首事件」≤300ms——最后几行 stdout（通常正是最后一条 `message_end`）可能还没被解析，usage 少记最后一条、session id 丢失、exit 之后还有 raw 行。16 线程下 6 次有 3 次失败（三个不同测试，均秒级失败，不是 30s 窗口超时）；慢 sink 确定性复现 3/3：归档 100 而非 250、jsonl 末行不是 exit；4 线程上限把它掩盖了（§35） | fixed(9e6331e)：waiter 清孤儿后先 drain_readers（有界 10s）再落账；幂等 guard 改 finishing 原子标记、terminal 最后发布；评审复现改编为回归测试（不 sleep，(a)(b) 同钉）；16T ×10 验证门全绿后线程上限已删除（§36） | — |
-| F-EXEC-1 | P1 | gated_auto | 存储/U9 | `crates/omt-exec/src/agents.rs::bindings_gc_value` / `list_agents` | **旧 store 损坏或未迁移的 home 失去 GC 冻结**。旧 `agents.json` 损坏时迁移跳过它，原地保留，冻结只靠 `seq.json` 缺失维持；用户在该 home 派发一次后 `seq.json` 被创建，冻结就解除，「清理绑定」会删掉指向旧 agent 的绑定。升级前已有的 `agents.json.corrupt-*` 留证也被忽略。已复现（§39） | open | — |
-| F-EXEC-2 | P2 | gated_auto | 执行面 | `launch.rs` 写 shim 身份 / `control.rs` | **shim 身份只由 launcher 尽力写入**。写入失败，或 launcher 在 spawn 与写入之间退出时，健康的 exec 会在 60s 宽限后被判为 SHIM_LOST，对账随即释放它正持有的租约（同一 ticket 可被再次派发），停止操作也被静默丢弃。修法：shim 启动时先自己写入身份（§39） | open | — |
-| F-EXEC-3 | P2 | gated_auto | 执行面 | `control.rs::stop_all` / 桌面退出路径 | **`stop_all` 遇到第一个错误就中断**，退出路径还吞掉了错误。shim 恰好在身份校验与 kill 之间退出（ESRCH）就会触发，用户选了「全部停止后退出」，其余 agent 却仍在运行（§39） | open | — |
-| F-EXEC-4 | P2 | gated_auto | 执行面 | `launch.rs::wait_ready` | **「shim 意外退出」分支只取消 run，不把 agent 标为 Failed**。agent 停在 Starting/Live，既不能续跑也不能删除，要等手动停止或下次重启才恢复（§39） | open | — |
-| F-EXEC-5 | P2 | gated_auto | 执行面/前端 | `agents.rs::append_exec` / 派发守卫 / AgentsPanel | **orphan 可以续跑**。续跑把 `attachment=Orphan` 覆盖成 Live：旧 harness 仍在跑同一会话，却再也无法强制终止。失败说明「可续跑」还在鼓励用户这样做（§39） | open | — |
-| F-EXEC-6 | P2 | gated_auto | 桌面 | `lib.rs` ExitRequested | **关主窗口（红按钮或 ⌘W）也会弹退出确认**，选「取消」后应用没有窗口，dock 点击（Reopen）没人处理，single-instance 又挡住重新启动（§39） | open | — |
-| F-EXEC-7 | P2 | gated_auto | 执行面 | `executor.rs::dispatch_daemon_side` ③–⑤ | **新建 run 之后有几条失败路径不补偿**（run/get、run/control start、resolve_launch、目标 agent 校验），新 run 卡在 running。改造前已存在（§39） | open | — |
-| F-EXEC-8 | P2 | gated_auto | 存储 | `migrate.rs` | **一个坏 home 让所有 home 的迁移中止，而且每次启动都中止**。非 UTF-8 的旧文件在 `read_to_string` 处直接返回错误，走不到 skipped_corrupt 分支。已复现（§39） | open | — |
-| F-EXEC-9 | P2 | gated_auto | 存储 | `agents.rs::delete_agent` | **删除的检查与删除不在同一把锁内**（相对旧实现是退化）。并发续跑会被 `remove_dir_all` 删掉 spec 和记录，租约无法再释放（§39） | open | — |
-| F-EXEC-10 | P2 | gated_auto | 执行面 | `executor.rs::finish_terminal` / `daemon_link` | **daemon 无响应时 shim 永不退出**。租约释放的 RPC 没有超时，terminal 不会发布，跟随线程不会结束；状态已是终态，停止操作是 no-op，退出确认也不计入这个 exec（§39） | open | — |
-| F-EXEC-11 | P2 | gated_auto | 执行面/测试 | `executor.rs::finish_terminal` / `exec_survives_launcher.rs:98` | **终态状态和 exit_code 分两次写入**，读方可能看到 Exited 但 exit_code 为空。单独跑 `exec_completes_after_launcher_is_killed` 6 次失败 1 次，CI 会偶发变红；UI 也会短暂显示不一致的状态（§39） | open | — |
+| F-EXEC-1 | P1 | gated_auto | 存储/U9 | `crates/omt-exec/src/agents.rs::bindings_gc_value` / `list_agents` | **旧 store 损坏或未迁移的 home 失去 GC 冻结**。旧 `agents.json` 损坏时迁移跳过它，原地保留，冻结只靠 `seq.json` 缺失维持；用户在该 home 派发一次后 `seq.json` 被创建，冻结就解除，「清理绑定」会删掉指向旧 agent 的绑定。升级前已有的 `agents.json.corrupt-*` 留证也被忽略。已复现（§39） | fixed(e292202)；P3：降级永久、无恢复入口、横幅文案不符（§41） | — |
+| F-EXEC-2 | P2 | gated_auto | 执行面 | `launch.rs` 写 shim 身份 / `control.rs` | **shim 身份只由 launcher 尽力写入**。写入失败，或 launcher 在 spawn 与写入之间退出时，健康的 exec 会在 60s 宽限后被判为 SHIM_LOST，对账随即释放它正持有的租约（同一 ticket 可被再次派发），停止操作也被静默丢弃。修法：shim 启动时先自己写入身份（§39） | fixed(bbdc194)；P3 残口：shim 自写可能把 Some 覆盖成 None（§41） | — |
+| F-EXEC-3 | P2 | gated_auto | 执行面 | `control.rs::stop_all` / 桌面退出路径 | **`stop_all` 遇到第一个错误就中断**，退出路径还吞掉了错误。shim 恰好在身份校验与 kill 之间退出（ESRCH）就会触发，用户选了「全部停止后退出」，其余 agent 却仍在运行（§39） | 部分 fixed(58f14d9+8ca92b6)：Rust 侧逐个续错已修；桌面侧把错误吞成成功，见 F-EXEC-12（§41） | — |
+| F-EXEC-4 | P2 | gated_auto | 执行面 | `launch.rs::wait_ready` | **「shim 意外退出」分支只取消 run，不把 agent 标为 Failed**。agent 停在 Starting/Live，既不能续跑也不能删除，要等手动停止或下次重启才恢复（§39） | fixed(58f14d9) | — |
+| F-EXEC-5 | P2 | gated_auto | 执行面/前端 | `agents.rs::append_exec` / 派发守卫 / AgentsPanel | **orphan 可以续跑**。续跑把 `attachment=Orphan` 覆盖成 Live：旧 harness 仍在跑同一会话，却再也无法强制终止。失败说明「可续跑」还在鼓励用户这样做（§39） | 部分 fixed(58f14d9)：后端已修；ExecutionDialog 仍列出 orphan，orphan 行仍显示「可续跑」（P3，§41） | — |
+| F-EXEC-6 | P2 | gated_auto | 桌面 | `lib.rs` ExitRequested | **关主窗口（红按钮或 ⌘W）也会弹退出确认**，选「取消」后应用没有窗口，dock 点击（Reopen）没人处理，single-instance 又挡住重新启动（§39） | 部分 fixed(bbdc194)：关窗确认、隐藏与恢复、⌘Q 已核实；关窗确认框可重入（P3，§41） | — |
+| F-EXEC-7 | P2 | gated_auto | 执行面 | `executor.rs::dispatch_daemon_side` ③–⑤ | **新建 run 之后有几条失败路径不补偿**（run/get、run/control start、resolve_launch、目标 agent 校验），新 run 卡在 running。改造前已存在（§39） | fixed(bbdc194) | — |
+| F-EXEC-8 | P2 | gated_auto | 存储 | `migrate.rs` | **一个坏 home 让所有 home 的迁移中止，而且每次启动都中止**。非 UTF-8 的旧文件在 `read_to_string` 处直接返回错误，走不到 skipped_corrupt 分支。已复现（§39） | fixed(3d692bf) | — |
+| F-EXEC-9 | P2 | gated_auto | 存储 | `agents.rs::delete_agent` | **删除的检查与删除不在同一把锁内**（相对旧实现是退化）。并发续跑会被 `remove_dir_all` 删掉 spec 和记录，租约无法再释放（§39） | 部分 fixed(3d692bf)：与 append_exec 互斥已修；删除丢失对账标记见 F-EXEC-13（§41） | — |
+| F-EXEC-10 | P2 | gated_auto | 执行面 | `executor.rs::finish_terminal` / `daemon_link` | **daemon 无响应时 shim 永不退出**。租约释放的 RPC 没有超时，terminal 不会发布，跟随线程不会结束；状态已是终态，停止操作是 no-op，退出确认也不计入这个 exec（§39） | fixed(cd332d1)；P3 副作用：超时后临时授权残留、item 卡在 failed（§41） | — |
+| F-EXEC-11 | P2 | gated_auto | 执行面/测试 | `executor.rs::finish_terminal` / `exec_survives_launcher.rs:98` | **终态状态和 exit_code 分两次写入**，读方可能看到 Exited 但 exit_code 为空。单独跑 `exec_completes_after_launcher_is_killed` 6 次失败 1 次，CI 会偶发变红；UI 也会短暂显示不一致的状态（§39） | fixed(cd332d1)；P3：kill_orphan 等写入方仍是两步写（§41） | — |
+| F-EXEC-12 | P2 | gated_auto | 桌面/前端 | `apps/desktop/src-tauri/src/executor.rs::exec_stop_all` | **「停止全部」的失败被报成成功**（F-EXEC-3 修复引入的回归）。错误只打到 stderr，命令仍返回 `Ok(signaled_count)`：全部失败时界面显示「当前没有运行中的 agent」，部分失败时显示「已向 N 个 agent 发出停止信号」，与 R2-7「失败、无事可做、成功三种结果分开提示」相违（§41） | open | — |
+| F-EXEC-13 | P2 | gated_auto | 执行面/存储 | `executor.rs::finish_terminal` / `agents.rs::delete_agent` | **租约释放的待对账标记会丢**。<br>(a) finalize 先写终态（pending=false），再去释放租约；这段窗口里 shim 被杀或机器关机，记录处于终态，却既无 SHIM_LOST 标记也无 pending 标记，对账永远找不到它。<br>(b) 删除守卫只看 status 和 attachment：在释放窗口里，或对一个仍带未对账标记的 Failed agent 执行删除，记录随目录一起消失，租约永不释放。<br>这是 F-EXEC-9 原本要防的结果（§41） | open | — |
 | F-BENCH-13 | P1 | manual | BENCH | `4e960a2` 提交说明 / §27（修复节） | 提交说明与日志称 F-BENCH-5/6/7/10 及 8/12 部分已修，但 `harness_probe.rs`、`harness-capture.rs`、`lib.rs` 自 f6eeaed 后**未改动**（无 worktree / stash / 其他分支留存）——改动疑似未提交即丢失（§28） | fixed(3192d60)（改动已重做并核实存在） | — |
 | F-BENCH-14 | P1 | manual | BENCH/U12 | `executor.rs` usage 归档 / `bench.rs` / `adapters.rs` | **usage 是每条消息的值，不是会话累计**：pi 1.3.0 与 omp 18.12.2 语料中 cost 逐消息非单调（0.0349→0.0095→0.0078→0.0092）。F-U12-3「累计快照取末值」的口径错误——ExecRecord 的 usage 与分析器的 tokens/cost 只记最后一条消息：pi 卷报 $0.0092 实为 $0.0615（少报 6.7 倍），omp 卷报 $0.0096 实为 $0.0431（§28） | fixed(da9c376 + 55a8e55)：三家均按消息/步求和 | — |
 | F-BENCH-15 | P1 | manual | BENCH | `bench.rs::raw_lines_reparse_through_current_adapter` | 重放测不到解析漂移：语料的 raw 行只是采集时**未产出事件**的行，产出 tool_call / thinking / text 的源行没有保留，无从重放；该测试能通过只因 4e960a2 新增的 turn_end usage 提取（改动前 pi 的 raw 行重放结构化数为 0）（§28） | fixed(55a8e55)：raw.log 已入库，重放对账测试在干净树上可跑 | — |
@@ -1552,6 +1554,63 @@ F-BENCH-13 查证结论：4e960a2 提交说明声称的探针/capture/lib 改动
 **验证**：fmt/clippy `-D warnings` 干净；workspace 366 passed ×3 全绿（343 基线 + 23 个新回归测试）；前端 141、tsc 干净；`nm` daemon=0 / cli=4037（KD-E9 保持）。
 
 **遗留**：§39 P3 清单未动（按建议留手工验收后）；F-EXEC-6 的 tauri 事件胶合无单测——手工验收矩阵追加五项：有 exec 时关窗三分支、KEEP 隐藏后 dock 点击恢复、⌘Q 仍确认、无 exec 关窗直接退出、第二实例聚焦恢复。quit-STOP 失败「再弹一次提示」为设计选择未做（现版 eprintln 留痕）。
+
+### §41. `35acda6..d2dbcd6` · F-EXEC-1..11 修复 · code review（2026-10-21）
+
+**方法**：3 组并行评审，按修复范围分组：存储（1/8/9），收尾、超时与身份（10/11/2），控制面与 desktop（3–7）。tauri 侧对照源码核实（tauri 2.12.4、tauri-runtime-wry 2.12.2、rfd 0.16.0）。评审用独立的 `CARGO_TARGET_DIR`，避免和后台验证互相干扰。F-EXEC-11 由评审方把旧的两步写放回去重跑新测试，6/6 红，确认测试有效。
+
+**自动化验证（安静环境）**：
+- fmt、clippy `-D warnings` 干净；
+- workspace 跑 3 遍，每遍 366 passed、0 failed；
+- `exec_survives_launcher` 单独连跑 10 次全绿，§39 的 flake 已消除；
+- `nm` daemon=0；
+- 桌面 vitest 141 passed，`tsc` 干净。
+
+**逐条结论**：
+- **FIXED**：
+  - F-EXEC-1：A、A2、A3 三个场景都已闭合；完全迁移的 home 不误伤；测试在旧代码上会红。
+  - F-EXEC-2：A、B 两个场景已闭合；launcher 的 SIGTERM 不会造成 harness 孤儿。
+  - F-EXEC-4：幂等，测试在旧代码上会红。
+  - F-EXEC-7：建 run 之前完成全部校验；③ 之后所有失败都经 `fail_post_run` 补偿；复用的 run 不会被取消。
+  - F-EXEC-8：逐 home 隔离；非 UTF-8 归入 skipped_corrupt。
+  - F-EXEC-10：超时设在实际使用的 socket 上（自建连接后走 `from_stream`）；中途超时不会污染后续调用；租约释放全程受 30s 上限约束；keeper 最多 join 2s 后放手。
+  - F-EXEC-11：`finish_terminal` 一次事务写入全部终态字段，F-BENCH-26 的顺序保持不变。
+- **PARTIAL**：
+  - F-EXEC-3：Rust 侧已修。desktop 命令把错误吞成成功，见 F-EXEC-12。回归测试的失败源来自修复新加的 `get_agent` 损坏分支，若退回旧的 `?` 写法，测试不会红，原 bug 没有被钉住。
+  - F-EXEC-5：后端已修。ExecutionDialog 仍把 orphan 列在「空闲 Agent（续跑）」里（服务端会拒绝，属 UX 问题）；orphan 行仍显示「…可续跑」——所有 orphan 都带 SHIM_LOST_MARKER，而测试夹具的 failureDetail 为 null，没覆盖到。
+  - F-EXEC-6：`prevent_close` 生效；隐藏窗口不会触发 ExitRequested；窗口隐藏时 ⌘Q 仍会确认；dock 的 Reopen 能恢复窗口；第二实例也能恢复窗口。缺口是关窗确认框可以重入：rfd 在没有父窗口时弹的不是模态框，用户可能在一个框里选 KEEP，又在另一个过期的框里选 STOP。
+  - F-EXEC-9：删除与 `append_exec` 已正确互斥，锁顺序无死锁。但删除会丢失对账标记，见 F-EXEC-13。
+
+| ID | 级别 | 说明 |
+|---|---|---|
+| F-EXEC-12 | P2 | `exec_stop_all` 返回 `Ok(outcome.signaled_count)`，错误只 `eprintln!`。以前全部失败时返回 Err，前端拿到 null，显示「停止失败」；现在返回 `Ok(0)`，显示「当前没有运行中的 agent」。修法：errors 非空且 signaled 为 0 时返回 Err；部分失败时把 `{signaled, errors}` 传给前端（需改 TS 接口约定），并同步改 `stopAll` 和提示文案；补测试。 |
+| F-EXEC-13 | P2 | 两个窗口的结果相同：终态记录没有任何标记，对账找不到，租约永不释放。<br>(a) `finalize_agent_exec` 写终态时 `lease_release_pending=false`，到释放完成之间最长 30s。<br>(b) `delete_agent` 的锁内检查不看 exec 的对账状态。<br>修法：<br>① 有 run_id 且有释放回调时，在 finalize 同一个事务里先置 `lease_release_pending=true`，释放成功后再清除；<br>② 删除守卫在锁内拒绝两种 agent：存在 `run_id.is_some() && !reconciled && (lease_release_pending ‖ failure_detail ∈ markers)` 的 exec，或最新 exec 的 shim 仍存活。 |
+
+**P3（新发现，或修复的副作用）**：
+- *存储*：
+  - F-EXEC-1 让旧文件损坏的 home 永久处于降级状态，没有恢复入口；横幅文案「已降级为空列表（损坏文件已留证 .corrupt-*）」与实际不符（列表并不为空，文件也没有被改名）；atomic_json 注释所说的「移入 recovered/」机制并不存在。建议给出单独的 `legacyUnmigrated` 标志并附上路径，再提供一个「确认并归档」的动作。
+  - 删除操作竞争失败的一方会重建一个只含锁文件的空 agent 目录，从不清理；落败的 `append_exec` 报「不可追加」，而不是「不存在」。
+  - `.trash-*` 目录删除失败时被静默吞掉，也没有任何清扫，应 `eprintln!` 并在 `startup_housekeeping` 里清扫。
+  - 删除在 `remove_dir_all` 期间仍持有 flock；同进程的 `update_json` 会持着全局 `STORE_LOCK` 等待。应在 rename 之后立即释放 guard。
+  - `agent.json` 已被隔离的 agent，删除时报「不存在」，以前报「已损坏」。
+- *收尾、超时与身份*：
+  - 超时后 worker 线程被放手，`TempGrant` 不会 drop，`cli:<shim pid>` 的 admin 授权残留到下次 desktop 启动，pid 被复用时有提权风险。修法：shim 返回前幂等地移除自己的 principal。
+  - 如果 report 已成功、retry 遇到超时，item 会停在 failed 状态；对账只挑 running 状态的 item，于是永远不会 retry。
+  - shim 自写身份时，如果读取自身起始标识失败，会把 launcher 已写好的 `Some` 覆盖成 `None`，使 F-EXEC-2 场景 A 重新出现。应只在读取成功时写入，且绝不把 Some 降为 None。
+  - launcher 的 SIGTERM 到达时，shim 若已装好信号处理，仍会把 harness 拉起来（run 已被取消），最终 Killed 状态会覆盖 Failed。应在 `manager.spawn` 之前检查 `STOP_REQUESTED`。
+  - `kill_orphan` 仍是先写 status、再写 kill_reason 的两步写。`reconcile_agent`、`fail_and_compensate`、shim 失败路径也不是原子写，但不会出现「终态 + 空字段」。
+- *控制面与 desktop*：
+  - 关窗确认框可以重入，见上文 F-EXEC-6，建议用 `DIALOG_OPEN` 的 CAS 防重入；
+  - ExecutionDialog 仍列出 orphan；orphan 行仍显示「可续跑」；
+  - F-EXEC-3 的回归测试没有钉住原 bug；
+  - 改造前就存在：② `node/execute` 仍在校验之前执行，配置错误时节点会被留在 in_progress；
+  - launcher 身份写入失败时的 SIGTERM + 补偿分支没有测试；
+  - 几个测试在进程级设置环境变量（`OMT_SHIM_LEASE_TIMEOUT_MS` 等），与同一二进制里其他测试并行，目前安全，CI 负载高时可能 flake。
+
+**建议**：
+1. 先修 F-EXEC-12、13（两条都是小改动）。
+2. P3 中优先处理：shim 自写身份把 Some 覆盖成 None（会让 F-EXEC-2 重新出现）、超时后临时授权残留（提权）、orphan 行显示「可续跑」、关窗确认框重入。
+3. 其余 P3 放到手工验收之后。
 
 ### 残留状态核查（第二轮验收后）
 
