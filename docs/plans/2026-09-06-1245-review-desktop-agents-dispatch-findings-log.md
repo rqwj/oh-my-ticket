@@ -1751,6 +1751,16 @@ F-BENCH-13 查证结论：4e960a2 提交说明声称的探针/capture/lib 改动
 
 **建议**：F-EXEC-16 是本轮唯一的 P2。最省事的组合是 ① + ③：先尽力释放一次，再如实说明后果。改动都不大，修完后本系列可以收口；其余 P3 放到手工验收之后。
 
+### §46. §45 修复（2026-10-21，c8abc6a）
+
+- **F-EXEC-16 ①+③**：`agents_delete(force)` 先经 admin connector 尽力释放该 agent 的未对账租约（新 `executor::force_release_agent_leases`——镜像对账循环、不跳存活 shim、逐项 best-effort 不中止；`is_reconcile_target` 谓词统一为单一来源），响应带 `leasesReleased`/`leaseReleaseFailures`；四处「交由 daemon 对账收尾/租约留给 daemon」全部改为如实后果（「run item 可能一直显示运行中，需到 Runs 面板手动取消该 run」），保留后端原始「请等待对账完成」提示。2 个 Rust 测试 + 前端文案断言（禁语零残留，grep 验证）。
+- **P3-1**：强制删除第二步去掉 3s 自动复位；按钮「放弃租约并删除 <显示名>」；出现时聚焦确认按钮 + `aria-describedby` 指向警告文本。
+- **P3-2**：停止失败明细改 `Agent N (exec-id): <err>`（display_name，缺失回退内部 id）。
+- **P3-3**：agents.rs 过期注释更正（finalize 先写终态、其后最多 ~30s 租约释放窗口）。
+- **P3-4**：§44 追加勘误（旧 store 上会红的 store 用例实为 1 个而非 2 个；TempGrant 增删受 10s flock 上限、锁竞争下最坏 ~70s，非「非阻塞」）。
+
+**验证**：workspace 382 ×3 全绿（380+2）；前端 158（+3）、tsc 干净；clippy/fmt 干净；nm daemon=0。
+
 ### 残留状态核查（第二轮验收后）
 
 失败尝试在 daemon 侧已成功创建 RUN-0001（pending，持有 TICKET-0001，无执行器），EPIC-0001/TICKET-0001 被 node/execute 标为 in_progress。重试无需清理：ensure-run 复用路径按 pending → start 正常接管（已实测 run-get 确认）。
