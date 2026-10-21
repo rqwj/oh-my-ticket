@@ -12,10 +12,60 @@ mod rpc_bridge;
 mod state;
 
 use state::SharedSession;
+use std::path::Path;
+use std::sync::atomic::Ordering;
 use tauri::Manager;
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogResult};
 
 /// review F6：用户在确认框里选过之后，再次进入 ExitRequested 时直接放行。
 static QUIT_CONFIRMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 退出 / 关窗确认共用的三按钮文案（review R2-6：第一个按钮是 Return 默认
+/// 键，放安全的「继续在后台运行」；「取消」= 不退出，误按 ⌘Q / 关窗时可以
+/// 反悔）。
+const DIALOG_KEEP: &str = "继续在后台运行";
+const DIALOG_STOP: &str = "全部停止后退出";
+const DIALOG_CANCEL: &str = "取消";
+
+/// 三按钮确认框（YesNoCancelCustom）的结果归一——部分平台/回退形态会以
+/// Yes/No 报告，按安全方向映射回三选一。
+fn dialog_choice(result: MessageDialogResult) -> String {
+    match result {
+        MessageDialogResult::Custom(label) => label,
+        MessageDialogResult::Yes => DIALOG_KEEP.to_string(),
+        MessageDialogResult::No => DIALOG_STOP.to_string(),
+        _ => DIALOG_CANCEL.to_string(),
+    }
+}
+
+/// F-EXEC-6 / review F6：退出或关窗前的「全部停止」——逐 home 停止，单个
+/// 失败不吞掉其余（F-EXEC-3 最小诚实版：错误如实记录，至少留下可诊断的
+/// 日志；退出前再弹一次提示属设计选择，见跟进备注）。
+fn stop_all_execs(runtime_dir: &Path) {
+    for home_id in omt_exec::layout::home_ids(runtime_dir) {
+        match omt_exec::control::stop_all(runtime_dir, &home_id) {
+            Ok(outcome) if outcome.errors.is_empty() => {}
+            Ok(outcome) => {
+                eprintln!(
+                    "退出停止（home {home_id}）部分失败：{}",
+                    outcome.errors.join("；")
+                )
+            }
+            Err(err) => eprintln!("退出停止（home {home_id}）失败：{err}"),
+        }
+    }
+}
+
+/// F-EXEC-6：主窗口恢复显示。关窗确认选「继续在后台运行」只隐藏不销毁窗口
+/// （CloseRequested 已 prevent），macOS dock 图标点击（RunEvent::Reopen /
+/// applicationShouldHandleReopen）或第二实例启动时由此恢复。
+fn restore_main_window(app: &tauri::AppHandle) {
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.show();
+        let _ = win.unminimize();
+        let _ = win.set_focus();
+    }
+}
 
 /// 设计 §3.4：桌面退出不再终止执行（KD-D7 已被 KD-E1 修订）；有运行中的
 /// exec 时退出前确认，并提供 Agents 面板「停止全部」。
@@ -43,11 +93,7 @@ pub fn run() {
     // 注意这是 best-effort 守卫（如 socket 被同机其他用户占用时插件会静默放行），
     // 跨进程写安全的正确性守卫是 U4a 的文件锁（计划 §3.6.6）——不要省掉文件锁。
     let single_instance = tauri_plugin_single_instance::init(|app, _args, _cwd| {
-        if let Some(win) = app.get_webview_window("main") {
-            let _ = win.show();
-            let _ = win.unminimize();
-            let _ = win.set_focus();
-        }
+        restore_main_window(app);
     });
     // F-U15-2：single-instance socket 仅由 identifier 派生，dev 实例会与打包版互判为
     // 第二实例。debug 构建可用 OMT_ALLOW_MULTI_INSTANCE=1 跳过守卫（多 worktree 并行
@@ -66,6 +112,54 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(SharedSession::new())
+        // F-EXEC-6：主窗口 CloseRequested 把关——有运行中的 exec 时不许窗口
+        // 直接销毁（销毁后才发出 ExitRequested{code:None}，届时 Cancel 只能
+        // prevent_exit，留下无窗口且无法恢复的应用）。这里先 prevent_close
+        // 再弹同款三按钮：KEEP = 隐藏窗口、应用后台继续（dock 图标仍在，
+        // Reopen 恢复）；STOP = 全部停止后退出；CANCEL = 窗口保持原样。
+        // 没有运行中的 exec 时放行关闭（随后的 ExitRequested{code:None}
+        // 直通退出）。
+        .on_window_event(|window, event| {
+            if window.label() != "main" {
+                return;
+            }
+            let tauri::WindowEvent::CloseRequested { api, .. } = event else {
+                return;
+            };
+            let runtime_dir = daemon::runtime_dir();
+            let running = omt_exec::control::active_exec_count(&runtime_dir);
+            if running == 0 {
+                return;
+            }
+            api.prevent_close();
+            let handle = window.app_handle().clone();
+            window
+                .dialog()
+                .message(format!(
+                    "还有 {running} 个 agent 在运行。选择「{DIALOG_KEEP}」后窗口会隐藏，\
+                     它们继续执行到完成或超时；点击 dock 图标可重新打开本应用查看或停止。"
+                ))
+                .title("关闭 oh-my-ticket")
+                .buttons(MessageDialogButtons::YesNoCancelCustom(
+                    DIALOG_KEEP.into(),
+                    DIALOG_STOP.into(),
+                    DIALOG_CANCEL.into(),
+                ))
+                .show_with_result(move |result| match dialog_choice(result).as_str() {
+                    DIALOG_KEEP => {
+                        // 后台继续：隐藏保活的窗口，应用不退出
+                        if let Some(win) = handle.get_webview_window("main") {
+                            let _ = win.hide();
+                        }
+                    }
+                    DIALOG_STOP => {
+                        stop_all_execs(&runtime_dir);
+                        QUIT_CONFIRMED.store(true, Ordering::SeqCst);
+                        handle.exit(0);
+                    }
+                    _ => {} // 取消 / Esc / 关闭对话框：close 已被 prevent，窗口不动
+                });
+        })
         // 自定义应用菜单（review R2-5）：默认 macOS 菜单的 Quit 走 `terminate:`，
         // 直接结束进程，不产生 ExitRequested，下面的退出确认永远弹不出来。
         // 自定义 Quit 菜单项改调 app.exit(0)——经 RequestExit 产生 ExitRequested。
@@ -153,67 +247,59 @@ pub fn run() {
         .run(|app, event| {
             // 设计 §3.4：退出不再终止执行（KD-D7 已被 KD-E1 修订）。还有运行中的
             // exec 时先问用户：全部停止后退出，或让它们在后台继续（review F6）
-            if let tauri::RunEvent::ExitRequested { api, .. } = event {
-                use std::sync::atomic::Ordering;
-                if QUIT_CONFIRMED.load(Ordering::SeqCst) {
-                    return;
-                }
-                let runtime_dir = daemon::runtime_dir();
-                let running = omt_exec::control::active_exec_count(&runtime_dir);
-                if running == 0 {
-                    return;
-                }
-                api.prevent_exit();
-                let handle = app.clone();
-                use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogResult};
-                const KEEP: &str = "继续在后台运行";
-                const STOP: &str = "全部停止后退出";
-                const CANCEL: &str = "取消";
-                app.dialog()
-                    .message(format!(
-                        "还有 {running} 个 agent 在运行。选择「{KEEP}」后，它们会一直执行到完成或超时；\
-                         随时可以重新打开本应用查看或停止。"
-                    ))
-                    .title("退出 oh-my-ticket")
-                    // review R2-6：第一个按钮是 Return 默认键，放安全的「继续在后台运行」；
-                    // 「取消」= 不退出（误按 ⌘Q 时可以反悔）
-                    .buttons(MessageDialogButtons::YesNoCancelCustom(
-                        KEEP.into(),
-                        STOP.into(),
-                        CANCEL.into(),
-                    ))
-                    .show_with_result(move |result| {
-                        let choice = match result {
-                            MessageDialogResult::Custom(label) => label,
-                            MessageDialogResult::Yes => KEEP.to_string(),
-                            MessageDialogResult::No => STOP.to_string(),
-                            _ => CANCEL.to_string(),
-                        };
-                        match choice.as_str() {
-                            KEEP => {}
-                            STOP => {
-                                // F-EXEC-3：逐 home 停止，单个失败不吞掉其余
-                                // ——错误如实记录（§39 最小诚实版：至少留下
-                                // 可诊断的日志；退出前再弹一次提示属设计
-                                // 选择，见跟进备注）。
-                                for home_id in omt_exec::layout::home_ids(&runtime_dir) {
-                                    match omt_exec::control::stop_all(&runtime_dir, &home_id) {
-                                        Ok(outcome) if outcome.errors.is_empty() => {}
-                                        Ok(outcome) => eprintln!(
-                                            "退出停止（home {home_id}）部分失败：{}",
-                                            outcome.errors.join("；")
-                                        ),
-                                        Err(err) => {
-                                            eprintln!("退出停止（home {home_id}）失败：{err}")
-                                        }
-                                    }
-                                }
+            match event {
+                tauri::RunEvent::ExitRequested { code, api, .. } => {
+                    if QUIT_CONFIRMED.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    // F-EXEC-6：code None = 最后一个窗口关闭后的自然退出请求。
+                    // 窗口关闭已在 CloseRequested 处把关（有运行中 exec 时
+                    // prevent 并弹确认），能走到这里说明没有需要确认的执行
+                    // ——直通退出。修复前 handler 无视 code，对这种窗口销毁
+                    // 后才到达的事件也弹确认，Cancel 后就剩下无窗口、无法
+                    // 恢复的应用进程。显式退出（code Some：菜单 Quit /
+                    // app.exit / STOP 路径）仍走三按钮确认。
+                    if code.is_none() {
+                        return;
+                    }
+                    let runtime_dir = daemon::runtime_dir();
+                    let running = omt_exec::control::active_exec_count(&runtime_dir);
+                    if running == 0 {
+                        return;
+                    }
+                    api.prevent_exit();
+                    let handle = app.clone();
+                    app.dialog()
+                        .message(format!(
+                            "还有 {running} 个 agent 在运行。选择「{DIALOG_KEEP}」后，它们会一直执行到完成或超时；\
+                             随时可以重新打开本应用查看或停止。"
+                        ))
+                        .title("退出 oh-my-ticket")
+                        // review R2-6：第一个按钮是 Return 默认键，放安全的「继续在后台运行」；
+                        // 「取消」= 不退出（误按 ⌘Q 时可以反悔）
+                        .buttons(MessageDialogButtons::YesNoCancelCustom(
+                            DIALOG_KEEP.into(),
+                            DIALOG_STOP.into(),
+                            DIALOG_CANCEL.into(),
+                        ))
+                        .show_with_result(move |result| {
+                            match dialog_choice(result).as_str() {
+                                DIALOG_KEEP => {}
+                                DIALOG_STOP => stop_all_execs(&runtime_dir),
+                                _ => return, // 取消 / Esc / 关闭对话框：不退出
                             }
-                            _ => return, // 取消 / Esc / 关闭对话框：不退出
-                        }
-                        QUIT_CONFIRMED.store(true, Ordering::SeqCst);
-                        handle.exit(0);
-                    });
+                            QUIT_CONFIRMED.store(true, Ordering::SeqCst);
+                            handle.exit(0);
+                        });
+                }
+                // F-EXEC-6：KEEP 隐藏后的恢复——用户点击 dock 图标
+                // （applicationShouldHandleReopen）时重新显示主窗口。
+                #[cfg(target_os = "macos")]
+                tauri::RunEvent::Reopen {
+                    has_visible_windows: false,
+                    ..
+                } => restore_main_window(app),
+                _ => {}
             }
         });
 }

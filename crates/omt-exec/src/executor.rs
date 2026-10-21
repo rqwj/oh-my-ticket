@@ -1132,67 +1132,11 @@ pub(crate) fn dispatch_daemon_side(
         }),
     )?;
 
-    // ③ ensure-run
-    let (run_id, run_was_newly_created) = if let Some(existing) = active_runs.first() {
-        (existing.clone(), false)
-    } else {
-        let resp = rpc(
-            "run/create",
-            serde_json::json!({
-                "homeId": home_id, "title": format!("dispatch {node_id}"),
-                "nodeIds": members, "commandId": format!("{dispatch_id}:create"),
-            }),
-        )?;
-        // run/create 返回 run_view_full（dispatch.rs）：run id 在 `run.runId`。
-        // 缺失时显式报错——空 runId 会在后续 run/get 以更迷惑的
-        // `unknown run: (NOT_FOUND)` 爆出（验收 F-ACC-4）。
-        let created = resp["run"]["runId"]
-            .as_str()
-            .ok_or("run/create 响应缺少 run.runId（daemon 契约漂移）")?
-            .to_string();
-        (created, true)
-    };
-
-    // ④ run/control start（仅 pending）
-    let run_status = rpc(
-        "run/get",
-        serde_json::json!({"homeId": home_id, "runId": run_id}),
-    )?["run"]["status"]
-        .as_str()
-        .unwrap_or("pending")
-        .to_string();
-    match run_status.as_str() {
-        "pending" => {
-            rpc(
-                "run/control",
-                serde_json::json!({
-                    "homeId": home_id, "runId": run_id, "action": "start",
-                    "commandId": format!("{dispatch_id}:start"),
-                }),
-            )?;
-        }
-        "running" => {} // 复用：跳过 start
-        "paused" | "interrupted" => {
-            return Err(format!(
-                "run {run_id} 是 {run_status}，需在弹窗中选择 resume/retry 或取消"
-            ));
-        }
-        other => return Err(format!("run {run_id} 状态 {other}，无法派发")),
-    }
-
-    // 启动参数（记录用；shim 会用同一输入重算，P-4）。语义上属步骤 ⑧，但
-    // 提前到 ⑤ 之前执行：NewExec 要落真实 binary 路径与 args（§3.1：路径与
-    // args 可落盘，env 值绝不），且解析失败时同 ①–④ 一样不留 Agent 记录。
+    // 启动参数（记录用；shim 会用同一输入重算，P-4）。F-EXEC-7：harness 解析、
+    // exec_id / agent 目录与目标 agent 校验提前到 ③ ensure-run 之前——它们不
+    // 依赖 run_id（prompt 的 {run_id} 替换仍留在 ③ 之后），失败时尚未新建
+    // run，天然无需补偿；原顺序下这些 ⑤ 前置步骤若在 ③ 后失败会泄漏新建 run。
     let plan = harness::resolve_launch(runtime_dir, provider_id)?;
-    let prompt = DISPATCH_PROMPT
-        .replace("{run_id}", &run_id)
-        .replace("{home_id}", home_id)
-        .replace(
-            "{tool_hint}",
-            harness::descriptor_of(provider_id)
-                .map(|d| d.tool_hint)
-                .unwrap_or(""),
-        );
     // exec_id 提前生成：Agent 记录、agent 目录三方共用（新 agent 的 id 由
     // execId 派生；续跑用目标 agent 自己的目录——KD-E2）。
     let exec_id = format!("exec-{}", omt_harness::atomic_json::unique_suffix());
@@ -1201,19 +1145,10 @@ pub(crate) fn dispatch_daemon_side(
         None => crate::layout::new_agent_id(&exec_id),
     };
     let agent_dir = crate::layout::agent_dir(runtime_dir, home_id, &agent_id_for_paths)?;
-    let prompt_file = harness::prompt_file_path(&agent_dir, &exec_id, plan.prompt_channel);
-    let args = harness::compose_launch_args(
-        &plan,
-        unattended,
-        &prompt,
-        prompt_file.as_deref(),
-        model,
-        resume_session,
-    );
 
-    // ⑤ 注册 / 续接 agent。U11：target_agent_id 命中既有 agent（会话续接）
-    // ——服务端硬校验（存在 / harness 一致 / 非存活），追加 exec 而非新建。
-    // 失败按补偿表 cancel 本次新建 run（不留记录）。
+    // ⑤ 注册 / 续接 agent 的目标校验（F-EXEC-7 提前到 ③ 之前）。U11：
+    // target_agent_id 命中既有 agent（会话续接）——服务端硬校验（存在 /
+    // harness 一致 / 非存活），追加 exec 而非新建。
     if let Some(target) = target_agent_id {
         match agents::get_agent(runtime_dir, home_id, target)? {
             Some(agent) if agent.harness != provider_id => {
@@ -1241,6 +1176,92 @@ pub(crate) fn dispatch_daemon_side(
             None => return Err(format!("目标 agent {target} 不存在（可能已被清理）")),
         }
     }
+
+    // ③ ensure-run
+    let (run_id, run_was_newly_created) = if let Some(existing) = active_runs.first() {
+        (existing.clone(), false)
+    } else {
+        let resp = rpc(
+            "run/create",
+            serde_json::json!({
+                "homeId": home_id, "title": format!("dispatch {node_id}"),
+                "nodeIds": members, "commandId": format!("{dispatch_id}:create"),
+            }),
+        )?;
+        // run/create 返回 run_view_full（dispatch.rs）：run id 在 `run.runId`。
+        // 缺失时显式报错——空 runId 会在后续 run/get 以更迷惑的
+        // `unknown run: (NOT_FOUND)` 爆出（验收 F-ACC-4）。此处不补偿：响应
+        // 缺 runId 时连补偿 cancel 的目标 id 都没有（daemon 契约漂移只能上抛）。
+        let created = resp["run"]["runId"]
+            .as_str()
+            .ok_or("run/create 响应缺少 run.runId（daemon 契约漂移）")?
+            .to_string();
+        (created, true)
+    };
+
+    // ④ run/control start（仅 pending）。F-EXEC-7：③ 之后的每个失败点
+    // （run/get 失败 / start 失败 / paused、interrupted 及未知状态拒绝）统一
+    // 过补偿表——run 是本次新建时 cancel，不留无人认领的 pending run；复用
+    // run 的 cancel 门关死（run_was_newly_created=false）。
+    let fail_post_run = |err: String| -> String {
+        compensate_new_run(rpc, home_id, &run_id, run_was_newly_created);
+        err
+    };
+    let run_status = match rpc(
+        "run/get",
+        serde_json::json!({"homeId": home_id, "runId": run_id}),
+    ) {
+        Ok(resp) => resp["run"]["status"]
+            .as_str()
+            .unwrap_or("pending")
+            .to_string(),
+        Err(err) => return Err(fail_post_run(err)),
+    };
+    match run_status.as_str() {
+        "pending" => {
+            if let Err(err) = rpc(
+                "run/control",
+                serde_json::json!({
+                    "homeId": home_id, "runId": run_id, "action": "start",
+                    "commandId": format!("{dispatch_id}:start"),
+                }),
+            ) {
+                return Err(fail_post_run(err));
+            }
+        }
+        "running" => {} // 复用：跳过 start
+        "paused" | "interrupted" => {
+            return Err(fail_post_run(format!(
+                "run {run_id} 是 {run_status}，需在弹窗中选择 resume/retry 或取消"
+            )));
+        }
+        other => {
+            return Err(fail_post_run(format!(
+                "run {run_id} 状态 {other}，无法派发"
+            )))
+        }
+    }
+
+    let prompt = DISPATCH_PROMPT
+        .replace("{run_id}", &run_id)
+        .replace("{home_id}", home_id)
+        .replace(
+            "{tool_hint}",
+            harness::descriptor_of(provider_id)
+                .map(|d| d.tool_hint)
+                .unwrap_or(""),
+        );
+    let prompt_file = harness::prompt_file_path(&agent_dir, &exec_id, plan.prompt_channel);
+    let args = harness::compose_launch_args(
+        &plan,
+        unattended,
+        &prompt,
+        prompt_file.as_deref(),
+        model,
+        resume_session,
+    );
+
+    // ⑤ 注册 / 续接 agent。失败按补偿表 cancel 本次新建 run（不留记录）。
     let new_exec = crate::agents::NewExec {
         exec_id: exec_id.clone(),
         node_id: Some(node_id.to_string()),
@@ -2714,6 +2735,8 @@ mod tests {
         node_get: serde_json::Value,
         run_get: serde_json::Value,
         run_create_id: String,
+        /// F-EXEC-7：run/control action=start 的脚本化失败（补偿表测试注入）。
+        run_control_start_err: Option<String>,
     }
 
     impl FakeDaemon {
@@ -2727,7 +2750,14 @@ mod tests {
                 node_get,
                 run_get,
                 run_create_id: run_create_id.to_string(),
+                run_control_start_err: None,
             }
+        }
+
+        /// F-EXEC-7：让 ④ 的 run/control start 失败（cancel 等其余调用不受影响）。
+        fn with_run_control_start_err(mut self, msg: &str) -> Self {
+            self.run_control_start_err = Some(msg.to_string());
+            self
         }
 
         fn rpc(
@@ -2738,7 +2768,12 @@ mod tests {
             self.calls
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push((method.to_string(), params));
+                .push((method.to_string(), params.clone()));
+            if method == "run/control" && params["action"] == "start" {
+                if let Some(err) = &self.run_control_start_err {
+                    return Err(err.clone());
+                }
+            }
             Ok(match method {
                 "node/get" => self.node_get.clone(),
                 "run/get" => self.run_get.clone(),
@@ -2894,6 +2929,76 @@ mod tests {
         assert!(!crate::layout::seq_file(&runtime, "h_test")
             .unwrap()
             .exists());
+    }
+
+    /// F-EXEC-7(1)：④ run/control start 失败——run 已在 ③ 新建，链在此失败时
+    /// 必须经补偿表 cancel 本次新建的 run（修复前该路径直接 Err，daemon 里
+    /// 留下无人认领的 pending run）。错误消息原样透传。
+    #[test]
+    fn dispatch_run_control_start_failure_cancels_new_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = write_script(dir.path(), "never-runs-g", "exit 0");
+        let (runtime, _home_path) = setup_dispatch_env(dir.path(), "opencode", &program);
+
+        let fake = FakeDaemon::new(
+            dispatch_node_get(serde_json::json!([])),
+            dispatch_run_get("pending"),
+            "run-new-g",
+        )
+        .with_run_control_start_err("daemon 拒绝 start");
+        let rpc = |method: &str, params: serde_json::Value| fake.rpc(method, params);
+
+        let err = dispatch_daemon_side(
+            &rpc, &runtime, "h_test", "t1", "opencode", false, None, None, None,
+        )
+        .expect_err("run/control start 失败应使 dispatch_daemon_side 失败");
+        assert_eq!(err, "daemon 拒绝 start", "错误消息应原样透传");
+
+        // 新建 run 恰好被补偿一次，且是最后一次 daemon 调用
+        let cancels = fake.cancel_params();
+        assert_eq!(cancels.len(), 1, "应恰好一次补偿 cancel: {err}");
+        assert_eq!(cancels[0]["runId"], "run-new-g");
+        assert_eq!(cancels[0]["homeId"], "h_test");
+        assert_eq!(
+            fake.method_names().last().map(String::as_str),
+            Some("run/control"),
+            "最后一次 daemon 调用应是补偿 cancel: {:?}",
+            fake.method_names()
+        );
+    }
+
+    /// F-EXEC-7(2)：④ run/get 报 paused——同样过补偿表 cancel 新建 run（修复
+    /// 前只 Err 不 cancel，新建 run 泄漏在 daemon 侧）。错误消息保持不变
+    /// （可行动文案：弹窗里 resume/retry 或取消）。
+    #[test]
+    fn dispatch_paused_run_failure_cancels_new_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = write_script(dir.path(), "never-runs-h", "exit 0");
+        let (runtime, _home_path) = setup_dispatch_env(dir.path(), "opencode", &program);
+
+        let fake = FakeDaemon::new(
+            dispatch_node_get(serde_json::json!([])),
+            dispatch_run_get("paused"),
+            "run-new-h",
+        );
+        let rpc = |method: &str, params: serde_json::Value| fake.rpc(method, params);
+
+        let err = dispatch_daemon_side(
+            &rpc, &runtime, "h_test", "t1", "opencode", false, None, None, None,
+        )
+        .expect_err("paused run 应使 dispatch_daemon_side 失败");
+        assert!(err.contains("paused"), "{err}");
+        assert!(err.contains("resume/retry"), "{err}");
+
+        let cancels = fake.cancel_params();
+        assert_eq!(cancels.len(), 1, "应恰好一次补偿 cancel: {err}");
+        assert_eq!(cancels[0]["runId"], "run-new-h");
+        assert_eq!(
+            fake.method_names().last().map(String::as_str),
+            Some("run/control"),
+            "最后一次 daemon 调用应是补偿 cancel: {:?}",
+            fake.method_names()
+        );
     }
 
     #[test]

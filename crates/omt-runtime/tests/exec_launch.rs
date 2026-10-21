@@ -116,6 +116,18 @@ fn launch_returns_once_harness_is_spawned_and_exec_finishes_later() {
         "launcher 不应等执行结束"
     );
     assert!(at_return.execs[0].pid.is_some(), "就绪 = harness 已 spawn");
+    // F-EXEC-2：launcher 的 shim 身份落档是关键步骤——pid 与内核起始标识
+    // 都必须在（缺起始身份会被 wait_ready / 存活检查当成未知或已死）。
+    assert!(
+        at_return.execs[0].shim_pid.is_some(),
+        "shim pid 应已落档: {:?}",
+        at_return.execs[0]
+    );
+    assert!(
+        at_return.execs[0].shim_start_id.is_some(),
+        "shim 起始身份应已落档: {:?}",
+        at_return.execs[0]
+    );
     let deadline = Instant::now() + Duration::from_secs(40);
     loop {
         let agent = omt_exec::agents::get_agent(&runtime, "h_test", &outcome.agent_id)

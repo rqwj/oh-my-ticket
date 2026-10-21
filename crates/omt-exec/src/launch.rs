@@ -122,11 +122,31 @@ pub fn start(rpc: DaemonRpc<'_>, req: &LaunchRequest<'_>) -> Result<ExecStartOut
         Ok(pid) => pid,
         Err(err) => return Err(compensate(err)),
     };
-    let shim_start_id = crate::executor::process_start_identity(shim_pid).ok();
-    let _ = agents::update_exec(runtime_dir, home_id, &plan.agent.id, &plan.exec_id, |e| {
-        e.shim_pid = Some(shim_pid);
-        e.shim_start_id.clone_from(&shim_start_id);
-    });
+    // F-EXEC-2：身份落档改为关键步骤——读取失败（重试一次，覆盖 spawn 与
+    // exec 间的瞬时窗口）或写失败都视同 ⑧ 失败：SIGTERM 刚拉起的 shim（若
+    // 信号早于 shim 安装处理函数，默认终止语义同样达成；shim 已自行退出的
+    // ESRCH 按已停止处理），走与 spawn 失败相同的补偿表。记录不了身份的
+    // shim 无法被停止 / 存活检查安全追踪，只能不留它。shim 自己的第一动作
+    // 也会写同一笔（自愈），但 launcher 无法区分「shim 已写好」与「记录
+    // 损坏」，故本侧失败按失败处理。
+    let shim_start_id = match crate::executor::process_start_identity(shim_pid)
+        .or_else(|first| crate::executor::process_start_identity(shim_pid).map_err(|_| first))
+    {
+        Ok(id) => Some(id),
+        Err(err) => {
+            terminate_shim(shim_pid);
+            return Err(compensate(format!("读取 exec-shim 起始身份失败: {err}")));
+        }
+    };
+    if let Err(err) =
+        agents::update_exec(runtime_dir, home_id, &plan.agent.id, &plan.exec_id, |e| {
+            e.shim_pid = Some(shim_pid);
+            e.shim_start_id.clone_from(&shim_start_id);
+        })
+    {
+        terminate_shim(shim_pid);
+        return Err(compensate(format!("记录 exec-shim 身份失败: {err}")));
+    }
 
     // ⑨ 就绪握手（P-5）
     let mut warnings = plan.warnings;
@@ -161,6 +181,28 @@ pub fn start(rpc: DaemonRpc<'_>, req: &LaunchRequest<'_>) -> Result<ExecStartOut
     })
 }
 
+/// F-EXEC-2(2)：就绪握手里的「shim 已死」判定——shim_pid 已记**且起始身份
+/// 也在**、但身份对不上，才算死；起始身份缺失（拉起时读取失败 / 旧记录）
+/// 按「未知身份」处理，不算死（继续等到超时）。否则启动竞态 B：wait_ready
+/// 的首个 poll 就把 start_id None 的健康 shim 判死，取消一次实际还在跑的
+/// 执行。与 control 侧的保守判定（identity_alive 对 None 恒 false——发信号
+/// 前必须确知身份）方向相反是有意的：这里是「不要误杀」，那里是「不要误发
+/// 信号」。
+fn shim_reported_dead(exec: &crate::agents::ExecRecord) -> bool {
+    exec.shim_pid.is_some() && exec.shim_start_id.is_some() && !crate::control::shim_alive(exec)
+}
+
+/// F-EXEC-2：wait_ready 的等待上限。生产缺省 30s；环境变量
+/// `OMT_LAUNCH_READY_TIMEOUT_MS` 覆盖（测试用，镜像 shim 侧
+/// `OMT_SHIM_LEASE_TIMEOUT_MS` 的既有 seam 形态）。
+fn ready_timeout() -> Duration {
+    std::env::var("OMT_LAUNCH_READY_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(READY_TIMEOUT)
+}
+
 fn wait_ready(
     runtime_dir: &Path,
     home_id: &str,
@@ -168,7 +210,7 @@ fn wait_ready(
     exec_id: &str,
     shim_log: &Path,
 ) -> Ready {
-    let deadline = Instant::now() + READY_TIMEOUT;
+    let deadline = Instant::now() + ready_timeout();
     loop {
         if let Ok(Some(agent)) = agents::get_agent(runtime_dir, home_id, agent_id) {
             if let Some(exec) = agent.execs.iter().find(|e| e.exec_id == exec_id) {
@@ -182,7 +224,7 @@ fn wait_ready(
                             .unwrap_or_else(|| "exec-shim 启动失败".into()),
                     );
                 }
-                if exec.shim_pid.is_some() && !crate::control::shim_alive(exec) {
+                if shim_reported_dead(exec) {
                     return Ready::Failed(format!(
                         "exec-shim 意外退出，详见 {}",
                         shim_log.display()
@@ -238,4 +280,108 @@ pub fn spawn_shim(
         let _ = child.wait();
     });
     Ok(pid)
+}
+
+/// F-EXEC-2：⑧ 身份落档失败时终止刚拉起的 shim（与 spawn 失败同一语义）。
+/// ESRCH = 它已自行退出（幂等，按已停止处理）；其余错误只能记日志——补偿表
+/// 仍照走。
+fn terminate_shim(pid: u32) {
+    let Ok(pid_i) = i32::try_from(pid) else {
+        return;
+    };
+    // SAFETY: 仅发送信号；pid 是本进程刚 spawn 的 shim 子进程
+    let rc = unsafe { libc::kill(pid_i, libc::SIGTERM) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::ESRCH) {
+            eprintln!("launcher: 终止 exec-shim（pid {pid}）失败: {err}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agents::{self, NewExec};
+
+    fn register(runtime: &Path, exec_id: &str) -> agents::AgentRecord {
+        agents::register_agent(
+            runtime,
+            "h_t",
+            "pi",
+            NewExec {
+                exec_id: exec_id.into(),
+                node_id: None,
+                run_id: Some("RUN-1".into()),
+                binary_path: None,
+                binary_args: vec![],
+                model: None,
+            },
+        )
+        .unwrap()
+    }
+
+    /// F-EXEC-2(2)：就绪握手不得把「shim_pid 已记但起始身份缺失」判成 shim
+    /// 已死（场景 B：拉起时身份读取失败——start_id None 的首个 poll 会因
+    /// identity_alive 恒 false 判死，把还在启动的健康执行误取消，而 shim 本体
+    /// 继续跑）。身份缺失的记录配一个真存活的 sleep 进程冒充 shim：身份缺失
+    /// 应按「未知」处理——继续等直到超时（Timeout），而不是 Failed。
+    /// `OMT_LAUNCH_READY_TIMEOUT_MS` 把等待压到测试量级（生产缺省 30s 不变）。
+    #[test]
+    fn wait_ready_treats_missing_shim_start_id_as_unknown_not_dead() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = tmp.path();
+        let agent = register(runtime, "exec-nostart");
+        let mut shim = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        agents::update_exec(runtime, "h_t", &agent.id, "exec-nostart", |e| {
+            e.shim_pid = Some(shim.id());
+            e.shim_start_id = None; // 场景 B：身份缺失，但 shim 本体存活
+        })
+        .unwrap();
+        let log = runtime.join("shim.log");
+        std::env::set_var("OMT_LAUNCH_READY_TIMEOUT_MS", "300");
+        let ready = wait_ready(runtime, "h_t", &agent.id, "exec-nostart", &log);
+        std::env::remove_var("OMT_LAUNCH_READY_TIMEOUT_MS");
+        assert!(
+            matches!(ready, Ready::Timeout),
+            "身份缺失应视为未知（继续等到超时），而非误报 shim 已死"
+        );
+        // 清理冒充 shim 的 sleep 进程
+        unsafe {
+            libc::kill(shim.id() as i32, libc::SIGKILL);
+        }
+        let _ = shim.wait();
+    }
+
+    /// F-EXEC-2(2) 的判定核心（shim_reported_dead）：起始身份在且不匹配 =
+    /// 已死；身份缺失 = 未知（不算死）；身份在且匹配 = 存活；未记 pid =
+    /// 尚在拉起（不算死）。
+    #[test]
+    fn shim_reported_dead_requires_start_identity() {
+        let me = std::process::id();
+        let my_start = crate::executor::process_start_identity(me).unwrap();
+        let dead = agents::ExecRecord {
+            shim_pid: Some(me),
+            shim_start_id: Some("macos:0:0".into()), // 身份不匹配 → 已死
+            ..Default::default()
+        };
+        assert!(shim_reported_dead(&dead));
+        let unknown = agents::ExecRecord {
+            shim_pid: Some(me),
+            shim_start_id: None, // 身份缺失 → 未知，不算死
+            ..Default::default()
+        };
+        assert!(!shim_reported_dead(&unknown));
+        let alive = agents::ExecRecord {
+            shim_pid: Some(me),
+            shim_start_id: Some(my_start), // 本测试进程自身 → 存活
+            ..Default::default()
+        };
+        assert!(!shim_reported_dead(&alive));
+        let untracked = agents::ExecRecord::default(); // 尚未记录 shim pid
+        assert!(!shim_reported_dead(&untracked));
+    }
 }

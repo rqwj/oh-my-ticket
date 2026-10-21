@@ -180,6 +180,19 @@ fn run_inner(
     keepalive: Connector,
 ) -> Result<(), String> {
     layout::validate_segment("exec id", exec_id)?;
+    // F-EXEC-2：身份自写是 shim 的第一个动作——参数校验之后、任何 spec 相关
+    // 工作之前的最早安全点（home/agent 段校验由 update_exec 内部完成）。把
+    // 自身 pid + 内核起始标识写进 exec 记录：launcher 在 spawn 后也写同一笔
+    // （F-EXEC-2 起改为关键步骤），此处自写治愈场景 A——launcher 侧写失败或
+    // desktop 在 spawn 与写之间退出时，没有这笔记录的话宽限期内 stop 是
+    // no-op、宽限期后被误判 SHIM_LOST/Orphan 并在执行中释放租约；场景 B
+    // （launcher 读身份失败留下 start_id None）也由此补齐。值与 launcher 写
+    // 的相同（同一 pid），覆盖无害；本笔失败不阻断（记录不存在等错误由后续
+    // 步骤的失败臂另行落档）。
+    let _ = agents::update_exec(runtime_dir, home_id, agent_id, exec_id, |e| {
+        e.shim_pid = Some(std::process::id());
+        e.shim_start_id = crate::executor::process_start_identity(std::process::id()).ok();
+    });
     let agent_dir = layout::agent_dir(runtime_dir, home_id, agent_id)?;
     let spec = LaunchSpec::read(&layout::exec_file(&agent_dir, exec_id, ExecFile::Spec))?;
     if spec.home_id != home_id || spec.agent_id != agent_id || spec.exec_id != exec_id {
@@ -586,6 +599,21 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("spec"));
+        // F-EXEC-2(1)：身份自写是 shim 的第一个动作——即使随后的 spec 读取就
+        // 失败，exec 记录里也必须有它自己的 pid + 起始身份（单测在进程内跑，
+        // std::process::id() 即测试进程自身，起始标识必然可读）。否则 launcher
+        // 侧落档失败 / desktop 提前退出时，停止在宽限期内是 no-op、宽限后被
+        // 误判 SHIM_LOST/Orphan 并释放租约。
+        assert!(
+            agent.execs[0].shim_pid.is_some(),
+            "shim 应先落自身 pid（F-EXEC-2）: {:?}",
+            agent.execs[0]
+        );
+        assert!(
+            agent.execs[0].shim_start_id.is_some(),
+            "shim 应先落自身起始身份（F-EXEC-2）: {:?}",
+            agent.execs[0]
+        );
     }
 
     #[test]
