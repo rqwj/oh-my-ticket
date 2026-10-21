@@ -1612,6 +1612,20 @@ F-BENCH-13 查证结论：4e960a2 提交说明声称的探针/capture/lib 改动
 2. P3 中优先处理：shim 自写身份把 Some 覆盖成 None（会让 F-EXEC-2 重新出现）、超时后临时授权残留（提权）、orphan 行显示「可续跑」、关窗确认框重入。
 3. 其余 P3 放到手工验收之后。
 
+### §42. §41 两轮修复（2026-10-21，501d898）
+
+两批修复（Rust 批 + 前端/综合批），先红后绿：
+
+- **F-EXEC-12**：`exec_stop_all` 返回 `{signaled, failed}`；store 映射——全败 → null（「停止失败」保持 R2-7 语义，失败明细入 error state）、部分失败 → 通知条「已向 N 个 agent 发出停止信号，M 个停止失败」。**与 §41 字面偏差**：§41 要求全败走 Rust Err；实现为 Ok({0,[…]}) 由 store 归一到 null——可观察行为等价。4 个 store/panel 新测试。
+- **F-EXEC-13**：finalize 同一事务内有 run_id 即预置 `lease_release_pending=true`；`LeaseRelease` 改返回 `Result`，成功清除/失败保留，写入位于 exit 行与 terminal 发布**之前**（terminal()==Some 即反映最终态）；`delete_agent` 锁内守卫扩展为 §41 全集（pending，或 run_id+!reconciled+markers）——「存在待对账的租约——请等待对账完成后再删除」。
+- **F-EXEC-3 回归钉死**：§41 指出原测试的错误源是修复新增的损坏分支，钉不住旧 bug。pid-1 EPERM 向量在本机不可达（普通用户读不了 root 进程起始标识，实测确认）；落 §41 预案：`stop_all_with` 注入缝——首个 agent 注入 `kill(1): EPERM` 形状错误，第二个走**真实** stop_exec（活 sleep 收到 SIGTERM）。变异回旧 `?` 语义时新测试红、旧测试绿——两案并钉。
+- **F-EXEC-5 残余**：ExecutionDialog 续跑 optgroup 排除 orphan；orphan 行失败文案改「…请先强制终止后重新派发」（describeFailure 按 attachment 区分，可续跑字样不再出现在 orphan 行）；spec 夹具补 SHIM_LOST_MARKER 用例。
+- **P3 四项**：shim 自写身份仅在算出 Some 时写、绝不把 Some 降为 None；租约授权移出 run_bounded（超时即 drop——`cli:<pid>` 不再残留到下次启动，测试断言 principals 清空）；退出/关窗确认框 DIALOG_OPEN CAS 防重入（tauri 胶合无单测——手工验收：连按 ⌘Q 不叠框、关后再开正常）；shim 身份写入保持不变式。
+
+**验证**：workspace 374 ×3 全绿（372 基线 + 删除守卫扩展 + stop_all 钉死）；前端 148（+7）、tsc 干净；clippy/fmt 干净；nm daemon=0。
+
+**遗留**（§41 其余 P3，按建议留手工验收后）：旧版 home 降级横幅文案与恢复入口、`delete_agent` 竞争败方空目录残留、`.trash-*` 静默失败与清扫、remove_dir_all 持锁窗口、已隔离 agent 删除报「不存在」、report 成功后 retry 超时的 item 停 failed、STOP_REQUESTED 前置于 manager.spawn、kill_orphan 两步写、node/execute 先于校验（改造前既有）、launcher SIGTERM 补偿分支无测试、env-var 测试并行窗口。手工验收矩阵追加：关窗确认框防重入（连按 ⌘Q）。
+
 ### 残留状态核查（第二轮验收后）
 
 失败尝试在 daemon 侧已成功创建 RUN-0001（pending，持有 TICKET-0001，无执行器），EPIC-0001/TICKET-0001 被 node/execute 标为 in_progress。重试无需清理：ensure-run 复用路径按 pending → start 正常接管（已实测 run-get 确认）。
