@@ -160,6 +160,20 @@ pub struct StopAllOutcome {
 /// 身份安全读）：list_agents 对损坏记录是降级跳过，而这里要发信号，必须
 /// 显式暴露「记录损坏、无法安全定位进程」的失败。
 pub fn stop_all(runtime_dir: &Path, home_id: &str) -> Result<StopAllOutcome, String> {
+    stop_all_with(runtime_dir, home_id, |exec| {
+        stop_exec_signaled(runtime_dir, &exec.exec_id)
+    })
+}
+
+/// stop_all 的内芯（F-EXEC-3 pin 的可测缝，§41）：循环本体——错误收集/
+/// 继续下一个/只计真实信号——是生产逻辑；逐 agent 的停止操作由 `stop_one`
+/// 注入（生产 = stop_exec_signaled；测试注入「身份可验但不可信号」的失败
+/// 形态，见 stop_all_continues_after_unsignalable_live_shim_and_signals_the_rest）。
+fn stop_all_with(
+    runtime_dir: &Path,
+    home_id: &str,
+    stop_one: impl Fn(&ExecRecord) -> Result<bool, String>,
+) -> Result<StopAllOutcome, String> {
     let mut outcome = StopAllOutcome::default();
     for agent_id in layout::agent_ids(runtime_dir, home_id)? {
         let agent = match agents::get_agent(runtime_dir, home_id, &agent_id) {
@@ -176,7 +190,7 @@ pub fn stop_all(runtime_dir: &Path, home_id: &str) -> Result<StopAllOutcome, Str
         let Some(exec) = latest_exec(&agent) else {
             continue;
         };
-        match stop_exec_signaled(runtime_dir, &exec.exec_id) {
+        match stop_one(exec) {
             Ok(signaled) => outcome.signaled_count += usize::from(signaled),
             Err(err) => outcome.errors.push(format!("exec {}: {err}", exec.exec_id)),
         }
@@ -477,5 +491,85 @@ mod tests {
         assert!(outcome.errors.is_empty(), "{outcome:?}");
         let a = crate::agents::get_agent(rt, "h_t", &dead).unwrap().unwrap();
         assert_eq!(a.status, AgentRecordStatus::Failed, "对账收尾仍生效");
+    }
+
+    /// F-EXEC-3 的**原始** bug 钉子（§41）：既有 continuation 测试的错误源是
+    /// 「记录损坏」这一新分支——旧 `?` 代码用 list_agents（损坏被静默跳过），
+    /// 该测试在旧代码同样通过，钉不住「首错即中止」。本测把错误源换成「活的
+    /// 已记录 shim 无法发信号」——signal_shim 的 kill 失败（EPERM 等）在旧代
+    /// 码同样如实 Err（`stop_exec(..)?` 处中止），只有新代码会继续停止其余。
+    ///
+    /// 真·「身份可验但不可信号」的进程（pid 1 launchd）在本机不可构造：普通
+    /// 用户的 `proc_pidinfo(1, PROC_PIDTBSDINFO)` 得 EPERM（本机运行时验证），
+    /// 身份校验先行失败、永远到不了 `kill(1, SIGTERM)` 的 EPERM；root 属主
+    /// 进程同样不可读。按 §41 的诚实兜底：逐 agent 停止抽成可测缝
+    /// （stop_all_with）——首个 agent 注入与 signal_shim 同形的 kill 失败，
+    /// 第二个 agent 走**真实** stop_exec_signaled（真 sleep 进程 + 真身份），
+    /// 断言其仍收到 SIGTERM。旧 `?` 形态下首 agent 的 Err 会中止循环、第二
+    /// 个 agent 永不被停止——本测即红。
+    #[test]
+    fn stop_all_continues_after_unsignalable_live_shim_and_signals_the_rest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = tmp.path();
+        // agent-a（目录序在前，先被迭代）：活跃 + 存活 shim 记录（pid 1
+        // launchd 的形态）。真实世界里 identity_alive 校验通过、kill 得
+        // EPERM；本机不可达（见上），经缝注入同形失败。
+        let unsignalable = reg(rt, "exec-a-ep");
+        update_exec(rt, "h_t", &unsignalable, "exec-a-ep", |e| {
+            e.shim_pid = Some(1);
+            // 占位身份：可读机器上由 process_start_identity(1) 给出；本测
+            // 不经真实身份校验（失败由缝注入），重点在失败后的继续语义。
+            e.shim_start_id = Some("macos:1:1".into());
+        })
+        .unwrap();
+        // agent-b：活跃 + 真 sleep 进程的真实身份——必须仍被停止
+        let real = reg(rt, "exec-b-sleep");
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let start = crate::executor::process_start_identity(child.id()).unwrap();
+        update_exec(rt, "h_t", &real, "exec-b-sleep", |e| {
+            e.shim_pid = Some(child.id());
+            e.shim_start_id = Some(start);
+        })
+        .unwrap();
+
+        let outcome = stop_all_with(rt, "h_t", |exec| {
+            if exec.exec_id == "exec-a-ep" {
+                // 与 signal_shim 的错误同形（kill EPERM 如实上报）——旧代码
+                // 在 stop_exec 的 `?` 处即中止
+                return Err(format!(
+                    "kill(1, SIGTERM): {}",
+                    std::io::Error::from_raw_os_error(libc::EPERM)
+                ));
+            }
+            stop_exec_signaled(rt, &exec.exec_id)
+        })
+        .unwrap();
+
+        assert_eq!(
+            outcome.signaled_count, 1,
+            "健康 agent 仍被停止: {outcome:?}"
+        );
+        assert_eq!(
+            outcome.errors.len(),
+            1,
+            "不可信号的失败如实收集: {outcome:?}"
+        );
+        assert!(
+            outcome.errors[0].contains("exec-a-ep"),
+            "{}",
+            outcome.errors[0]
+        );
+        // 第二个 agent 确实收到 SIGTERM——旧代码（首错即中止）下它永不会被
+        // 停止，wait 将一直等不到退出
+        let status = child.wait().unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGTERM),
+            "首个 agent 不可信号后，其余 agent 仍必须被停止"
+        );
     }
 }

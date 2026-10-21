@@ -109,8 +109,10 @@ pub type EventSink = Arc<dyn Fn(serde_json::Value) + Send + Sync>;
 /// daemon RPC 通道（桌面端由 SharedSession 适配；shim 由 daemon_link 适配）。
 pub type RpcFn =
     Arc<dyn Fn(&str, serde_json::Value) -> Result<serde_json::Value, String> + Send + Sync>;
-/// 终态租约释放回调（home_id, run_id, exec_id）。
-pub type LeaseRelease = Arc<dyn Fn(&str, &str, &str) + Send + Sync>;
+/// 终态租约释放回调（home_id, run_id, exec_id）→ 释放结果。
+/// F-EXEC-13：Ok = 租约已释放（finish_terminal 清 `lease_release_pending`），
+/// Err = 释放失败（保留 pending，留给 U10 对账重试）。
+pub type LeaseRelease = Arc<dyn Fn(&str, &str, &str) -> Result<(), String> + Send + Sync>;
 
 /// 单个 exec 的注册表条目（Arc 共享给读线程/等待线程）。
 /// F-BENCH-14：exec 用量合计（message 求和 + cumulative 末值二择）。
@@ -835,7 +837,22 @@ fn finish_terminal(session: &ExecSession, terminal: &Terminal) {
         },
     );
     if let (Some(release), Some(run_id)) = (&session.lease_release, &session.run_id) {
-        release(&session.home_id, run_id, &session.exec_id);
+        let released = release(&session.home_id, run_id, &session.exec_id);
+        // F-EXEC-13(1)：释放结果的终局写入——Ok 清 pending、Err 保持（与
+        // finalize 的预置幂等）。必须在 exit 事件/terminal 发布**之前**：
+        // terminal()==Some 即意味着 pending 已反映最终结果（shim 在此后死亡
+        // 也不丢对账标记）。lease_release 缺席（测试注入等）时不写——
+        // finalize 的预置保持 true，宁可多一次对账也不泄漏租约。
+        let pending = released.is_err();
+        let _ = agents::update_exec(
+            runtime_dir,
+            &session.home_id,
+            &session.agent_id,
+            &session.exec_id,
+            |exec| {
+                exec.lease_release_pending = pending;
+            },
+        );
     }
     let duration_ms = session.started.elapsed().as_millis() as u64;
     // F-U2-6：exit 事件同样携带 seq/ts（与 session_start、raw 同构）
@@ -2109,6 +2126,7 @@ mod tests {
             Some(Arc::new(move |home_id, run_id, exec_id| {
                 let _ =
                     lease_tx.send((home_id.to_string(), run_id.to_string(), exec_id.to_string()));
+                Ok(())
             }));
         let agent = agents::register_agent(
             &runtime,
@@ -2158,6 +2176,72 @@ mod tests {
         let term = wait_for(|| session.terminal(), Duration::from_secs(10));
         assert!(term.is_some(), "租约释放后 terminal 应随即发布");
         assert!(lease_rx.try_recv().is_err(), "幂等终态不得重复释放租约");
+    }
+
+    /// F-EXEC-13(1)：释放结果驱动 pending 标记——Ok 清、Err 留。且
+    /// pending 的终局写入必须在 exit 事件/terminal 发布**之前**：terminal()
+    /// 变 Some 的瞬间读记录，pending 必须已反映释放的最终结果（shim 若在
+    /// 此后死亡，对账标记不丢）。
+    #[test]
+    fn terminal_release_outcome_drives_pending_marker() {
+        let ok_release: LeaseRelease = Arc::new(|_, _, _| Ok(()));
+        let err_release: LeaseRelease = Arc::new(|_, _, _| Err("daemon down".to_string()));
+        for (case, release, expect_pending) in
+            [("ok", ok_release, false), ("err", err_release, true)]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let runtime = dir.path().join("runtime");
+            let home_path = dir.path().join("ws").join(".omt");
+            std::fs::create_dir_all(&home_path).unwrap();
+            let manager = ExecutionManager::with_limits(STARTUP_WINDOW, DEFAULT_MAX_DURATION);
+            manager.set_lease_release(release);
+            let agent = agents::register_agent(
+                &runtime,
+                "h_test",
+                "fake",
+                NewExec {
+                    exec_id: "exec-pend".into(),
+                    node_id: Some("node-1".into()),
+                    run_id: Some("run-1".into()),
+                    binary_path: None,
+                    binary_args: vec![],
+                    model: None,
+                },
+            )
+            .unwrap();
+            let script = write_script(dir.path(), &format!("pend-{case}"), "exit 0");
+            let session = manager
+                .spawn(
+                    &runtime,
+                    SpawnRequest {
+                        exec_id: "exec-pend".into(),
+                        agent_id: agent.id.clone(),
+                        home_id: "h_test".into(),
+                        home_path,
+                        harness: "fake".into(),
+                        node_id: Some("node-1".into()),
+                        run_id: Some("run-1".into()),
+                        program: script,
+                        args: vec![],
+                        env_additions: BTreeMap::new(),
+                        mcp: McpInjection::None,
+                        transcript_dir: crate::layout::agent_dir(&runtime, "h_test", &agent.id)
+                            .unwrap(),
+                    },
+                    Arc::new(|_| {}),
+                )
+                .unwrap();
+            wait_for(|| session.terminal().map(|_| ()), Duration::from_secs(20))
+                .unwrap_or_else(|| panic!("{case}: 应到达终态"));
+            // 刻意不 sleep：terminal() 发布即完整（F-BENCH-26(a) 契约延伸到
+            // pending 标记——它属于终态落账，不是事后补写）
+            let file = crate::agents::snapshot(&runtime, "h_test");
+            let exec = &file.agents[0].execs[0];
+            assert_eq!(
+                exec.lease_release_pending, expect_pending,
+                "{case}: terminal() 发布后 pending 必须已反映释放结果: {exec:?}"
+            );
+        }
     }
 
     /// F-BENCH-20：终态归档的 usage 必须带口径标记——两条 message_end

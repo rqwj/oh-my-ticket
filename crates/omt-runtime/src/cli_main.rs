@@ -30,10 +30,20 @@ fn exec_shim_entry(args: &[String]) -> Option<i32> {
                 .ok()
                 .and_then(|exe| exe.parent().map(|dir| dir.join("omt-daemon")))
                 .filter(|path| path.is_file());
-            let lease = omt_exec::daemon_link::admin_connector(
-                target.runtime_dir.clone(),
-                daemon_bin.clone(),
-            );
+            // P3-b：租约释放走 admin_rpc_with_grant——授权守卫由 lease_releaser
+            // 持有在有界等待之外，释放超时（run_bounded 放弃工作线程）也能
+            // 立即撤销临时 admin 授权。
+            let lease_runtime = target.runtime_dir.clone();
+            let lease_bin = daemon_bin.clone();
+            let lease: omt_exec::shim::Leaser =
+                std::sync::Arc::new(move |home_path: &std::path::Path, home_id: &str| {
+                    omt_exec::daemon_link::admin_rpc_with_grant(
+                        &lease_runtime,
+                        lease_bin.as_deref(),
+                        home_path,
+                        home_id,
+                    )
+                });
             let keepalive =
                 omt_exec::daemon_link::plain_connector(target.runtime_dir.clone(), daemon_bin);
             Some(omt_exec::shim::run(

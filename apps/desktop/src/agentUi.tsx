@@ -133,13 +133,20 @@ export function ConfirmStopAllButton({
 /**
  * review F8（P-10）：失败详情的展示文案。已知的内部标记（omt-exec 的
  * `SHIM_LOST_MARKER` 与重启对账标记）映射为可读说明，其余截断原文。
+ * F-EXEC-5 residue（§41）：`canResume = false`（orphan——不受控、pid 仍
+ * 存活，续跑会被服务端 append_exec 守卫拒绝）时不得承诺「可续跑」，改指
+ * 路「先强制终止后重新派发」。
  */
-export function describeFailure(detail: string): string {
+export function describeFailure(detail: string, canResume = true): string {
   if (detail === 'exec shim exited before finishing') {
-    return '执行进程异常退出（运行项会在对账时释放，可续跑）'
+    return canResume
+      ? '执行进程异常退出（运行项会在对账时释放，可续跑）'
+      : '执行进程异常退出（运行项会在对账时释放，请先强制终止后重新派发）'
   }
   if (detail === 'app restarted before exec finished') {
-    return '应用重启时执行被中断（运行项会在对账时释放，可续跑）'
+    return canResume
+      ? '应用重启时执行被中断（运行项会在对账时释放，可续跑）'
+      : '应用重启时执行被中断（运行项会在对账时释放，请先强制终止后重新派发）'
   }
   return detail.length > 120 ? `${detail.slice(0, 120)}…` : detail
 }

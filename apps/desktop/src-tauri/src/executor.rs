@@ -102,11 +102,23 @@ pub fn exec_stop(exec_id: String) -> Result<(), String> {
 }
 
 /// P-10：停止当前 home 的全部运行中 exec（替代旧的「桌面退出即终止」）。
-/// F-EXEC-3：单个失败不中止其余——返回实际发出信号的数量（TS 契约
-/// `Promise<number>` 不变），失败明细记 stderr（UI 已有结果提示条）。
+/// F-EXEC-3：单个失败不中止其余——失败明细**进返回值**（F-EXEC-12：此前
+/// 只进 stderr，UI 把部分失败当成功提示「当前没有运行中的 agent」）。
+///
+/// 返回 JSON（camelCase 键）形状：
+/// `{ "signaled": <number>, "failed": [<string>, ...] }`
+/// - `signaled`（number）：实际发出停止信号的 exec 数（ESRCH 竞态计入；
+///   shim 已死走对账收尾的不计）。
+/// - `failed`（string[]）：逐 agent/exec 收集的失败明细，空数组 = 全部成功。
 #[tauri::command(async)]
-pub fn exec_stop_all(home_id: String) -> Result<usize, String> {
+pub fn exec_stop_all(home_id: String) -> Result<serde_json::Value, String> {
     let outcome = omt_exec::control::stop_all(&daemon::runtime_dir(), &home_id)?;
+    Ok(stop_all_value(&home_id, &outcome))
+}
+
+/// F-EXEC-12：exec_stop_all 的内芯（tauri 胶水之外的可测面）——把
+/// StopAllOutcome 映射成前端契约 JSON；失败明细同时保留 stderr 记录。
+fn stop_all_value(home_id: &str, outcome: &omt_exec::control::StopAllOutcome) -> serde_json::Value {
     if !outcome.errors.is_empty() {
         eprintln!(
             "exec_stop_all（home {home_id}）：{} 个 agent 停止失败：{}",
@@ -114,7 +126,10 @@ pub fn exec_stop_all(home_id: String) -> Result<usize, String> {
             outcome.errors.join("；")
         );
     }
-    Ok(outcome.signaled_count)
+    serde_json::json!({
+        "signaled": outcome.signaled_count,
+        "failed": outcome.errors,
+    })
 }
 
 /// P-10：重新接上仍在运行的 exec 的实时流（桌面重启后 shim 仍在跑）。
@@ -157,4 +172,30 @@ pub fn exec_transcript_tail(
 #[tauri::command(async)]
 pub fn exec_kill_orphan(home_id: String, agent_id: String, exec_id: String) -> Result<(), String> {
     omt_exec::executor::kill_orphan(&daemon::runtime_dir(), &home_id, &agent_id, &exec_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// F-EXEC-12：exec_stop_all 的返回值必须以**数据**携带失败明细（旧形状
+    /// `Promise<number>` 只回 signaled 计数、失败仅进 stderr，UI 把部分失败
+    /// 当成功提示「当前没有运行中的 agent」）。契约形状（camelCase 键）：
+    /// `{ "signaled": <number>, "failed": [<string>, ...] }`。
+    #[test]
+    fn stop_all_value_carries_failed_list() {
+        let outcome = omt_exec::control::StopAllOutcome {
+            signaled_count: 2,
+            errors: vec!["agent a1: 记录损坏".into(), "exec e2: kill 失败".into()],
+        };
+        let value = stop_all_value("h_x", &outcome);
+        assert_eq!(value["signaled"], 2, "{value}");
+        let failed = value["failed"].as_array().expect("failed 必须是数组");
+        assert_eq!(failed.len(), 2, "{value}");
+        assert!(failed[0].as_str().unwrap().contains("a1"));
+
+        let clean = stop_all_value("h_x", &Default::default());
+        assert_eq!(clean["signaled"], 0, "{clean}");
+        assert_eq!(clean["failed"], serde_json::json!([]), "{clean}");
+    }
 }

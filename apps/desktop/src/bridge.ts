@@ -233,10 +233,20 @@ export async function execKillOrphan(homeId: string, agentId: string, execId: st
   return invoke<void>('exec_kill_orphan', { homeId, agentId, execId })
 }
 
+/** P-10 / F-EXEC-12：exec_stop_all 的返回形状——失败明细以**数据**携带
+ * （此前只回 signaled 计数、失败仅进 stderr，UI 把部分失败当成功提示）。
+ * - `signaled`：实际发出停止信号的 exec 数（ESRCH 竞态计入；shim 已死走
+ *   对账收尾的不计）。
+ * - `failed`：逐 agent/exec 收集的失败明细，空数组 = 全部成功。 */
+export interface StopAllOutcome {
+  signaled: number
+  failed: string[]
+}
+
 /** P-10：停止当前 home 的全部运行中 exec（设计 §3.4：替代「桌面退出即终止」）。
- * 返回发出停止信号的数量。 */
-export async function execStopAll(homeId: string): Promise<number> {
-  return invoke<number>('exec_stop_all', { homeId })
+ * 返回发出停止信号的数量与失败明细（F-EXEC-12）。 */
+export async function execStopAll(homeId: string): Promise<StopAllOutcome> {
+  return invoke<StopAllOutcome>('exec_stop_all', { homeId })
 }
 
 /** P-10：重新接上仍在运行的 exec 的实时 transcript（桌面重启后 shim 仍在跑）。

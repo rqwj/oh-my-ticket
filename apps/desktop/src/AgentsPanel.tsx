@@ -10,7 +10,7 @@
  * executorActor.endsWith('/exec:<execId>')（嵌套命名空间，KD 定稿）。
  */
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { omtCall, type TranscriptEvent } from './bridge'
+import { omtCall, type StopAllOutcome, type TranscriptEvent } from './bridge'
 import type { AgentRecord, ExecRecord, OmtNode, RunDetail, RunItemView } from './types'
 import { claimedCountForExec, danglingBindingsOf, nodeTitlesById } from './store'
 import { agentDisplayName, ConfirmStopAllButton, ConfirmStopButton, describeFailure } from './agentUi'
@@ -70,8 +70,9 @@ interface Props {
   loadHistoryTail: (execId: string, homeId: string) => void
   /** P-10：选中仍在运行、但本会话无事件的 agent 时接回实时流（桌面重启后） */
   attachTranscript?: (execId: string, homeId: string) => void
-  /** P-10：停止全部运行中 exec（替代桌面退出即终止）；返回发出停止的数量，失败为 null */
-  onStopAll?: () => Promise<number | null>
+  /** P-10：停止全部运行中 exec（替代桌面退出即终止）。返回 F-EXEC-12 的
+   * `{ signaled, failed }`（部分失败供提示「M 个停止失败」）；失败为 null。 */
+  onStopAll?: () => Promise<StopAllOutcome | null>
   onSelectAgent: (id: string) => void
   onStopAgent: (execId: string) => void
   /** U10：空闲 agent 一键续跑（App → store.resumeAgent） */
@@ -306,16 +307,20 @@ export function AgentsPanel({
     if (!onStopAll) return
     setStoppingAll(true)
     try {
-      const count = await onStopAll()
+      const outcome = await onStopAll()
       const orphanNote =
         groups.orphan.length > 0 ? `；${groups.orphan.length} 个不受控 agent 需单独强制终止` : ''
-      // review R2-7：失败、无事可做、成功三种结果分开提示
+      // review R2-7 / F-EXEC-12：全失败、无事可做、成功、部分失败分开提示
+      // （部分失败 = store 折算后的 { signaled>0, failed>0 }，用户须被告知
+      // 有 agent 没能停止——此前被当成功吞掉）
       setStopAllNotice(
-        count === null
+        outcome === null
           ? '停止失败，请重试'
-          : count === 0
+          : outcome.signaled === 0
             ? '当前没有运行中的 agent'
-            : `已向 ${count} 个 agent 发出停止信号${orphanNote}`,
+            : `已向 ${outcome.signaled} 个 agent 发出停止信号${
+                outcome.failed.length > 0 ? `，${outcome.failed.length} 个停止失败` : ''
+              }${orphanNote}`,
       )
     } finally {
       setStoppingAll(false)
@@ -398,7 +403,9 @@ export function AgentsPanel({
           {stat && <span className="run-progress">完成 {stat.done} / 失败 {stat.failed}</span>}
           {agent.status === 'failed' && exec?.failureDetail && (
             <span className="agent-failure" title={exec.failureDetail}>
-              {describeFailure(exec.failureDetail)}
+              {/* F-EXEC-5 residue：orphan（不受控、pid 存活）不可续跑——失败
+                  说明不得承诺「可续跑」，改指路强制终止（agentUi 按此分流） */}
+              {describeFailure(exec.failureDetail, agent.attachment !== 'orphan')}
             </span>
           )}
           {agent.status === 'exited' && stat && claimed === 0 && (

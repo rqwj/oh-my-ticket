@@ -22,10 +22,17 @@ use std::time::{Duration, Instant};
 use crate::agents::{self, AgentAttachment, AgentRecordStatus};
 use crate::daemon_link::Connector;
 use crate::executor::{ExecutionManager, RpcFn, SpawnRequest};
+use crate::grants::TempGrant;
 use crate::layout::{self, ExecFile};
 use crate::spec::LaunchSpec;
 
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// P3-b：租约释放的 daemon 连接 seam——连接 + 临时 admin 授权**成对**返回。
+/// 与 Connector（admin_connector）的差别：TempGrant 显式交给调用方持有，
+/// 释放超时（run_bounded 放弃其工作线程）后仍能在本侧立即撤销授权，
+/// 不留 pid 复用可乘之机的临时 admin 窗口。
+pub type Leaser = Arc<dyn Fn(&Path, &str) -> Result<(RpcFn, TempGrant), String> + Send + Sync>;
 
 /// F-EXEC-10：租约释放序列（连接 + run/get + 逐项 report/retry）的有界等待
 /// 上限——wedged daemon 不得挂死收尾（finish_terminal 同步等它）。生产默认
@@ -134,7 +141,7 @@ pub fn run(
     home_id: &str,
     agent_id: &str,
     exec_id: &str,
-    lease: Connector,
+    lease: Leaser,
     keepalive: Connector,
 ) -> i32 {
     install_stop_handler();
@@ -147,7 +154,7 @@ pub fn execute(
     home_id: &str,
     agent_id: &str,
     exec_id: &str,
-    lease: Connector,
+    lease: Leaser,
     keepalive: Connector,
 ) -> i32 {
     match run_inner(runtime_dir, home_id, agent_id, exec_id, lease, keepalive) {
@@ -171,28 +178,54 @@ pub fn execute(
     }
 }
 
+/// F-EXEC-2：身份自写是 shim 的第一个动作——参数校验之后、任何 spec 相关
+/// 工作之前的最早安全点（home/agent 段校验由 update_exec 内部完成）。把
+/// 自身 pid + 内核起始标识写进 exec 记录：launcher 在 spawn 后也写同一笔
+/// （F-EXEC-2 起改为关键步骤），此处自写治愈场景 A——launcher 侧写失败或
+/// desktop 在 spawn 与写之间退出时，没有这笔记录的话宽限期内 stop 是
+/// no-op、宽限期后被误判 SHIM_LOST/Orphan 并在执行中释放租约；场景 B
+/// （launcher 读身份失败留下 start_id None）也由此补齐。本笔失败不阻断
+/// （记录不存在等错误由后续步骤的失败臂另行落档）。
+///
+/// P3-a：计算出的 start_id 为 None（读取失败）时**不得**覆盖 launcher 已写
+/// 的 Some——覆盖会让存活校验从此永假（stop 变 no-op、宽限后误判 Orphan）。
+/// 只在 Some 时写 shim_start_id；shim_pid 仅在当前为 None 时写（生产里与
+/// launcher 写的是同一 pid，无行为差）。
+fn write_own_identity(
+    runtime_dir: &Path,
+    home_id: &str,
+    agent_id: &str,
+    exec_id: &str,
+    pid: u32,
+    start_id: Option<String>,
+) -> Result<bool, String> {
+    agents::update_exec(runtime_dir, home_id, agent_id, exec_id, |e| {
+        if e.shim_pid.is_none() {
+            e.shim_pid = Some(pid);
+        }
+        if start_id.is_some() {
+            e.shim_start_id.clone_from(&start_id);
+        }
+    })
+}
+
 fn run_inner(
     runtime_dir: &Path,
     home_id: &str,
     agent_id: &str,
     exec_id: &str,
-    lease: Connector,
+    lease: Leaser,
     keepalive: Connector,
 ) -> Result<(), String> {
     layout::validate_segment("exec id", exec_id)?;
-    // F-EXEC-2：身份自写是 shim 的第一个动作——参数校验之后、任何 spec 相关
-    // 工作之前的最早安全点（home/agent 段校验由 update_exec 内部完成）。把
-    // 自身 pid + 内核起始标识写进 exec 记录：launcher 在 spawn 后也写同一笔
-    // （F-EXEC-2 起改为关键步骤），此处自写治愈场景 A——launcher 侧写失败或
-    // desktop 在 spawn 与写之间退出时，没有这笔记录的话宽限期内 stop 是
-    // no-op、宽限期后被误判 SHIM_LOST/Orphan 并在执行中释放租约；场景 B
-    // （launcher 读身份失败留下 start_id None）也由此补齐。值与 launcher 写
-    // 的相同（同一 pid），覆盖无害；本笔失败不阻断（记录不存在等错误由后续
-    // 步骤的失败臂另行落档）。
-    let _ = agents::update_exec(runtime_dir, home_id, agent_id, exec_id, |e| {
-        e.shim_pid = Some(std::process::id());
-        e.shim_start_id = crate::executor::process_start_identity(std::process::id()).ok();
-    });
+    let _ = write_own_identity(
+        runtime_dir,
+        home_id,
+        agent_id,
+        exec_id,
+        std::process::id(),
+        crate::executor::process_start_identity(std::process::id()).ok(),
+    );
     let agent_dir = layout::agent_dir(runtime_dir, home_id, agent_id)?;
     let spec = LaunchSpec::read(&layout::exec_file(&agent_dir, exec_id, ExecFile::Spec))?;
     if spec.home_id != home_id || spec.agent_id != agent_id || spec.exec_id != exec_id {
@@ -227,12 +260,7 @@ fn run_inner(
     }
 
     let manager = ExecutionManager::with_max_duration(Duration::from_secs(spec.max_duration_secs));
-    manager.set_lease_release(lease_releaser(
-        runtime_dir.to_path_buf(),
-        agent_id.to_string(),
-        spec.home_path.clone(),
-        lease,
-    ));
+    manager.set_lease_release(lease_releaser(spec.home_path.clone(), lease));
     let request = SpawnRequest {
         exec_id: exec_id.to_string(),
         agent_id: agent_id.to_string(),
@@ -319,40 +347,43 @@ fn spawn_keepalive(
 }
 
 /// 终态租约释放：按需连接 daemon（长时间执行期间 daemon 可能已 idle 退出；
-/// 连接时保证 home 在凭据范围内，review F4）。失败只记待对账标记，不影响
-/// 收尾的其余步骤。F-EXEC-10：整个释放序列经 `run_bounded` 有界等待——
-/// finish_terminal 同步等本回调，wedged daemon（accept 但永不回复）不得
-/// 借此挂死 shim（exec_active 永真、followers 不结束、stop_exec 空转）。
-fn lease_releaser(
-    runtime_dir: PathBuf,
-    agent_id: String,
-    home_path: PathBuf,
-    connector: Connector,
-) -> crate::executor::LeaseRelease {
+/// 连接时保证 home 在凭据范围内，review F4）。失败只记待对账标记（由
+/// finish_terminal 落 pending，F-EXEC-13），不影响收尾的其余步骤。
+/// F-EXEC-10：释放序列经 `run_bounded` 有界等待——finish_terminal 同步等本
+/// 回调，wedged daemon（accept 但永不回复）不得借此挂死 shim（exec_active
+/// 永真、followers 不结束、stop_exec 空转）。连接自身受 daemon_link 的
+/// socket 超时约束，不会挂死，故在有界等待之外建立。
+/// P3-b：TempGrant 持有在 run_bounded **之外**——超时路径 run_bounded 会
+/// 放弃其工作线程，授权若只被线程内的值持有就泄漏到进程结束（pid 复用
+/// 即提权窗口）；成功/失败/超时三条路径都在本侧 drop(grant) 立即撤销。
+fn lease_releaser(home_path: PathBuf, leaser: Leaser) -> crate::executor::LeaseRelease {
     Arc::new(move |home_id: &str, run_id: &str, exec_id: &str| {
         let home_id = home_id.to_string();
         let run_id = run_id.to_string();
         let exec_id = exec_id.to_string();
-        // 工作闭包须 'static（跑在独立线程里）：捕获值克隆进去
-        let release = {
-            let connector = connector.clone();
-            let home_path = home_path.clone();
-            let home_id = home_id.clone();
-            let run_id = run_id.clone();
-            let exec_id = exec_id.clone();
-            move || {
-                connector(&home_path, &home_id).and_then(|rpc: RpcFn| {
-                    crate::executor::release_items_for_exec(&*rpc, &home_id, &run_id, &exec_id)
-                })
+        let outcome = match leaser(&home_path, &home_id) {
+            // 连接/授权失败：TempGrant 未建立（add 失败不产生守卫），无需界内等待
+            Err(err) => Err(err),
+            Ok((rpc, grant)) => {
+                // 工作闭包须 'static（跑在独立线程里）：rpc 克隆进去，grant 留下
+                let bounded = {
+                    let rpc = rpc.clone();
+                    let home_id = home_id.clone();
+                    let run_id = run_id.clone();
+                    let exec_id = exec_id.clone();
+                    move || {
+                        crate::executor::release_items_for_exec(&*rpc, &home_id, &run_id, &exec_id)
+                    }
+                };
+                let result = run_bounded(bounded, lease_timeout());
+                drop(grant); // 成功/失败/超时统一在此撤销临时授权
+                result
             }
         };
-        let outcome = run_bounded(release, lease_timeout());
-        if let Err(err) = outcome {
+        if let Err(err) = &outcome {
             eprintln!("exec-shim {exec_id}: 租约释放失败（{err}），留待对账");
-            let _ = agents::update_exec(&runtime_dir, &home_id, &agent_id, &exec_id, |exec| {
-                exec.lease_release_pending = true;
-            });
         }
+        outcome
     })
 }
 
@@ -420,14 +451,18 @@ mod tests {
         (tmp, runtime, spec)
     }
 
-    fn recording_connector(calls: Arc<Mutex<Vec<String>>>) -> Connector {
+    /// P3-b：测试假 Leaser 在真实临时 runtime 上建真实 TempGrant——Drop 即
+    /// 撤销授权，不污染同进程其他测试；同时按 method 记账供断言。
+    fn recording_leaser(calls: Arc<Mutex<Vec<String>>>, runtime: &Path) -> Leaser {
+        let runtime = runtime.to_path_buf();
         Arc::new(move |_home: &Path, _home_id: &str| {
             let calls = calls.clone();
             let rpc: RpcFn = Arc::new(move |method: &str, _params: serde_json::Value| {
                 calls.lock().unwrap().push(method.to_string());
                 Ok(serde_json::json!({ "items": [] }))
             });
-            Ok(rpc)
+            let grant = TempGrant::add(&runtime, &format!("cli:{}", std::process::id()))?;
+            Ok((rpc, grant))
         })
     }
 
@@ -435,6 +470,11 @@ mod tests {
     fn idle_keepalive() -> Connector {
         Arc::new(|_: &Path, _: &str| Err("keepalive not used in unit tests".to_string()))
     }
+
+    /// `OMT_SHIM_LEASE_TIMEOUT_MS` 是进程级 env——并行测试互相踩 set/remove
+    /// 会把另一方的界放大回 30s 默认（其「界内完成」断言随即失真）。所有
+    /// 改它的测试经此锁串行。
+    static LEASE_TIMEOUT_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// F-EXEC-10：run_bounded——阻塞超过上限的闭包在界内按 Err 返回；
     /// 正常闭包透传 Ok/Err 载荷。
@@ -513,7 +553,7 @@ mod tests {
             "h_test",
             &spec.agent_id,
             "exec-s",
-            recording_connector(calls.clone()),
+            recording_leaser(calls.clone(), &runtime),
             idle_keepalive(),
         );
         assert_eq!(code, 0);
@@ -552,7 +592,7 @@ mod tests {
             "h_test",
             &spec.agent_id,
             "exec-s",
-            recording_connector(Default::default()),
+            recording_leaser(Default::default(), &runtime),
             idle_keepalive(),
         );
         assert_eq!(code, 0);
@@ -571,6 +611,55 @@ mod tests {
         );
     }
 
+    /// P3-a：自身份写入不得用 None 覆盖 launcher 已落的 Some——身份计算失败
+    /// （computed None）时记录保持原值（修复前 None 会把好值抹掉，存活校验
+    /// 从此永假）；Some 时正常写入；shim_pid 仅在当前为 None 时写（生产里
+    /// 与 launcher 写的是同一值，写不写无差）。
+    #[test]
+    fn identity_write_preserves_existing_start_id_when_compute_fails() {
+        let (_t, runtime, spec) = rig("exit 0", None);
+        let read_exec = || {
+            crate::agents::get_agent(&runtime, "h_test", &spec.agent_id)
+                .unwrap()
+                .unwrap()
+                .execs[0]
+                .clone()
+        };
+        // launcher 已写好身份；shim 自算失败（None）
+        crate::agents::update_exec(&runtime, "h_test", &spec.agent_id, "exec-s", |e| {
+            e.shim_pid = Some(4242);
+            e.shim_start_id = Some("macos:9:9".into());
+        })
+        .unwrap();
+        write_own_identity(&runtime, "h_test", &spec.agent_id, "exec-s", 4242, None).unwrap();
+        let exec = read_exec();
+        assert_eq!(
+            exec.shim_start_id.as_deref(),
+            Some("macos:9:9"),
+            "None 不得覆盖 Some: {exec:?}"
+        );
+        assert_eq!(exec.shim_pid, Some(4242));
+        // Some 时正常写入
+        write_own_identity(
+            &runtime,
+            "h_test",
+            &spec.agent_id,
+            "exec-s",
+            4242,
+            Some("macos:1:1".into()),
+        )
+        .unwrap();
+        assert_eq!(read_exec().shim_start_id.as_deref(), Some("macos:1:1"));
+        // pid 仅在当前为 None 时写（已有 4242 → 传入 999 不覆盖）
+        write_own_identity(&runtime, "h_test", &spec.agent_id, "exec-s", 999, None).unwrap();
+        assert_eq!(
+            read_exec().shim_pid,
+            Some(4242),
+            "shim_pid 只在空时写: {:?}",
+            read_exec()
+        );
+    }
+
     #[test]
     fn shim_marks_failed_when_spec_missing() {
         let (_t, runtime, spec) = rig("exit 0", None);
@@ -586,7 +675,7 @@ mod tests {
             "h_test",
             &spec.agent_id,
             "exec-s",
-            recording_connector(Default::default()),
+            recording_leaser(Default::default(), &runtime),
             idle_keepalive(),
         );
         assert_eq!(code, 1);
@@ -619,7 +708,7 @@ mod tests {
     #[test]
     fn unreachable_daemon_leaves_lease_release_pending() {
         let (_t, runtime, spec) = rig("exit 0", Some("RUN-1"));
-        let failing: Connector = Arc::new(|_: &Path, _: &str| Err("daemon down".to_string()));
+        let failing: Leaser = Arc::new(|_: &Path, _: &str| Err("daemon down".to_string()));
         assert_eq!(
             execute(
                 &runtime,
@@ -643,13 +732,16 @@ mod tests {
     /// 留给 U10 对账。
     #[test]
     fn wedged_lease_rpc_completes_with_pending_marker() {
+        let env_guard = LEASE_TIMEOUT_ENV_LOCK.lock().unwrap();
         let (_t, runtime, spec) = rig("exit 0", Some("RUN-1"));
-        let wedged: Connector = Arc::new(|_: &Path, _: &str| {
+        let rt = runtime.clone();
+        let wedged: Leaser = Arc::new(move |_: &Path, _: &str| {
             let rpc: RpcFn = Arc::new(|_: &str, _: serde_json::Value| {
                 std::thread::sleep(Duration::from_secs(300));
                 Ok(serde_json::json!({ "items": [] }))
             });
-            Ok(rpc)
+            let grant = TempGrant::add(&rt, "cli:111111")?;
+            Ok((rpc, grant))
         });
         std::env::set_var("OMT_SHIM_LEASE_TIMEOUT_MS", "200");
         let started = Instant::now();
@@ -676,5 +768,48 @@ mod tests {
             "超时的释放必须标记待对账：{:?}",
             agent.execs[0]
         );
+        drop(env_guard);
+    }
+
+    /// P3-b：租约释放超时（run_bounded 放弃其工作线程）后，临时 admin 授权
+    /// 必须已被撤销——admin-grants.json 里不再有该 principal、
+    /// exec/temp-grants.json 登记表已清。修复前授权只被工作线程内的守卫
+    /// 持有，超时 detach 后泄漏到下次 desktop 启动清扫，pid 复用即提权窗口。
+    #[test]
+    fn lease_timeout_revokes_temp_grant_immediately() {
+        let env_guard = LEASE_TIMEOUT_ENV_LOCK.lock().unwrap();
+        let (_t, runtime, spec) = rig("exit 0", Some("RUN-1"));
+        let rt = runtime.clone();
+        let wedged: Leaser = Arc::new(move |_: &Path, _: &str| {
+            let rpc: RpcFn = Arc::new(|_: &str, _: serde_json::Value| {
+                std::thread::sleep(Duration::from_secs(300));
+                Ok(serde_json::json!({ "items": [] }))
+            });
+            let grant = TempGrant::add(&rt, "cli:222222")?;
+            Ok((rpc, grant))
+        });
+        std::env::set_var("OMT_SHIM_LEASE_TIMEOUT_MS", "200");
+        let code = execute(
+            &runtime,
+            "h_test",
+            &spec.agent_id,
+            "exec-s",
+            wedged,
+            idle_keepalive(),
+        );
+        std::env::remove_var("OMT_SHIM_LEASE_TIMEOUT_MS");
+        assert_eq!(code, 0);
+        let principals = crate::grants::principals(&runtime);
+        assert!(
+            !principals.contains(&"cli:222222".to_string()),
+            "超时后临时授权必须立即撤销: {principals:?}"
+        );
+        let registry = std::fs::read_to_string(runtime.join("exec").join("temp-grants.json"))
+            .unwrap_or_default();
+        assert!(
+            !registry.contains("cli:222222"),
+            "临时登记表必须已清: {registry}"
+        );
+        drop(env_guard);
     }
 }

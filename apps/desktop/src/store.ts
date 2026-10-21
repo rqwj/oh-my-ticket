@@ -46,6 +46,7 @@ import {
   subscribeEvents,
   type EventEnvelope,
   type ExecStartOutcome,
+  type StopAllOutcome,
   type TranscriptEvent,
 } from './bridge'
 import type { AgentRecord, HomeInfo, OmtNode, RunDetail, RunSummary, SavedFilters } from './types'
@@ -779,15 +780,26 @@ export function useTreeStore() {
     [ingestTranscriptEvent],
   )
 
-  /** P-10 / review F14 / R2-7：停止当前 home 的全部运行中 exec，返回发出停止的
-   * 数量；失败返回 null（不能与「本来就没有运行中的」0 混淆）。 */
-  const stopAll = useCallback(async (): Promise<number | null> => {
+  /** P-10 / review F14 / R2-7 / F-EXEC-12：停止当前 home 的全部运行中 exec。
+   * 返回 `{ signaled, failed }`（部分失败如实上抛供面板提示「N 个停止失败」）；
+   * 失败返回 null（不能与「本来就没有运行中的」0 混淆）：
+   * - invoke 拒绝（home 级失败）→ 全局 error + null（既有语义）。
+   * - 全部失败（signaled=0 且有 failed）→ 全局 error（合并明细）+ null
+   *   （R2-7 的「停止失败」语义保留——F-EXEC-12 在 Rust 侧以 Ok 数据携带
+   *   明细而非 Err，此处折算回等价的可观察行为）。
+   * - 部分失败（signaled>0 且有 failed）→ 返回结果本身，面板拼接
+   *   「已向 N 个 agent 发出停止信号，M 个停止失败」。 */
+  const stopAll = useCallback(async (): Promise<StopAllOutcome | null> => {
     const home = activeHomeRef.current
     if (!home) return null
     try {
-      const count = await execStopAll(home.homeId)
+      const outcome = await execStopAll(home.homeId)
+      if (outcome.failed.length > 0 && outcome.signaled === 0) {
+        setState(s => ({ ...s, error: presentError(outcome.failed.join('；')) }))
+        return null
+      }
       scheduleAgentsRepull()
-      return count
+      return outcome
     } catch (error) {
       setState(s => ({ ...s, error: presentError(error) }))
       return null

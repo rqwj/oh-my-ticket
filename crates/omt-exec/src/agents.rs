@@ -491,6 +491,29 @@ pub fn delete_agent(runtime_dir: &Path, home_id: &str, agent_id: &str) -> Result
             "agent {agent_id} 处于不受控态（pid 存活）——请先强制终止再删除"
         ));
     }
+    // F-EXEC-13(2)：任一 exec 仍是待对账目标时拒绝删除——目录连记录一起
+    // 删会把对账目标带走，daemon 侧租约永久泄漏。两种形态（与
+    // list_reconcile_targets 同一谓词）：
+    // ① lease_release_pending（F-EXEC-13(1) 的预置——终态写入与租约释放
+    //    完成之间的在途窗口，或释放失败留待对账）；
+    // ② 带 run_id、failure_detail 命中重启/丢失签名且未 reconciled——对账
+    //    尚未追上（§41 扩展：pending=false 也要挡）。
+    // 注：终态但 shim 仍活的 exec 已被上面的 Starting/Running 状态守卫覆盖
+    // （shim 收尾前 agent 状态不会是终态）；「真·终态且 shim 活着」的对账
+    // 竞态边角按残余接受——stop / kill_orphan 仍能凭记录定位它。
+    if record.execs.iter().any(|e| {
+        e.lease_release_pending
+            || (e.run_id.is_some()
+                && !e.reconciled
+                && matches!(
+                    e.failure_detail.as_deref(),
+                    Some(RESTART_MARKER) | Some(SHIM_LOST_MARKER)
+                ))
+    }) {
+        return Err(format!(
+            "agent {agent_id} 存在待对账的租约——请等待对账完成后再删除"
+        ));
+    }
     // P-7：按 agent 拆目录后，transcript 随 agent 一起删除。改名仍在锁内：
     // append_exec 在锁的另一侧只会看到「文件不存在」，不会写进将删的目录。
     let dir = layout::agent_dir(runtime_dir, home_id, agent_id)?;
@@ -571,6 +594,12 @@ pub fn update_exec(
 /// 看到「Exited + exit_code 空」的中间态。`apply` 在锁内拿到整条 AgentRecord
 /// （含 agent 级字段），负责同时改两侧；返回是否实际变化（无变化不落盘，
 /// 写合并语义与 update_agent_status 一致）。
+///
+/// F-EXEC-13(1)：exec 带 run_id 时，**同一笔事务**预置 `lease_release_pending
+/// = true`——终态写入与租约释放完成之间有最长一个释放窗（shim 侧可达 30s）
+/// 的窗口，shim 若在此死亡，没有任何标记留下、租约永不释放。预置后由
+/// finish_terminal 按释放结果清（Ok）或保持（Err）；对账路径（mark_reconciled）
+/// 也会清——置位是幂等安全的。
 pub(crate) fn finalize_agent_exec(
     runtime_dir: &Path,
     home_id: &str,
@@ -588,6 +617,13 @@ pub(crate) fn finalize_agent_exec(
         }
         let before = agent.clone();
         apply(agent);
+        // F-EXEC-13(1)：带 run_id 的 exec 终态必有租约要释放——同笔预置
+        // pending，释放成功才清（见 finish_terminal）。
+        if let Some(exec) = agent.execs.iter_mut().find(|e| e.exec_id == exec_id) {
+            if exec.run_id.is_some() {
+                exec.lease_release_pending = true;
+            }
+        }
         // 与 update_exec 同规则的 session id 镜像（exec 归档时同步 agent 级）
         if let Some(exec) = agent.execs.iter().find(|e| e.exec_id == exec_id) {
             if let Some(session) = &exec.harness_session_id {
@@ -1436,5 +1472,135 @@ mod tests {
         .unwrap();
         assert!(!changed_again, "无变化不落盘（写合并）");
         assert_eq!(before, std::fs::read(&path).unwrap());
+    }
+
+    /// F-EXEC-13(1)：终态事务在 exec 带 run_id 时**同一笔**预置
+    /// lease_release_pending——终态写入与租约释放完成（可达 30s）之间 shim
+    /// 死亡也不再丢失对账标记（终态 + pending=false 之间曾是无标记窗口，
+    /// 租约永不释放）；run_id None（无租约可释）不预置。
+    #[test]
+    fn finalize_presets_lease_release_pending_only_with_run_id() {
+        let (_dir, runtime, home) = temp_runtime();
+        let a = register_agent(
+            &runtime,
+            &home,
+            "pi",
+            NewExec {
+                run_id: Some("RUN-1".into()),
+                ..new_exec("exec-pend-run")
+            },
+        )
+        .unwrap();
+        finalize_agent_exec(&runtime, &home, &a.id, "exec-pend-run", |agent| {
+            agent.status = AgentRecordStatus::Exited;
+        })
+        .unwrap();
+        let rec = get_agent(&runtime, &home, &a.id).unwrap().unwrap();
+        assert!(
+            rec.execs[0].lease_release_pending,
+            "带 run_id 的终态回写必须同笔预置 pending: {:?}",
+            rec.execs[0]
+        );
+
+        let b = register_agent(&runtime, &home, "pi", new_exec("exec-pend-norun")).unwrap();
+        finalize_agent_exec(&runtime, &home, &b.id, "exec-pend-norun", |agent| {
+            agent.status = AgentRecordStatus::Failed;
+        })
+        .unwrap();
+        let rec2 = get_agent(&runtime, &home, &b.id).unwrap().unwrap();
+        assert!(
+            !rec2.execs[0].lease_release_pending,
+            "无 run_id（无租约）不得预置 pending: {:?}",
+            rec2.execs[0]
+        );
+    }
+
+    /// F-EXEC-13(2)：任一 exec 的租约释放仍在途/待对账（lease_release_pending）
+    /// 时拒绝删除——目录删除会把对账目标一起带走，租约永久泄漏；错误可行动
+    /// （等对账完成后再删）。
+    #[test]
+    fn delete_agent_rejects_pending_lease_release() {
+        let (_dir, runtime, home) = temp_runtime();
+        let a = register_agent(&runtime, &home, "pi", new_exec("exec-pend")).unwrap();
+        update_agent_status(
+            &runtime,
+            &home,
+            &a.id,
+            AgentRecordStatus::Exited,
+            AgentAttachment::None,
+        )
+        .unwrap();
+        update_exec(&runtime, &home, &a.id, "exec-pend", |e| {
+            e.lease_release_pending = true;
+        })
+        .unwrap();
+        let err = delete_agent(&runtime, &home, &a.id).unwrap_err();
+        assert!(err.contains("对账"), "{err}");
+        assert!(
+            crate::layout::agent_file(&runtime, &home, &a.id)
+                .unwrap()
+                .is_file(),
+            "拒绝删除时记录必须原样保留"
+        );
+
+        // 对账完成（pending 清）后可删
+        update_exec(&runtime, &home, &a.id, "exec-pend", |e| {
+            e.lease_release_pending = false;
+        })
+        .unwrap();
+        delete_agent(&runtime, &home, &a.id).unwrap();
+        assert!(get_agent(&runtime, &home, &a.id).unwrap().is_none());
+    }
+
+    /// F-EXEC-13(2) 扩展（§41）：exec 带 run_id + 对账签名（SHIM_LOST）且
+    /// 未 reconciled（pending=false）时**同样**拒绝删除——这正是
+    /// list_reconcile_targets 的待对账目标，删掉目录 = 租约永久泄漏。对账完成
+    /// （reconciled=true）后可删。注：RESTART_MARKER 形态走同一谓词（此处
+    /// 以 SHIM_LOST 为代表；谓词与 list_reconcile_targets 逐字对齐）。
+    #[test]
+    fn delete_agent_rejects_unreconciled_marker_exec_until_reconciled() {
+        let (_dir, runtime, home) = temp_runtime();
+        let a = register_agent(
+            &runtime,
+            &home,
+            "pi",
+            NewExec {
+                run_id: Some("RUN-1".into()),
+                ..new_exec("exec-shimlost")
+            },
+        )
+        .unwrap();
+        update_agent_status(
+            &runtime,
+            &home,
+            &a.id,
+            AgentRecordStatus::Failed,
+            AgentAttachment::None,
+        )
+        .unwrap();
+        // 对账目标的典型形态：run_id + SHIM_LOST 签名 + 未 reconciled +
+        // pending=false（签名即对账依据，不依赖 pending 位）
+        update_exec(&runtime, &home, &a.id, "exec-shimlost", |e| {
+            e.failure_detail = Some(SHIM_LOST_MARKER.to_string());
+            e.reconciled = false;
+            e.lease_release_pending = false;
+        })
+        .unwrap();
+        let err = delete_agent(&runtime, &home, &a.id).unwrap_err();
+        assert!(err.contains("对账"), "{err}");
+        assert!(
+            crate::layout::agent_file(&runtime, &home, &a.id)
+                .unwrap()
+                .is_file(),
+            "拒绝删除时记录必须原样保留"
+        );
+
+        // 对账完成（mark_reconciled 等价：reconciled=true）后可删
+        update_exec(&runtime, &home, &a.id, "exec-shimlost", |e| {
+            e.reconciled = true;
+        })
+        .unwrap();
+        delete_agent(&runtime, &home, &a.id).unwrap();
+        assert!(get_agent(&runtime, &home, &a.id).unwrap().is_none());
     }
 }

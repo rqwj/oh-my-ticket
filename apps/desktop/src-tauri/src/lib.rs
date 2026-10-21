@@ -20,6 +20,14 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogResult};
 /// review F6：用户在确认框里选过之后，再次进入 ExitRequested 时直接放行。
 static QUIT_CONFIRMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// F-EXEC-6 残留：确认框重入守卫。重复 ⌘Q / 关窗会叠出多个模态框，且旧框
+/// 的选择会作用于弹框时刻的过时状态快照——已有确认框在场时，后来的退出/
+/// 关窗请求只 prevent 不再叠框；标志在 `show_with_result` 回调的**第一句**
+/// 清零（先于对选择做任何动作），确认框关闭后新请求可以再弹。
+/// 无单测缝（tauri 胶水）——手动验收：连按 ⌘Q 只弹一个框；框 A 在场时再
+/// ⌘Q 不出现第二个框；关掉 A 后再 ⌘Q 能再弹。
+static DIALOG_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// 退出 / 关窗确认共用的三按钮文案（review R2-6：第一个按钮是 Return 默认
 /// 键，放安全的「继续在后台运行」；「取消」= 不退出，误按 ⌘Q / 关窗时可以
 /// 反悔）。
@@ -132,6 +140,11 @@ pub fn run() {
                 return;
             }
             api.prevent_close();
+            // F-EXEC-6 残留：已有确认框在场（ExitRequested 或另一关窗已弹出）
+            // 时不再叠框——旧框选择会作用于过时状态；prevent 已做，直接返回。
+            if DIALOG_OPEN.swap(true, Ordering::SeqCst) {
+                return;
+            }
             let handle = window.app_handle().clone();
             window
                 .dialog()
@@ -145,19 +158,22 @@ pub fn run() {
                     DIALOG_STOP.into(),
                     DIALOG_CANCEL.into(),
                 ))
-                .show_with_result(move |result| match dialog_choice(result).as_str() {
-                    DIALOG_KEEP => {
-                        // 后台继续：隐藏保活的窗口，应用不退出
-                        if let Some(win) = handle.get_webview_window("main") {
-                            let _ = win.hide();
+                .show_with_result(move |result| {
+                    DIALOG_OPEN.store(false, Ordering::SeqCst); // 第一句清零：选择生效前放行后续弹框
+                    match dialog_choice(result).as_str() {
+                        DIALOG_KEEP => {
+                            // 后台继续：隐藏保活的窗口，应用不退出
+                            if let Some(win) = handle.get_webview_window("main") {
+                                let _ = win.hide();
+                            }
                         }
+                        DIALOG_STOP => {
+                            stop_all_execs(&runtime_dir);
+                            QUIT_CONFIRMED.store(true, Ordering::SeqCst);
+                            handle.exit(0);
+                        }
+                        _ => {} // 取消 / Esc / 关闭对话框：close 已被 prevent，窗口不动
                     }
-                    DIALOG_STOP => {
-                        stop_all_execs(&runtime_dir);
-                        QUIT_CONFIRMED.store(true, Ordering::SeqCst);
-                        handle.exit(0);
-                    }
-                    _ => {} // 取消 / Esc / 关闭对话框：close 已被 prevent，窗口不动
                 });
         })
         // 自定义应用菜单（review R2-5）：默认 macOS 菜单的 Quit 走 `terminate:`，
@@ -268,6 +284,11 @@ pub fn run() {
                         return;
                     }
                     api.prevent_exit();
+                    // F-EXEC-6 残留：已有确认框在场（关窗或更早的 ⌘Q 已弹出）时不
+                    // 再叠框——旧框选择会作用于过时状态；prevent 已做，直接返回。
+                    if DIALOG_OPEN.swap(true, Ordering::SeqCst) {
+                        return;
+                    }
                     let handle = app.clone();
                     app.dialog()
                         .message(format!(
@@ -283,6 +304,7 @@ pub fn run() {
                             DIALOG_CANCEL.into(),
                         ))
                         .show_with_result(move |result| {
+                            DIALOG_OPEN.store(false, Ordering::SeqCst); // 第一句清零：选择生效前放行后续弹框
                             match dialog_choice(result).as_str() {
                                 DIALOG_KEEP => {}
                                 DIALOG_STOP => stop_all_execs(&runtime_dir),
