@@ -324,15 +324,29 @@ export async function harnessLaunchPreview(harness: string): Promise<HarnessLaun
   return invoke<HarnessLaunchPreview>('harness_launch_preview', { harness })
 }
 
+/** F-EXEC-16 ①（§45）：`agents_delete`（force=true）的响应——尽力释放的
+ * 结果如实上报（`deleted` 为既有字段，保持兼容）。 */
+export interface AgentsDeleteResult {
+  deleted: string
+  /** 成功释放并标记 reconciled 的租约数（force 分支先行尽力释放）。 */
+  leasesReleased: number
+  /** 释放失败的明细（逐 exec）——这些租约被真正放弃，对应 run item 可能
+   * 一直显示运行中，需在 Runs 面板手动取消该 run。 */
+  leaseReleaseFailures: string[]
+}
+
 /** F-DEL / F-EXEC-14(4)：删除 agent（终态守卫在服务端）。`force=true` =
- * 「放弃租约并删除」——只绕过待对账租约守卫（租约留给 daemon 侧对账收尾），
- * Starting/Running 与 Orphan 守卫不受 force 影响；缺省 false 走常规守卫。 */
+ * 「放弃租约并删除」——只绕过待对账租约守卫；服务端会**先尽力释放一次**
+ * 该 agent 待对账的租约（结果见 AgentsDeleteResult），释放失败的租约被
+ * 真正放弃——daemon 不回收租约，run item 可能一直显示运行中，需到 Runs
+ * 面板手动取消该 run。Starting/Running 与 Orphan 守卫不受 force 影响；
+ * 缺省 false 走常规守卫（不做释放）。 */
 export async function agentsDelete(
   homeId: string,
   agentId: string,
   force: boolean = false,
-): Promise<void> {
-  await invoke<void>('agents_delete', { homeId, agentId, force })
+): Promise<AgentsDeleteResult> {
+  return invoke<AgentsDeleteResult>('agents_delete', { homeId, agentId, force })
 }
 
 /** 历史 transcript 尾部（F-PI-3）：raw.log 尾部重建的展示事件——

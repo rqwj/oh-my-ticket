@@ -383,6 +383,21 @@ const RESTART_MARKER: &str = "app restarted before exec finished";
 /// shim 在 exec 结束前消失（崩溃 / 被 KILL）的对账签名（P-8）。
 pub const SHIM_LOST_MARKER: &str = "exec shim exited before finishing";
 
+/// 对账谓词的**单一事实源**（F-EXEC-14(1)：谓词曾与 list_reconcile_targets
+/// 漂移，pending 残位把 §43 的僵尸形态卡成永远删不掉）：`run_id.is_some()
+/// && !reconciled && (lease_release_pending ‖ failure_detail 命中签名)`。
+/// list_reconcile_targets / delete_agent 的租约守卫 / executor 的
+/// force_release_agent_leases（F-EXEC-16 ①）三处共用，永不漂移。
+pub fn is_reconcile_target(exec: &ExecRecord) -> bool {
+    !exec.reconciled
+        && exec.run_id.is_some()
+        && (exec.lease_release_pending
+            || matches!(
+                exec.failure_detail.as_deref(),
+                Some(RESTART_MARKER) | Some(SHIM_LOST_MARKER)
+            ))
+}
+
 /// 枚举待对账 exec：failure_detail 命中重启签名且未 reconciled、带 run_id。
 pub fn list_reconcile_targets(runtime_dir: &Path) -> Result<Vec<ReconcileTarget>, String> {
     let mut targets = Vec::new();
@@ -394,14 +409,7 @@ pub fn list_reconcile_targets(runtime_dir: &Path) -> Result<Vec<ReconcileTarget>
                 Err(_) => continue, // 损坏/缺失 → 该 agent 跳过（回放面另行降级）
             };
             for exec in &agent.execs {
-                if !exec.reconciled
-                    && exec.run_id.is_some()
-                    && (exec.lease_release_pending
-                        || matches!(
-                            exec.failure_detail.as_deref(),
-                            Some(RESTART_MARKER) | Some(SHIM_LOST_MARKER)
-                        ))
-                {
+                if is_reconcile_target(exec) {
                     targets.push(ReconcileTarget {
                         home_id: home_id.clone(),
                         agent_id: agent.id.clone(),
@@ -439,8 +447,13 @@ pub fn get_agent(
 ///
 /// F-EXEC-14(4)：`force=true` = 「放弃租约并删除」——待对账租约守卫（下方
 /// F-EXEC-13(2)/F-EXEC-14(1)）被绕过：run/home 已被删、租约永远无法释放时
-/// 的逃生口，租约留给 daemon 侧自行回收，record+dir 照常删除。Starting/
-/// Running 与 Orphan 守卫**不因 force 松动**（进程还活着就不是租约问题）。
+/// 的逃生口。F-EXEC-16 ③（§45 勘误）：daemon **不会**回收租约（omt-runtime
+/// 从不 janitor_sweep），删除又会抹掉唯一的对账依据——release 责任在调用方：
+/// desktop 的 `agents_delete` 在 force 分支先经
+/// `executor::force_release_agent_leases` 尽力释放一次，释放失败的租约被
+/// 真正放弃（对应 run item 可能一直显示运行中，需在 Runs 面板手动取消该
+/// run）。Starting/Running 与 Orphan 守卫**不因 force 松动**（进程还活着
+/// 就不是租约问题）。
 ///
 /// F-EXEC-9：检查与删除必须在**同一把** agent.json companion flock 内完成
 /// （append_exec / update_json 经 update_json 持的正是这把锁）——旧的
@@ -502,26 +515,19 @@ pub fn delete_agent(
         ));
     }
     // F-EXEC-13(2)：任一 exec 仍是待对账目标时拒绝删除——目录连记录一起
-    // 删会把对账目标带走，daemon 侧租约永久泄漏。F-EXEC-14(1)：谓词与
-    // list_reconcile_targets **逐字对齐**（`run_id.is_some() && !reconciled &&
-    // (lease_release_pending ‖ failure_detail 命中签名)`）——修复前 pending
-    // 位单独成障，§43 的僵尸形态（对账完成后 shim 的重复释放失败把 pending
-    // 写回 true）从此永远删不掉；reconciled=true 即不是对账目标，pending
-    // 残位不挡删除。F-EXEC-14(4)：force=true 绕过本守卫（放弃租约强删）。
-    // 注：终态但 shim 仍活的 exec 已被上面的 Starting/Running 状态守卫覆盖
-    // （shim 收尾前 agent 状态不会是终态）；「真·终态且 shim 活着」的对账
-    // 竞态边角按残余接受——stop / kill_orphan 仍能凭记录定位它。
-    if !force
-        && record.execs.iter().any(|e| {
-            e.run_id.is_some()
-                && !e.reconciled
-                && (e.lease_release_pending
-                    || matches!(
-                        e.failure_detail.as_deref(),
-                        Some(RESTART_MARKER) | Some(SHIM_LOST_MARKER)
-                    ))
-        })
-    {
+    // 删会把对账目标带走，daemon 侧租约永久泄漏。F-EXEC-14(1)：谓词收拢为
+    // is_reconcile_target 单一事实源（与 list_reconcile_targets 同一函数，
+    // 不再逐字抄写）——修复前 pending 位单独成障，§43 的僵尸形态（对账
+    // 完成后 shim 的重复释放失败把 pending 写回 true）从此永远删不掉；
+    // reconciled=true 即不是对账目标，pending 残位不挡删除。
+    // F-EXEC-14(4)：force=true 绕过本守卫（放弃租约强删）。
+    // 注（§45 P3-3 勘误）：终态之后 shim 可能仍在收尾——finalize **先写
+    // 终态**，随后最多约 30s 的租约释放窗口，此窗口内删除不被上面的
+    // Starting/Running 状态守卫拦截：非 force 由本守卫拦下（pending 未清）；
+    // force 路径由调用方的尽力释放（executor::force_release_agent_leases）
+    // 兜底；「收尾中的 shim 随后重复释放失败把 pending 写回」的形态由
+    // 谓词的 !reconciled 位兜住（F-EXEC-14(2)）。
+    if !force && record.execs.iter().any(is_reconcile_target) {
         return Err(format!(
             "agent {agent_id} 存在待对账的租约——请等待对账完成后再删除（或放弃租约强制删除）"
         ));
@@ -1722,8 +1728,9 @@ mod tests {
     }
 
     /// F-EXEC-14(4)：force=true = 「放弃租约并删除」——待对账守卫被绕过
-    /// （run/home 已被删、租约永远无法释放时的逃生口：租约留给 daemon 侧，
-    /// record+dir 照常删除）；Starting/Running 守卫**不因 force 松动**。
+    /// （run/home 已被删、租约永远无法释放时的逃生口；F-EXEC-16 ①：daemon
+    /// 不回收租约，release 由调用方 force 分支先行尽力释放，失败的才真放弃）；
+    /// Starting/Running 守卫**不因 force 松动**。
     #[test]
     fn delete_agent_force_bypasses_lease_guard_but_not_running_guard() {
         let (_dir, runtime, home) = temp_runtime();

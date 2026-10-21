@@ -299,12 +299,94 @@ describe('exec plane delete lease guard (F-EXEC-14(4))', () => {
     expect(del).toHaveBeenNthCalledWith(1, expect.objectContaining({ id: 'agent-exec-1' }))
     // 第二步：放弃租约的确认文案（含 确认/取消），原始长错误不重复刷屏
     expect(screen.getByText(/该 agent 有未释放的租约。放弃租约并删除？/)).toBeTruthy()
-    fireEvent.click(screen.getByRole('button', { name: '确认' }))
+    // §45 P3-1：第二步确认按钮带 agent 展示名（不再只是「确认」）
+    fireEvent.click(screen.getByRole('button', { name: '放弃租约并删除 Agent 1' }))
     await waitFor(() => expect(del).toHaveBeenCalledTimes(2))
     expect(del).toHaveBeenNthCalledWith(2, expect.objectContaining({ id: 'agent-exec-1' }), true)
     await waitFor(() =>
       expect(screen.queryByRole('alertdialog', { name: '确认删除 agent' })).toBeNull(),
     )
+  })
+})
+
+// ── F-EXEC-16 ③ / §45 P3-1：force 删除的如实文案与第二步 UX ──────────────
+
+describe('exec plane force-delete honest copy and UX (F-EXEC-16 / §45)', () => {
+  beforeEach(() => {
+    invokeMock.mockReset()
+    invokeMock.mockResolvedValue({})
+  })
+
+  /** 常规删除被租约守卫拒绝一次 → 进入第二步；再发一次（force）成功。 */
+  const leaseRejection = () =>
+    vi
+      .fn()
+      .mockRejectedValueOnce(
+        new Error('agent agent-exec-1 存在待对账的租约——请等待对账完成后再删除（或放弃租约强制删除）'),
+      )
+      .mockResolvedValueOnce(undefined)
+
+  const enterForceStep = async (onDeleteAgent = leaseRejection()) => {
+    renderPanel({
+      agents: [agent({ status: 'exited', attachment: 'none' })],
+      onDeleteAgent,
+    })
+    fireEvent.click(screen.getByRole('button', { name: '删除 Agent 1' }))
+    fireEvent.click(screen.getByRole('button', { name: '确认删除' }))
+    await waitFor(() =>
+      expect(screen.getByText(/该 agent 有未释放的租约。放弃租约并删除？/)).toBeTruthy(),
+    )
+    return onDeleteAgent
+  }
+
+  /** F-EXEC-16 ③：警告必须如实说明后果——服务端会先尽力释放一次，释放失败
+   * 的 run item 会一直停在运行中（daemon 不回收租约：omt-runtime 从不
+   * janitor_sweep，删除又抹掉对账依据）。「交由 daemon 对账收尾」全 UI
+   * 不得再现。 */
+  it('第二步警告如实说明释放失败后果，不再出现「daemon 对账收尾」', async () => {
+    await enterForceStep()
+    expect(screen.getByText(/强制删除前会先尝试释放租约/)).toBeTruthy()
+    expect(screen.getByText(/run item 可能一直显示运行中/)).toBeTruthy()
+    expect(screen.getByText(/Runs 面板手动取消该 run/)).toBeTruthy()
+    expect(screen.queryByText(/daemon 对账收尾/)).toBeNull()
+    expect(screen.queryByText(/对账收尾/)).toBeNull()
+  })
+
+  /** §45 P3-1：不可逆的两行警告不做 3s 自动复位（CONFIRM_RESET_MS 只用于
+   * 停止全部的 arming）——假计时器推进 5s 后仍在第二步。 */
+  it('第二步不自动复位：5s 后仍在放弃租约确认步（§45 P3-1）', async () => {
+    vi.useFakeTimers()
+    try {
+      const del = leaseRejection()
+      renderPanel({
+        agents: [agent({ status: 'exited', attachment: 'none' })],
+        onDeleteAgent: del,
+      })
+      fireEvent.click(screen.getByRole('button', { name: '删除 Agent 1' }))
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: '确认删除' }))
+      })
+      expect(screen.getByText(/该 agent 有未释放的租约/)).toBeTruthy()
+      await act(async () => {
+        vi.advanceTimersByTime(5000)
+      })
+      expect(screen.getByText(/该 agent 有未释放的租约/)).toBeTruthy()
+      expect(screen.getByRole('button', { name: /放弃租约并删除/ })).toBeTruthy()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  /** §45 P3-1：确认按钮带 agent 展示名（agentDisplayName）、出现第二步时
+   * 聚焦其上，且 aria-describedby 指向后果说明（WCAG 2.2.1：切换可感知）。 */
+  it('第二步确认按钮带展示名、获得焦点并 aria-describedby 指向后果说明（§45 P3-1）', async () => {
+    await enterForceStep()
+    const confirm = screen.getByRole('button', { name: '放弃租约并删除 Agent 1' })
+    expect(document.activeElement).toBe(confirm)
+    const describedBy = confirm.getAttribute('aria-describedby')
+    expect(describedBy).toBeTruthy()
+    const warning = document.getElementById(describedBy ?? '')
+    expect(warning?.textContent).toContain('run item 可能一直显示运行中')
   })
 })
 

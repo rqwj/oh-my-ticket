@@ -1598,6 +1598,81 @@ pub fn reconcile_with_connector(
     handled
 }
 
+/// F-EXEC-16 ① 尽力释放的结果：`released` = 成功释放并标记 reconciled 的
+/// 目标数；`failures` = 逐目标失败明细（含 spec 缺失），供调用方如实上报。
+#[derive(Debug, Default, Clone)]
+pub struct ForceReleaseOutcome {
+    pub released: usize,
+    pub failures: Vec<String>,
+}
+
+/// F-EXEC-16 ①（§45）：force 删除前的**尽力**租约释放——用户已在 UI 两步
+/// 确认「放弃租约并删除」，此处先把仍能释放的租约还回去，把「真放弃」
+/// 缩小到释放失败的那部分。逐目标循环与 `reconcile_with_connector` 同构
+/// （按该 exec 自己的 spec 里的 home 路径连接、admin 授权、
+/// release_items_for_exec、成功 mark_reconciled），差异有二：
+/// 1. 作用域限定在 `(home_id, agent_id)` 这一个 agent 内，且目标筛选用
+///    `agents::is_reconcile_target`——与对账/删除守卫同一谓词（单一事实源）；
+/// 2. **不跳过 shim 身份仍存活的目标**。对账路径跳过存活 shim 是为了避免
+///    与 shim 自己的收尾双重释放（F-EXEC-14(3)）；而这里是用户定向的
+///    force——删除要求 agent 非 Starting/Running，但 finalize **先写终态**、
+///    最多约 30s 后才释放租约，终态之下 shim 仍可能在收尾。此时若不释放，
+///    记录一删就再没有对账依据（daemon 不回收租约）；释放中的 shim 造成的
+///    双重释放由 release_items_for_exec 只针对本 exec 仍持有的 running item
+///    兜底——两害相权，对收尾中的 shim 释放是较小恶（§45 ①）。
+///
+/// 尽力语义：逐目标失败不中止（收进 `failures` 继续下一个，删除由调用方
+/// 继续）；只有 agent 记录本身读不出来（缺失/损坏）才整体 Err——那种形态
+/// 删除守卫也会拒绝。spec 缺失（旧记录 / 目录已被清）视作该目标的失败
+/// 如实上报，而非静默跳过——这是放弃租约前的最后一次尝试。
+pub fn force_release_agent_leases(
+    runtime_dir: &Path,
+    connector: &crate::daemon_link::Connector,
+    home_id: &str,
+    agent_id: &str,
+) -> Result<ForceReleaseOutcome, String> {
+    let record = crate::agents::get_agent(runtime_dir, home_id, agent_id)?
+        .ok_or_else(|| format!("agent {agent_id} 不存在"))?;
+    let mut outcome = ForceReleaseOutcome::default();
+    for exec in &record.execs {
+        if !crate::agents::is_reconcile_target(exec) {
+            continue;
+        }
+        let target = crate::agents::ReconcileTarget {
+            home_id: home_id.to_string(),
+            agent_id: agent_id.to_string(),
+            exec_id: exec.exec_id.clone(),
+            run_id: exec.run_id.clone().unwrap_or_default(),
+            harness: record.harness.clone(),
+        };
+        let release = || -> Result<(), String> {
+            let dir = crate::layout::agent_dir(runtime_dir, home_id, agent_id)?;
+            let spec_path =
+                crate::layout::exec_file(&dir, &exec.exec_id, crate::layout::ExecFile::Spec);
+            let spec = crate::spec::LaunchSpec::read(&spec_path)
+                .map_err(|err| format!("无 launch spec（{err}）——无法定位 home"))?;
+            let rpc = connector(&spec.home_path, home_id)?;
+            release_items_for_exec(&*rpc, home_id, &target.run_id, &exec.exec_id)
+        };
+        match release() {
+            Ok(()) => {
+                mark_reconciled(runtime_dir, &target);
+                outcome.released += 1;
+            }
+            Err(err) => {
+                eprintln!(
+                    "强制删除：exec {} 租约释放失败（{err}）——该租约将被放弃",
+                    exec.exec_id
+                );
+                outcome
+                    .failures
+                    .push(format!("exec {}: {err}", exec.exec_id));
+            }
+        }
+    }
+    Ok(outcome)
+}
+
 /// run/get 挑出本 exec 仍持有的 running item 并逐个释放（admin report
 /// failed + retry 回 pending）。终态线程（shim 经 set_lease_release 注入的
 /// 租约释放）与启动对账（reconcile_interrupted_execs）共用。run/get 失败
@@ -4017,6 +4092,198 @@ mod tests {
         assert!(crate::agents::list_reconcile_targets(rt)
             .unwrap()
             .is_empty());
+    }
+
+    /// F-EXEC-16 ①：force 删除前的尽力释放——只作用于该 agent 中仍是
+    /// 对账目标的 exec（与 list_reconcile_targets 同谓词），成功即走与
+    /// reconcile_with_connector 相同的 shim 路径（spec 里的 home 连接 +
+    /// release_items_for_exec + mark_reconciled）。作用域：别的 agent 的
+    /// 待对账 exec 不受影响。**不跳过 shim 仍存活的目标**（用户定向的
+    /// force，与对账路径的 F-EXEC-14(3) 跳过语义相反——见 helper 文档）。
+    #[test]
+    fn force_release_agent_leases_releases_pending_target_and_marks_reconciled() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = dir.path();
+        let target = crate::agents::register_agent(
+            rt,
+            "h_t",
+            "pi",
+            crate::agents::NewExec {
+                exec_id: "exec-force".into(),
+                node_id: None,
+                run_id: Some("RUN-1".into()),
+                binary_path: None,
+                binary_args: vec![],
+                model: None,
+            },
+        )
+        .unwrap();
+        crate::agents::update_exec(rt, "h_t", &target.id, "exec-force", |e| {
+            e.lease_release_pending = true;
+            // 存活 shim（本测试进程）：对账路径会跳过，force 路径必须释放
+            e.shim_pid = Some(std::process::id());
+            e.shim_start_id =
+                Some(crate::executor::process_start_identity(std::process::id()).unwrap());
+        })
+        .unwrap();
+        let mut spec = crate::spec::sample(&rt.join("ws").join(".omt"), Path::new("/bin/omt"));
+        spec.home_id = "h_t".into();
+        spec.agent_id = target.id.clone();
+        spec.exec_id = "exec-force".into();
+        let adir = crate::layout::agent_dir(rt, "h_t", &target.id).unwrap();
+        spec.write(&crate::layout::exec_file(
+            &adir,
+            "exec-force",
+            crate::layout::ExecFile::Spec,
+        ))
+        .unwrap();
+        // 另一个 agent 的待对账 exec：不在作用域内，必须原样保留
+        let other = crate::agents::register_agent(
+            rt,
+            "h_t",
+            "pi",
+            crate::agents::NewExec {
+                exec_id: "exec-other".into(),
+                node_id: None,
+                run_id: Some("RUN-2".into()),
+                binary_path: None,
+                binary_args: vec![],
+                model: None,
+            },
+        )
+        .unwrap();
+        crate::agents::update_exec(rt, "h_t", &other.id, "exec-other", |e| {
+            e.lease_release_pending = true
+        })
+        .unwrap();
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<(PathBuf, String)>::new()));
+        let seen2 = seen.clone();
+        let ok: crate::daemon_link::Connector = Arc::new(move |home: &Path, id: &str| {
+            seen2
+                .lock()
+                .unwrap()
+                .push((home.to_path_buf(), id.to_string()));
+            let rpc: RpcFn =
+                Arc::new(|_: &str, _: serde_json::Value| Ok(serde_json::json!({ "items": [] })));
+            Ok(rpc)
+        });
+        let outcome = force_release_agent_leases(rt, &ok, "h_t", &target.id).unwrap();
+        assert_eq!(outcome.released, 1, "{outcome:?}");
+        assert!(outcome.failures.is_empty(), "{outcome:?}");
+        // 连接用的是该 exec spec 里的 home 路径（shim 同款），且只此一次
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            [(rt.join("ws").join(".omt"), "h_t".to_string())]
+        );
+        let record = crate::agents::get_agent(rt, "h_t", &target.id)
+            .unwrap()
+            .unwrap();
+        let exec = record
+            .execs
+            .iter()
+            .find(|e| e.exec_id == "exec-force")
+            .unwrap();
+        assert!(exec.reconciled && !exec.lease_release_pending, "{exec:?}");
+        // 作用域外：另一个 agent 的 exec 仍是对账目标
+        assert_eq!(
+            crate::agents::list_reconcile_targets(rt)
+                .unwrap()
+                .iter()
+                .map(|t| t.exec_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["exec-other"]
+        );
+    }
+
+    /// F-EXEC-16 ① 的尽力语义：逐目标失败（connector 失败 / spec 缺失）不
+    /// 中止——如实收进 failures 返回（删除仍由调用方继续），失败的 exec 不
+    /// 标记 reconciled（保持待对账事实，尽管记录即将被删）；agent 不存在
+    /// 整体 Err。
+    #[test]
+    fn force_release_agent_leases_collects_failures_and_keeps_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = dir.path();
+        // 目标 1：有 spec，connector 失败
+        let failing_agent = crate::agents::register_agent(
+            rt,
+            "h_t",
+            "pi",
+            crate::agents::NewExec {
+                exec_id: "exec-fl".into(),
+                node_id: None,
+                run_id: Some("RUN-1".into()),
+                binary_path: None,
+                binary_args: vec![],
+                model: None,
+            },
+        )
+        .unwrap();
+        crate::agents::update_exec(rt, "h_t", &failing_agent.id, "exec-fl", |e| {
+            e.lease_release_pending = true
+        })
+        .unwrap();
+        let mut spec = crate::spec::sample(&rt.join("ws").join(".omt"), Path::new("/bin/omt"));
+        spec.home_id = "h_t".into();
+        spec.agent_id = failing_agent.id.clone();
+        spec.exec_id = "exec-fl".into();
+        let adir = crate::layout::agent_dir(rt, "h_t", &failing_agent.id).unwrap();
+        spec.write(&crate::layout::exec_file(
+            &adir,
+            "exec-fl",
+            crate::layout::ExecFile::Spec,
+        ))
+        .unwrap();
+        let failing: crate::daemon_link::Connector =
+            Arc::new(|_: &Path, _: &str| Err("daemon down".to_string()));
+        let outcome = force_release_agent_leases(rt, &failing, "h_t", &failing_agent.id).unwrap();
+        assert_eq!(outcome.released, 0, "{outcome:?}");
+        assert_eq!(outcome.failures.len(), 1, "{outcome:?}");
+        assert!(
+            outcome.failures[0].contains("exec-fl") && outcome.failures[0].contains("daemon down"),
+            "{}",
+            outcome.failures[0]
+        );
+        // 失败不标记：仍是对账目标（如实保留，尽管调用方随后会删记录）
+        assert_eq!(
+            crate::agents::list_reconcile_targets(rt)
+                .unwrap()
+                .iter()
+                .map(|t| t.exec_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["exec-fl"]
+        );
+
+        // 目标 2：无 spec（旧记录 / 已被清掉）——同样收进 failures 而非静默跳过
+        let nospec_agent = crate::agents::register_agent(
+            rt,
+            "h_t",
+            "pi",
+            crate::agents::NewExec {
+                exec_id: "exec-nospec".into(),
+                node_id: None,
+                run_id: Some("RUN-2".into()),
+                binary_path: None,
+                binary_args: vec![],
+                model: None,
+            },
+        )
+        .unwrap();
+        crate::agents::update_exec(rt, "h_t", &nospec_agent.id, "exec-nospec", |e| {
+            e.lease_release_pending = true
+        })
+        .unwrap();
+        let outcome2 = force_release_agent_leases(rt, &failing, "h_t", &nospec_agent.id).unwrap();
+        assert_eq!(outcome2.released, 0, "{outcome2:?}");
+        assert_eq!(outcome2.failures.len(), 1, "{outcome2:?}");
+        assert!(
+            outcome2.failures[0].contains("exec-nospec"),
+            "{}",
+            outcome2.failures[0]
+        );
+
+        // agent 不存在：整体 Err（调用方原样上报，删除守卫随后也会拒绝）
+        assert!(force_release_agent_leases(rt, &failing, "h_t", "agent-nope").is_err());
     }
 
     /// U11：定向派发到既有 agent（追加 exec 不新建）+ 运行中守卫拒绝。

@@ -15,7 +15,6 @@ import type { AgentRecord, ExecRecord, OmtNode, RunDetail, RunItemView } from '.
 import { claimedCountForExec, danglingBindingsOf, nodeTitlesById } from './store'
 import {
   agentDisplayName,
-  CONFIRM_RESET_MS,
   ConfirmStopAllButton,
   ConfirmStopButton,
   describeFailure,
@@ -124,13 +123,20 @@ export function AgentsPanel({
   const [deleting, setDeleting] = useState(false)
   const [deleteError, setDeleteError] = useState<string | null>(null)
   /** F-EXEC-14(4)：删除弹窗处于第二步（常规删除被待对账租约守卫拒绝后的
-   * 「放弃租约并删除」确认；CONFIRM_RESET_MS 无操作还原回第一步） */
+   * 「放弃租约并删除」确认）。
+   * §45 P3-1：第二步是**不可逆**的两行警告——不做 3s 自动复位（旧实现
+   * CONFIRM_RESET_MS 无操作还原第一步，既不适合不可逆操作，屏幕阅读器也
+   * 不播报内容切换，违反 WCAG 2.2.1）；改为出现即聚焦确认按钮 +
+   * aria-describedby 关联后果说明。CONFIRM_RESET_MS 仍用于停止全部/单个
+   * 终止的 arming（agentUi 内部），那是可逆的防误点。 */
   const [forceArming, setForceArming] = useState(false)
+  const forceConfirmRef = useRef<HTMLButtonElement | null>(null)
+  // 进入第二步即聚焦确认按钮。`deleting` 也入 deps：进入第二步的首帧按钮
+  // 可能仍是 disabled（deleting 在稍后的微任务里才复位——disabled 元素的
+  // focus() 是 no-op），复位后补聚焦。
   useEffect(() => {
-    if (!forceArming) return
-    const timer = setTimeout(() => setForceArming(false), CONFIRM_RESET_MS)
-    return () => clearTimeout(timer)
-  }, [forceArming])
+    if (forceArming && !deleting) forceConfirmRef.current?.focus()
+  }, [forceArming, deleting])
   /** review F14（P-10）：停止全部的进行中状态与结果提示（5 秒后消失） */
   const [stoppingAll, setStoppingAll] = useState(false)
   const [stopAllNotice, setStopAllNotice] = useState<string | null>(null)
@@ -513,15 +519,22 @@ export function AgentsPanel({
         {deleteTarget && (
           // F-DEL：删除确认弹窗——红色危险态，明确不可恢复与影响面。
           // F-EXEC-14(4)：常规删除被「待对账租约」守卫拒绝时进入第二步
-          // 「放弃租约并删除」确认（CONFIRM_RESET_MS 无操作还原第一步）；
-          // 其余错误照旧就地报错。
+          // 「放弃租约并删除」确认；其余错误照旧就地报错。
+          // F-EXEC-16 ③（§45）：后果如实说明——服务端会先尽力释放一次，
+          // 释放失败的租约被真正放弃（daemon 不回收租约），对应 run item
+          // 可能一直显示运行中，需在 Runs 面板手动取消。
+          // §45 P3-1：第二步不自动复位；确认按钮带展示名、聚焦 +
+          // aria-describedby（见 force-delete-consequence）。
           <div className="trust-gate-popup delete-confirm" role="alertdialog" aria-label="确认删除 agent">
             {forceArming ? (
               <>
                 <p className="trust-gate-popup-title">该 agent 有未释放的租约。放弃租约并删除？</p>
                 <p className="hm-hint">
-                  将放弃待对账的租约（交由 daemon 对账收尾），并删除该 agent 的记录、执行历史和
-                  transcript 文件。此操作不可恢复。
+                  将删除该 agent 的记录、执行历史和 transcript 文件。此操作不可恢复。
+                </p>
+                <p className="hm-hint" id="force-delete-consequence">
+                  强制删除前会先尝试释放租约；若释放失败，该 run item 可能一直显示运行中，需到
+                  Runs 面板手动取消该 run。
                 </p>
               </>
             ) : (
@@ -536,6 +549,8 @@ export function AgentsPanel({
             <div className="chip-row">
               <button
                 className="chip active"
+                ref={forceConfirmRef}
+                aria-describedby={forceArming ? 'force-delete-consequence' : undefined}
                 disabled={deleting}
                 onClick={() => {
                   setDeleting(true)
@@ -563,7 +578,12 @@ export function AgentsPanel({
                     .finally(() => setDeleting(false))
                 }}
               >
-                {deleting ? '删除中…' : forceArming ? '确认' : '确认删除'}
+                {/* §45 P3-1：第二步按钮不再只写「确认」——动作 + agent 展示名 */}
+                {deleting
+                  ? '删除中…'
+                  : forceArming
+                    ? `放弃租约并删除 ${agentDisplayName(deleteTarget)}`
+                    : '确认删除'}
               </button>
               <button
                 className="chip"

@@ -192,10 +192,20 @@ fn stop_all_with(
         };
         match stop_one(exec) {
             Ok(signaled) => outcome.signaled_count += usize::from(signaled),
-            // P3-b（§43）：逐 agent 错误必须携带 agent 身份——退出/停止全部
-            // 的失败明细只进 stderr/通知条，只有 exec id 时用户看不出是哪个
-            // agent 停止失败。与上方 get_agent 错误分支的 `agent <id>:` 同形。
-            Err(err) => outcome.errors.push(format!("agent {}: {err}", agent.id)),
+            // P3-b（§43）+ P3-2（§45）：逐 agent 错误必须携带 agent 身份，且
+            // 用**展示名**（`Agent N`，与界面行首一致；缺失时回退内部 id）+
+            // exec id（精确定位）——退出/停止全部的失败明细只进 stderr/通知
+            // 条，内部 id（agent-<execId>）与界面显示名对不上。
+            Err(err) => {
+                let name = if agent.display_name.is_empty() {
+                    &agent.id
+                } else {
+                    &agent.display_name
+                };
+                outcome
+                    .errors
+                    .push(format!("{name} ({}): {err}", exec.exec_id))
+            }
         }
     }
     Ok(outcome)
@@ -565,12 +575,17 @@ mod tests {
             "{}",
             outcome.errors[0]
         );
-        // P3-b（§43）：失败明细必须携带 agent 身份（`agent <agentId>: …`）——
-        // 界面/退出日志只显示这些字符串，只有 exec id 时用户看不出是哪个
-        // agent 停止失败。
+        // P3-b（§43）+ P3-2（§45）：失败明细必须携带 agent 身份，且用展示名
+        // （`Agent N`，register_agent 分配）——界面显示的是展示名，内部 id
+        // （agent-<execId>）与界面对不上；exec id 保留作精确定位。
         assert!(
-            outcome.errors[0].contains(&unsignalable),
-            "失败明细必须含 agent id（P3-b）: {}",
+            outcome.errors[0].contains("Agent 1"),
+            "失败明细必须含展示名（P3-2）: {}",
+            outcome.errors[0]
+        );
+        assert!(
+            outcome.errors[0].contains("exec-a-ep"),
+            "失败明细必须保留 exec id（P3-b）: {}",
             outcome.errors[0]
         );
         // 第二个 agent 确实收到 SIGTERM——旧代码（首错即中止）下它永不会被
