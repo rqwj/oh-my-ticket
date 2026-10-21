@@ -45,8 +45,10 @@ branch: feat/desktop-agents-dispatch
 | F-EXEC-9 | P2 | gated_auto | 存储 | `agents.rs::delete_agent` | **删除的检查与删除不在同一把锁内**（相对旧实现是退化）。并发续跑会被 `remove_dir_all` 删掉 spec 和记录，租约无法再释放（§39） | 部分 fixed(3d692bf)：与 append_exec 互斥已修；删除丢失对账标记见 F-EXEC-13（§41） | — |
 | F-EXEC-10 | P2 | gated_auto | 执行面 | `executor.rs::finish_terminal` / `daemon_link` | **daemon 无响应时 shim 永不退出**。租约释放的 RPC 没有超时，terminal 不会发布，跟随线程不会结束；状态已是终态，停止操作是 no-op，退出确认也不计入这个 exec（§39） | fixed(cd332d1)；P3 副作用：超时后临时授权残留、item 卡在 failed（§41） | — |
 | F-EXEC-11 | P2 | gated_auto | 执行面/测试 | `executor.rs::finish_terminal` / `exec_survives_launcher.rs:98` | **终态状态和 exit_code 分两次写入**，读方可能看到 Exited 但 exit_code 为空。单独跑 `exec_completes_after_launcher_is_killed` 6 次失败 1 次，CI 会偶发变红；UI 也会短暂显示不一致的状态（§39） | fixed(cd332d1)；P3：kill_orphan 等写入方仍是两步写（§41） | — |
-| F-EXEC-12 | P2 | gated_auto | 桌面/前端 | `apps/desktop/src-tauri/src/executor.rs::exec_stop_all` | **「停止全部」的失败被报成成功**（F-EXEC-3 修复引入的回归）。错误只打到 stderr，命令仍返回 `Ok(signaled_count)`：全部失败时界面显示「当前没有运行中的 agent」，部分失败时显示「已向 N 个 agent 发出停止信号」，与 R2-7「失败、无事可做、成功三种结果分开提示」相违（§41） | open | — |
-| F-EXEC-13 | P2 | gated_auto | 执行面/存储 | `executor.rs::finish_terminal` / `agents.rs::delete_agent` | **租约释放的待对账标记会丢**。<br>(a) finalize 先写终态（pending=false），再去释放租约；这段窗口里 shim 被杀或机器关机，记录处于终态，却既无 SHIM_LOST 标记也无 pending 标记，对账永远找不到它。<br>(b) 删除守卫只看 status 和 attachment：在释放窗口里，或对一个仍带未对账标记的 Failed agent 执行删除，记录随目录一起消失，租约永不释放。<br>这是 F-EXEC-9 原本要防的结果（§41） | open | — |
+| F-EXEC-12 | P2 | gated_auto | 桌面/前端 | `apps/desktop/src-tauri/src/executor.rs::exec_stop_all` | **「停止全部」的失败被报成成功**（F-EXEC-3 修复引入的回归）。错误只打到 stderr，命令仍返回 `Ok(signaled_count)`：全部失败时界面显示「当前没有运行中的 agent」，部分失败时显示「已向 N 个 agent 发出停止信号」，与 R2-7「失败、无事可做、成功三种结果分开提示」相违（§41） | fixed(501d898)；P3：部分失败的明细不显示、全部失败时不重拉列表（§43） | — |
+| F-EXEC-13 | P2 | gated_auto | 执行面/存储 | `executor.rs::finish_terminal` / `agents.rs::delete_agent` | **租约释放的待对账标记会丢**。<br>(a) finalize 先写终态（pending=false），再去释放租约；这段窗口里 shim 被杀或机器关机，记录处于终态，却既无 SHIM_LOST 标记也无 pending 标记，对账永远找不到它。<br>(b) 删除守卫只看 status 和 attachment：在释放窗口里，或对一个仍带未对账标记的 Failed agent 执行删除，记录随目录一起消失，租约永不释放。<br>这是 F-EXEC-9 原本要防的结果（§41） | 部分 fixed(501d898)：pending 预置与删除守卫已落地；守卫谓词过宽 + 双重释放竞态 → F-EXEC-14（§43） | — |
+| F-EXEC-14 | P2 | gated_auto | 执行面/存储 | `agents.rs::delete_agent` 守卫 ① / `executor.rs::finish_terminal` / `reconcile_with_connector` | **agent 可能永久删不掉，同一租约可能被双重释放**。<br>· 守卫 ① 只看 `lease_release_pending`，没有和 `list_reconcile_targets` 一样加 `run_id.is_some() && !reconciled`。<br>· shim 的租约释放窗口会跨过 desktop 重启，而 desktop 每次启动都会跑 shim 路径对账，两边可能同时释放同一租约：desktop 先 `mark_reconciled`，shim 的重复释放失败后又把 pending 写回 true，于是出现 `pending=true && reconciled=true`，这条记录不是对账目标，却被守卫永久挡住删除。<br>· 释放永远无法成功（run 或 home 已被删、home id 不一致）的 exec 也同样删不掉，而且没有逃生口。<br>· 双重释放中，用陈旧的 run/get 快照发出的 admin report，可能把另一个 exec 刚认领的 item 判为失败（置信度 50）（§43） | open | — |
+| F-EXEC-15 | P2 | gated_auto | 执行面 | `shim.rs::lease_releaser` / `daemon_link::admin_rpc_with_grant` | **租约释放的 30s 上限被打破**（501d898 的回归）。为了让超时也能撤销授权，`connect` 被挪到 `run_bounded` 外面：连接（最长 10s）加上 enroll、declare、re-enroll（各 30s 读超时）都发生在计时开始之前，`finish_terminal` 最坏要阻塞约 130s，`OMT_SHIM_LEASE_TIMEOUT_MS` 不再能限制整个过程。这推翻了 §41 已核实的 F-EXEC-10 性质。wedged-daemon 测试的 Leaser 都是立即返回，没覆盖到（§43） | open | — |
 | F-BENCH-13 | P1 | manual | BENCH | `4e960a2` 提交说明 / §27（修复节） | 提交说明与日志称 F-BENCH-5/6/7/10 及 8/12 部分已修，但 `harness_probe.rs`、`harness-capture.rs`、`lib.rs` 自 f6eeaed 后**未改动**（无 worktree / stash / 其他分支留存）——改动疑似未提交即丢失（§28） | fixed(3192d60)（改动已重做并核实存在） | — |
 | F-BENCH-14 | P1 | manual | BENCH/U12 | `executor.rs` usage 归档 / `bench.rs` / `adapters.rs` | **usage 是每条消息的值，不是会话累计**：pi 1.3.0 与 omp 18.12.2 语料中 cost 逐消息非单调（0.0349→0.0095→0.0078→0.0092）。F-U12-3「累计快照取末值」的口径错误——ExecRecord 的 usage 与分析器的 tokens/cost 只记最后一条消息：pi 卷报 $0.0092 实为 $0.0615（少报 6.7 倍），omp 卷报 $0.0096 实为 $0.0431（§28） | fixed(da9c376 + 55a8e55)：三家均按消息/步求和 | — |
 | F-BENCH-15 | P1 | manual | BENCH | `bench.rs::raw_lines_reparse_through_current_adapter` | 重放测不到解析漂移：语料的 raw 行只是采集时**未产出事件**的行，产出 tool_call / thinking / text 的源行没有保留，无从重放；该测试能通过只因 4e960a2 新增的 turn_end usage 提取（改动前 pi 的 raw 行重放结构化数为 0）（§28） | fixed(55a8e55)：raw.log 已入库，重放对账测试在干净树上可跑 | — |
@@ -1625,6 +1627,56 @@ F-BENCH-13 查证结论：4e960a2 提交说明声称的探针/capture/lib 改动
 **验证**：workspace 374 ×3 全绿（372 基线 + 删除守卫扩展 + stop_all 钉死）；前端 148（+7）、tsc 干净；clippy/fmt 干净；nm daemon=0。
 
 **遗留**（§41 其余 P3，按建议留手工验收后）：旧版 home 降级横幅文案与恢复入口、`delete_agent` 竞争败方空目录残留、`.trash-*` 静默失败与清扫、remove_dir_all 持锁窗口、已隔离 agent 删除报「不存在」、report 成功后 retry 超时的 item 停 failed、STOP_REQUESTED 前置于 manager.spawn、kill_orphan 两步写、node/execute 先于校验（改造前既有）、launcher SIGTERM 补偿分支无测试、env-var 测试并行窗口。手工验收矩阵追加：关窗确认框防重入（连按 ⌘Q）。
+
+### §43. `501d898` · §41 修复 · code review（2026-10-21）
+
+**方法**：后端、前端两组并行评审。评审方用变异测试确认两处新钉子是有效的：把 `stop_one(exec)?` 改回去，`stop_all_continues_after_unsignalable_live_shim_and_signals_the_rest` 变红；把 TempGrant 挪回 `run_bounded` 内部，`lease_timeout_revokes_temp_grant_immediately` 变红。新的前端 spec 也在旧源码上跑过一遍，用来确认哪些用例真正有效。
+
+**自动化验证（安静环境）**：
+- fmt、clippy 干净；
+- workspace 3 遍全绿，374 passed；
+- `nm` daemon=0；
+- 桌面 vitest 148 passed，`tsc` 干净。
+
+**逐条结论**：
+- **F-EXEC-12：FIXED。**
+  - Rust 返回的 `{signaled, failed}` 与 TS 的 `StopAllOutcome` 完全一致。
+  - 唯一的 TS 调用链（App → store.stopAll → AgentsPanel）已全部适配。Rust 侧退出 / 关窗的 STOP 路径直接调 `control::stop_all`，不受影响。
+  - 全部失败时返回 Ok、由 store 归一成 null，这一偏差在用户可见行为上与 §41 等价。
+- **F-EXEC-13：PARTIAL。**
+  - finalize 在同一事务里预置 pending；`LeaseRelease` 改为返回 Result；pending 在 exit 行与 terminal 发布之前写入；删除守卫在锁内检查。
+  - 但守卫谓词过宽，而且存在双重释放的竞态，见 F-EXEC-14。
+  - 没有释放回调时 pending 永远为 true，生产中只有 shim 会用到 `ExecutionManager`，且一定装了回调，所以只影响测试。
+- **F-EXEC-3 钉子：FIXED。** `stop_all_with` 是私有注入缝，公共 API 没变；变异确认有效。
+- **F-EXEC-5 残余：FIXED。**
+  - ExecutionDialog 的续跑分组排除了 orphan。
+  - 按绑定预选只会选中 harness，不会设置 `targetAgentId`，所以选不中 orphan 来续跑。
+  - orphan 行的文案改为「请先强制终止后重新派发」。
+- **P3 四项：FIXED。**
+  - shim 写自身身份时只写 Some，绝不把 Some 降为 None。
+  - 授权在 `run_bounded` 外部持有，Ok、Err、超时三种情况下都会 drop。
+  - 退出与关窗共用 `DIALOG_OPEN` 的 CAS，每个回调分支的第一句都清零；rfd 的显示错误和被丢弃的 oneshot 都归为 Cancel，回调一定会触发，应用不会卡在无法退出。
+  - `cli_main.rs` 只改了 exec-shim 分支（换成 Leaser 闭包），普通 `omt` CLI 的行为不变。
+- **测试有效性**：7 个新的前端用例里有 4 个在旧代码上会红。另外 3 个 store 用例（部分失败返回 outcome、全部成功、invoke 被拒）在旧代码上也是绿的——旧 store 原样透传 invoke 的结果——因此没有钉住这次的改动。
+
+| ID | 级别 | 说明 |
+|---|---|---|
+| F-EXEC-14 | P2 | 守卫 ① 的注释写「与 list_reconcile_targets 同一谓词」，实际上少了 `run_id.is_some() && !reconciled`。<br>**触发**：desktop 在 shim 释放租约的窗口内重启，shim 路径对账与 shim 同时释放：<br>1. desktop 先 `mark_reconciled`（reconciled=true、pending=false）；<br>2. shim 的重复 report / retry 出错；<br>3. `finish_terminal` 写回 pending=true；<br>4. 这个 agent 从此永远删不掉。<br>另一条路径：shim 被误判为 SHIM_LOST，U10 先完成对账，之后 shim 收尾时释放失败。<br>**修法**：<br>① 守卫 ① 补上 `run_id.is_some() && !reconciled`，与对账真正同谓词；<br>② `finish_terminal` 和 finalize 的预置在 `exec.reconciled` 为真时跳过；<br>③ 对账跳过 shim 身份仍然存活的 exec（由 shim 自己收尾），这同时消除双重释放；<br>④ 为永远无法释放的租约（run 或 home 已被删）提供「放弃租约 / 强制删除」入口。 |
+| F-EXEC-15 | P2 | 501d898 把 `leaser(&home_path, &home_id)`（内部是 `DaemonLink::connect`）移出了 `run_bounded`。一个只卡在 declare 上的半卡死 daemon，会让 `finish_terminal` 阻塞约 130s。**修法**：把 connect 放回 bounded 闭包里，授权通过 `Arc<Mutex<Option<TempGrant>>>` 交回调用方，在上限到期后由调用方 drop；或者给 connect 本身设截止时间。同时补一个 Leaser 慢连接的超时测试。 |
+
+**P3**：
+- *退出流程*：
+  - 选「全部停止后退出」时，DIALOG_OPEN 在 `stop_all_execs` 之前就被清零，这个窗口里按 ⌘Q 仍会叠出第二个确认框，应用随后带着一个无法应答的框退出。修法：会退出的分支（STOP、退出路径上的 KEEP）不清零，或在 `stop_all_execs` 之前先置 `QUIT_CONFIRMED`。
+- *停止全部*：
+  - 部分失败的明细只进了 stderr，界面只显示「M 个停止失败」，看不出是哪个 agent。
+  - 全部失败时在 `scheduleAgentsRepull()` 之前就返回了，被对账成 Failed 的行会一直显示过时状态。
+  - 面板的文案依赖 store 的归一化：`signaled===0` 时不检查 `failed`。
+- *对账*：双重释放用陈旧快照做 admin report，可能误伤其他 exec 刚认领的 item（与 F-EXEC-14 同源，置信度 50）。
+- *测试*：3 个 store 用例在旧代码上同样为绿，没有钉住改动。
+
+**遗留**：§42 列出的 §41 其余 P3 仍未处理（降级横幅与恢复入口、`.trash-*` 清扫、remove_dir_all 期间持锁、STOP_REQUESTED 前置、kill_orphan 两步写等）。
+
+**建议**：F-EXEC-14、15 都是小改动，修完后本轮即可收口。F-EXEC-14 中「对账跳过 shim 仍存活的 exec」这一条同时解决删不掉的陷阱和双重释放，优先级最高。其余 P3 放到手工验收（含 §40/§42 追加的验收项）之后。
 
 ### 残留状态核查（第二轮验收后）
 
