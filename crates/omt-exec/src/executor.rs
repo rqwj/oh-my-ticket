@@ -755,6 +755,10 @@ fn classify(
 }
 
 /// 终态收口：写 agents.json（仅状态变化时落盘）+ 终态事件。
+/// F-EXEC-11：agent 状态/attachment 与 exec 终态字段（exit_code/kill_reason/
+/// failure_detail/usage+caliber/session id + last_session_id 镜像）在**同一笔
+/// update_json 事务**里落盘（agents::finalize_agent_exec）——读侧永远看不到
+/// 「终态 status + 空 exit_code」的中间态。
 /// F-BENCH-26(a)：幂等 guard 是独立的 `finishing` 标记——`terminal` 在
 /// 全部落账（MCP 释放 / agents.json 状态与 usage / session id / 租约
 /// 释放 / exit 事件与行）完成之后**最后**发布；轮询方（测试 wait_for、
@@ -780,26 +784,37 @@ fn finish_terminal(session: &ExecSession, terminal: &Terminal) {
             session.exec_id
         );
     }
-    let _ = agents::update_agent_status(
-        runtime_dir,
-        &session.home_id,
-        &session.agent_id,
-        status,
-        AgentAttachment::None,
-    );
-    // F-U2-3：exec 终态三字段一次回写（U5 显示退出码、U10 reconcile 依赖）；
-    // F-U12-4/F-BENCH-14：usage 终态归档（message 求和 / cumulative 末值）
+    // F-U2-3：exec 终态三字段回写（U5 显示退出码、U10 reconcile 依赖）；
+    // F-U12-4/F-BENCH-14：usage 终态归档（message 求和 / cumulative 末值）；
+    // U11：捕获的 session id 归档 + agent.last_session_id 镜像。
+    // F-EXEC-11：以上与 agent 状态/attachment 在**同一笔** update_json 落盘
+    // ——此前是「update_agent_status + update_exec(+session id)」的分离写，
+    // 读侧在两笔之间会看到「Exited + exit_code 空」的中间态（e2e 1/6 复现）。
     let final_usage = session
         .usage_totals
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .final_with_caliber();
-    let _ = agents::update_exec(
+    let captured_session = session
+        .harness_session_id
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let _ = agents::finalize_agent_exec(
         runtime_dir,
         &session.home_id,
         &session.agent_id,
         &session.exec_id,
-        |exec| {
+        |agent| {
+            agent.status = status;
+            agent.attachment = AgentAttachment::None;
+            let Some(exec) = agent
+                .execs
+                .iter_mut()
+                .find(|e| e.exec_id == session.exec_id)
+            else {
+                return;
+            };
             match terminal {
                 Terminal::Exited(code) => exec.exit_code = Some(*code),
                 Terminal::Failed(detail) => exec.failure_detail = Some(detail.clone()),
@@ -812,25 +827,11 @@ fn finish_terminal(session: &ExecSession, terminal: &Terminal) {
                 // 不再误标 message-sum）
                 exec.usage_caliber = Some(caliber.to_string());
             }
+            if let Some(id) = &captured_session {
+                exec.harness_session_id = Some(id.clone());
+            }
         },
     );
-    // U11：捕获的 session id 归档（update_exec 内部镜像 agent.last_session_id）
-    let captured_session = session
-        .harness_session_id
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
-    if let Some(id) = captured_session {
-        let _ = agents::update_exec(
-            runtime_dir,
-            &session.home_id,
-            &session.agent_id,
-            &session.exec_id,
-            |exec| {
-                exec.harness_session_id = Some(id.clone());
-            },
-        );
-    }
     if let (Some(release), Some(run_id)) = (&session.lease_release, &session.run_id) {
         release(&session.home_id, run_id, &session.exec_id);
     }
@@ -2251,6 +2252,10 @@ mod tests {
         let exec = &file.agents[0].execs[0];
         assert_eq!(exec.usage_tokens, Some(250), "末条 message_end 不得漏记");
         assert_eq!(exec.usage_caliber.as_deref(), Some("message-sum"));
+        // F-EXEC-11：status 与 exit_code/usage 同一笔事务落盘——terminal()
+        // 发布后立即读，二者必须同时在场
+        assert_eq!(file.agents[0].status, AgentRecordStatus::Exited);
+        assert_eq!(exec.exit_code, Some(0), "exit_code 不得晚于 status 可见");
         let jsonl = std::fs::read_to_string(crate::layout::exec_file(
             &crate::layout::agent_dir(&runtime, "h_test", &agent.id).unwrap(),
             "exec-slow",
@@ -3738,6 +3743,119 @@ mod tests {
             .unwrap();
         assert_eq!(after.attachment, AgentAttachment::Orphan);
         assert_eq!(after.execs.len(), 1, "不得追加 exec");
+    }
+
+    /// F-EXEC-11：终态原子性——「终态 status + 空 exit_code/kill_reason/
+    /// failure_detail」的中间态不得可被读到（终态 status 与 exec 终态字段
+    /// 必须同一笔 update_json 落盘）。读线程全程紧密轮询 agent.json 捕捉
+    /// 分离写之间的窗口；同时按 F-BENCH-26(a) 契约断言 terminal() 发布后
+    /// **立即**读到的记录已完整（status=Exited 且 exit_code=Some）。
+    #[test]
+    fn terminal_status_and_exec_fields_land_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        let home_path = dir.path().join("ws").join(".omt");
+        std::fs::create_dir_all(&home_path).unwrap();
+        let manager = ExecutionManager::with_limits(STARTUP_WINDOW, DEFAULT_MAX_DURATION);
+        let script = write_script(dir.path(), "atomic-exit", "echo hi\nexit 0");
+        let agent = agents::register_agent(
+            &runtime,
+            "h_test",
+            "fake",
+            NewExec {
+                exec_id: "exec-atomic".into(),
+                node_id: None,
+                run_id: None,
+                binary_path: None,
+                binary_args: vec![],
+                model: None,
+            },
+        )
+        .unwrap();
+        let session = manager
+            .spawn(
+                &runtime,
+                SpawnRequest {
+                    exec_id: "exec-atomic".into(),
+                    agent_id: agent.id.clone(),
+                    home_id: "h_test".into(),
+                    home_path,
+                    harness: "fake".into(),
+                    node_id: None,
+                    run_id: None,
+                    program: script,
+                    args: vec![],
+                    env_additions: BTreeMap::new(),
+                    mcp: McpInjection::None,
+                    transcript_dir: crate::layout::agent_dir(&runtime, "h_test", &agent.id)
+                        .unwrap(),
+                },
+                Arc::new(|_| {}),
+            )
+            .unwrap();
+
+        // 读线程：模拟 e2e/desktop 读侧（直接轮询磁盘，看不到 in-process
+        // terminal 标志），记录任何「终态 status 但 exec 终态字段全空」的观测。
+        let stop = Arc::new(AtomicBool::new(false));
+        let violations = Arc::new(Mutex::new(Vec::<String>::new()));
+        let poller = {
+            let stop = stop.clone();
+            let violations = violations.clone();
+            let runtime = runtime.clone();
+            let agent_id = agent.id.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let Ok(Some(record)) = crate::agents::get_agent(&runtime, "h_test", &agent_id)
+                    else {
+                        continue;
+                    };
+                    let terminal_status = matches!(
+                        record.status,
+                        AgentRecordStatus::Exited
+                            | AgentRecordStatus::Failed
+                            | AgentRecordStatus::Killed
+                    );
+                    if !terminal_status {
+                        continue;
+                    }
+                    if let Some(exec) = record.execs.iter().find(|e| e.exec_id == "exec-atomic") {
+                        if exec.exit_code.is_none()
+                            && exec.kill_reason.is_none()
+                            && exec.failure_detail.is_none()
+                        {
+                            violations
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .push(format!(
+                                    "读到中间态：status={:?} 但 exec 终态字段全空（exit_code/kill_reason/failure_detail）",
+                                    record.status
+                                ));
+                        }
+                    }
+                }
+            })
+        };
+        wait_for(|| session.terminal().map(|_| ()), Duration::from_secs(20)).expect("应到达终态");
+        // 覆盖 terminal 发布前后的最后几次轮询
+        std::thread::sleep(Duration::from_millis(300));
+        stop.store(true, Ordering::Relaxed);
+        poller.join().unwrap();
+
+        // 刻意不 sleep：terminal 发布即完整（F-BENCH-26(a) 契约延伸到记录面）
+        let file = crate::agents::snapshot(&runtime, "h_test");
+        assert_eq!(file.agents[0].status, AgentRecordStatus::Exited);
+        assert_eq!(
+            file.agents[0].execs[0].exit_code,
+            Some(0),
+            "terminal() 发布后立即读，exit_code 必须已落盘"
+        );
+        let observed = violations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            observed.is_empty(),
+            "终态 status 与 exec 终态字段必须原子落盘：{observed:?}"
+        );
     }
 
     /// 验收回归同源第三处：run/get item 的执行器字段是 `executorActor`

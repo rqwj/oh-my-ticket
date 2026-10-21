@@ -511,6 +511,41 @@ pub fn update_exec(
     .map(|(_, outcome)| outcome.changed)
 }
 
+/// F-EXEC-11：exec 终态的**单事务**回写——agent 级字段（status/attachment/
+/// last_session_id 镜像）与匹配 exec 的终态字段在同一笔 update_json（进程内
+/// 锁 + flock + tmp/rename 原子替换）里落盘。此前 `update_agent_status` 与
+/// `update_exec` 是两笔分离写，读侧（e2e/UI 轮询 agent.json）在两笔之间会
+/// 看到「Exited + exit_code 空」的中间态。`apply` 在锁内拿到整条 AgentRecord
+/// （含 agent 级字段），负责同时改两侧；返回是否实际变化（无变化不落盘，
+/// 写合并语义与 update_agent_status 一致）。
+pub(crate) fn finalize_agent_exec(
+    runtime_dir: &Path,
+    home_id: &str,
+    agent_id: &str,
+    exec_id: &str,
+    apply: impl FnOnce(&mut AgentRecord),
+) -> Result<bool, String> {
+    let path = layout::agent_file(runtime_dir, home_id, agent_id)?;
+    if !path.is_file() {
+        return Ok(false);
+    }
+    update_json(&path, |agent: &mut AgentRecord| {
+        if agent.id != agent_id {
+            return false;
+        }
+        let before = agent.clone();
+        apply(agent);
+        // 与 update_exec 同规则的 session id 镜像（exec 归档时同步 agent 级）
+        if let Some(exec) = agent.execs.iter().find(|e| e.exec_id == exec_id) {
+            if let Some(session) = &exec.harness_session_id {
+                agent.last_session_id = Some(session.clone());
+            }
+        }
+        *agent != before
+    })
+    .map(|(_, outcome)| outcome.changed)
+}
+
 /// Agents 面板数据面（U5 消费）：记录列表 + `parseFailed` 标志（前端提示
 /// 数据已降级；U9 据此冻结 GC）。
 pub fn agents_list_value(runtime_dir: &Path, home_id: &str) -> Result<serde_json::Value, String> {
@@ -1199,5 +1234,57 @@ mod tests {
         let resumed = append_exec(&runtime, &home, &a.id, "pi", new_exec("exec-a3")).unwrap();
         assert_eq!(resumed.execs.len(), 2);
         assert_eq!(resumed.attachment, AgentAttachment::Live);
+    }
+
+    /// F-EXEC-11：finalize_agent_exec 是单事务回写——一次调用后 agent 级
+    /// （status/attachment/last_session_id 镜像）与 exec 终态字段（exit_code/
+    /// usage/口径/session id）同时可见；无变化不落盘（写合并）。
+    #[test]
+    fn finalize_agent_exec_writes_agent_and_exec_fields_together() {
+        let (_dir, runtime, home) = temp_runtime();
+        let a = register_agent(&runtime, &home, "pi", new_exec("exec-fin")).unwrap();
+        let path = crate::layout::agent_file(&runtime, &home, &a.id).unwrap();
+
+        let changed = finalize_agent_exec(&runtime, &home, &a.id, "exec-fin", |agent| {
+            agent.status = AgentRecordStatus::Exited;
+            agent.attachment = AgentAttachment::None;
+            for exec in agent.execs.iter_mut() {
+                exec.exit_code = Some(0);
+                exec.usage_tokens = Some(250);
+                exec.usage_cost = Some(0.03);
+                exec.usage_caliber = Some("message-sum".into());
+                exec.harness_session_id = Some("ses_fin1".into());
+            }
+        })
+        .unwrap();
+        assert!(changed, "终态回写必须落盘");
+
+        let (record, _) = read_json::<AgentRecord>(&path).unwrap();
+        assert_eq!(record.status, AgentRecordStatus::Exited);
+        assert_eq!(record.attachment, AgentAttachment::None);
+        let exec = &record.execs[0];
+        assert_eq!(exec.exit_code, Some(0));
+        assert_eq!(exec.usage_tokens, Some(250));
+        assert_eq!(exec.usage_caliber.as_deref(), Some("message-sum"));
+        assert_eq!(
+            exec.harness_session_id.as_deref(),
+            Some("ses_fin1"),
+            "session id 归档与终态字段同事务"
+        );
+        assert_eq!(
+            record.last_session_id.as_deref(),
+            Some("ses_fin1"),
+            "agent.last_session_id 镜像与终态字段同事务"
+        );
+
+        // 写合并：相同内容再写 → 不落盘
+        let before = std::fs::read(&path).unwrap();
+        let changed_again = finalize_agent_exec(&runtime, &home, &a.id, "exec-fin", |agent| {
+            agent.status = AgentRecordStatus::Exited;
+            agent.attachment = AgentAttachment::None;
+        })
+        .unwrap();
+        assert!(!changed_again, "无变化不落盘（写合并）");
+        assert_eq!(before, std::fs::read(&path).unwrap());
     }
 }

@@ -29,6 +29,19 @@ use crate::grants::TempGrant;
 /// 参数 = (需要在凭据范围内的 home（`.omt` 目录）, 它应有的 homeId)。
 pub type Connector = Arc<dyn Fn(&Path, &str) -> Result<RpcFn, String> + Send + Sync>;
 
+/// F-EXEC-10：daemon socket 的读写超时——wedged daemon（accept UDS 连接但
+/// 永不回复）不得挂死 shim 的租约释放/保活。生产默认 30s；环境变量
+/// `OMT_DAEMON_RPC_TIMEOUT_MS` 覆盖（测试用，先例 OMT_SHIM_KEEPALIVE_MS）。
+const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn rpc_timeout() -> Duration {
+    std::env::var("OMT_DAEMON_RPC_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_RPC_TIMEOUT)
+}
+
 pub struct DaemonLink {
     client: omt_client::Client,
     principal: String,
@@ -70,6 +83,22 @@ fn spawn_daemon(bin: &Path, runtime_dir: &Path) -> Result<omt_client::Descriptor
 impl DaemonLink {
     fn enroll(runtime_dir: &Path, kind: &str) -> Result<Self, String> {
         let descriptor = live_descriptor(runtime_dir).ok_or("daemon descriptor 不可用")?;
+        // F-EXEC-10：自行 connect 并先在 socket 上装读写超时，再经 omt_client
+        // 公开的 from_stream + enroll 组装连接——`connect_and_enroll` 不带
+        // 超时，直接用会被 wedged daemon（accept 但永不回复）挂死。超时装在
+        // socket 上（SO_RCVTIMEO/SO_SNDTIMEO），Client::request 里 try_clone 出
+        // 的读端共享同一 socket，handshake 与后续全部调用都被界住；omt-client
+        // 其他使用方（CLI/mcp）不走本路径，行为不变。
+        let stream = std::os::unix::net::UnixStream::connect(&descriptor.endpoint)
+            .map_err(|err| format!("endpoint connect: {err}"))?;
+        let timeout = rpc_timeout();
+        stream
+            .set_read_timeout(Some(timeout))
+            .map_err(|err| format!("set read timeout: {err}"))?;
+        stream
+            .set_write_timeout(Some(timeout))
+            .map_err(|err| format!("set write timeout: {err}"))?;
+        let mut client = omt_client::Client::from_stream(stream);
         let options = omt_client::EnrollOptions {
             kind: kind.into(),
             name: Some(format!("omt-exec-{kind}")),
@@ -77,9 +106,10 @@ impl DaemonLink {
             operations: None,
             credential_path: None,
         };
-        let enrollment = omt_client::Client::connect_and_enroll(&descriptor, &options)
+        let handshake = client
+            .enroll(&options)
             .map_err(|p| format!("enroll: {} ({})", p.message, p.code))?;
-        let principal = enrollment.handshake["credential"]["principalId"]
+        let principal = handshake["credential"]["principalId"]
             .as_str()
             .unwrap_or_default()
             .to_string();
@@ -87,9 +117,9 @@ impl DaemonLink {
             return Err("handshake 缺少 credential.principalId".into());
         }
         Ok(Self {
-            client: enrollment.client,
+            client,
             principal,
-            handshake: enrollment.handshake,
+            handshake,
         })
     }
 
@@ -206,4 +236,60 @@ pub fn plain_connector(runtime_dir: PathBuf, daemon_bin: Option<PathBuf>) -> Con
         });
         Ok(rpc)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    /// F-EXEC-10：wedged daemon（accept UDS 连接但永不回复）不得挂死
+    /// DaemonLink——socket 必须带读写超时（生产默认 30s；测试经
+    /// `OMT_DAEMON_RPC_TIMEOUT_MS` 调小），enroll 在界内报错返回。
+    #[test]
+    fn wedged_daemon_connection_times_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = tmp.path().join("runtime");
+        std::fs::create_dir_all(&runtime).unwrap();
+        let socket = tmp.path().join("wedged.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        std::thread::spawn(move || {
+            // accept 并持有连接、永不回复（live_descriptor 的探活连接也吃掉）
+            let mut held = Vec::new();
+            for _ in 0..8 {
+                if let Ok((stream, _)) = listener.accept() {
+                    held.push(stream);
+                }
+            }
+            std::thread::sleep(Duration::from_secs(30));
+        });
+        std::fs::write(
+            omt_client::descriptor_path(&runtime),
+            serde_json::json!({
+                "schemaVersion": 1,
+                "endpoint": socket.display().to_string(),
+                "generation": 1,
+                "pid": std::process::id(),
+                "bootToken": "test",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let home_path = tmp.path().join("ws").join(".omt");
+        std::fs::create_dir_all(&home_path).unwrap();
+
+        std::env::set_var("OMT_DAEMON_RPC_TIMEOUT_MS", "300");
+        let started = Instant::now();
+        let err = match DaemonLink::connect(&runtime, "cli", None, &home_path, Some("h_wedged")) {
+            Ok(_) => panic!("wedged daemon 的 enroll 必须在界内报错"),
+            Err(err) => err,
+        };
+        std::env::remove_var("OMT_DAEMON_RPC_TIMEOUT_MS");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "enroll 应在 300ms 超时界内返回，实际 {:?}（err={err}）",
+            started.elapsed()
+        );
+    }
 }

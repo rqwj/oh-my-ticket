@@ -27,6 +27,62 @@ use crate::spec::LaunchSpec;
 
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+/// F-EXEC-10：租约释放序列（连接 + run/get + 逐项 report/retry）的有界等待
+/// 上限——wedged daemon 不得挂死收尾（finish_terminal 同步等它）。生产默认
+/// 30s（与 daemon_link 的 socket 超时同量级，这是同一防线的收尾级兜底）；
+/// 环境变量 `OMT_SHIM_LEASE_TIMEOUT_MS` 覆盖（测试用）。
+const DEFAULT_LEASE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// F-EXEC-10：终态后等 keepalive 线程退出的上限。keeper 的连接调用受
+/// daemon_link 的 socket 超时约束、休眠段每 100ms 查 done——2s 覆盖正常
+/// 退出；超时 detach（shim 进程退出时线程随之结束），不再无界 join。
+const KEEPER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn lease_timeout() -> Duration {
+    std::env::var("OMT_SHIM_LEASE_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_LEASE_TIMEOUT)
+}
+
+/// F-EXEC-10：把可能无限阻塞的闭包放到工作线程里跑，主调有界等待。超时
+/// （或工作线程未交付结果即结束）按 Err 返回——调用方走既有的失败路径
+///（租约释放 → lease_release_pending），收尾绝不因 wedged 对端挂死。
+/// 工作线程超时后随句柄丢弃而 detach。每次租约释放（每 exec 恰一次）才
+/// 起一个线程，不在热路径。
+fn run_bounded<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T, String> + Send + 'static,
+    timeout: Duration,
+) -> Result<T, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            Err(format!("有界等待超时（{timeout:?}）"))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err("有界等待中断（工作线程未交付结果）".to_string())
+        }
+    }
+}
+
+/// F-EXEC-10：有界 join——超时返回 false，调用方丢弃句柄即 detach；线程靠
+/// done 标志自行退出（下一次 100ms 检查点，或当前连接调用的 socket 超时后）。
+fn join_bounded(handle: std::thread::JoinHandle<()>, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while !handle.is_finished() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    handle.join().is_ok()
+}
+
 extern "C" fn on_stop_signal(_sig: libc::c_int) {
     STOP_REQUESTED.store(true, Ordering::SeqCst);
 }
@@ -190,8 +246,16 @@ fn run_inner(
     );
     loop {
         if session.terminal().is_some() {
+            // F-EXEC-10：先置 done 再有界等 keeper 退出——wedged daemon 下
+            // keeper 的连接调用可能长时间不返回，无界 join 会把 shim 挂死在
+            // 退出路径；超时 detach（连接受 socket 超时约束，线程自行结束）
             done.store(true, Ordering::SeqCst);
-            let _ = keeper.join();
+            if !join_bounded(keeper, KEEPER_JOIN_TIMEOUT) {
+                eprintln!(
+                    "exec-shim {exec_id}: keepalive 线程 {} 内未退出，detach（其连接受 socket 超时约束，将自行结束）",
+                    KEEPER_JOIN_TIMEOUT.as_secs(),
+                );
+            }
             return Ok(());
         }
         if STOP_REQUESTED.swap(false, Ordering::SeqCst) {
@@ -243,7 +307,9 @@ fn spawn_keepalive(
 
 /// 终态租约释放：按需连接 daemon（长时间执行期间 daemon 可能已 idle 退出；
 /// 连接时保证 home 在凭据范围内，review F4）。失败只记待对账标记，不影响
-/// 收尾的其余步骤。
+/// 收尾的其余步骤。F-EXEC-10：整个释放序列经 `run_bounded` 有界等待——
+/// finish_terminal 同步等本回调，wedged daemon（accept 但永不回复）不得
+/// 借此挂死 shim（exec_active 永真、followers 不结束、stop_exec 空转）。
 fn lease_releaser(
     runtime_dir: PathBuf,
     agent_id: String,
@@ -251,12 +317,26 @@ fn lease_releaser(
     connector: Connector,
 ) -> crate::executor::LeaseRelease {
     Arc::new(move |home_id: &str, run_id: &str, exec_id: &str| {
-        let outcome = connector(&home_path, home_id).and_then(|rpc: RpcFn| {
-            crate::executor::release_items_for_exec(&*rpc, home_id, run_id, exec_id)
-        });
+        let home_id = home_id.to_string();
+        let run_id = run_id.to_string();
+        let exec_id = exec_id.to_string();
+        // 工作闭包须 'static（跑在独立线程里）：捕获值克隆进去
+        let release = {
+            let connector = connector.clone();
+            let home_path = home_path.clone();
+            let home_id = home_id.clone();
+            let run_id = run_id.clone();
+            let exec_id = exec_id.clone();
+            move || {
+                connector(&home_path, &home_id).and_then(|rpc: RpcFn| {
+                    crate::executor::release_items_for_exec(&*rpc, &home_id, &run_id, &exec_id)
+                })
+            }
+        };
+        let outcome = run_bounded(release, lease_timeout());
         if let Err(err) = outcome {
             eprintln!("exec-shim {exec_id}: 租约释放失败（{err}），留待对账");
-            let _ = agents::update_exec(&runtime_dir, home_id, &agent_id, exec_id, |exec| {
+            let _ = agents::update_exec(&runtime_dir, &home_id, &agent_id, &exec_id, |exec| {
                 exec.lease_release_pending = true;
             });
         }
@@ -341,6 +421,50 @@ mod tests {
     /// 保活在单测里不连 daemon（保活间隔远大于测试时长，不会触发）。
     fn idle_keepalive() -> Connector {
         Arc::new(|_: &Path, _: &str| Err("keepalive not used in unit tests".to_string()))
+    }
+
+    /// F-EXEC-10：run_bounded——阻塞超过上限的闭包在界内按 Err 返回；
+    /// 正常闭包透传 Ok/Err 载荷。
+    #[test]
+    fn run_bounded_returns_err_within_bound_on_slow_closure() {
+        let started = Instant::now();
+        let err = run_bounded(
+            || {
+                std::thread::sleep(Duration::from_secs(60));
+                Ok(())
+            },
+            Duration::from_millis(100),
+        )
+        .expect_err("慢闭包必须在界内超时报错");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "超时返回应远早于闭包完成：{:?}",
+            started.elapsed()
+        );
+        assert!(err.contains("超时"), "{err}");
+        assert_eq!(run_bounded(|| Ok(42), Duration::from_secs(5)).unwrap(), 42);
+        assert_eq!(
+            run_bounded::<()>(|| Err("daemon down".to_string()), Duration::from_secs(5))
+                .unwrap_err(),
+            "daemon down",
+            "闭包自身的 Err 载荷必须透传（不得误报超时）"
+        );
+    }
+
+    /// F-EXEC-10：join_bounded——慢线程超时返回 false（调用方 detach）；
+    /// 已完成线程正常 join 返回 true。
+    #[test]
+    fn join_bounded_detaches_slow_thread() {
+        let slow = std::thread::spawn(|| std::thread::sleep(Duration::from_secs(60)));
+        let started = Instant::now();
+        assert!(!join_bounded(slow, Duration::from_millis(100)));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "有界 join 不得等满慢线程：{:?}",
+            started.elapsed()
+        );
+        let quick = std::thread::spawn(|| ());
+        assert!(join_bounded(quick, Duration::from_secs(5)));
     }
 
     /// review R2-2：保活间隔从 daemon.json 的 idleQuietMs 推导（≤ 5 分钟、取 1/3），
@@ -483,5 +607,46 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(agent.execs[0].lease_release_pending);
+    }
+
+    /// F-EXEC-10：wedged daemon（连接建立但 rpc 永不返回）不得挂死收尾——
+    /// 租约释放序列必须有界等待（生产默认 30s；`OMT_SHIM_LEASE_TIMEOUT_MS`
+    /// 调小），超时按失败处理：execute() 完成 + lease_release_pending 置位，
+    /// 留给 U10 对账。
+    #[test]
+    fn wedged_lease_rpc_completes_with_pending_marker() {
+        let (_t, runtime, spec) = rig("exit 0", Some("RUN-1"));
+        let wedged: Connector = Arc::new(|_: &Path, _: &str| {
+            let rpc: RpcFn = Arc::new(|_: &str, _: serde_json::Value| {
+                std::thread::sleep(Duration::from_secs(300));
+                Ok(serde_json::json!({ "items": [] }))
+            });
+            Ok(rpc)
+        });
+        std::env::set_var("OMT_SHIM_LEASE_TIMEOUT_MS", "200");
+        let started = Instant::now();
+        let code = execute(
+            &runtime,
+            "h_test",
+            &spec.agent_id,
+            "exec-s",
+            wedged,
+            idle_keepalive(),
+        );
+        std::env::remove_var("OMT_SHIM_LEASE_TIMEOUT_MS");
+        assert_eq!(code, 0, "wedged rpc 下收尾仍须完成");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "execute 应在租约超时后随即返回，实际 {:?}",
+            started.elapsed()
+        );
+        let agent = crate::agents::get_agent(&runtime, "h_test", &spec.agent_id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            agent.execs[0].lease_release_pending,
+            "超时的释放必须标记待对账：{:?}",
+            agent.execs[0]
+        );
     }
 }

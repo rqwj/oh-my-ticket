@@ -94,8 +94,19 @@ fn exec_completes_after_launcher_is_killed() {
         let a = omt_exec::agents::get_agent(&runtime, "h_test", &agent.id)
             .unwrap()
             .unwrap();
-        if a.status == omt_exec::agents::AgentRecordStatus::Exited {
-            assert_eq!(a.execs[0].exit_code, Some(0));
+        // F-EXEC-11：终态 status 与 exit_code 现在同一笔事务落盘，读侧按构造
+        // 不会再看到「Exited + 空 exit_code」；轮询条件仍取**两者齐备**——
+        // 对任何历史中间态都稳健，断言只在校验完整终态时触发。
+        let terminal = matches!(
+            a.status,
+            omt_exec::agents::AgentRecordStatus::Exited
+                | omt_exec::agents::AgentRecordStatus::Failed
+                | omt_exec::agents::AgentRecordStatus::Killed
+        );
+        let exit_code = a.execs.first().and_then(|e| e.exit_code);
+        if terminal && exit_code.is_some() {
+            assert_eq!(a.status, omt_exec::agents::AgentRecordStatus::Exited);
+            assert_eq!(exit_code, Some(0));
             break;
         }
         assert!(Instant::now() < deadline, "发起方被杀后 exec 未完成：{a:?}");
