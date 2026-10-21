@@ -134,9 +134,10 @@ describe('exec plane P-10', () => {
     expect(screen.getByText(/已向 1 个 agent 发出停止信号/)).toBeTruthy()
   })
 
-  /** F-EXEC-12：部分失败必须如实提示（已停止 N 个、M 个失败）——此前
+  /** F-EXEC-12 + §43 P3：部分失败必须如实提示（已停止 N 个、M 个失败）并
+   * 带失败明细（agent id 级，Rust 失败串形如 `agent <id>: <err>`）——此前
    * signaled 计数与失败明细一起被吞，UI 按「全部成功」提示。 */
-  it('停止全部 partial failure surfaces both counts (F-EXEC-12)', async () => {
+  it('停止全部 partial failure surfaces both counts and details (F-EXEC-12, §43 P3)', async () => {
     renderPanel({
       onStopAll: vi.fn().mockResolvedValue({ signaled: 2, failed: ['agent b: kill EPERM'] }),
     })
@@ -144,7 +145,46 @@ describe('exec plane P-10', () => {
     await act(async () => {
       fireEvent.click(screen.getByRole('button', { name: '确认' }))
     })
-    expect(screen.getByText(/已向 2 个 agent 发出停止信号，1 个停止失败/)).toBeTruthy()
+    expect(
+      screen.getByText(/已向 2 个 agent 发出停止信号，1 个停止失败：agent b: kill EPERM/),
+    ).toBeTruthy()
+  })
+
+  /** §43 P3：面板不得只依赖 store 的全失败 null 折算——outcome 本身携带
+   * `signaled=0 && failed>0` 时也要按失败处理并带明细（而非「没有运行中」）。 */
+  it('停止全部 full failure outcome reports the failure details (§43 P3)', async () => {
+    renderPanel({
+      onStopAll: vi
+        .fn()
+        .mockResolvedValue({ signaled: 0, failed: ['agent-a: kill(1, SIGTERM): EPERM', 'agent-b: 记录损坏'] }),
+    })
+    fireEvent.click(screen.getByRole('button', { name: '停止全部' }))
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '确认' }))
+    })
+    expect(
+      screen.getByText(/停止失败：agent-a: kill\(1, SIGTERM\): EPERM；agent-b: 记录损坏/),
+    ).toBeTruthy()
+    // 不得误报「没有运行中的 agent」
+    expect(screen.queryByText(/当前没有运行中的 agent/)).toBeNull()
+  })
+
+  /** §43 P3：失败明细过长截断——只列前 2 条 + 「等 N 个」，第三条的 agent id 不出现。 */
+  it('停止全部 failure details truncate beyond the first two entries (§43 P3)', async () => {
+    renderPanel({
+      onStopAll: vi.fn().mockResolvedValue({
+        signaled: 1,
+        failed: ['agent-a: kill EPERM', 'agent-b: 记录损坏', 'agent-c: kill ESRCH'],
+      }),
+    })
+    fireEvent.click(screen.getByRole('button', { name: '停止全部' }))
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '确认' }))
+    })
+    expect(
+      screen.getByText(/已向 1 个 agent 发出停止信号，3 个停止失败：agent-a: kill EPERM；agent-b: 记录损坏；等 3 个/),
+    ).toBeTruthy()
+    expect(screen.queryByText(/agent-c/)).toBeNull()
   })
 
   it('停止全部 failure is reported as failure, not as 0 stopped (review R2-7)', async () => {
@@ -212,6 +252,59 @@ describe('exec plane P-10', () => {
   it('renders without the new props (existing callers unaffected)', () => {
     renderPanel()
     expect(screen.queryByRole('button', { name: '停止全部' })).toBeNull()
+  })
+})
+
+// ── F-EXEC-14(4)：删除的待对账租约守卫——两段式「放弃租约并删除」──────────
+
+describe('exec plane delete lease guard (F-EXEC-14(4))', () => {
+  beforeEach(() => {
+    invokeMock.mockReset()
+    invokeMock.mockResolvedValue({})
+  })
+
+  /** 可删除的 agent：终态（exited/none）——运行中/orphan 不给删除入口。 */
+  const deletable = (over: Partial<AgentRecord> = {}) =>
+    agent({ status: 'exited', attachment: 'none', ...over })
+
+  /** 非租约拒绝：原错误就地呈现，不得误给「放弃租约」入口（force 只绕过
+   * 待对账租约守卫，其余错误照旧）。 */
+  it('非租约拒绝 → 原错误就地呈现，无放弃租约入口', async () => {
+    renderPanel({
+      agents: [deletable()],
+      onDeleteAgent: vi.fn().mockRejectedValue(new Error('agents.json 正在被写入，请稍后重试')),
+    })
+    fireEvent.click(screen.getByRole('button', { name: '删除 Agent 1' }))
+    fireEvent.click(screen.getByRole('button', { name: '确认删除' }))
+    await waitFor(() => expect(screen.getByText(/正在被写入/)).toBeTruthy())
+    expect(screen.queryByText(/放弃租约/)).toBeNull()
+    // 未删除成功：弹窗保留
+    expect(screen.getByRole('alertdialog', { name: '确认删除 agent' })).toBeTruthy()
+  })
+
+  /** 租约守卫拒绝 → 第二步确认「放弃租约并删除？」；确认以 force=true 重发，
+   * 成功后关闭弹窗。 */
+  it('租约守卫拒绝 → 第二步确认；确认以 force=true 重发并关闭弹窗', async () => {
+    const del = vi
+      .fn()
+      .mockRejectedValueOnce(
+        new Error('agent agent-exec-1 存在待对账的租约——请等待对账完成后再删除（或放弃租约强制删除）'),
+      )
+      .mockResolvedValueOnce(undefined)
+    renderPanel({ agents: [deletable()], onDeleteAgent: del })
+    fireEvent.click(screen.getByRole('button', { name: '删除 Agent 1' }))
+    fireEvent.click(screen.getByRole('button', { name: '确认删除' }))
+    await waitFor(() => expect(del).toHaveBeenCalledTimes(1))
+    // 第一步保持既有单参契约（force 缺省——store/bridge 侧按 false 走常规守卫）
+    expect(del).toHaveBeenNthCalledWith(1, expect.objectContaining({ id: 'agent-exec-1' }))
+    // 第二步：放弃租约的确认文案（含 确认/取消），原始长错误不重复刷屏
+    expect(screen.getByText(/该 agent 有未释放的租约。放弃租约并删除？/)).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: '确认' }))
+    await waitFor(() => expect(del).toHaveBeenCalledTimes(2))
+    expect(del).toHaveBeenNthCalledWith(2, expect.objectContaining({ id: 'agent-exec-1' }), true)
+    await waitFor(() =>
+      expect(screen.queryByRole('alertdialog', { name: '确认删除 agent' })).toBeNull(),
+    )
   })
 })
 
@@ -295,23 +388,83 @@ describe('exec plane stop-all mapping (F-EXEC-12)', () => {
     unmount()
   })
 
-  it('部分失败 → 返回 { signaled, failed } 供面板提示，不置全局 error', async () => {
+  /** §43 P3 判别说明：旧 store（§41 前，`const count = await execStopAll(...)`
+   * 后原样 return）对部分失败输入同样返回原对象——本测试以「精确 outcome +
+   * 不置 error」+ 相邻的全失败折算（第二次调用 → null + error）组合判别：
+   * 旧透传在全失败时会返回原对象而非 null，第二段在旧代码上必红。 */
+  it('部分失败 → 返回 { signaled, failed } 供面板提示，不置全局 error；相邻全失败仍折算 null', async () => {
     const { outcome, state, unmount } = await stopAllWith({
       signaled: 1,
-      failed: ['exec b2: kill(1, SIGTERM): EPERM'],
+      failed: ['agent b2: kill(1, SIGTERM): EPERM'],
     })
-    expect(outcome).toEqual({ signaled: 1, failed: ['exec b2: kill(1, SIGTERM): EPERM'] })
+    expect(outcome).toEqual({ signaled: 1, failed: ['agent b2: kill(1, SIGTERM): EPERM'] })
     expect(state.error).toBeNull()
     unmount()
+    // 相邻判别（§43 P3）：同款全失败 wire 在 store 折算为 null + 全局 error
+    const second = await stopAllWith({
+      signaled: 0,
+      failed: ['agent c3: kill(1, SIGTERM): EPERM'],
+    })
+    expect(second.outcome).toBeNull()
+    expect(second.state.error).toContain('kill(1, SIGTERM)')
+    second.unmount()
   })
 
-  it('全部成功 → 返回计数与空 failed', async () => {
+  /** §43 P3 判别说明：逐属性断言返回形状——旧 store（§41 前）+ 旧 Rust 的
+   * wire 是裸计数（number），`.failed` 为 undefined、`.signaled` 缺失，
+   * 本测试在旧端到端契约上必红（reviewer：old code returned a plain
+   * number）。旧 store 吃到对象 mock 时确会透传——成功路径与部分失败路径
+   * 的差异在上一测试的第二段钉死。 */
+  it('全部成功 → 返回 { signaled, failed: [] }（对象形状；裸计数透传时 failed 为 undefined）', async () => {
     const { outcome, state, unmount } = await stopAllWith({ signaled: 2, failed: [] })
-    expect(outcome).toEqual({ signaled: 2, failed: [] })
+    expect(outcome).not.toBeNull()
+    const o = outcome as { signaled?: unknown; failed?: unknown }
+    expect(o.signaled).toBe(2)
+    expect(Array.isArray(o.failed)).toBe(true)
+    expect(o.failed).toEqual([])
     expect(state.error).toBeNull()
     unmount()
   })
 
+  /** §43 P3：全失败也重拉 agents_list（防抖 400ms）——此前 repull 只在非
+   * 全失败路径，全失败后行内残留的运行态不会被刷新。 */
+  it('全失败（signaled=0 且有 failed）→ 也触发 agents_list 防抖重拉（§43 P3）', async () => {
+    vi.useFakeTimers()
+    try {
+      invokeMock.mockReset()
+      invokeMock.mockImplementation(async (cmd: string) => {
+        if (cmd === 'daemon_homes') return { homes: [], homeDir: '/tmp' }
+        if (cmd === 'exec_stop_all') {
+          return { signaled: 0, failed: ['agent a1: kill(1, SIGTERM): EPERM'] }
+        }
+        return {}
+      })
+      const { useTreeStore } = await import('../src/store')
+      const { renderHook } = await import('@testing-library/react')
+      const { result, unmount } = renderHook(() => useTreeStore())
+      const home = { homeId: 'h1', kind: 'workspace', path: '/tmp/ws/.omt' } as never
+      await act(async () => {
+        await result.current.selectHome(home)
+      })
+      const before = invokeMock.mock.calls.filter(c => c[0] === 'agents_list').length
+      let outcome: unknown
+      await act(async () => {
+        outcome = await result.current.stopAll()
+      })
+      expect(outcome).toBeNull()
+      await act(async () => {
+        vi.advanceTimersByTime(500)
+      })
+      const after = invokeMock.mock.calls.filter(c => c[0] === 'agents_list').length
+      expect(after).toBeGreaterThan(before)
+      unmount()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  /** 行为护栏（非回归钉）：invoke 拒绝的 null + 全局 error 语义在旧 store
+   * （§41 前）即存在，本测试无法判别新旧——它钉住的是「不得回归」的现状。 */
   it('invoke 拒绝 → null + 全局 error（既有语义不变）', async () => {
     const { result, unmount } = await renderStoreWithHome()
     invokeMock.mockImplementation(async (cmd: string) => {
@@ -324,6 +477,56 @@ describe('exec plane stop-all mapping (F-EXEC-12)', () => {
     })
     expect(outcome).toBeNull()
     expect(result.current.state.error).toContain('daemon 不可达')
+    unmount()
+  })
+})
+
+// ── F-EXEC-14(4)：deleteAgent 的 force 透传（agents_delete wire 形状）──────
+
+describe('exec plane delete store (F-EXEC-14(4))', () => {
+  beforeEach(() => {
+    invokeMock.mockReset()
+    invokeMock.mockResolvedValue({})
+  })
+
+  const setupStore = async () => {
+    const { useTreeStore } = await import('../src/store')
+    const { renderHook } = await import('@testing-library/react')
+    const { result, unmount } = renderHook(() => useTreeStore())
+    const home = { homeId: 'h1', kind: 'workspace', path: '/tmp/ws/.omt' } as never
+    await act(async () => {
+      await result.current.selectHome(home)
+    })
+    return { result, unmount }
+  }
+
+  it('deleteAgent force=true → agents_delete 带 force；成功后清选中态并重拉', async () => {
+    const { result, unmount } = await setupStore()
+    act(() => {
+      result.current.selectAgent('agent-exec-1')
+    })
+    await act(async () => {
+      await result.current.deleteAgent('agent-exec-1', true)
+    })
+    expect(invokeMock).toHaveBeenCalledWith('agents_delete', {
+      homeId: 'h1',
+      agentId: 'agent-exec-1',
+      force: true,
+    })
+    expect(result.current.state.selectedAgentId).toBeNull()
+    unmount()
+  })
+
+  it('deleteAgent 缺省 → force=false（Rust 侧守卫按常规执行）', async () => {
+    const { result, unmount } = await setupStore()
+    await act(async () => {
+      await result.current.deleteAgent('agent-exec-2')
+    })
+    expect(invokeMock).toHaveBeenCalledWith('agents_delete', {
+      homeId: 'h1',
+      agentId: 'agent-exec-2',
+      force: false,
+    })
     unmount()
   })
 })

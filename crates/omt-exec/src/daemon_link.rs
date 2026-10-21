@@ -217,20 +217,30 @@ pub fn admin_connector(runtime_dir: PathBuf, daemon_bin: Option<PathBuf>) -> Con
     })
 }
 
-/// P3-b：连接 + 临时 admin 授权，**授权守卫与 RpcFn 分离返回**。调用方
-/// （shim 的租约释放）把 TempGrant 持有在有界等待（run_bounded）**之外**：
-/// 释放超时 run_bounded 会放弃其工作线程，若授权只被线程内的值持有
-/// （admin_connector 的形态），它会随被放弃的线程泄漏到进程结束——pid
-/// 复用即提权窗口。分离后，成功/失败/超时三条路径都能在本侧立即 drop
-/// 撤销。RpcFn 只共享 DaemonLink，不持有授权。
-pub fn admin_rpc_with_grant(
+/// F-EXEC-15：连接（含必要的 home/declare 与 homeId 校验，与
+/// admin_connector 同一规则）并校验 handshake principal 与
+/// `expected_principal` 一致，**不建立授权**——返回的 RpcFn 不持有任何
+/// TempGrant。调用方（shim 的 lease_releaser）先把确定性 principal
+/// `cli:<pid>` 的临时授权建好（本地文件 IO，不阻塞）再进入有界等待，
+/// connect + enroll + declare 的全部 daemon 往返因此都受
+/// OMT_SHIM_LEASE_TIMEOUT_MS 约束——半卡死 daemon（accept 但卡在 declare）
+/// 不再把 30s 的释放上限撑到 ~130s。授权按 expected principal 发放，
+/// handshake 不一致即 Err（错配的连接不可用）。kind 固定 "cli"，handshake
+/// principal 恒为 `cli:<本进程 pid>`（daemon_link 模块不变式）。
+pub fn admin_rpc_prepared(
     runtime_dir: &Path,
     daemon_bin: Option<&Path>,
     home_path: &Path,
     home_id: &str,
-) -> Result<(RpcFn, TempGrant), String> {
+    expected_principal: &str,
+) -> Result<RpcFn, String> {
     let link = DaemonLink::connect(runtime_dir, "cli", daemon_bin, home_path, Some(home_id))?;
-    let grant = TempGrant::add(runtime_dir, link.principal())?;
+    if link.principal() != expected_principal {
+        return Err(format!(
+            "handshake principal {} 与预期的 {expected_principal} 不一致",
+            link.principal()
+        ));
+    }
     let shared = Arc::new(Mutex::new(link));
     let rpc: RpcFn = Arc::new(move |method: &str, params: serde_json::Value| {
         shared
@@ -238,7 +248,7 @@ pub fn admin_rpc_with_grant(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .call(method, params)
     });
-    Ok((rpc, grant))
+    Ok(rpc)
 }
 
 /// 只连接、不授权（Task 8 的 home 保活用）。

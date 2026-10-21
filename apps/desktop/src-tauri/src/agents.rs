@@ -8,8 +8,20 @@ pub fn agents_list(home_id: String) -> Result<serde_json::Value, String> {
 }
 
 #[tauri::command(async)]
-pub fn agents_delete(home_id: String, agent_id: String) -> Result<serde_json::Value, String> {
-    omt_exec::agents::delete_agent(&daemon::runtime_dir(), &home_id, &agent_id)?;
+pub fn agents_delete(
+    home_id: String,
+    agent_id: String,
+    force: Option<bool>,
+) -> Result<serde_json::Value, String> {
+    // F-EXEC-14(4)：force=true = 「放弃租约并删除」（待对账租约守卫绕过，
+    // 租约留给 daemon 侧）；缺省 false 保持常规守卫。Starting/Running 与
+    // Orphan 守卫在 Rust 侧始终生效。
+    omt_exec::agents::delete_agent(
+        &daemon::runtime_dir(),
+        &home_id,
+        &agent_id,
+        force.unwrap_or(false),
+    )?;
     Ok(serde_json::json!({ "deleted": agent_id }))
 }
 

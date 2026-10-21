@@ -8,7 +8,9 @@
 import { useEffect, useState } from 'react'
 import type { AgentRecord } from './types'
 
-const CONFIRM_RESET_MS = 3000
+/** 两段式确认的自动还原窗口（ConfirmStopButton / ConfirmStopAllButton 与
+ * F-EXEC-14(4) 删除的「放弃租约并删除」第二步共用）。 */
+export const CONFIRM_RESET_MS = 3000
 
 /** 展示名：harness 给出的 title 优先，回退记录 displayName（P0 即 Agent N）。 */
 export function agentDisplayName(agent: AgentRecord): string {

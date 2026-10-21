@@ -843,6 +843,10 @@ fn finish_terminal(session: &ExecSession, terminal: &Terminal) {
         // terminal()==Some 即意味着 pending 已反映最终结果（shim 在此后死亡
         // 也不丢对账标记）。lease_release 缺席（测试注入等）时不写——
         // finalize 的预置保持 true，宁可多一次对账也不泄漏租约。
+        // F-EXEC-14(2)：reconciled=true（U10 对账已完成）的 exec 不再挂
+        // pending——§43 的僵尸路径：desktop 先 mark_reconciled，shim 随后的
+        // 重复释放失败无条件回写 pending=true，agent 从此删不掉；Err 不重挂，
+        // Ok 顺带清掉任何残留位。
         let pending = released.is_err();
         let _ = agents::update_exec(
             runtime_dir,
@@ -850,7 +854,7 @@ fn finish_terminal(session: &ExecSession, terminal: &Terminal) {
             &session.agent_id,
             &session.exec_id,
             |exec| {
-                exec.lease_release_pending = pending;
+                exec.lease_release_pending = pending && !exec.reconciled;
             },
         );
     }
@@ -1456,6 +1460,19 @@ pub fn transcript_tail_from(
     events
 }
 
+/// F-EXEC-14(3)：对账目标的 shim 身份仍存活 → 跳过且**不标记**——shim 自己
+/// 会收尾并释放租约（U10 对账与 shim 释放的竞态窗口里，desktop 此刻释放
+/// = 双重释放，陈旧快照的 admin report 可能误伤其他 exec 刚认领的 item）。
+/// 记录读不出（已删/损坏）时不按存活处理——交给各自的释放路径按原有
+/// 语义收口。
+fn target_shim_alive(runtime_dir: &Path, t: &agents::ReconcileTarget) -> bool {
+    agents::find_exec_in_home(runtime_dir, &t.home_id, &t.exec_id)
+        .ok()
+        .flatten()
+        .map(|(_, exec)| crate::control::shim_alive(&exec))
+        .unwrap_or(false)
+}
+
 /// U10 启动对账：对 demote 标记的中断 exec（app 重启杀死、daemon 侧租约
 /// 未释放——run item 卡 running、run 卡死）执行 §3.3 释放序列（admin
 /// report failed + retry 回 pending）。**只有释放成功才**置 `reconciled`
@@ -1473,6 +1490,11 @@ pub fn reconcile_interrupted_execs_with(
     };
     let mut handled = 0usize;
     for t in &targets {
+        // F-EXEC-14(3)：shim 仍存活的目标由 shim 自己收尾——跳过（不释放、
+        // 不标记），保持为下一轮的对账目标。
+        if target_shim_alive(runtime_dir, t) {
+            continue;
+        }
         if let Err(err) = release_items_for_exec(rpc, &t.home_id, &t.run_id, &t.exec_id) {
             eprintln!(
                 "对账：exec {} 租约释放失败（{err}），保留为对账目标",
@@ -1549,6 +1571,11 @@ pub fn reconcile_with_connector(
     };
     let mut handled = 0usize;
     for t in &targets {
+        // F-EXEC-14(3)：shim 仍存活的目标由 shim 自己收尾——跳过（不释放、
+        // 不标记），保持为下一轮的对账目标。
+        if target_shim_alive(runtime_dir, t) {
+            continue;
+        }
         let Ok(dir) = crate::layout::agent_dir(runtime_dir, &t.home_id, &t.agent_id) else {
             continue;
         };
@@ -2242,6 +2269,72 @@ mod tests {
                 "{case}: terminal() 发布后 pending 必须已反映释放结果: {exec:?}"
             );
         }
+    }
+
+    /// F-EXEC-14(2)：desktop 对账与 shim 收尾的竞态（§43 僵尸的第二步）——
+    /// U10 已 mark_reconciled（reconciled=true）后，shim 的重复 report/retry
+    /// 失败，finish_terminal 的 Err 回写不得把 pending 重新置位。旧代码无条件
+    /// 写 `pending = released.is_err()`，记录变回 pending=true + reconciled=true，
+    /// 与过宽的删除守卫组合成「永远删不掉」。
+    #[test]
+    fn terminal_release_err_does_not_rearm_pending_on_reconciled_exec() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        let home_path = dir.path().join("ws").join(".omt");
+        std::fs::create_dir_all(&home_path).unwrap();
+        let manager = ExecutionManager::with_limits(STARTUP_WINDOW, DEFAULT_MAX_DURATION);
+        manager.set_lease_release(Arc::new(|_, _, _| Err("daemon down".to_string())));
+        let agent = agents::register_agent(
+            &runtime,
+            "h_test",
+            "fake",
+            NewExec {
+                exec_id: "exec-zomb".into(),
+                node_id: None,
+                run_id: Some("run-1".into()),
+                binary_path: None,
+                binary_args: vec![],
+                model: None,
+            },
+        )
+        .unwrap();
+        // U10 对账已完成的形态：reconciled=true、pending 已清（mark_reconciled）
+        agents::update_exec(&runtime, "h_test", &agent.id, "exec-zomb", |e| {
+            e.reconciled = true;
+            e.lease_release_pending = false;
+        })
+        .unwrap();
+        let script = write_script(dir.path(), "zomb", "exit 0");
+        let session = manager
+            .spawn(
+                &runtime,
+                SpawnRequest {
+                    exec_id: "exec-zomb".into(),
+                    agent_id: agent.id.clone(),
+                    home_id: "h_test".into(),
+                    home_path,
+                    harness: "fake".into(),
+                    node_id: None,
+                    run_id: Some("run-1".into()),
+                    program: script,
+                    args: vec![],
+                    env_additions: BTreeMap::new(),
+                    mcp: McpInjection::None,
+                    transcript_dir: crate::layout::agent_dir(&runtime, "h_test", &agent.id)
+                        .unwrap(),
+                },
+                Arc::new(|_| {}),
+            )
+            .unwrap();
+        wait_for(|| session.terminal().map(|_| ()), Duration::from_secs(20))
+            .unwrap_or_else(|| panic!("应到达终态"));
+        let file = crate::agents::snapshot(&runtime, "h_test");
+        let exec = &file.agents[0].execs[0];
+        assert!(
+            !exec.lease_release_pending,
+            "reconciled 的 exec 不得因释放失败重回 pending（§43 僵尸）: {exec:?}"
+        );
+        assert!(exec.reconciled, "reconciled 不得被收尾改回: {exec:?}");
     }
 
     /// F-BENCH-20：终态归档的 usage 必须带口径标记——两条 message_end
@@ -3784,6 +3877,143 @@ mod tests {
             seen.lock().unwrap()[0],
             (rt.join("ws").join(".omt"), "h_t".to_string())
         );
+        assert!(crate::agents::list_reconcile_targets(rt)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// F-EXEC-14(3)：对账必须跳过记录的 shim 身份仍存活的 exec——shim 自己
+    /// 会收尾并释放租约，desktop 此刻释放 = 双重释放（shim 路径对账与 shim
+    /// 自身释放竞态，陈旧快照的 admin report 可能误伤其他 exec 刚认领的
+    /// item）。跳过**且不标记**（保持为对账目标，留给 shim 死亡后的下一轮）。
+    /// 修复前：无视存活 shim 直接释放（handled=1）。
+    #[test]
+    fn reconcile_with_connector_skips_live_shim_until_it_dies() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = dir.path();
+        let agent = crate::agents::register_agent(
+            rt,
+            "h_t",
+            "pi",
+            crate::agents::NewExec {
+                exec_id: "exec-live".into(),
+                node_id: None,
+                run_id: Some("RUN-1".into()),
+                binary_path: None,
+                binary_args: vec![],
+                model: None,
+            },
+        )
+        .unwrap();
+        crate::agents::update_exec(rt, "h_t", &agent.id, "exec-live", |e| {
+            e.lease_release_pending = true;
+            // 存活 shim：本测试进程自己的 pid + 真实起始标识
+            e.shim_pid = Some(std::process::id());
+            e.shim_start_id =
+                Some(crate::executor::process_start_identity(std::process::id()).unwrap());
+        })
+        .unwrap();
+        let mut spec = crate::spec::sample(&rt.join("ws").join(".omt"), Path::new("/bin/omt"));
+        spec.home_id = "h_t".into();
+        spec.agent_id = agent.id.clone();
+        spec.exec_id = "exec-live".into();
+        let adir = crate::layout::agent_dir(rt, "h_t", &agent.id).unwrap();
+        spec.write(&crate::layout::exec_file(
+            &adir,
+            "exec-live",
+            crate::layout::ExecFile::Spec,
+        ))
+        .unwrap();
+
+        let released = Arc::new(std::sync::Mutex::new(0usize));
+        let seen_release = released.clone();
+        let ok: crate::daemon_link::Connector = Arc::new(move |_: &Path, _: &str| {
+            *seen_release.lock().unwrap() += 1;
+            let rpc: RpcFn =
+                Arc::new(|_: &str, _: serde_json::Value| Ok(serde_json::json!({ "items": [] })));
+            Ok(rpc)
+        });
+        // shim 仍存活：跳过（不释放、不标记），保持为对账目标
+        assert_eq!(reconcile_with_connector(&ok, rt), 0, "存活 shim 必须被跳过");
+        assert_eq!(*released.lock().unwrap(), 0, "不得对存活 shim 发起释放");
+        assert_eq!(
+            crate::agents::list_reconcile_targets(rt).unwrap().len(),
+            1,
+            "跳过不标记——仍是下一轮的对账目标"
+        );
+        let untouched = crate::agents::get_agent(rt, "h_t", &agent.id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !untouched.execs[0].reconciled,
+            "跳过不得置 reconciled: {:?}",
+            untouched.execs[0]
+        );
+
+        // shim 死亡（身份翻转）→ 下一轮正常释放
+        crate::agents::update_exec(rt, "h_t", &agent.id, "exec-live", |e| {
+            e.shim_start_id = Some("macos:0:0".into());
+        })
+        .unwrap();
+        assert_eq!(reconcile_with_connector(&ok, rt), 1, "shim 死后应释放");
+        assert_eq!(*released.lock().unwrap(), 1);
+        assert!(crate::agents::list_reconcile_targets(rt)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// F-EXEC-14(3) 的另一半：U10 会话对账路径（reconcile_interrupted_execs）
+    /// 同样跳过存活 shim——desktop 启动对账与 shim 自身释放的竞态窗口在两条
+    /// 对账路径上都存在。
+    #[test]
+    fn reconcile_interrupted_execs_skips_live_shim() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = dir.path();
+        let agent = crate::agents::register_agent(
+            rt,
+            "h_t",
+            "pi",
+            crate::agents::NewExec {
+                exec_id: "exec-live2".into(),
+                node_id: None,
+                run_id: Some("RUN-1".into()),
+                binary_path: None,
+                binary_args: vec![],
+                model: None,
+            },
+        )
+        .unwrap();
+        crate::agents::update_exec(rt, "h_t", &agent.id, "exec-live2", |e| {
+            e.lease_release_pending = true;
+            e.shim_pid = Some(std::process::id());
+            e.shim_start_id =
+                Some(crate::executor::process_start_identity(std::process::id()).unwrap());
+        })
+        .unwrap();
+
+        let calls = Arc::new(std::sync::Mutex::new(0usize));
+        let seen = calls.clone();
+        let rpc = move |_: &str, _: serde_json::Value| -> Result<serde_json::Value, String> {
+            *seen.lock().unwrap() += 1;
+            Ok(serde_json::json!({ "items": [] }))
+        };
+        assert_eq!(
+            reconcile_interrupted_execs_with(&rpc, rt),
+            0,
+            "存活 shim 必须被跳过"
+        );
+        assert_eq!(*calls.lock().unwrap(), 0, "不得对存活 shim 发起释放");
+        assert_eq!(
+            crate::agents::list_reconcile_targets(rt).unwrap().len(),
+            1,
+            "跳过不标记——仍是下一轮的对账目标"
+        );
+
+        crate::agents::update_exec(rt, "h_t", &agent.id, "exec-live2", |e| {
+            e.shim_start_id = Some("macos:0:0".into());
+        })
+        .unwrap();
+        assert_eq!(reconcile_interrupted_execs_with(&rpc, rt), 1);
         assert!(crate::agents::list_reconcile_targets(rt)
             .unwrap()
             .is_empty());

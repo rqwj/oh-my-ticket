@@ -13,7 +13,13 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { omtCall, type StopAllOutcome, type TranscriptEvent } from './bridge'
 import type { AgentRecord, ExecRecord, OmtNode, RunDetail, RunItemView } from './types'
 import { claimedCountForExec, danglingBindingsOf, nodeTitlesById } from './store'
-import { agentDisplayName, ConfirmStopAllButton, ConfirmStopButton, describeFailure } from './agentUi'
+import {
+  agentDisplayName,
+  CONFIRM_RESET_MS,
+  ConfirmStopAllButton,
+  ConfirmStopButton,
+  describeFailure,
+} from './agentUi'
 import { TranscriptView } from './TranscriptView'
 import { DeleteIcon } from './icons'
 
@@ -77,8 +83,10 @@ interface Props {
   onStopAgent: (execId: string) => void
   /** U10：空闲 agent 一键续跑（App → store.resumeAgent） */
   onResumeAgent: (agent: AgentRecord) => Promise<void>
-  /** F-DEL：删除 agent（确认弹窗在面板内；终态守卫在服务端） */
-  onDeleteAgent: (agent: AgentRecord) => Promise<void>
+  /** F-DEL / F-EXEC-14(4)：删除 agent（确认弹窗在面板内；终态守卫在服务端）。
+   * `force=true` = 常规删除被「待对账租约」守卫拒绝后的「放弃租约并删除」
+   * （第二步确认提供该入口；force 只绕过租约守卫，其余守卫仍在服务端）。 */
+  onDeleteAgent: (agent: AgentRecord, force?: boolean) => Promise<void>
   onKillOrphan: (agentId: string, execId: string) => void
   onOpenHarnessSettings: () => void
   /** U9：一键清理悬空绑定（bindings_gc，成功后 App/store 侧重拉绑定表） */
@@ -115,6 +123,14 @@ export function AgentsPanel({
   const [deleteTarget, setDeleteTarget] = useState<AgentRecord | null>(null)
   const [deleting, setDeleting] = useState(false)
   const [deleteError, setDeleteError] = useState<string | null>(null)
+  /** F-EXEC-14(4)：删除弹窗处于第二步（常规删除被待对账租约守卫拒绝后的
+   * 「放弃租约并删除」确认；CONFIRM_RESET_MS 无操作还原回第一步） */
+  const [forceArming, setForceArming] = useState(false)
+  useEffect(() => {
+    if (!forceArming) return
+    const timer = setTimeout(() => setForceArming(false), CONFIRM_RESET_MS)
+    return () => clearTimeout(timer)
+  }, [forceArming])
   /** review F14（P-10）：停止全部的进行中状态与结果提示（5 秒后消失） */
   const [stoppingAll, setStoppingAll] = useState(false)
   const [stopAllNotice, setStopAllNotice] = useState<string | null>(null)
@@ -303,6 +319,10 @@ export function AgentsPanel({
     if (!exec || !stat) return sum
     return (sum ?? 0) + claimedCountForExec(stat.items, exec.execId)
   }, null)
+  /** §43 P3：停止失败明细的截断呈现——最多列前 2 条，余者以「等 N 个」带过
+   * （Rust 失败串形如 `agent <agentId>: <err>`，agent id 是用户定位线索）。 */
+  const describeStopAllFailures = (failed: string[]): string =>
+    failed.length <= 2 ? failed.join('；') : `${failed[0]}；${failed[1]}；等 ${failed.length} 个`
   const handleStopAll = async () => {
     if (!onStopAll) return
     setStoppingAll(true)
@@ -310,16 +330,21 @@ export function AgentsPanel({
       const outcome = await onStopAll()
       const orphanNote =
         groups.orphan.length > 0 ? `；${groups.orphan.length} 个不受控 agent 需单独强制终止` : ''
-      // review R2-7 / F-EXEC-12：全失败、无事可做、成功、部分失败分开提示
-      // （部分失败 = store 折算后的 { signaled>0, failed>0 }，用户须被告知
-      // 有 agent 没能停止——此前被当成功吞掉）
+      // review R2-7 / F-EXEC-12 / §43 P3：全失败、无事可做、成功、部分失败
+      // 分开提示，且失败要带明细（此前只报计数，用户无从定位是哪个 agent）。
+      // §43 P3：outcome 携带 signaled=0 && failed>0 时也按失败处理——不得
+      // 只依赖 store 的 null 折算（面板对 outcome 原形状自卫）。
       setStopAllNotice(
         outcome === null
           ? '停止失败，请重试'
           : outcome.signaled === 0
-            ? '当前没有运行中的 agent'
+            ? outcome.failed.length > 0
+              ? `停止失败：${describeStopAllFailures(outcome.failed)}`
+              : '当前没有运行中的 agent'
             : `已向 ${outcome.signaled} 个 agent 发出停止信号${
-                outcome.failed.length > 0 ? `，${outcome.failed.length} 个停止失败` : ''
+                outcome.failed.length > 0
+                  ? `，${outcome.failed.length} 个停止失败：${describeStopAllFailures(outcome.failed)}`
+                  : ''
               }${orphanNote}`,
       )
     } finally {
@@ -379,6 +404,7 @@ export function AgentsPanel({
               onClick={event => {
                 event.stopPropagation()
                 setDeleteError(null)
+                setForceArming(false)
                 setDeleteTarget(agent)
               }}
             >
@@ -455,6 +481,7 @@ export function AgentsPanel({
               selected.attachment !== 'orphan'
                 ? () => {
                     setDeleteError(null)
+                    setForceArming(false)
                     setDeleteTarget(selected)
                   }
                 : undefined
@@ -484,12 +511,27 @@ export function AgentsPanel({
         )}
         {gatePopup}
         {deleteTarget && (
-          // F-DEL：删除确认弹窗——红色危险态，明确不可恢复与影响面
+          // F-DEL：删除确认弹窗——红色危险态，明确不可恢复与影响面。
+          // F-EXEC-14(4)：常规删除被「待对账租约」守卫拒绝时进入第二步
+          // 「放弃租约并删除」确认（CONFIRM_RESET_MS 无操作还原第一步）；
+          // 其余错误照旧就地报错。
           <div className="trust-gate-popup delete-confirm" role="alertdialog" aria-label="确认删除 agent">
-            <p className="trust-gate-popup-title">
-              删除 {agentDisplayName(deleteTarget)}（{deleteTarget.harness}）？
-            </p>
-            <p className="hm-hint">将删除该 agent 的记录、执行历史和 transcript 文件。此操作不可恢复。</p>
+            {forceArming ? (
+              <>
+                <p className="trust-gate-popup-title">该 agent 有未释放的租约。放弃租约并删除？</p>
+                <p className="hm-hint">
+                  将放弃待对账的租约（交由 daemon 对账收尾），并删除该 agent 的记录、执行历史和
+                  transcript 文件。此操作不可恢复。
+                </p>
+              </>
+            ) : (
+              <>
+                <p className="trust-gate-popup-title">
+                  删除 {agentDisplayName(deleteTarget)}（{deleteTarget.harness}）？
+                </p>
+                <p className="hm-hint">将删除该 agent 的记录、执行历史和 transcript 文件。此操作不可恢复。</p>
+              </>
+            )}
             {deleteError && <p className="error-banner">{deleteError}</p>}
             <div className="chip-row">
               <button
@@ -497,15 +539,40 @@ export function AgentsPanel({
                 disabled={deleting}
                 onClick={() => {
                   setDeleting(true)
-                  onDeleteAgent(deleteTarget)
-                    .then(() => setDeleteTarget(null))
-                    .catch(err => setDeleteError(String(err)))
+                  // F-EXEC-14(4)：第二步（放弃租约）以 force=true 重发；第一步
+                  // 保持 onDeleteAgent(agent) 的既有单参契约（store/bridge
+                  // 侧缺省按 false 走常规守卫）
+                  const attempt = forceArming
+                    ? onDeleteAgent(deleteTarget, true)
+                    : onDeleteAgent(deleteTarget)
+                  attempt
+                    .then(() => {
+                      setDeleteTarget(null)
+                      setForceArming(false)
+                    })
+                    .catch(err => {
+                      if (String(err).includes('存在待对账的租约')) {
+                        // F-EXEC-14(4)：租约守卫拒绝 → 第二步「放弃租约并删除」
+                        //（守卫原因由第二步文案说明，不重复刷原始长错误）
+                        setDeleteError(null)
+                        setForceArming(true)
+                      } else {
+                        setDeleteError(String(err))
+                      }
+                    })
                     .finally(() => setDeleting(false))
                 }}
               >
-                {deleting ? '删除中…' : '确认删除'}
+                {deleting ? '删除中…' : forceArming ? '确认' : '确认删除'}
               </button>
-              <button className="chip" disabled={deleting} onClick={() => setDeleteTarget(null)}>
+              <button
+                className="chip"
+                disabled={deleting}
+                onClick={() => {
+                  setDeleteTarget(null)
+                  setForceArming(false)
+                }}
+              >
                 取消
               </button>
             </div>

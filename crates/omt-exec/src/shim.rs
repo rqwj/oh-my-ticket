@@ -28,11 +28,14 @@ use crate::spec::LaunchSpec;
 
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-/// P3-b：租约释放的 daemon 连接 seam——连接 + 临时 admin 授权**成对**返回。
-/// 与 Connector（admin_connector）的差别：TempGrant 显式交给调用方持有，
-/// 释放超时（run_bounded 放弃其工作线程）后仍能在本侧立即撤销授权，
-/// 不留 pid 复用可乘之机的临时 admin 窗口。
-pub type Leaser = Arc<dyn Fn(&Path, &str) -> Result<(RpcFn, TempGrant), String> + Send + Sync>;
+/// P3-b/F-EXEC-15：租约释放的 daemon 连接 seam——**只连接并校验 principal，
+/// 不持有授权**。调用方（lease_releaser）先把确定性 principal `cli:<本进程
+/// pid>` 的 TempGrant 建好（本地文件 IO，不阻塞），再把 connect+enroll+
+/// declare 的全部 daemon 往返关进 run_bounded——半卡死 daemon（accept 但
+/// declare 卡住）不能再把 30s 的租约释放上限撑到 ~130s；超时（run_bounded
+/// 放弃工作线程）后 grant 由调用方 drop，不留 pid 复用可乘之机的临时 admin
+/// 窗口。
+pub type Leaser = Arc<dyn Fn(&Path, &str) -> Result<RpcFn, String> + Send + Sync>;
 
 /// F-EXEC-10：租约释放序列（连接 + run/get + 逐项 report/retry）的有界等待
 /// 上限——wedged daemon 不得挂死收尾（finish_terminal 同步等它）。生产默认
@@ -260,7 +263,11 @@ fn run_inner(
     }
 
     let manager = ExecutionManager::with_max_duration(Duration::from_secs(spec.max_duration_secs));
-    manager.set_lease_release(lease_releaser(spec.home_path.clone(), lease));
+    manager.set_lease_release(lease_releaser(
+        runtime_dir.to_path_buf(),
+        spec.home_path.clone(),
+        lease,
+    ));
     let request = SpawnRequest {
         exec_id: exec_id.to_string(),
         agent_id: agent_id.to_string(),
@@ -349,29 +356,42 @@ fn spawn_keepalive(
 /// 终态租约释放：按需连接 daemon（长时间执行期间 daemon 可能已 idle 退出；
 /// 连接时保证 home 在凭据范围内，review F4）。失败只记待对账标记（由
 /// finish_terminal 落 pending，F-EXEC-13），不影响收尾的其余步骤。
-/// F-EXEC-10：释放序列经 `run_bounded` 有界等待——finish_terminal 同步等本
-/// 回调，wedged daemon（accept 但永不回复）不得借此挂死 shim（exec_active
-/// 永真、followers 不结束、stop_exec 空转）。连接自身受 daemon_link 的
-/// socket 超时约束，不会挂死，故在有界等待之外建立。
+/// F-EXEC-10/F-EXEC-15：**整个释放序列**（连接 + 授权 + run/get + 逐项
+/// report/retry）经 `run_bounded` 有界等待——finish_terminal 同步等本回调，
+/// wedged daemon（accept 但永不回复，或只卡在 declare 上）不得借此挂死
+/// shim。F-EXEC-15：501d898 曾把 connect 移出有界等待（授权分离的副作
+/// 用），半卡死 daemon 的 connect 可达 ~130s，上限形同虚设——现在授权
+/// 用**确定性 principal** `cli:<本进程 pid>`（kind "cli" 的 handshake 保证
+/// 同值）在有界等待**之前**建好（TempGrant::add 是本地文件 IO，不阻塞），
+/// connect（Leaser 闭包）回到 run_bounded 闭包内部。
 /// P3-b：TempGrant 持有在 run_bounded **之外**——超时路径 run_bounded 会
 /// 放弃其工作线程，授权若只被线程内的值持有就泄漏到进程结束（pid 复用
 /// 即提权窗口）；成功/失败/超时三条路径都在本侧 drop(grant) 立即撤销。
-fn lease_releaser(home_path: PathBuf, leaser: Leaser) -> crate::executor::LeaseRelease {
+fn lease_releaser(
+    runtime_dir: PathBuf,
+    home_path: PathBuf,
+    leaser: Leaser,
+) -> crate::executor::LeaseRelease {
     Arc::new(move |home_id: &str, run_id: &str, exec_id: &str| {
         let home_id = home_id.to_string();
         let run_id = run_id.to_string();
         let exec_id = exec_id.to_string();
-        let outcome = match leaser(&home_path, &home_id) {
-            // 连接/授权失败：TempGrant 未建立（add 失败不产生守卫），无需界内等待
+        // 授权先行：principal 确定性（cli kind + 本进程 pid），Leaser 侧的
+        // handshake principal 校验与之比对（daemon_link::admin_rpc_prepared）
+        let principal = format!("cli:{}", std::process::id());
+        let outcome = match TempGrant::add(&runtime_dir, &principal) {
             Err(err) => Err(err),
-            Ok((rpc, grant)) => {
-                // 工作闭包须 'static（跑在独立线程里）：rpc 克隆进去，grant 留下
+            Ok(grant) => {
+                // 工作闭包须 'static（跑在独立线程里）：leaser 的 Arc 与参数
+                // 克隆进去；connect（daemon 往返）与释放序列一起受界约束
                 let bounded = {
-                    let rpc = rpc.clone();
+                    let leaser = leaser.clone();
+                    let home_path = home_path.clone();
                     let home_id = home_id.clone();
                     let run_id = run_id.clone();
                     let exec_id = exec_id.clone();
                     move || {
+                        let rpc = leaser(&home_path, &home_id)?;
                         crate::executor::release_items_for_exec(&*rpc, &home_id, &run_id, &exec_id)
                     }
                 };
@@ -451,18 +471,16 @@ mod tests {
         (tmp, runtime, spec)
     }
 
-    /// P3-b：测试假 Leaser 在真实临时 runtime 上建真实 TempGrant——Drop 即
-    /// 撤销授权，不污染同进程其他测试；同时按 method 记账供断言。
-    fn recording_leaser(calls: Arc<Mutex<Vec<String>>>, runtime: &Path) -> Leaser {
-        let runtime = runtime.to_path_buf();
+    /// F-EXEC-15：测试假 Leaser 只连接（按 method 记账供断言）——临时授权由
+    /// lease_releaser 在有界等待之前以 `cli:<pid>` 建立，不在 stub 里。
+    fn recording_leaser(calls: Arc<Mutex<Vec<String>>>, _runtime: &Path) -> Leaser {
         Arc::new(move |_home: &Path, _home_id: &str| {
             let calls = calls.clone();
             let rpc: RpcFn = Arc::new(move |method: &str, _params: serde_json::Value| {
                 calls.lock().unwrap().push(method.to_string());
                 Ok(serde_json::json!({ "items": [] }))
             });
-            let grant = TempGrant::add(&runtime, &format!("cli:{}", std::process::id()))?;
-            Ok((rpc, grant))
+            Ok(rpc)
         })
     }
 
@@ -734,14 +752,12 @@ mod tests {
     fn wedged_lease_rpc_completes_with_pending_marker() {
         let env_guard = LEASE_TIMEOUT_ENV_LOCK.lock().unwrap();
         let (_t, runtime, spec) = rig("exit 0", Some("RUN-1"));
-        let rt = runtime.clone();
-        let wedged: Leaser = Arc::new(move |_: &Path, _: &str| {
+        let wedged: Leaser = Arc::new(|_: &Path, _: &str| {
             let rpc: RpcFn = Arc::new(|_: &str, _: serde_json::Value| {
                 std::thread::sleep(Duration::from_secs(300));
                 Ok(serde_json::json!({ "items": [] }))
             });
-            let grant = TempGrant::add(&rt, "cli:111111")?;
-            Ok((rpc, grant))
+            Ok(rpc)
         });
         std::env::set_var("OMT_SHIM_LEASE_TIMEOUT_MS", "200");
         let started = Instant::now();
@@ -775,18 +791,18 @@ mod tests {
     /// 必须已被撤销——admin-grants.json 里不再有该 principal、
     /// exec/temp-grants.json 登记表已清。修复前授权只被工作线程内的守卫
     /// 持有，超时 detach 后泄漏到下次 desktop 启动清扫，pid 复用即提权窗口。
+    /// F-EXEC-15：授权以确定性 principal `cli:<本进程 pid>` 预建（lease_
+    /// releaser），与本测试进程同 pid。
     #[test]
     fn lease_timeout_revokes_temp_grant_immediately() {
         let env_guard = LEASE_TIMEOUT_ENV_LOCK.lock().unwrap();
         let (_t, runtime, spec) = rig("exit 0", Some("RUN-1"));
-        let rt = runtime.clone();
-        let wedged: Leaser = Arc::new(move |_: &Path, _: &str| {
+        let wedged: Leaser = Arc::new(|_: &Path, _: &str| {
             let rpc: RpcFn = Arc::new(|_: &str, _: serde_json::Value| {
                 std::thread::sleep(Duration::from_secs(300));
                 Ok(serde_json::json!({ "items": [] }))
             });
-            let grant = TempGrant::add(&rt, "cli:222222")?;
-            Ok((rpc, grant))
+            Ok(rpc)
         });
         std::env::set_var("OMT_SHIM_LEASE_TIMEOUT_MS", "200");
         let code = execute(
@@ -799,15 +815,75 @@ mod tests {
         );
         std::env::remove_var("OMT_SHIM_LEASE_TIMEOUT_MS");
         assert_eq!(code, 0);
+        let principal = format!("cli:{}", std::process::id());
         let principals = crate::grants::principals(&runtime);
         assert!(
-            !principals.contains(&"cli:222222".to_string()),
+            !principals.contains(&principal),
             "超时后临时授权必须立即撤销: {principals:?}"
         );
         let registry = std::fs::read_to_string(runtime.join("exec").join("temp-grants.json"))
             .unwrap_or_default();
         assert!(
-            !registry.contains("cli:222222"),
+            !registry.contains(&principal),
+            "临时登记表必须已清: {registry}"
+        );
+        drop(env_guard);
+    }
+
+    /// F-EXEC-15：Leaser 的 connect/enroll 本身慢（半卡死 daemon：accept 但
+    /// 卡在 declare）也必须受租约上限约束——connect 在 run_bounded 闭包
+    /// **内部**（501d898 曾把它移出去，30s 上限被 ~130s 的 connect 撑穿）。
+    /// execute() 有界完成 + lease_release_pending 置位 + 临时授权（确定性
+    /// `cli:<本进程 pid>`）已被撤销。
+    /// 计时断言的余量：慢 connect 睡 30s（界外形态必须撞线）、上限放宽到
+    /// 15s——TempGrant::add 在界外先行，经 atomic_json 的进程级 STORE_LOCK
+    /// 与同二进制其他测试串行，workspace 首跑（测试与编译并发）下墙钟会
+    /// 拉长；绿路径的工作线程在 200ms 界即被 detach，30s 沉睡不进测试时长。
+    #[test]
+    fn slow_leaser_connect_is_bounded_and_revokes_grant() {
+        let env_guard = LEASE_TIMEOUT_ENV_LOCK.lock().unwrap();
+        let (_t, runtime, spec) = rig("exit 0", Some("RUN-1"));
+        let slow: Leaser = Arc::new(|_: &Path, _: &str| {
+            std::thread::sleep(Duration::from_secs(30));
+            let rpc: RpcFn =
+                Arc::new(|_: &str, _: serde_json::Value| Ok(serde_json::json!({ "items": [] })));
+            Ok(rpc)
+        });
+        std::env::set_var("OMT_SHIM_LEASE_TIMEOUT_MS", "200");
+        let started = Instant::now();
+        let code = execute(
+            &runtime,
+            "h_test",
+            &spec.agent_id,
+            "exec-s",
+            slow,
+            idle_keepalive(),
+        );
+        std::env::remove_var("OMT_SHIM_LEASE_TIMEOUT_MS");
+        assert_eq!(code, 0, "慢 connect 下收尾仍须有界完成");
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "execute 应在租约超时（200ms）后随即返回，实际 {:?}——connect 不在界内",
+            started.elapsed()
+        );
+        let agent = crate::agents::get_agent(&runtime, "h_test", &spec.agent_id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            agent.execs[0].lease_release_pending,
+            "超时的释放必须标记待对账：{:?}",
+            agent.execs[0]
+        );
+        let principal = format!("cli:{}", std::process::id());
+        let principals = crate::grants::principals(&runtime);
+        assert!(
+            !principals.contains(&principal),
+            "超时后临时授权必须立即撤销: {principals:?}"
+        );
+        let registry = std::fs::read_to_string(runtime.join("exec").join("temp-grants.json"))
+            .unwrap_or_default();
+        assert!(
+            !registry.contains(&principal),
             "临时登记表必须已清: {registry}"
         );
         drop(env_guard);

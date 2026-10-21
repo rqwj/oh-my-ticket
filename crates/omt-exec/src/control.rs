@@ -192,7 +192,10 @@ fn stop_all_with(
         };
         match stop_one(exec) {
             Ok(signaled) => outcome.signaled_count += usize::from(signaled),
-            Err(err) => outcome.errors.push(format!("exec {}: {err}", exec.exec_id)),
+            // P3-b（§43）：逐 agent 错误必须携带 agent 身份——退出/停止全部
+            // 的失败明细只进 stderr/通知条，只有 exec id 时用户看不出是哪个
+            // agent 停止失败。与上方 get_agent 错误分支的 `agent <id>:` 同形。
+            Err(err) => outcome.errors.push(format!("agent {}: {err}", agent.id)),
         }
     }
     Ok(outcome)
@@ -560,6 +563,14 @@ mod tests {
         assert!(
             outcome.errors[0].contains("exec-a-ep"),
             "{}",
+            outcome.errors[0]
+        );
+        // P3-b（§43）：失败明细必须携带 agent 身份（`agent <agentId>: …`）——
+        // 界面/退出日志只显示这些字符串，只有 exec id 时用户看不出是哪个
+        // agent 停止失败。
+        assert!(
+            outcome.errors[0].contains(&unsignalable),
+            "失败明细必须含 agent id（P3-b）: {}",
             outcome.errors[0]
         );
         // 第二个 agent 确实收到 SIGTERM——旧代码（首错即中止）下它永不会被

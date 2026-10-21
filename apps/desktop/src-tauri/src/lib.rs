@@ -22,10 +22,14 @@ static QUIT_CONFIRMED: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 
 /// F-EXEC-6 残留：确认框重入守卫。重复 ⌘Q / 关窗会叠出多个模态框，且旧框
 /// 的选择会作用于弹框时刻的过时状态快照——已有确认框在场时，后来的退出/
-/// 关窗请求只 prevent 不再叠框；标志在 `show_with_result` 回调的**第一句**
-/// 清零（先于对选择做任何动作），确认框关闭后新请求可以再弹。
+/// 关窗请求只 prevent 不再叠框。
+/// P3-a（§43）：清零只发生在**回到正常运行**的分支（关窗框的 KEEP 隐藏后、
+/// 两框的 Cancel）；会退出的分支（STOP，以及退出路径上选择 KEEP/确认退
+/// 出）**保持置位**直到进程退出——否则 stop_all_execs 的窗口里再按 ⌘Q 会
+/// 叠出第二个（退出后无法应答的）确认框。
 /// 无单测缝（tauri 胶水）——手动验收：连按 ⌘Q 只弹一个框；框 A 在场时再
-/// ⌘Q 不出现第二个框；关掉 A 后再 ⌘Q 能再弹。
+/// ⌘Q 不出现第二个框；关掉 A 后再 ⌘Q 能再弹；选「全部停止后退出」后
+/// 立即再按 ⌘Q 不叠框。
 static DIALOG_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// 退出 / 关窗确认共用的三按钮文案（review R2-6：第一个按钮是 Return 默认
@@ -159,20 +163,26 @@ pub fn run() {
                     DIALOG_CANCEL.into(),
                 ))
                 .show_with_result(move |result| {
-                    DIALOG_OPEN.store(false, Ordering::SeqCst); // 第一句清零：选择生效前放行后续弹框
                     match dialog_choice(result).as_str() {
                         DIALOG_KEEP => {
-                            // 后台继续：隐藏保活的窗口，应用不退出
+                            // 后台继续：隐藏保活的窗口，应用不退出——回到
+                            // 正常运行，清 DIALOG_OPEN 放行后续弹框
                             if let Some(win) = handle.get_webview_window("main") {
                                 let _ = win.hide();
                             }
+                            DIALOG_OPEN.store(false, Ordering::SeqCst);
                         }
                         DIALOG_STOP => {
+                            // 退出路径（P3-a）：DIALOG_OPEN 保持置位直到进程
+                            // 退出——stop_all_execs 期间再 ⌘Q / 关窗只 prevent
+                            // 不叠框
                             stop_all_execs(&runtime_dir);
                             QUIT_CONFIRMED.store(true, Ordering::SeqCst);
                             handle.exit(0);
                         }
-                        _ => {} // 取消 / Esc / 关闭对话框：close 已被 prevent，窗口不动
+                        // 取消 / Esc / 关闭对话框：窗口保持原样（close 已被
+                        // prevent）——回到正常运行，清 DIALOG_OPEN
+                        _ => DIALOG_OPEN.store(false, Ordering::SeqCst),
                     }
                 });
         })
@@ -304,11 +314,18 @@ pub fn run() {
                             DIALOG_CANCEL.into(),
                         ))
                         .show_with_result(move |result| {
-                            DIALOG_OPEN.store(false, Ordering::SeqCst); // 第一句清零：选择生效前放行后续弹框
                             match dialog_choice(result).as_str() {
+                                // KEEP / STOP 都是退出路径（P3-a）：DIALOG_OPEN
+                                // 保持置位直到进程退出——stop_all_execs / 退出
+                                // 窗口里再 ⌘Q 只 prevent 不叠框
                                 DIALOG_KEEP => {}
                                 DIALOG_STOP => stop_all_execs(&runtime_dir),
-                                _ => return, // 取消 / Esc / 关闭对话框：不退出
+                                // 取消 / Esc / 关闭对话框：不退出——只有回到
+                                // 正常运行的分支清 DIALOG_OPEN（P3-a）
+                                _ => {
+                                    DIALOG_OPEN.store(false, Ordering::SeqCst);
+                                    return;
+                                }
                             }
                             QUIT_CONFIRMED.store(true, Ordering::SeqCst);
                             handle.exit(0);

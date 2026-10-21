@@ -735,12 +735,14 @@ export function useTreeStore() {
     [startDispatch],
   )
 
-  /** F-DEL：删除 agent（终态守卫在服务端）；成功后清选中态并重拉列表。 */
+  /** F-DEL / F-EXEC-14(4)：删除 agent（终态守卫在服务端）。`force=true` =
+   * 「放弃租约并删除」——只绕过待对账租约守卫（面板在常规删除被租约守卫
+   * 拒绝后以两段式确认提供该入口）；成功后清选中态并重拉列表。 */
   const deleteAgent = useCallback(
-    async (agentId: string) => {
+    async (agentId: string, force?: boolean) => {
       const home = activeHomeRef.current
       if (!home) throw new Error('无活动 workspace')
-      await agentsDelete(home.homeId, agentId)
+      await agentsDelete(home.homeId, agentId, force ?? false)
       setState(s => ({
         ...s,
         selectedAgentId: s.selectedAgentId === agentId ? null : s.selectedAgentId,
@@ -780,25 +782,27 @@ export function useTreeStore() {
     [ingestTranscriptEvent],
   )
 
-  /** P-10 / review F14 / R2-7 / F-EXEC-12：停止当前 home 的全部运行中 exec。
-   * 返回 `{ signaled, failed }`（部分失败如实上抛供面板提示「N 个停止失败」）；
-   * 失败返回 null（不能与「本来就没有运行中的」0 混淆）：
+  /** P-10 / review F14 / R2-7 / F-EXEC-12 / §43 P3：停止当前 home 的全部运行中
+   * exec。返回 `{ signaled, failed }`（部分失败如实上抛供面板提示「N 个停止
+   * 失败：明细」）；失败返回 null（不能与「本来就没有运行中的」0 混淆）：
    * - invoke 拒绝（home 级失败）→ 全局 error + null（既有语义）。
    * - 全部失败（signaled=0 且有 failed）→ 全局 error（合并明细）+ null
    *   （R2-7 的「停止失败」语义保留——F-EXEC-12 在 Rust 侧以 Ok 数据携带
    *   明细而非 Err，此处折算回等价的可观察行为）。
    * - 部分失败（signaled>0 且有 failed）→ 返回结果本身，面板拼接
-   *   「已向 N 个 agent 发出停止信号，M 个停止失败」。 */
+   *   「已向 N 个 agent 发出停止信号，M 个停止失败」。
+   * §43 P3：repull 在映射前无条件执行——全失败路径此前跳过重拉，行内残留
+   * 的运行态不会被刷新（对账收尾后 agents.json 已变，UI 需要跟上）。 */
   const stopAll = useCallback(async (): Promise<StopAllOutcome | null> => {
     const home = activeHomeRef.current
     if (!home) return null
     try {
       const outcome = await execStopAll(home.homeId)
+      scheduleAgentsRepull()
       if (outcome.failed.length > 0 && outcome.signaled === 0) {
         setState(s => ({ ...s, error: presentError(outcome.failed.join('；')) }))
         return null
       }
-      scheduleAgentsRepull()
       return outcome
     } catch (error) {
       setState(s => ({ ...s, error: presentError(error) }))

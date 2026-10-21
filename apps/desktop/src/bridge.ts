@@ -324,9 +324,15 @@ export async function harnessLaunchPreview(harness: string): Promise<HarnessLaun
   return invoke<HarnessLaunchPreview>('harness_launch_preview', { harness })
 }
 
-/** F-DEL：删除 agent（终态；运行中/不受控会被服务端拒绝并给可读理由） */
-export async function agentsDelete(homeId: string, agentId: string): Promise<void> {
-  await invoke<void>('agents_delete', { homeId, agentId })
+/** F-DEL / F-EXEC-14(4)：删除 agent（终态守卫在服务端）。`force=true` =
+ * 「放弃租约并删除」——只绕过待对账租约守卫（租约留给 daemon 侧对账收尾），
+ * Starting/Running 与 Orphan 守卫不受 force 影响；缺省 false 走常规守卫。 */
+export async function agentsDelete(
+  homeId: string,
+  agentId: string,
+  force: boolean = false,
+): Promise<void> {
+  await invoke<void>('agents_delete', { homeId, agentId, force })
 }
 
 /** 历史 transcript 尾部（F-PI-3）：raw.log 尾部重建的展示事件——

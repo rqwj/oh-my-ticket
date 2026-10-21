@@ -30,18 +30,21 @@ fn exec_shim_entry(args: &[String]) -> Option<i32> {
                 .ok()
                 .and_then(|exe| exe.parent().map(|dir| dir.join("omt-daemon")))
                 .filter(|path| path.is_file());
-            // P3-b：租约释放走 admin_rpc_with_grant——授权守卫由 lease_releaser
-            // 持有在有界等待之外，释放超时（run_bounded 放弃工作线程）也能
-            // 立即撤销临时 admin 授权。
+            // F-EXEC-15：Leaser 只连接并校验 principal（admin_rpc_prepared），
+            // 不携带授权——临时授权由 shim 的 lease_releaser 以确定性
+            // principal `cli:<本进程 pid>` 预先建立，connect+enroll+declare
+            // 的全部 daemon 往返都在租约超时的有界等待内部；授权在有界等待
+            // 之外持有，成功/失败/超时都会立即撤销（P3-b）。
             let lease_runtime = target.runtime_dir.clone();
             let lease_bin = daemon_bin.clone();
             let lease: omt_exec::shim::Leaser =
                 std::sync::Arc::new(move |home_path: &std::path::Path, home_id: &str| {
-                    omt_exec::daemon_link::admin_rpc_with_grant(
+                    omt_exec::daemon_link::admin_rpc_prepared(
                         &lease_runtime,
                         lease_bin.as_deref(),
                         home_path,
                         home_id,
+                        &format!("cli:{}", std::process::id()),
                     )
                 });
             let keepalive =
