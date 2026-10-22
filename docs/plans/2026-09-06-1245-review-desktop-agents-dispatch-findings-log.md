@@ -1467,6 +1467,8 @@ F-BENCH-13 查证结论：4e960a2 提交说明声称的探针/capture/lib 改动
 - 强制删除（F-EXEC-14/16，「放弃租约并删除」）：**通过**（2026-10-22，Agent 47 pi / TICKET-0009 / RUN-0046）。构造：认领后 `kill -9` shim 与 harness 进程组，并在 agent.json 写入 shim 收尾释放失败的形态（`failed`、`leaseReleasePending=true`、`reconciled=false`），daemon 侧 item 仍 `running` 挂在 `mcp:73903/exec:exec-48961-1`。UI：普通删除被租约守卫拒绝 → 出现「放弃租约并删除 Agent 47」→ 点击后 agent 消失（用户确认）。后台：15:19:18 item `running → failed → pending`（`force_release_agent_leases` 先释放后删除），agent 目录已删除、无 `.trash-*` 残留。注：bindings.json 仍留 `TICKET-0009 → agent-exec-48961-1` 悬空绑定（按设计由用户触发 `bindings_gc` 清理）；UI 不展示释放结果（§47 P3）。
 - 「不受控（执行进程已丢失）」分组 + 强制终止：**通过**（2026-10-22，Agent 50 omp / TICKET-0010 / RUN-0049）。构造：认领后 `kill -9` shim、**待其确实退出后**立即 `kill -STOP` harness 进程组（先 STOP 再杀 shim 会因 POSIX 孤儿进程组规则收到 SIGHUP+SIGCONT 而退出；不 STOP 则 omp/pi 随 shim 退出——两次失败尝试即 Agent 48/49）。重启 app：日志「启动对账：3 个 exec 的 shim 已不在」；Agent 50 `failed` + `attachment=orphan`，item 经对账回 pending；UI 不受控分组可见、点「强制终止」后 omp（87339）被 SIGKILL，agent `killed`（kill_reason=orphan）。**遗留**：`kill_orphan` 只杀单 pid（计划「已知的有意简化」），harness 的 MCP 桥子进程 `omt mcp`（87340，同进程组）残留——真实场景中它会因 stdin EOF 自行退出，本次因被 STOP 而滞留，已手工清理。
 
+**验收环境注记（2026-10-23）**：验收 runtime/home 位于 `/tmp`，macOS 每日 tmp 清理在 00:00 删除了 3 天以上未访问的文件——`harness/config.json`（+lock，10-18 后未改）、迁移前遗留的 9 个无主 transcript 文件、已删除 agent（exec-42739-1）的残留文件与两个空锁文件——导致派发弹窗报「尚无已启用的 harness」。非产品缺陷；已从 `.bak-20261022` 恢复 config.json。后续验收环境应放在 `/tmp` 之外。
+
 **待实测（§8）**：pi 与 omp 各一次「派发 → 结束 → 续跑」，比较续跑 exec 首条 usage 与前一 exec 末值（判定逐消息计 vs 延续累计），结论写回设计 §8。
 
 **§8 实测结果（2026-10-22）**：两家均为**逐消息计**，续跑不延续前一 exec 的累计——agent 级用量应为各 exec 求和。
@@ -1475,9 +1477,9 @@ F-BENCH-13 查证结论：4e960a2 提交说明声称的探针/capture/lib 改动
 - 续跑首值 ≈ 前一 exec 末值 + 新 prompt（历史上下文计入单条消息 input），远小于前一 exec 合计，排除「延续累计」。
 
 **验收中发现（P3，均为改造前既有，不阻塞子项目 1）**：
-- **P3-ACC-1 · 派发 prompt 未要求 leaseToken**：`executor.rs` DISPATCH_PROMPT 第 4 条只列 homeId/runId/nodeId/outcome；omp 首次 `run__report` 未带 token 被拒（`CONFLICT: presented token does not fence this item`），自行补 token 重试成功。pi 碰巧自带。建议第 4 条明确「传入 run__claim 返回的 leaseToken」。
+- **P3-ACC-1 · 派发 prompt 未要求 leaseToken**：`executor.rs` DISPATCH_PROMPT 第 4 条只列 homeId/runId/nodeId/outcome；omp 首次 `run__report` 未带 token 被拒（`CONFLICT: presented token does not fence this item`），自行补 token 重试成功。pi 碰巧自带。建议第 4 条明确「传入 run__claim 返回的 leaseToken」。 **fixed（2026-10-23）**：第 4 条改为「leaseToken set to the claim result's lease.token」（claim 响应字段为 `lease.token`，report 参数为 `leaseToken`）。
 - **P3-ACC-2 · 缺 token 的报错文案误导**：`dispatch.rs:2279` 缺 token 且非管理员时按空 token 比对，报「token 不匹配」而非「缺少 leaseToken」。daemon 侧改动，留子项目 2（KD-E9）。
-- **P3-ACC-3 · run 完成后的多余认领**：prompt 第 7 条「循环到无 pending」使模型在 run completed 后再 claim 一次，得 `run-status-gate violated` 红字（三次派发均出现）。建议第 7 条补「report 结果显示 run completed 或无 pending 时直接退出」。
+- **P3-ACC-3 · run 完成后的多余认领**：prompt 第 7 条「循环到无 pending」使模型在 run completed 后再 claim 一次，得 `run-status-gate violated` 红字（三次派发均出现）。建议第 7 条补「report 结果显示 run completed 或无 pending 时直接退出」。 **fixed（2026-10-23）**：第 7 条改为「run__report 结果显示 run 不再 running 或无 pending、或 run__claim 返回 claimed: false 时退出，不再认领」。两条均有 `dispatch_success_builds_dispatch_plan` 断言钉住；**实机复测**（Agent 53 omp / TICKET-0008 / RUN-0051）：工具调用仅 claim → bash → report 三次、零报错，首次 report 即带 leaseToken，report 后自述「stopping per protocol without claiming again」，run completed。
 - **P3-ACC-4 · 已完成 ticket 续跑的报错不说明原因**：「继续执行」沿用最后一个 exec 的 nodeId，ticket 已 done 时预检报「无未完成可执行成员」，未提示是关联 ticket 已完成。
 - **P3-ACC-5 · agent 状态从不进入 running**：执行期间 agent.json 一直为 `starting`（执行器无写 Running 的路径，改造前同形），UI 把两者同组呈现故无功能影响，状态名误导。
 - **P3-ACC-6 · 退出/关窗确认框 Esc 无效**（本子项目 F-EXEC-6 引入）：`tauri-plugin-dialog` 2.7.1 → rfd 0.16.0 在 macOS 以 `addButtonWithTitle` 逐个加按钮、不设 keyEquivalent（`rfd-0.16.0/src/backend/macos/message_dialog.rs:64`）；NSAlert 仅对标题恰为英文 "Cancel" 的按钮自动绑定 Esc，「取消」未绑定 → Esc 无反应。不退出、不误操作，但无法用 Esc 取消。修法：绕开 rfd 以 objc2 直调 NSAlert，为「取消」设 `keyEquivalent = "\u{1b}"`（约 30–50 行，macOS 专属，tauri 胶水无单测）；或接受限制。
