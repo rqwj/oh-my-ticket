@@ -1,6 +1,7 @@
 //! jsonl 尾随（设计 §3.4 / KD-E3，P-6 纯轮询）：从文件读出新增的完整行，
 //! 按原样推给 sink（事件形状与旧 Channel 推送一致），读到 exit 即结束；
-//! exec 已不活跃且文件连续两次不增长时也结束（shim 崩溃的兜底）。
+//! exec 已不活跃且文件连续两次不增长时也结束（shim 崩溃的兜底）——此时调用
+//! `on_lost`（F-EXEC-17），其返回的合成 exit 事件照常推给 sink，前端据此收尾。
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -13,14 +14,20 @@ const POLL: Duration = Duration::from_millis(200);
 /// 文件尚不存在时最多等多久（shim 还没写出 header）。
 const APPEAR_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// 「不活跃却没读到 exit」时的收尾钩子：入参为合成事件应使用的 seq（已见
+/// 最大 seq + 1），返回要补推给 sink 的事件（通常是合成 exit），None 不推。
+pub type LostHook = Box<dyn FnOnce(u64) -> Option<serde_json::Value> + Send>;
+
 pub fn follow_jsonl(
     path: PathBuf,
     after_seq: Option<u64>,
     sink: EventSink,
     active: Arc<dyn Fn() -> bool + Send + Sync>,
+    on_lost: Option<LostHook>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut offset: u64 = 0;
+        let mut next_seq: u64 = after_seq.map_or(0, |after| after + 1);
         let mut pending: Vec<u8> = Vec::new();
         let mut idle_inactive = 0u32;
         let appear_deadline = std::time::Instant::now() + APPEAR_TIMEOUT;
@@ -50,6 +57,9 @@ pub fn follow_jsonl(
                 if event["kind"] == "session_header" {
                     continue;
                 }
+                if let Some(seq) = event["seq"].as_u64() {
+                    next_seq = next_seq.max(seq + 1);
+                }
                 if let (Some(after), Some(seq)) = (after_seq, event["seq"].as_u64()) {
                     if seq <= after {
                         continue;
@@ -66,6 +76,9 @@ pub fn follow_jsonl(
             } else if !active() {
                 idle_inactive += 1;
                 if idle_inactive >= 2 {
+                    if let Some(event) = on_lost.and_then(|hook| hook(next_seq)) {
+                        sink(event);
+                    }
                     return;
                 }
             }
@@ -96,7 +109,7 @@ mod tests {
         )
         .unwrap();
         let (sink, seen) = collector();
-        let handle = follow_jsonl(path.clone(), None, sink, Arc::new(|| true));
+        let handle = follow_jsonl(path.clone(), None, sink, Arc::new(|| true), None);
         std::thread::sleep(Duration::from_millis(300));
         let mut f = std::fs::OpenOptions::new()
             .append(true)
@@ -128,7 +141,7 @@ mod tests {
         )
         .unwrap();
         let (sink, seen) = collector();
-        follow_jsonl(path, Some(0), sink, Arc::new(|| true))
+        follow_jsonl(path, Some(0), sink, Arc::new(|| true), None)
             .join()
             .unwrap();
         let seqs: Vec<u64> = seen
@@ -147,10 +160,48 @@ mod tests {
         std::fs::write(&path, "{\"kind\":\"raw\",\"seq\":0}\n").unwrap();
         let (sink, seen) = collector();
         let started = std::time::Instant::now();
-        follow_jsonl(path, None, sink, Arc::new(|| false))
+        follow_jsonl(path, None, sink, Arc::new(|| false), None)
             .join()
             .unwrap();
         assert!(started.elapsed() < Duration::from_secs(3));
         assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    /// F-EXEC-17：不活跃放弃时调用 on_lost（seq 续接已见最大值），其返回的
+    /// 合成 exit 推给 sink；读到真实 exit 结束时不调用。
+    #[test]
+    fn abandon_invokes_on_lost_and_forwards_synthetic_exit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("e.jsonl");
+        std::fs::write(&path, "{\"kind\":\"raw\",\"seq\":4}\n").unwrap();
+        let (sink, seen) = collector();
+        let hook: LostHook = Box::new(|seq| {
+            Some(serde_json::json!({ "kind": "exit", "seq": seq, "status": "failed" }))
+        });
+        follow_jsonl(path, None, sink, Arc::new(|| false), Some(hook))
+            .join()
+            .unwrap();
+        let events = seen.lock().unwrap().clone();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1]["kind"], "exit");
+        assert_eq!(events[1]["seq"], 5);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("done.jsonl");
+        std::fs::write(&path, "{\"kind\":\"exit\",\"seq\":0}\n").unwrap();
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&called);
+        let hook: LostHook = Box::new(move |_| {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            None
+        });
+        let (sink, _) = collector();
+        follow_jsonl(path, None, sink, Arc::new(|| false), Some(hook))
+            .join()
+            .unwrap();
+        assert!(
+            !called.load(std::sync::atomic::Ordering::SeqCst),
+            "真实 exit 结束不得触发 on_lost"
+        );
     }
 }

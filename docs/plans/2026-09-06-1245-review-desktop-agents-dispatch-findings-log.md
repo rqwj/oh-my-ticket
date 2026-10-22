@@ -1490,6 +1490,13 @@ F-BENCH-13 查证结论：4e960a2 提交说明声称的探针/capture/lib 改动
 - **根因**：`follow_jsonl` 在「exec 不再活跃（`exec_active` = shim 不存活且出宽限期）且文件连续两次不增长」时**静默 return**，不向 sink 发任何终止事件；桌面端运行期间也没有针对单个 exec 的对账（只在启动时 `reconcile_interrupted_execs`）。前端因此收不到结束信号，租约持有到下次 app 启动。
 - **附带观察**：omp 随 shim 一同退出（stdio 管道断开）——该场景下 harness 不存活，「不受控（执行进程已丢失）」分组无法经此路径触发，需另行构造（harness 忽略 SIGPIPE / 独立进程组存活）才能验收。
 - **建议修法**：follower 在「无 exit 而不活跃」结束分支里，调用与启动对账同一谓词/路径对该 exec 做一次 reconcile（标 failed + `SHIM_LOST` 说明、释放租约），并向 sink 补发一条合成 `exit`（status=failed，failureDetail「执行进程异常退出…」），前端照常收尾。回归测试：follower 在 shim 死亡后发出合成 exit；exec 记录被标 failed、租约释放。
+- **状态：fixed（2026-10-22）**。
+  - `omt-exec::control::settle_lost_exec`：仅当该 exec 是 agent 最新 exec、且 shim 已死并出宽限期时，按启动对账同一 `reconcile_agent` 落终态（harness 仍活则 `Orphan`，failure_detail=`SHIM_LOST_MARKER`，保持为对账目标），并合成 exit（seq 续接、status、code、killReason、durationMs、failureDetail）；
+  - `follow::follow_jsonl` 增 `on_lost: Option<LostHook>`：「不活跃且连续两次不增长」放弃时调用，返回的事件照常推 sink（真实 exit 结束不调用）；
+  - 桌面端 `follow()` 接线：hook 内 settle + 后台 `release_reconcile_targets_in_background`（与启动对账共用，经 shim 路径释放租约；lib.rs 启动处改为调用同一函数）。前端无改动——合成 exit 走既有 `applyExitLocal` + 重拉 + 失败通知。
+  - 测试：`settle_lost_exec_marks_failed_and_synthesizes_exit`、`settle_lost_exec_leaves_live_or_stale_exec_alone`、`abandon_invokes_on_lost_and_forwards_synthetic_exit`。
+  - **实机复测通过**（2026-10-22，Agent 51 pi / TICKET-0009 / RUN-0050）：app 开着时 `kill -9` shim 与 harness 进程组 → **0.6s** 内 agent 落 `failed`（attachment none），app 日志「执行进程丢失：经 shim 路径释放了 1 个 exec 的租约」，item `running → failed → pending`（15:50:05），全程无需重启 app；UI 显示「失败」、transcript 末尾出现「■ failed」结束行（用户确认）。
+- **验证**：fmt / clippy `-D warnings` 干净；`cargo test --workspace` ×3 = 390 passed / 0 failed（+5 新测试）；桌面 vitest 158、tsc 干净；`nm` daemon 中 omt_exec = 0。
 
 #### F-ACC-12 · P2 · `executor.rs` dispatch_daemon_side ② · 停止后重新派发同一 ticket，item 被桌面端身份劫持（2026-10-22 验收）
 
@@ -1498,6 +1505,8 @@ F-BENCH-13 查证结论：4e960a2 提交说明声称的探针/capture/lib 改动
 - **归属**：改造前既有（派发链 ①–⑥ 原样搬入 `dispatch_daemon_side`）。设计 §3.5 已计划子项目 2 的 CLI/MCP 派发绕开 `node/execute`；桌面端路径也应一并改。
 - **临时处置**：验收中已 cancel RUN-0034/0035 并把 TICKET-0007~0010 改回 open（无活动 run 时重新派发会新建 run，不触发）。
 - **建议修法**：② 之前若节点在活动 run 中有 pending item，跳过 `node/execute`（或改为先 ensure-run 再由 exec 认领置 in_progress）；回归测试：停止 → 重新派发同一 ticket → 新 exec 认领成功。
+- **状态：fixed（2026-10-22）**。`dispatch_daemon_side`：③ 将复用的 run（`node/get.runs` 首项，run_link 投影）为 `running` 且本节点 `itemState=pending` 时跳过 ②，由 exec 自己 claim；其余情形（新建 run、run 尚 pending 等）照常 `node/execute`。代价：复用路径下节点状态不再由 ② 置 in_progress（claim 只激活祖先），直到 report 落终态；审计绑定 meta 行亦不写——与设计 §3.5「CLI/MCP 派发绕开 node/execute」同向。回归：`dispatch_skips_node_execute_when_reused_run_holds_pending_item`（修复前红）+ 反例 `dispatch_keeps_node_execute_without_pending_item_in_reused_run`。daemon 零改动。
+  - **实机复测通过**（2026-10-22）：F-EXEC-17 复测后 RUN-0050 仍 running、TICKET-0009 item 已回 pending，立即对同一 ticket 重新派发（Agent 52）→ 复用 RUN-0050，事件流中**无** `node/execute` 的 `node.updated in_progress`，15:51:24 item 由 `mcp:54292/exec:exec-5212-3`（新 exec 自身）认领为 running。
 
 #### F-DAEMON-1 · P1 · thread-leak · `server.rs:762` + `events.rs:127` · events/resume 每次调用都新增一个永不撤销的订阅与转发线程（2026-10-22 验收中发现）
 

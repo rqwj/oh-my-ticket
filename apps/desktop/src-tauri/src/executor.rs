@@ -23,7 +23,24 @@ pub fn rpc_of(shared: &SharedSession) -> RpcFn {
     })
 }
 
+/// review R2-4：对账目标的租约走 shim 路径释放（声明 home + 临时授权），
+/// 不依赖 desktop 会话此刻是否已打开该 workspace home。后台执行；启动对账与
+/// 运行期的执行丢失收尾（F-EXEC-17）共用。
+pub(crate) fn release_reconcile_targets_in_background(label: &'static str) {
+    let runtime_dir = daemon::runtime_dir();
+    let daemon_bin = daemon::sidecar_path("omt-daemon").ok();
+    std::thread::spawn(move || {
+        let connector = omt_exec::daemon_link::admin_connector(runtime_dir.clone(), daemon_bin);
+        let released = omt_exec::executor::reconcile_with_connector(&connector, &runtime_dir);
+        if released > 0 {
+            eprintln!("{label}：经 shim 路径释放了 {released} 个 exec 的租约");
+        }
+    });
+}
+
 /// 尾随 `<agentDir>/<execId>.jsonl` 推送前端（KD-E3：取代进程内 Channel 泵）。
+/// F-EXEC-17：shim 已死却没写出 exit 行时，就地对账（落 Failed / Orphan）、
+/// 补推合成 exit 让前端收尾，并在后台经 shim 路径释放租约。
 fn follow(
     home_id: &str,
     agent_id: &str,
@@ -39,8 +56,15 @@ fn follow(
         agent_id.to_string(),
         exec_id.to_string(),
     );
+    let (lost_rt, lost_h, lost_a, lost_e) = (runtime_dir.clone(), h.clone(), a.clone(), e.clone());
+    let on_lost: omt_exec::follow::LostHook = Box::new(move |next_seq| {
+        let exit =
+            omt_exec::control::settle_lost_exec(&lost_rt, &lost_h, &lost_a, &lost_e, next_seq)?;
+        release_reconcile_targets_in_background("执行进程丢失");
+        Some(exit)
+    });
     let active = Arc::new(move || omt_exec::control::exec_active(&runtime_dir, &h, &a, &e));
-    omt_exec::follow::follow_jsonl(path, after_seq, sink, active);
+    omt_exec::follow::follow_jsonl(path, after_seq, sink, active, Some(on_lost));
     Ok(())
 }
 

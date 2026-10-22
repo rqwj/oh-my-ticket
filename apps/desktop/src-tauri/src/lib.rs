@@ -86,20 +86,9 @@ pub fn run() {
     // 执行面启动清扫（迁移 / 启动对账 / 临时授权与 MCP 残留）——放在任何
     // command 可被调用之前；对账只改记录，不发信号。
     omt_exec::executor::startup_housekeeping(&daemon::runtime_dir());
-    // review R2-4：shim 丢失 / 释放失败的租约走 shim 路径释放（声明 home + 临时
-    // 授权），不依赖 desktop 会话此刻是否已打开该 workspace home。后台执行，
-    // 不阻塞窗口出现；旧记录仍由 rpc_bridge 的 U10 对账处理。
-    {
-        let runtime_dir = daemon::runtime_dir();
-        let daemon_bin = daemon::sidecar_path("omt-daemon").ok();
-        std::thread::spawn(move || {
-            let connector = omt_exec::daemon_link::admin_connector(runtime_dir.clone(), daemon_bin);
-            let released = omt_exec::executor::reconcile_with_connector(&connector, &runtime_dir);
-            if released > 0 {
-                eprintln!("启动对账：经 shim 路径释放了 {released} 个 exec 的租约");
-            }
-        });
-    }
+    // review R2-4：shim 丢失 / 释放失败的租约走 shim 路径释放（后台执行，不
+    // 阻塞窗口出现）；旧记录仍由 rpc_bridge 的 U10 对账处理。
+    executor::release_reconcile_targets_in_background("启动对账");
     // single-instance 必须最先注册（插件约定）：双开 = 两个发起方对
     // agents/bindings 的跨进程并发写（计划 §3.6.9），第二实例直接退出并聚焦首实例。
     // 注意这是 best-effort 守卫（如 socket 被同机其他用户占用时插件会静默放行），

@@ -266,6 +266,52 @@ pub fn reconcile_on_startup(runtime_dir: &Path) -> usize {
     changed
 }
 
+/// F-EXEC-17：尾随方发现 exec 不再活跃、却始终没读到 exit 行（shim 崩溃 /
+/// 被 kill -9）时就地收尾——与启动对账同一判定（`reconcile_agent`）把 agent
+/// 落成终态（harness 仍活则 Orphan），并合成一条 exit 事件交给前端收尾。
+/// 该 exec 已不是 agent 的最新 exec、或 shim 仍活 / 仍在拉起宽限期内时返回
+/// None（不越权改写）。租约不在此释放：调用方走 shim 路径的
+/// `executor::reconcile_with_connector`（与启动对账同一条）。
+pub fn settle_lost_exec(
+    runtime_dir: &Path,
+    home_id: &str,
+    agent_id: &str,
+    exec_id: &str,
+    next_seq: u64,
+) -> Option<serde_json::Value> {
+    let agent = agents::get_agent(runtime_dir, home_id, agent_id).ok()??;
+    if latest_exec(&agent)?.exec_id != exec_id {
+        return None;
+    }
+    if is_active(&agent) && !reconcile_agent(runtime_dir, home_id, &agent) {
+        return None;
+    }
+    let agent = agents::get_agent(runtime_dir, home_id, agent_id).ok()??;
+    let exec = agent.execs.iter().find(|e| e.exec_id == exec_id)?;
+    let status = match agent.status {
+        AgentRecordStatus::Exited => "exited",
+        AgentRecordStatus::Failed => "failed",
+        AgentRecordStatus::Killed => "killed",
+        _ => return None,
+    };
+    let now = agents::now_epoch_ms();
+    let duration_ms = now
+        .parse::<u128>()
+        .unwrap_or(0)
+        .saturating_sub(exec.started_at.parse::<u128>().unwrap_or(0));
+    Some(serde_json::json!({
+        "execId": exec_id,
+        "seq": next_seq,
+        "ts": now,
+        "kind": "exit",
+        "status": status,
+        "code": exec.exit_code,
+        "killReason": exec.kill_reason,
+        "durationMs": duration_ms as u64,
+        "failureDetail": exec.failure_detail,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,6 +342,63 @@ mod tests {
             e.started_at = "1000000000000".into();
         })
         .unwrap();
+    }
+
+    /// F-EXEC-17：shim 已死、无 exit 行的 exec 被就地落成 Failed（SHIM_LOST），
+    /// 并合成 exit 事件（seq 续接、status=failed）。
+    #[test]
+    fn settle_lost_exec_marks_failed_and_synthesizes_exit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = tmp.path();
+        let dead = reg(rt, "exec-lost");
+        update_exec(rt, "h_t", &dead, "exec-lost", |e| {
+            e.shim_pid = Some(std::process::id());
+            e.shim_start_id = Some("macos:0:0".into());
+        })
+        .unwrap();
+        backdate(rt, &dead, "exec-lost");
+
+        let exit = settle_lost_exec(rt, "h_t", &dead, "exec-lost", 7).expect("应合成 exit");
+        assert_eq!(exit["kind"], "exit");
+        assert_eq!(exit["status"], "failed");
+        assert_eq!(exit["seq"], 7);
+        assert_eq!(exit["execId"], "exec-lost");
+        assert!(exit["durationMs"].is_u64());
+        let agent = crate::agents::get_agent(rt, "h_t", &dead).unwrap().unwrap();
+        assert_eq!(agent.status, AgentRecordStatus::Failed);
+        assert_eq!(
+            agent.execs[0].failure_detail.as_deref(),
+            Some(crate::agents::SHIM_LOST_MARKER)
+        );
+        assert!(
+            crate::agents::is_reconcile_target(&agent.execs[0]),
+            "落成终态后仍是对账目标——租约由 shim 路径对账释放"
+        );
+    }
+
+    /// 反例：shim 仍活（本进程冒充）→ 不改写、不合成；非最新 exec 同样不动。
+    #[test]
+    fn settle_lost_exec_leaves_live_or_stale_exec_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = tmp.path();
+        let live = reg(rt, "exec-alive");
+        let me = std::process::id();
+        let my_start = crate::executor::process_start_identity(me).unwrap();
+        update_exec(rt, "h_t", &live, "exec-alive", |e| {
+            e.shim_pid = Some(me);
+            e.shim_start_id = Some(my_start.clone());
+        })
+        .unwrap();
+        backdate(rt, &live, "exec-alive");
+        assert!(settle_lost_exec(rt, "h_t", &live, "exec-alive", 1).is_none());
+        assert_eq!(
+            crate::agents::get_agent(rt, "h_t", &live)
+                .unwrap()
+                .unwrap()
+                .status,
+            AgentRecordStatus::Starting
+        );
+        assert!(settle_lost_exec(rt, "h_t", &live, "exec-other", 1).is_none());
     }
 
     #[test]
