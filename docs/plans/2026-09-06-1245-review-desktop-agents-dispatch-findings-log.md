@@ -49,7 +49,7 @@ branch: feat/desktop-agents-dispatch
 | F-EXEC-13 | P2 | gated_auto | 执行面/存储 | `executor.rs::finish_terminal` / `agents.rs::delete_agent` | **租约释放的待对账标记会丢**。<br>(a) finalize 先写终态（pending=false），再去释放租约；这段窗口里 shim 被杀或机器关机，记录处于终态，却既无 SHIM_LOST 标记也无 pending 标记，对账永远找不到它。<br>(b) 删除守卫只看 status 和 attachment：在释放窗口里，或对一个仍带未对账标记的 Failed agent 执行删除，记录随目录一起消失，租约永不释放。<br>这是 F-EXEC-9 原本要防的结果（§41） | fixed(501d898 + c72830c) | — |
 | F-EXEC-14 | P2 | gated_auto | 执行面/存储 | `agents.rs::delete_agent` 守卫 ① / `executor.rs::finish_terminal` / `reconcile_with_connector` | **agent 可能永久删不掉，同一租约可能被双重释放**。<br>· 守卫 ① 只看 `lease_release_pending`，没有和 `list_reconcile_targets` 一样加 `run_id.is_some() && !reconciled`。<br>· shim 的租约释放窗口会跨过 desktop 重启，而 desktop 每次启动都会跑 shim 路径对账，两边可能同时释放同一租约：desktop 先 `mark_reconciled`，shim 的重复释放失败后又把 pending 写回 true，于是出现 `pending=true && reconciled=true`，这条记录不是对账目标，却被守卫永久挡住删除。<br>· 释放永远无法成功（run 或 home 已被删、home id 不一致）的 exec 也同样删不掉，而且没有逃生口。<br>· 双重释放中，用陈旧的 run/get 快照发出的 admin report，可能把另一个 exec 刚认领的 item 判为失败（置信度 50）（§43） | fixed(c72830c)：守卫同谓词、reconciled 不回写 pending、对账跳过存活 shim（变异验证）；强制删除的出口描述失实 → F-EXEC-16（§45） | — |
 | F-EXEC-15 | P2 | gated_auto | 执行面 | `shim.rs::lease_releaser` / `daemon_link::admin_rpc_with_grant` | **租约释放的 30s 上限被打破**（501d898 的回归）。为了让超时也能撤销授权，`connect` 被挪到 `run_bounded` 外面：连接（最长 10s）加上 enroll、declare、re-enroll（各 30s 读超时）都发生在计时开始之前，`finish_terminal` 最坏要阻塞约 130s，`OMT_SHIM_LEASE_TIMEOUT_MS` 不再能限制整个过程。这推翻了 §41 已核实的 F-EXEC-10 性质。wedged-daemon 测试的 Leaser 都是立即返回，没覆盖到（§43） | fixed(c72830c)：connect 已回到计时段内；实际最坏约 30s，锁竞争时约 70s（变异验证） | — |
-| F-EXEC-16 | P2 | gated_auto | 执行面/前端 | `AgentsPanel.tsx` 强制删除第二步 / `omt-exec agents.rs::delete_agent(force)` | **强制删除会让租约永久泄漏，文案却说「交由 daemon 对账收尾」**。<br>· daemon 没有租约回收：janitor 未接线（dispatch.rs 注释「heartbeat renewal wiring lands with the janitor in U5b」），`LEASE_TTL_MS` 只在 report 授权时检查。<br>· 强制删除抹掉的是唯一的对账依据，run item 会永远停在 running，ticket 一直是 in_progress，只能手动 interrupt 或 cancel 整个 run。<br>· 一次瞬时的守卫拒绝（启动对账还没跑、daemon 短暂离线）就会立即提供第二步，用户可能放弃一个本来能释放的租约。<br>（前端、后端评审独立指出）（§45） | open | — |
+| F-EXEC-16 | P2 | gated_auto | 执行面/前端 | `AgentsPanel.tsx` 强制删除第二步 / `omt-exec agents.rs::delete_agent(force)` | **强制删除会让租约永久泄漏，文案却说「交由 daemon 对账收尾」**。<br>· daemon 没有租约回收：janitor 未接线（dispatch.rs 注释「heartbeat renewal wiring lands with the janitor in U5b」），`LEASE_TTL_MS` 只在 report 授权时检查。<br>· 强制删除抹掉的是唯一的对账依据，run item 会永远停在 running，ticket 一直是 in_progress，只能手动 interrupt 或 cancel 整个 run。<br>· 一次瞬时的守卫拒绝（启动对账还没跑、daemon 短暂离线）就会立即提供第二步，用户可能放弃一个本来能释放的租约。<br>（前端、后端评审独立指出）（§45） | fixed(c8abc6a)：强制删除前先尽力释放；文案已如实；P3：释放失败的明细没有展示给用户、desktop 端释放没有总时限（§47） | — |
 | F-BENCH-13 | P1 | manual | BENCH | `4e960a2` 提交说明 / §27（修复节） | 提交说明与日志称 F-BENCH-5/6/7/10 及 8/12 部分已修，但 `harness_probe.rs`、`harness-capture.rs`、`lib.rs` 自 f6eeaed 后**未改动**（无 worktree / stash / 其他分支留存）——改动疑似未提交即丢失（§28） | fixed(3192d60)（改动已重做并核实存在） | — |
 | F-BENCH-14 | P1 | manual | BENCH/U12 | `executor.rs` usage 归档 / `bench.rs` / `adapters.rs` | **usage 是每条消息的值，不是会话累计**：pi 1.3.0 与 omp 18.12.2 语料中 cost 逐消息非单调（0.0349→0.0095→0.0078→0.0092）。F-U12-3「累计快照取末值」的口径错误——ExecRecord 的 usage 与分析器的 tokens/cost 只记最后一条消息：pi 卷报 $0.0092 实为 $0.0615（少报 6.7 倍），omp 卷报 $0.0096 实为 $0.0431（§28） | fixed(da9c376 + 55a8e55)：三家均按消息/步求和 | — |
 | F-BENCH-15 | P1 | manual | BENCH | `bench.rs::raw_lines_reparse_through_current_adapter` | 重放测不到解析漂移：语料的 raw 行只是采集时**未产出事件**的行，产出 tool_call / thinking / text 的源行没有保留，无从重放；该测试能通过只因 4e960a2 新增的 turn_end usage 提取（改动前 pi 的 raw 行重放结构化数为 0）（§28） | fixed(55a8e55)：raw.log 已入库，重放对账测试在干净树上可跑 | — |
@@ -1443,22 +1443,77 @@ F-BENCH-13 查证结论：4e960a2 提交说明声称的探针/capture/lib 改动
 
 | # | 场景 | 期望 | 结果 |
 |---|---|---|---|
-| 1 | 派发 pi / omp / opencode 各一次 | 实时 transcript 与改造前一致；结束后 run 进度正确 | 待验收 |
-| 2 | 执行中点「停止」 | 3s 内 `killed`，run item 回到 pending（租约已释放） | 待验收 |
-| 3 | 空闲 agent「续跑」 | 同一 agent 追加 exec，新 jsonl 在同一目录 | 待验收 |
-| 4 | 进入信任门（awaiting_confirmation）后在桌面端裁决 | 与改造前一致 | 待验收 |
-| 5 | 执行中 ⌘Q，在退出确认框选「继续在后台运行」，等执行结束再打开 | agent `exited`，transcript 完整，run 进度正确 | 待验收 |
-| 6 | 执行中 ⌘Q 选「继续在后台运行」后立刻打开 | agent「运行中」，实时流接回（P-10），可停止 | 待验收 |
-| 7 | 执行中 `kill -9 <shim pid>`，再打开桌面端 | agent `failed`，行内说明「执行进程异常退出…」；租约被对账释放；harness 若仍活则进入「不受控（执行进程已丢失）」分组，可强制终止 | 待验收 |
-| 8 | 「停止全部」 | 第一次点击只出现确认（显示运行数与已认领项数）；确认后按钮显示「停止中…」，随后提示停止数量；所有运行中 exec 进入 `killed` | 待验收 |
-| 9 | 旧版本留下的 `agents.json` 数据 | 首次启动迁移，Agents 面板列表与历史 transcript 完整 | 待验收 |
-| 10 | 执行中 ⌘Q，在退出确认框选「全部停止后退出」 | 应用退出；所有 exec 进入 `killed`，run item 回到 pending | 待验收 |
-| 11 | 删除一个已结束的 agent | 确认框写明 transcript 一并删除；删除后磁盘上该 agent 目录（含 jsonl）不存在 | 待验收 |
-| 12 | 长任务期间关闭桌面端（可在 `daemon.json` 把 `idleQuietMs` 调到 60000 加速） | harness 在静默期之后的认领 / 汇报仍成功（shim 保活）；结束后 run 进度正确，`leaseReleasePending` 为 false | 待验收 |
-| 13 | 有运行中的 exec 时按 ⌘Q：(a) Return；(b) Esc；(c) 点「取消」 | ⌘Q 必弹确认框；(a) 后台继续并退出；(b)(c) 不退出，exec 不受影响 | 待验收 |
+| 1 | 派发 pi / omp / opencode 各一次 | 实时 transcript 与改造前一致；结束后 run 进度正确 | **pi 通过**（Agent 32/33，TICKET-0008/0009，k3，exit 0，run completed，租约无残留）；**omp 通过**（Agent 34，TICKET-0010 长任务 6×30s，exit 0，run completed）；**opencode 通过**（Agent 35，RUN-0033，exit 0）（2026-10-22） |
+| 2 | 执行中点「停止」 | 3s 内 `killed`，run item 回到 pending（租约已释放） | **通过**（2026-10-22，Agent 36 / RUN-0034）：停止后 item 依次 running → failed → pending，租约释放。**但随后对同一 ticket 重新派发触发 F-ACC-12（P2）**，见下 |
+| 3 | 空闲 agent「续跑」 | 同一 agent 追加 exec，新 jsonl 在同一目录 | **通过**（2026-10-22）：pi Agent 32 追加 exec-12695-6（`--session` 同 id）、omp Agent 34 追加 exec-12695-10（`--resume` 同 id），文件均落在原 agent 目录；omp 续跑自述「Claimed TICKET-0010 again」并主动带 leaseToken 汇报，上下文延续实证。注：关联 ticket 已 done 时续跑报「无未完成可执行成员」（改造前同形，见下方 P3） |
+| 4 | 进入信任门（awaiting_confirmation）后在桌面端裁决 | 与改造前一致 | **通过**（2026-10-22，RUN-0032）：CLI 认领后直接改 done 触发 awaiting_confirmation，桌面端弹窗「确认」后 run completed。「打回」分支**通过**（RUN-0045：TICKET-0007 done → open，item `interrupted`，run `completed_with_failures`，弹窗消失）；RUN-0044 误点「确认」再次验证确认路径 |
+| 5 | 执行中 ⌘Q，在退出确认框选「继续在后台运行」，等执行结束再打开 | agent `exited`，transcript 完整，run 进度正确 | **通过**（2026-10-22，Agent 42 omp / RUN-0039，与第 12 项同一轮）：⌘Q 选 KEEP 后执行在后台跑完（exit 0、run completed），重开 app 后 agent `exited`、transcript 完整（用户确认） |
+| 6 | 执行中 ⌘Q 选「继续在后台运行」后立刻打开 | agent「运行中」，实时流接回（P-10），可停止 | 后台通过（2026-10-22，Agent 41 / RUN-0038）：⌘Q 选 KEEP 后 shim 48149 持续执行，重开 app 时在 2/6，此后 3/6…6/6 持续推进，exit 0、run completed、item done（actor `mcp:48152/exec:exec-4598-13`）、leaseReleasePending=false；UI「运行中 / 实时流接回 / 可停止」待用户确认 |
+| 7 | 执行中 `kill -9 <shim pid>`，再打开桌面端 | agent `failed`，行内说明「执行进程异常退出…」；租约被对账释放；harness 若仍活则进入「不受控（执行进程已丢失）」分组，可强制终止 | **对账路径通过**（2026-10-22，Agent 44 omp / TICKET-0010 / RUN-0041）：认领后 `kill -9` shim → 重启 app 时日志「启动对账：1 个 exec 的 shim 已不在，标记为失败」「启动清扫：1 个 workspace 的 MCP 注入残留已恢复」「经 shim 路径释放了 1 个 exec 的租约」；agent `failed`（failureDetail `exec shim exited before finishing`）、`reconciled=true`、item 回 pending。「不受控」分组**补测通过**（Agent 50 omp / RUN-0049，见下方追加项）；app 运行期间不可见见 F-EXEC-17 |
+| 8 | 「停止全部」 | 第一次点击只出现确认（显示运行数与已认领项数）；确认后按钮显示「停止中…」，随后提示停止数量；所有运行中 exec 进入 `killed` | **通过**（2026-10-22 补测）：Agent 39（pi，TICKET-0009/RUN-0036）与 Agent 40（omp，TICKET-0010/RUN-0037）并行运行时「停止全部」，两者均 `killed`（kill_reason=user），shim 均退出，两个 item 均回 pending（首轮按下时仅 1 个 exec 在跑，已补测） |
+| 9 | 旧版本留下的 `agents.json` 数据 | 首次启动迁移，Agents 面板列表与历史 transcript 完整 | 磁盘侧通过（2026-10-22，`/tmp/omt-accept-rt`，迁移前整目录备份 `.bak-20261022`）：`MigrationReport { homes: 1, agents: 26, files_moved: 47, skipped_corrupt: [], failed: [] }`，`agents.json` → `.migrated`；`transcripts/` 余 9 个无 agent 记录的早期 exec 文件（预期不迁）。UI 列表/历史 transcript 用户确认通过 |
+| 10 | 执行中 ⌘Q，在退出确认框选「全部停止后退出」 | 应用退出；所有 exec 进入 `killed`，run item 回到 pending | **通过**（2026-10-22，Agent 43 pi / TICKET-0009 / RUN-0040）：⌘Q 选「全部停止后退出」→ 应用退出，exec `killed`（kill_reason=user）、shim 退出，item 回 pending（lastError `exec … terminated (kill/app-exit)`），`leaseReleasePending=false` |
+| 11 | 删除一个已结束的 agent | 确认框写明 transcript 一并删除；删除后磁盘上该 agent 目录（含 jsonl）不存在 | 用户确认通过（2026-10-22） |
+| 12 | 长任务期间关闭桌面端（可在 `daemon.json` 把 `idleQuietMs` 调到 60000 加速） | harness 在静默期之后的认领 / 汇报仍成功（shim 保活）；结束后 run 进度正确，`leaseReleasePending` 为 false | **通过**（2026-10-22，`idleQuietMs=60000`，Agent 42 omp / TICKET-0010 / RUN-0039）：21:00:50 认领后 ⌘Q 选 KEEP 关闭桌面端；daemon（pid 4777）全程存活、日志无 IDLE_SHUTDOWN；21:04:13 汇报成功（距桌面端关闭 >3 分钟，远超 60s 静默期），run completed、item done（actor `mcp:65521/exec:exec-50195-1`）、exit 0、`leaseReleasePending=false`。旁证：首次 report 未带 leaseToken 被拒后重试成功（P3-ACC-1 复现） |
+| 13 | 有运行中的 exec 时按 ⌘Q：(a) Return；(b) Esc；(c) 点「取消」 | ⌘Q 必弹确认框；(a) 后台继续并退出；(b)(c) 不退出，exec 不受影响 | **部分通过**（2026-10-22）：⌘Q 必弹确认框；(c)「取消」不退出、exec 不受影响 ✓；(b) **Esc 无反应、弹窗不关闭**（不退出，但无法用 Esc 取消，见 P3-ACC-6）；(a) Return 对应首按钮「继续在后台运行」 |
 | 14 | 只开着 DSH 插件、desktop 已关闭，长任务结束后 shim 拉起过 daemon | `omt daemon-status` 的 daemon 同时有全局 home 和 workspace home；DSH 的全局 ticket 操作仍落在 `~/.omt` | 待验收 |
 
+**追加验收项（§40/§42/§44）结果**：
+- 第二实例聚焦：**通过**（2026-10-22）——同环境直接再起 `oh-my-ticket-desktop`，第二实例立即退出（exit 0），首实例窗口被前置（用户确认）。
+- 有 exec 时关窗确认框（取消保持 / KEEP 隐藏窗口）与 KEEP 后 Dock 点击恢复：**通过**（2026-10-22，Agent 45 pi / RUN-0042 执行期间，用户确认）。
+- 无 exec 关窗直接退出：**通过**（Agent 45 跑完后点关闭按钮，无确认框直接退出，用户确认）。
+- 连按 ⌘Q 不叠框：**通过**（用户确认）。
+- 「全部停止后退出」后立即再按 ⌘Q 不叠框：**通过**（2026-10-22，Agent 46 pi / RUN-0043）：选 STOP 后窗口立即关闭、来不及二次 ⌘Q（停止窗口极短，未实际触发重入）；exec `killed`、item 回 pending、`leaseReleasePending=false`。
+- 强制删除（F-EXEC-14/16，「放弃租约并删除」）：**通过**（2026-10-22，Agent 47 pi / TICKET-0009 / RUN-0046）。构造：认领后 `kill -9` shim 与 harness 进程组，并在 agent.json 写入 shim 收尾释放失败的形态（`failed`、`leaseReleasePending=true`、`reconciled=false`），daemon 侧 item 仍 `running` 挂在 `mcp:73903/exec:exec-48961-1`。UI：普通删除被租约守卫拒绝 → 出现「放弃租约并删除 Agent 47」→ 点击后 agent 消失（用户确认）。后台：15:19:18 item `running → failed → pending`（`force_release_agent_leases` 先释放后删除），agent 目录已删除、无 `.trash-*` 残留。注：bindings.json 仍留 `TICKET-0009 → agent-exec-48961-1` 悬空绑定（按设计由用户触发 `bindings_gc` 清理）；UI 不展示释放结果（§47 P3）。
+- 「不受控（执行进程已丢失）」分组 + 强制终止：**通过**（2026-10-22，Agent 50 omp / TICKET-0010 / RUN-0049）。构造：认领后 `kill -9` shim、**待其确实退出后**立即 `kill -STOP` harness 进程组（先 STOP 再杀 shim 会因 POSIX 孤儿进程组规则收到 SIGHUP+SIGCONT 而退出；不 STOP 则 omp/pi 随 shim 退出——两次失败尝试即 Agent 48/49）。重启 app：日志「启动对账：3 个 exec 的 shim 已不在」；Agent 50 `failed` + `attachment=orphan`，item 经对账回 pending；UI 不受控分组可见、点「强制终止」后 omp（87339）被 SIGKILL，agent `killed`（kill_reason=orphan）。**遗留**：`kill_orphan` 只杀单 pid（计划「已知的有意简化」），harness 的 MCP 桥子进程 `omt mcp`（87340，同进程组）残留——真实场景中它会因 stdin EOF 自行退出，本次因被 STOP 而滞留，已手工清理。
+
 **待实测（§8）**：pi 与 omp 各一次「派发 → 结束 → 续跑」，比较续跑 exec 首条 usage 与前一 exec 末值（判定逐消息计 vs 延续累计），结论写回设计 §8。
+
+**§8 实测结果（2026-10-22）**：两家均为**逐消息计**，续跑不延续前一 exec 的累计——agent 级用量应为各 exec 求和。
+- pi（k3，Agent 32）：exec-12695-1 usage 末值 14,145、合计 53,222 → 续跑 exec-12695-6 首值 14,533、合计 64,386；
+- omp（k3，Agent 34）：exec-12695-8 序列 9,198…12,855、合计 80,386 → 续跑 exec-12695-10 序列 13,298…16,389、合计 91,497；
+- 续跑首值 ≈ 前一 exec 末值 + 新 prompt（历史上下文计入单条消息 input），远小于前一 exec 合计，排除「延续累计」。
+
+**验收中发现（P3，均为改造前既有，不阻塞子项目 1）**：
+- **P3-ACC-1 · 派发 prompt 未要求 leaseToken**：`executor.rs` DISPATCH_PROMPT 第 4 条只列 homeId/runId/nodeId/outcome；omp 首次 `run__report` 未带 token 被拒（`CONFLICT: presented token does not fence this item`），自行补 token 重试成功。pi 碰巧自带。建议第 4 条明确「传入 run__claim 返回的 leaseToken」。
+- **P3-ACC-2 · 缺 token 的报错文案误导**：`dispatch.rs:2279` 缺 token 且非管理员时按空 token 比对，报「token 不匹配」而非「缺少 leaseToken」。daemon 侧改动，留子项目 2（KD-E9）。
+- **P3-ACC-3 · run 完成后的多余认领**：prompt 第 7 条「循环到无 pending」使模型在 run completed 后再 claim 一次，得 `run-status-gate violated` 红字（三次派发均出现）。建议第 7 条补「report 结果显示 run completed 或无 pending 时直接退出」。
+- **P3-ACC-4 · 已完成 ticket 续跑的报错不说明原因**：「继续执行」沿用最后一个 exec 的 nodeId，ticket 已 done 时预检报「无未完成可执行成员」，未提示是关联 ticket 已完成。
+- **P3-ACC-5 · agent 状态从不进入 running**：执行期间 agent.json 一直为 `starting`（执行器无写 Running 的路径，改造前同形），UI 把两者同组呈现故无功能影响，状态名误导。
+- **P3-ACC-6 · 退出/关窗确认框 Esc 无效**（本子项目 F-EXEC-6 引入）：`tauri-plugin-dialog` 2.7.1 → rfd 0.16.0 在 macOS 以 `addButtonWithTitle` 逐个加按钮、不设 keyEquivalent（`rfd-0.16.0/src/backend/macos/message_dialog.rs:64`）；NSAlert 仅对标题恰为英文 "Cancel" 的按钮自动绑定 Esc，「取消」未绑定 → Esc 无反应。不退出、不误操作，但无法用 Esc 取消。修法：绕开 rfd 以 objc2 直调 NSAlert，为「取消」设 `keyEquivalent = "\u{1b}"`（约 30–50 行，macOS 专属，tauri 胶水无单测）；或接受限制。
+- **P3-ACC-7 · 开发工具链：sidecar 更新后 `pnpm tauri:dev` 构建脚本 EPERM**（Darwin 25）：`copy-sidecar.mjs` 用 `copyFileSync` 把带 `com.apple.provenance` 的 `target/debug/omt*` 复制进 `src-tauri/binaries/`；sidecar 变化触发 tauri-build 重跑，其 `copy_binaries` 先 `remove_file(target/debug/omt-daemon)` 再 `fs::copy`（macOS 走 clonefile），克隆带 provenance 的可执行文件被拒 → `Operation not permitted`，且 `target/debug/omt-daemon` 已被删除。关沙箱、直调真实 cargo 均复现；Python `shutil.copyfile` 产生的副本不带 provenance，可正常构建。绕行：以不带 provenance 的副本重新暂存 `binaries/` 后直接 `pnpm exec tauri dev`。根治建议：`copy-sidecar.mjs` 改为读写字节流复制（不保留 xattr），或复制后去掉 provenance。不影响产品功能。
+- **P3-ACC-8 · 对账释放遇已取消 run 报失败**：`release_items_for_exec` 对 canceled run 先 admin report failed 再 `run/control retry`，后者返回 `CONFLICT: run … is canceled; retry is unavailable` → 首条对账路径记「释放失败，保留为对账目标」，随后 U10 路径兜底完成（`reconciled=true`）。结果正确但日志误导；建议 run 已为终态（canceled/completed）时视为无需释放。
+
+#### F-EXEC-17 · P2 · `follow.rs` + 桌面端 · app 运行期间 shim 崩溃不可见（2026-10-22 验收第 7 项）
+
+- **现象**：执行中 `kill -9` shim（Agent 44 omp / TICKET-0010 / RUN-0041，21:18:42）后，app 仍开着时 transcript 尾部一直显示「运行中…」与「长时间无输出——agent 可能仍在等待外部操作」；agent.json 停在 `starting`，item 仍 `running` 挂在 `mcp:…/exec:exec-84281-1` 名下。
+- **根因**：`follow_jsonl` 在「exec 不再活跃（`exec_active` = shim 不存活且出宽限期）且文件连续两次不增长」时**静默 return**，不向 sink 发任何终止事件；桌面端运行期间也没有针对单个 exec 的对账（只在启动时 `reconcile_interrupted_execs`）。前端因此收不到结束信号，租约持有到下次 app 启动。
+- **附带观察**：omp 随 shim 一同退出（stdio 管道断开）——该场景下 harness 不存活，「不受控（执行进程已丢失）」分组无法经此路径触发，需另行构造（harness 忽略 SIGPIPE / 独立进程组存活）才能验收。
+- **建议修法**：follower 在「无 exit 而不活跃」结束分支里，调用与启动对账同一谓词/路径对该 exec 做一次 reconcile（标 failed + `SHIM_LOST` 说明、释放租约），并向 sink 补发一条合成 `exit`（status=failed，failureDetail「执行进程异常退出…」），前端照常收尾。回归测试：follower 在 shim 死亡后发出合成 exit；exec 记录被标 failed、租约释放。
+
+#### F-ACC-12 · P2 · `executor.rs` dispatch_daemon_side ② · 停止后重新派发同一 ticket，item 被桌面端身份劫持（2026-10-22 验收）
+
+- **现象**：第 2 项停止 Agent 36（TICKET-0009，RUN-0034）后，item 正确回到 pending；随后重新派发 TICKET-0009（Agent 37），exec 认领得 `claimed:false` 即退出，item 卡在 `running`，`executorActor = desktop:4598`，无人汇报。
+- **根因**：派发链 ② `node/execute` 把节点置 in_progress，走 `apply_update_and_activate`——活动 run（RUN-0034 仍为 running）里该节点的 pending item 被以**调用方身份**（桌面端连接 `desktop:4598`）激活为 running（事件 seq 302/303 同一毫秒）；③ ensure-run 复用这个活动 run，shim 侧 harness 再 claim 时已无 pending 项。首次派发不触发，因为 `node/execute` 时 run 尚不存在。
+- **归属**：改造前既有（派发链 ①–⑥ 原样搬入 `dispatch_daemon_side`）。设计 §3.5 已计划子项目 2 的 CLI/MCP 派发绕开 `node/execute`；桌面端路径也应一并改。
+- **临时处置**：验收中已 cancel RUN-0034/0035 并把 TICKET-0007~0010 改回 open（无活动 run 时重新派发会新建 run，不触发）。
+- **建议修法**：② 之前若节点在活动 run 中有 pending item，跳过 `node/execute`（或改为先 ensure-run 再由 exec 认领置 in_progress）；回归测试：停止 → 重新派发同一 ticket → 新 exec 认领成功。
+
+#### F-DAEMON-1 · P1 · thread-leak · `server.rs:762` + `events.rs:127` · events/resume 每次调用都新增一个永不撤销的订阅与转发线程（2026-10-22 验收中发现）
+
+- **现象**：验收 daemon（pid 12838）4 小时累计 194 分钟 CPU；桌面端关闭时 0%。`sample` 显示 2,190 个线程，其中 2,167 个为 `omt-events`（`route_methods` 拉起），桌面端打开期间线程数约以 **4 个/秒**增长（10 秒内 2441 → 2481，随后 2607）。
+- **根因**：`events/resume` 在 daemon 侧**每次调用**都 `Hub::subscribe_with_cursor` 追加一个订阅者，并拉起一个 `omt-events` 转发线程（`recv_timeout(250ms)` 轮询）。转发线程只在连接断开（`conn_dead`）/写端关闭/订阅被 hub 丢弃时退出；`Hub::unsubscribe` 是 dead code，同一连接对同一 home 的旧订阅**从不被替换**。
+  - 桌面端 `rpc_bridge.rs::subscription_pump`（`cbf3edc`，2026-10-19 引入）在一条长连接上**每 250ms 轮询一次** `events/resume` → 每秒泄漏约 4 个订阅 + 线程，直到桌面端断开才整体回收。
+  - TS 客户端（DSH 插件，`client-ts/src/client.ts` resume）每收到一条 live 通知就再调一次 `events/resume` → 每个事件泄漏一个订阅，长会话同样累积。
+- **后果**：① 线程每个每秒醒 4 次，CPU 随线程数线性上涨；② 每条提交事件按订阅数 N **重复推送 N 份**通知到同一连接（放大）；③ `oldest_subscriber_cursor` 被最早的订阅钉住，outbox 保留期清理在桌面端打开期间失效；④ 进程线程上限 16,384（`kern.num_taskthreads`），按 4/秒约 1 小时触顶，之后 spawn 静默失败（`.ok()`）。
+- **归属**：改造前既有（daemon 订阅语义 + `cbf3edc` 轮询泵的组合），与执行面子项目 1 无关；但长时间验收会受其影响（CPU、通知放大）。
+- **建议修法（daemon 侧）**：按「连接 × homeId」维护唯一 live 订阅——同连接再次 `events/resume` 同一 home 时先 `unsubscribe` 旧订阅（旧转发线程随 sub_tx 被 drop 收到 Disconnected 退出），再登记新的；连接拆除时按表批量撤销。回归测试：同一连接连续 N 次 `events/resume` 后 hub 订阅数 = 1、`omt-events` 线程数有界；live 事件只推送一份。桌面端泵可顺带改为「订阅一次 + 读通知、断线再 resume」，但只修 daemon 即可止血。
+- **状态：fixed（2026-10-22，未提交）**。实现：
+  - `events.rs`：`Subscriber` 增 `key`；`Hub::subscribe_keyed` 在锁内先移除同 key 旧订阅（旧 sender 被 drop → 旧 `omt-events` 线程收到 Disconnected 退出，缓冲内的行先送完不丢）；`unsubscribe_key` 供连接拆除；
+  - `server.rs`：`ConnState` 增 `conn_key`（每连接随机）与 `subscribed_hubs`；`events/resume` 以 `conn_key` 登记；读循环结束时对记录的 hub 逐个 `unsubscribe_key`。登记前先记 hub、登记后复查 `conn_dead`——与拆除竞态时谁后到谁撤销，不会漏；
+  - `homes.rs` / `dispatch.rs`：`subscribe_key` 沿 `call_full` → `Job::Rpc` → `Ctx` 透传（`OpenedHome.hub` 去掉 dead_code 标注）。
+- **验证**：新 e2e `repeated_events_resume_on_one_connection_keeps_one_subscription`（同连接 40 次 resume 后线程数增长 ≤ 2、一次提交只推一份）——修复前实测 **11 → 51** 失败，变异验证（把 keyed 换回 unkeyed）同样失败；Hub 单测 2 个（同 key 替换并断开旧 sender / 拆除只删本 key）。fmt、clippy `-D warnings` 干净；`cargo test --workspace` 三遍 385 passed / 0 failed；根 vitest 447 passed；`nm` daemon 中 omt_exec = 0。
+- **实机复测**：验收 daemon 换新二进制后桌面端常开，30 秒内线程数恒为 **11**，CPU 约 0.6%（修复前约 4 线程/秒增长，4 小时累计 194 分钟 CPU）。
 
 ### §38. 执行面子项目 1 实现完成 + ce-work 收尾评审（2026-10-21）
 
@@ -1760,6 +1815,48 @@ F-BENCH-13 查证结论：4e960a2 提交说明声称的探针/capture/lib 改动
 - **P3-4**：§44 追加勘误（旧 store 上会红的 store 用例实为 1 个而非 2 个；TempGrant 增删受 10s flock 上限、锁竞争下最坏 ~70s，非「非阻塞」）。
 
 **验证**：workspace 382 ×3 全绿（380+2）；前端 158（+3）、tsc 干净；clippy/fmt 干净；nm daemon=0。
+
+### §47. `c8abc6a` · F-EXEC-16 修复 · code review（2026-10-22）
+
+**范围**：改动约 570 行，由评审方直接通读 diff，没有分派子评审。
+
+**验证**：
+- **前端**：vitest 158 passed，`tsc` 干净。
+- **Rust 侧本轮无法执行**。clippy、test、build 都在构建脚本这一步失败：`failed to link or copy …/build_script_build-… → build-script-build: Operation not permitted (os error 1)`。排查经过：
+  - 关闭沙箱后依旧失败；
+  - 绕过 `cargo`→`mbx` 的 alias、直接用真 cargo 依旧失败；
+  - 换全新的 `CARGO_TARGET_DIR` 后，tauri 的构建脚本同样报 EPERM；
+  - 手工执行 `ln` 也报 EPERM：文件带 `com.apple.provenance` 扩展属性，系统拒绝为它建硬链接。
+  
+  结论：这是系统层的权限限制，不是代码问题。前几轮在同一个仓库里都能正常构建，所以是环境变了。本轮 Rust 侧的结论只基于读代码；新增的两个 Rust 测试是否通过，需要在可构建的环境里补跑 `cargo test --workspace`。（本轮输出的 `nm` daemon=0 读的是之前留下的旧二进制，不计入。）
+- **Rust 补跑（同日稍后）**：换用全新的 `CARGO_TARGET_DIR=/tmp/omt-verify-target`，并排除 desktop crate（只有它的 tauri 构建脚本受 EPERM 影响）后，可以正常构建：
+  - `cargo test --workspace --exclude oh-my-ticket-desktop` 跑 3 遍全绿，373 passed、0 failed；
+  - 两个新测试 `force_release_agent_leases_*` 实际运行并通过；
+  - 上述 crate 的 clippy `-D warnings` 干净；
+  - 新构建的二进制 `nm`：omt-daemon 为 0、omt 为 3989，KD-E9 成立。
+  
+  仍未覆盖的：desktop crate 自身的 9 个测试和它的 clippy。本轮 desktop Rust 侧的改动只有 `agents_delete` 的 force 分支（调用已测试过的 `force_release_agent_leases`），风险低，但需要在恢复构建的环境里补跑。
+- **环境恢复后的全量补跑**：默认 target 目录重新可以构建。`cargo clippy --workspace --all-targets -D warnings` 干净，fmt 干净；`cargo test --workspace` 全绿，382 passed（其中 desktop crate 9 个），0 failed。至此 `c8abc6a` 的验证缺口已全部补齐。
+
+**逐条结论**：
+- **F-EXEC-16 ①：FIXED。**
+  - `agents_delete(force)` 先调用新的 `executor::force_release_agent_leases`：只处理该 agent 里仍是对账目标的 exec，按各自 spec 中的 home 连接，加 admin 授权后 `release_items_for_exec`，成功则 `mark_reconciled`；
+  - 逐目标失败（包括 spec 缺失）记入 `failures`，不中断删除；
+  - 有意不跳过 shim 仍存活的目标，理由已写进函数文档：用户主动 force 时，不释放的代价是对账依据消失，比重复释放更糟。
+  - 两个 Rust 测试覆盖了：只作用于本 agent、使用 spec 中的 home、存活 shim 也会释放、失败不标记、spec 缺失计为失败、agent 不存在时报错。
+- **F-EXEC-16 ③：FIXED。** 四处「交由 daemon 对账收尾」的说法（UI、bridge、两处 Rust 注释）都改成了实际后果：「若释放失败，该 run item 可能一直显示运行中，需到 Runs 面板手动取消该 run」。
+- **对账谓词收拢：FIXED。** 新增 `agents::is_reconcile_target` 作为唯一判断依据，`list_reconcile_targets`、删除守卫、强制释放三处共用，不会再出现 F-EXEC-14 ① 那种谓词各写一份、彼此不一致的问题。
+- **§45 P3 三项：FIXED。**
+  - 第二步确认去掉了 3s 自动复位；按钮文字改为「放弃租约并删除 <展示名>」；出现时聚焦该按钮，并用 `aria-describedby` 关联后果说明；
+  - 停止失败的明细显示为「Agent N (exec-id)」；
+  - 过期注释已改正。
+
+**P3（新）**：
+- *释放结果没有给到用户*：`agents_delete` 返回了 `leasesReleased` 和 `leaseReleaseFailures`，但 `store.deleteAgent` 直接 `await` 后丢弃了返回值，界面只有一句「若释放失败……」的条件提示，用户无从知道这次是否真的放弃了租约、该去取消哪个 run。建议有失败时用通知条列出对应的 exec 和 run_id，并引导去 Runs 面板。（置信度 100）
+- *desktop 端没有总时限*：force 分支在 desktop 进程里同步释放，没有 shim 那样的 `run_bounded` 总上限。每个目标都要连接（拉起 daemon 最长 10s）加上若干 30s 读超时，daemon 半卡死时「删除中…」可能持续几分钟，期间没有任何反馈。启动对账也有同样的性质（改造前就存在）。建议给整个释放过程一个上限，例如 30s 后把剩余目标记为失败。（置信度 75）
+- *双重释放残余*：force 不跳过存活 shim 是有意的设计，但收尾中的 shim 和 force 同时释放时，陈旧快照发出的 admin report 仍可能误伤别的 exec 刚认领的 item（与 §45 同源，置信度 50）。
+
+**结论**：F-EXEC-16 修复到位，这个系列的 P2 已全部清零。待办：① 在可构建的环境里补跑 Rust 全量验证；② 把释放结果展示给用户（建议在手工验收前补上）；③ 其余 P3 放到手工验收之后。
 
 ### 残留状态核查（第二轮验收后）
 

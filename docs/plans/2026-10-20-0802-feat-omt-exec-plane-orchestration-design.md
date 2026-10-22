@@ -264,7 +264,7 @@ desktop agents dispatch 已全量落地（PR #9），但 harness 的拉起、执
 
 ## 8. 实测项与开放问题
 
-- **resume 后的 usage 语义**：pi / omp 续跑时 usage 是从零计还是延续 session 累计——决定 agent 级用量是「末值」还是「差分求和」（子项目 1）。
+- **resume 后的 usage 语义**：pi / omp 续跑时 usage 是从零计还是延续 session 累计——决定 agent 级用量是「末值」还是「差分求和」（子项目 1）。**已实测（2026-10-22）**：pi、omp 均为逐消息计、续跑不延续累计，agent 级用量取各 exec 合计之和（数据见 findings log「执行面子项目 1 验收」§8 实测结果）。
 - **Claude Code resume 与 session id**：`claude --resume` 沿用原 session 文件还是新开 session id（子项目 3）。
 - **`run/claim` 是否置 node in_progress**：决定 CLI / MCP 派发能否完全绕开 `node/execute`（子项目 2）。
 - **hook 进程祖先链**：hook 经 shell 执行，确认最近公共祖先稳定命中 Claude 进程（子项目 3）。
