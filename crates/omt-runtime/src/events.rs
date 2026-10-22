@@ -98,6 +98,9 @@ pub struct Subscriber {
     pub sender: std::sync::mpsc::SyncSender<String>,
     /// Cursor this subscriber resumed from (0 = full replay).
     pub from_cursor: i64,
+    /// Owning connection (F-DAEMON-1): a keyed subscription is unique per
+    /// key — re-registering replaces it, connection teardown removes it.
+    pub key: Option<String>,
 }
 
 /// Per-home live subscription registry + broadcast watermark. The home
@@ -129,14 +132,55 @@ impl Hub {
         from_cursor: i64,
         sender: std::sync::mpsc::SyncSender<String>,
     ) -> String {
+        self.register(None, from_cursor, sender)
+    }
+
+    /// Register the live subscription owned by `key`, REPLACING any earlier
+    /// one under the same key (F-DAEMON-1). A client polling events/resume
+    /// on one connection thus holds one subscription per home instead of
+    /// one per call; dropping the replaced sender disconnects its forwarder.
+    pub fn subscribe_keyed(
+        &self,
+        key: &str,
+        from_cursor: i64,
+        sender: std::sync::mpsc::SyncSender<String>,
+    ) -> String {
+        self.register(Some(key.to_string()), from_cursor, sender)
+    }
+
+    fn register(
+        &self,
+        key: Option<String>,
+        from_cursor: i64,
+        sender: std::sync::mpsc::SyncSender<String>,
+    ) -> String {
         let id = crate::problem::entropy::short_id();
         let mut subscribers = self.subscribers.lock().expect("hub");
+        if let Some(key) = key.as_deref() {
+            subscribers.retain(|subscriber| subscriber.key.as_deref() != Some(key));
+        }
         subscribers.push(Subscriber {
             id: id.clone(),
             sender,
             from_cursor,
+            key,
         });
         id
+    }
+
+    /// Drop every subscription owned by `key` (connection teardown): a dead
+    /// connection must not keep pinning retention or the idle-quiet exit.
+    pub fn unsubscribe_key(&self, key: &str) {
+        self.subscribers
+            .lock()
+            .expect("hub")
+            .retain(|subscriber| subscriber.key.as_deref() != Some(key));
+    }
+
+    /// Live subscriber count (diagnostics / tests).
+    #[allow(dead_code)]
+    pub fn subscriber_count(&self) -> usize {
+        self.subscribers.lock().expect("hub").len()
     }
 
     /// Oldest live subscriber cursor (None when nobody subscribes). The
@@ -214,4 +258,48 @@ pub fn latest_cursor(conn: &rusqlite::Connection) -> omt_storage::Result<i64> {
 /// stamping (U5b will stamp prune-time resync envelopes).
 pub fn _now_ms(clock: &Arc<dyn MillisClock>) -> i64 {
     clock.now_ms()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// F-DAEMON-1: re-registering under the same key replaces the earlier
+    /// subscription (its sender drops, so its forwarder disconnects).
+    #[test]
+    fn keyed_subscribe_replaces_same_key() {
+        let hub = Hub::new();
+        let (first_tx, first_rx) = std::sync::mpsc::sync_channel::<String>(4);
+        let (second_tx, _second_rx) = std::sync::mpsc::sync_channel::<String>(4);
+        hub.subscribe_keyed("conn-a", 3, first_tx);
+        hub.subscribe_keyed("conn-a", 7, second_tx);
+        assert_eq!(hub.subscriber_count(), 1);
+        assert_eq!(hub.oldest_subscriber_cursor(), Some(7));
+        assert!(matches!(
+            first_rx.recv_timeout(std::time::Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+        ));
+
+        let (other_tx, _other_rx) = std::sync::mpsc::sync_channel::<String>(4);
+        hub.subscribe_keyed("conn-b", 1, other_tx);
+        assert_eq!(hub.subscriber_count(), 2, "distinct keys coexist");
+    }
+
+    /// Teardown drops only the departing connection's subscriptions;
+    /// unkeyed registrations are untouched.
+    #[test]
+    fn unsubscribe_key_drops_only_that_key() {
+        let hub = Hub::new();
+        let (a_tx, _a_rx) = std::sync::mpsc::sync_channel::<String>(4);
+        let (b_tx, _b_rx) = std::sync::mpsc::sync_channel::<String>(4);
+        let (plain_tx, _plain_rx) = std::sync::mpsc::sync_channel::<String>(4);
+        hub.subscribe_keyed("conn-a", 2, a_tx);
+        hub.subscribe_keyed("conn-b", 5, b_tx);
+        hub.subscribe_with_cursor(9, plain_tx);
+        hub.unsubscribe_key("conn-a");
+        assert_eq!(hub.subscriber_count(), 2);
+        assert_eq!(hub.oldest_subscriber_cursor(), Some(5));
+        hub.unsubscribe_key("conn-b");
+        assert_eq!(hub.oldest_subscriber_cursor(), Some(9));
+    }
 }

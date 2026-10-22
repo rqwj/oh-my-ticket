@@ -342,6 +342,13 @@ struct ConnState {
     /// forwarders poll it to exit instead of pinning the writer channel
     /// (and its socket fd) forever on an idle hub subscription.
     conn_dead: Arc<AtomicBool>,
+    /// Subscription key of THIS connection (F-DAEMON-1): events/resume
+    /// replaces this connection's previous live subscription per home
+    /// instead of stacking one subscription + forwarder thread per call.
+    conn_key: String,
+    /// Hubs this connection holds a keyed subscription on — teardown drops
+    /// them so a dead connection stops pinning retention / idle exit.
+    subscribed_hubs: Mutex<Vec<Arc<crate::events::Hub>>>,
 }
 
 #[allow(clippy::type_complexity)]
@@ -400,6 +407,8 @@ pub(crate) fn serve_connection(
         peer,
         inflight: Arc::new(Mutex::new(std::collections::HashMap::new())),
         conn_dead: Arc::new(AtomicBool::new(false)),
+        conn_key: crate::problem::entropy::short_id(),
+        subscribed_hubs: Mutex::new(Vec::new()),
     });
 
     // Dispatcher thread: processes requests SEQUENTIALLY (per-connection
@@ -477,6 +486,14 @@ pub(crate) fn serve_connection(
     // Reader finished (EOF/error): wake live-event forwarders so their
     // line_tx clones drop and the writer thread (and its fd) can exit.
     state.conn_dead.store(true, Ordering::SeqCst);
+    for hub in state
+        .subscribed_hubs
+        .lock()
+        .expect("subscribed hubs")
+        .iter()
+    {
+        hub.unsubscribe_key(&state.conn_key);
+    }
     drop(line_tx); // closes the writer thread when notifications drain
 }
 
@@ -786,14 +803,28 @@ fn route_method(
                 }
             })
             .ok();
-        match home.call_full(
+        // Record the hub BEFORE registering and re-check liveness AFTER:
+        // whichever of this path and teardown runs second drops the keyed
+        // subscription, so a request racing connection close cannot leak it.
+        {
+            let mut hubs = state.subscribed_hubs.lock().expect("subscribed hubs");
+            if !hubs.iter().any(|hub| Arc::ptr_eq(hub, &home.hub)) {
+                hubs.push(Arc::clone(&home.hub));
+            }
+        }
+        let outcome = home.call_full(
             &request.method,
             request.params.clone(),
             credential,
             Some(sub_tx),
             resume_cursor,
+            Some(state.conn_key.clone()),
             cancel,
-        ) {
+        );
+        if state.conn_dead.load(Ordering::SeqCst) {
+            home.hub.unsubscribe_key(&state.conn_key);
+        }
+        match outcome {
             Ok(value) => value,
             Err(problem) => {
                 state.inflight.lock().expect("inflight").remove(&request.id);
@@ -806,6 +837,7 @@ fn route_method(
             &request.method,
             request.params.clone(),
             credential,
+            None,
             None,
             None,
             cancel,

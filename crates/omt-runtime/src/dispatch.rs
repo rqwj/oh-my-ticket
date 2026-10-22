@@ -94,6 +94,8 @@ pub struct Ctx<'a> {
     pub subscribe: Option<SyncSender<String>>,
     /// Cursor the live subscription resumes from (retention keying).
     pub subscribe_from_cursor: Option<i64>,
+    /// Owning connection key (one live subscription per connection × home).
+    pub subscribe_key: Option<String>,
 }
 
 struct SystemClockBox;
@@ -144,6 +146,7 @@ pub fn dispatch(
         auth_credential,
         subscribe,
         None,
+        None,
         &AtomicBool::new(false),
         &Limits::default(),
     )
@@ -162,6 +165,7 @@ pub fn dispatch_cancellable(
     auth_credential: &Credential,
     subscribe: Option<SyncSender<String>>,
     subscribe_from_cursor: Option<i64>,
+    subscribe_key: Option<String>,
     cancel: &AtomicBool,
     limits: &Limits,
 ) -> Result<Value> {
@@ -220,6 +224,7 @@ pub fn dispatch_cancellable(
         clock: SystemClockBox,
         subscribe,
         subscribe_from_cursor,
+        subscribe_key,
     };
 
     let outcome = match method {
@@ -2745,7 +2750,10 @@ fn events_resume(ctx: &mut Ctx, params: &Value) -> Result<Value> {
     // task can key snapshot.resync on the oldest live consumer.
     if let Some(sender) = ctx.subscribe.take() {
         let from_cursor = ctx.subscribe_from_cursor.unwrap_or(cursor);
-        ctx.hub.subscribe_with_cursor(from_cursor, sender);
+        match ctx.subscribe_key.as_deref() {
+            Some(key) => ctx.hub.subscribe_keyed(key, from_cursor, sender),
+            None => ctx.hub.subscribe_with_cursor(from_cursor, sender),
+        };
     }
     let new_cursor = batch.last().map(|e| e.cursor).unwrap_or(cursor);
     Ok(json!({

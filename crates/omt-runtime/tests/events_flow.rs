@@ -216,3 +216,89 @@ fn events_resume_from_cursor_is_strictly_new() {
 
     proc.kill();
 }
+
+/// Live thread count of a process: `/proc/<pid>/task` on Linux, `ps -M`
+/// rows (minus the header) on macOS.
+fn thread_count(pid: i64) -> usize {
+    if let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/task")) {
+        return entries.count();
+    }
+    let out = std::process::Command::new("ps")
+        .args(["-M", "-p", &pid.to_string()])
+        .output()
+        .expect("ps -M");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .count()
+        .saturating_sub(1)
+}
+
+/// F-DAEMON-1 regression: a client that polls `events/resume` on ONE
+/// connection (the desktop pump does so every 250ms) keeps exactly one live
+/// subscription for that home — no forwarder thread per call, and a commit
+/// is pushed once, not once per past resume.
+#[test]
+fn repeated_events_resume_on_one_connection_keeps_one_subscription() {
+    let (_ctx, mut proc, endpoint) = ready();
+    let (mut writer, w_cred) = connected_client(&endpoint, "cli").expect("writer");
+    let epic = writer
+        .call(
+            "node/create",
+            authed(json!({ "type": "epic", "title": "poll epic" }), &w_cred),
+        )
+        .expect("epic");
+    let epic_id = epic["node"]["nodeId"].as_str().unwrap().to_string();
+
+    let (mut reader, r_cred) = connected_client(&endpoint, "desktop").expect("reader");
+    let mut cursor = 0;
+    let poll = |reader: &mut common::TestClient, cursor: &mut i64| {
+        let page = reader
+            .call(
+                "events/resume",
+                authed(json!({ "cursor": *cursor, "limit": 500 }), &r_cred),
+            )
+            .expect("poll");
+        *cursor = page["cursor"].as_i64().unwrap_or(*cursor);
+    };
+    poll(&mut reader, &mut cursor);
+    std::thread::sleep(Duration::from_millis(300));
+    let baseline = thread_count(proc.pid());
+
+    for _ in 0..40 {
+        poll(&mut reader, &mut cursor);
+    }
+    // Superseded forwarders exit on channel disconnect; give them a beat.
+    std::thread::sleep(Duration::from_millis(600));
+    let after = thread_count(proc.pid());
+    assert!(
+        after <= baseline + 2,
+        "40 polls on one connection must not grow daemon threads: {baseline} → {after}"
+    );
+
+    writer
+        .call(
+            "node/update",
+            authed(
+                json!({ "nodeId": epic_id, "changes": { "title": "poll epic v2" } }),
+                &w_cred,
+            ),
+        )
+        .expect("live commit");
+    reader
+        .wait_notification("omt/event", Duration::from_secs(10))
+        .expect("live omt/event");
+    // Duplicates (one per stale subscription) would land within the same
+    // burst; drain them through a round-trip before counting.
+    std::thread::sleep(Duration::from_millis(500));
+    reader
+        .call("node/get", authed(json!({ "nodeId": epic_id }), &r_cred))
+        .expect("drain round-trip");
+    let duplicates = reader
+        .notifications
+        .iter()
+        .filter(|line| line.contains("\"omt/event\""))
+        .count();
+    assert_eq!(duplicates, 0, "the commit is pushed exactly once");
+
+    proc.kill();
+}

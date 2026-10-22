@@ -67,6 +67,9 @@ pub enum Job {
         /// Resume cursor when this job opens a live subscription (used to
         /// key retention pruning), else None.
         subscribe_from_cursor: Option<i64>,
+        /// Owning connection key: the subscription replaces any earlier
+        /// one from the same connection (F-DAEMON-1).
+        subscribe_key: Option<String>,
         cancel: Arc<AtomicBool>,
         reply: SyncSender<Result<Value, omt_storage::Problem>>,
     },
@@ -100,7 +103,8 @@ pub struct OpenedHome {
     pub name: String,
     pub kind: HomeKind,
     tx: SyncSender<Job>,
-    #[allow(dead_code)] // hub reaches the actor via clone; field kept for diagnostics
+    /// Live-event hub (the actor holds a clone); connections use it to drop
+    /// their keyed subscriptions on teardown (F-DAEMON-1).
     pub hub: Arc<Hub>,
 }
 
@@ -143,6 +147,7 @@ impl OpenedHome {
             auth,
             None,
             None,
+            None,
             Arc::new(AtomicBool::new(false)),
         )
     }
@@ -163,12 +168,14 @@ impl OpenedHome {
             auth,
             subscribe,
             None,
+            None,
             Arc::new(AtomicBool::new(false)),
         )
     }
 
     /// Full-fidelity call: subscription channel, its starting cursor (keys
-    /// retention pruning), and a cancellable execution probe.
+    /// retention pruning), its owning connection key, and a cancellable
+    /// execution probe.
     #[allow(clippy::too_many_arguments)]
     pub fn call_full(
         &self,
@@ -177,6 +184,7 @@ impl OpenedHome {
         auth: &crate::auth::Credential,
         subscribe: Option<SyncSender<String>>,
         subscribe_from_cursor: Option<i64>,
+        subscribe_key: Option<String>,
         cancel: Arc<AtomicBool>,
     ) -> Result<Value, omt_storage::Problem> {
         let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
@@ -186,6 +194,7 @@ impl OpenedHome {
             auth: auth.clone(),
             subscribe,
             subscribe_from_cursor,
+            subscribe_key,
             cancel,
             reply: reply_tx,
         })?;
@@ -635,6 +644,7 @@ impl Homes {
                             auth,
                             subscribe,
                             subscribe_from_cursor,
+                            subscribe_key,
                             cancel,
                             reply,
                         }) => {
@@ -648,6 +658,7 @@ impl Homes {
                                 &auth,
                                 subscribe,
                                 subscribe_from_cursor,
+                                subscribe_key,
                                 &cancel,
                                 &limits,
                             );
