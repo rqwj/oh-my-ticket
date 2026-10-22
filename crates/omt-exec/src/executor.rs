@@ -1137,21 +1137,28 @@ pub(crate) fn dispatch_daemon_side(
     if members.is_empty() {
         return Err("无未完成可执行成员".into());
     }
-    let active_runs: Vec<String> = node_resp["runs"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
+    let run_links = node_resp["runs"].as_array().cloned().unwrap_or_default();
+    let active_runs: Vec<String> = run_links
         .iter()
         .filter_map(|r| r["runId"].as_str().map(str::to_owned))
         .collect();
+    // F-ACC-12：③ 将复用的 run 正在运行、且本节点 item 仍 pending（停止后
+    // 重新派发的典型形态）时，node/execute 置 in_progress 会触发 daemon 的
+    // 被动观察，以桌面端身份把该 item 激活成 running——exec 随后认领落空、
+    // item 卡死。此时跳过 ②，由 exec 自己 claim。
+    let reused_pending_item = run_links.first().is_some_and(|link| {
+        link["status"].as_str() == Some("running") && link["itemState"].as_str() == Some("pending")
+    });
 
     // ② node/execute（发起方是 desktop，adapter_only 可用；P-3）
-    rpc(
-        "node/execute",
-        serde_json::json!({
-            "homeId": home_id, "nodeId": node_id, "commandId": format!("{dispatch_id}:execute"),
-        }),
-    )?;
+    if !reused_pending_item {
+        rpc(
+            "node/execute",
+            serde_json::json!({
+                "homeId": home_id, "nodeId": node_id, "commandId": format!("{dispatch_id}:execute"),
+            }),
+        )?;
+    }
 
     // 启动参数（记录用；shim 会用同一输入重算，P-4）。F-EXEC-7：harness 解析、
     // exec_id / agent 目录与目标 agent 校验提前到 ③ ensure-run 之前——它们不
@@ -3512,6 +3519,66 @@ mod tests {
             file.agents[0].execs[0].run_id.as_deref(),
             Some("run-existing")
         );
+    }
+
+    /// F-ACC-12：复用的 run 正在运行且本节点 item 仍 pending（停止后重新
+    /// 派发的典型形态）时，② `node/execute` 必须跳过——否则 daemon 的被动
+    /// 观察会以桌面端身份把该 item 激活成 running，exec 认领落空、item 卡死。
+    #[test]
+    fn dispatch_skips_node_execute_when_reused_run_holds_pending_item() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = write_script(dir.path(), "reuse-pending", "exit 0");
+        let (runtime, _home_path) = setup_dispatch_env(dir.path(), "pi", &program);
+
+        // node/get 的 runs 是 run_link 投影（views.rs）：status + itemState
+        let fake = FakeDaemon::new(
+            dispatch_node_get(serde_json::json!([{
+                "runId": "run-existing", "status": "running", "itemState": "pending",
+            }])),
+            dispatch_run_get("running"),
+            "run-should-not-be-created",
+        );
+        let rpc = |method: &str, params: serde_json::Value| fake.rpc(method, params);
+
+        let plan = dispatch_daemon_side(
+            &rpc, &runtime, "h_test", "t1", "pi", false, None, None, None,
+        )
+        .expect("复用 run 派发应成功");
+        assert_eq!(plan.run_id, "run-existing");
+        assert!(
+            !fake.method_names().iter().any(|m| m == "node/execute"),
+            "pending item 由 exec 自己认领，不得经 node/execute 被桌面端身份抢占: {:?}",
+            fake.method_names()
+        );
+    }
+
+    /// 反例：新建 run（无活动 run）与复用 run 中本节点 item 已不在 pending
+    /// 时，② 照常执行（置 in_progress + 审计绑定，既有行为不回退）。
+    #[test]
+    fn dispatch_keeps_node_execute_without_pending_item_in_reused_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = write_script(dir.path(), "reuse-other", "exit 0");
+        let (runtime, _home_path) = setup_dispatch_env(dir.path(), "pi", &program);
+        for runs in [
+            serde_json::json!([]),
+            serde_json::json!([{ "runId": "run-existing", "status": "pending", "itemState": "pending" }]),
+        ] {
+            let fake = FakeDaemon::new(
+                dispatch_node_get(runs.clone()),
+                dispatch_run_get("pending"),
+                "run-new",
+            );
+            let rpc = |method: &str, params: serde_json::Value| fake.rpc(method, params);
+            dispatch_daemon_side(
+                &rpc, &runtime, "h_test", "t1", "pi", false, None, None, None,
+            )
+            .expect("派发应成功");
+            assert!(
+                fake.method_names().iter().any(|m| m == "node/execute"),
+                "runs={runs}: 无抢占风险时 node/execute 照常调用: {:?}",
+                fake.method_names()
+            );
+        }
     }
 
     #[test]
