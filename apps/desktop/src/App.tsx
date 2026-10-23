@@ -174,6 +174,9 @@ export function App() {
                   <AgentsPanel
                     agents={state.agents}
                     parseFailed={state.parseFailed}
+                    legacyUnmigrated={state.legacyUnmigrated}
+                    corruptAgents={state.corruptAgents}
+                    onArchiveLegacy={store.archiveLegacyAgents}
                     selectedAgentId={state.selectedAgentId}
                     nodes={state.nodes}
                     bindings={state.bindingsByHome[state.activeHome.homeId] ?? EMPTY_BINDINGS}

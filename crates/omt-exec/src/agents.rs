@@ -815,14 +815,121 @@ pub(crate) fn finalize_agent_exec(
 }
 
 /// Agents 面板数据面（U5 消费）：记录列表 + `parseFailed` 标志（前端提示
-/// 数据已降级；U9 据此冻结 GC）。
+/// 数据已降级；U9 据此冻结 GC）。§41：附带降级来源的结构化说明——
+/// `legacyUnmigrated`（旧版 home 级文件未迁移 / 只剩留证）与
+/// `corruptAgents`（单个 agent.json 损坏：目录 + 留证文件名），横幅据此
+/// 如实呈现、说明解冻办法，并提供「确认并归档」。
 pub fn agents_list_value(runtime_dir: &Path, home_id: &str) -> Result<serde_json::Value, String> {
     let (agents, parse_failed) = list_agents(runtime_dir, home_id)?;
     Ok(serde_json::json!({
         "agents": agents,
         "agentSeq": agent_seq(runtime_dir, home_id)?,
         "parseFailed": parse_failed,
+        "legacyUnmigrated": legacy_unmigrated(runtime_dir, home_id)?,
+        "corruptAgents": corrupt_agents(runtime_dir, home_id)?,
     }))
+}
+
+/// `path` 同目录下的 `<文件名>.corrupt-*` 留证（文件名，排序）。
+fn corrupt_evidence_of(path: &Path) -> Vec<String> {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return Vec::new();
+    };
+    let prefix = format!("{}.corrupt-", name.to_string_lossy());
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .filter(|n| n.starts_with(&prefix))
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+fn legacy_unmigrated(runtime_dir: &Path, home_id: &str) -> Result<serde_json::Value, String> {
+    let legacy = legacy_agents_monolith(runtime_dir, home_id)?;
+    let evidence = corrupt_evidence_of(&legacy);
+    let present = legacy.is_file();
+    if !present && evidence.is_empty() {
+        return Ok(serde_json::Value::Null);
+    }
+    let parseable = std::fs::read(&legacy)
+        .ok()
+        .is_some_and(|bytes| serde_json::from_slice::<AgentsFile>(&bytes).is_ok());
+    Ok(serde_json::json!({
+        "path": legacy.display().to_string(),
+        "present": present,
+        "parseable": parseable,
+        "corruptEvidence": evidence,
+    }))
+}
+
+/// §41：单个 agent.json 损坏（解析失败或留有 `.corrupt-*` 证据）的 agent——
+/// 目录绝对路径 + 留证文件名。list_agents 的 parseFailed 正是因这些留证
+/// 粘性置位；删掉留证（或修复后改名回 agent.json）即解冻。
+fn corrupt_agents(runtime_dir: &Path, home_id: &str) -> Result<Vec<serde_json::Value>, String> {
+    let mut out = Vec::new();
+    for agent_id in layout::agent_ids(runtime_dir, home_id)? {
+        let path = layout::agent_file(runtime_dir, home_id, &agent_id)?;
+        let unreadable = std::fs::read(&path)
+            .ok()
+            .is_some_and(|bytes| serde_json::from_slice::<AgentRecord>(&bytes).is_err());
+        let evidence = corrupt_evidence_of(&path);
+        if unreadable || !evidence.is_empty() {
+            out.push(serde_json::json!({
+                "agentId": agent_id,
+                "dir": layout::agent_dir(runtime_dir, home_id, &agent_id)?.display().to_string(),
+                "evidence": evidence,
+            }));
+        }
+    }
+    Ok(out)
+}
+
+/// §41 legacy-degraded-permanent：「确认并归档」——把未能迁移的旧版 home 级
+/// 存储文件及其 `.corrupt-*` 留证移入 `<home>/.recovered/`（点前缀：agent
+/// 列表与残留清扫都跳过它），解除 F-EXEC-1 的 GC 冻结（atomic_json 注释里
+/// 说的「移入 recovered/」从此真实存在）。只在旧文件**不可解析**或只剩
+/// 留证时允许：可解析的旧文件由启动迁移处理，归档会让其中的 agent 从列表
+/// 消失。与迁移共用 `agents/.migrate` 全局锁。返回移走的文件名。
+pub fn archive_legacy_store(runtime_dir: &Path, home_id: &str) -> Result<Vec<String>, String> {
+    let legacy = legacy_agents_monolith(runtime_dir, home_id)?;
+    let _guard = lock_exclusive(
+        &runtime_dir.join("agents").join(".migrate"),
+        LOCK_ACQUIRE_TIMEOUT,
+    )?;
+    if let Ok(bytes) = std::fs::read(&legacy) {
+        if serde_json::from_slice::<AgentsFile>(&bytes).is_ok() {
+            return Err("旧版文件可以解析——重启桌面端会自动迁移，无需归档".to_string());
+        }
+    }
+    let home = layout::home_dir(runtime_dir, home_id)?;
+    let recovered = home.join(".recovered");
+    std::fs::create_dir_all(&recovered).map_err(|e| format!("create .recovered: {e}"))?;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or_default();
+    let mut moved = Vec::new();
+    if legacy.is_file() {
+        let name = format!("{}.json.{ts}", "agents");
+        std::fs::rename(&legacy, recovered.join(&name))
+            .map_err(|e| format!("归档 {} 失败：{e}", legacy.display()))?;
+        moved.push(name);
+    }
+    for name in corrupt_evidence_of(&legacy) {
+        std::fs::rename(home.join(&name), recovered.join(&name))
+            .map_err(|e| format!("归档 {name} 失败：{e}"))?;
+        moved.push(name);
+    }
+    let _ = std::fs::remove_file(home.join(format!("{}.json.lock", "agents")));
+    if moved.is_empty() {
+        return Err("没有需要归档的旧版文件".to_string());
+    }
+    Ok(moved)
 }
 
 /// U4 步骤 ⑥：写入 bindings.json（显式绑定 nodeId → agentId）。
@@ -1420,6 +1527,88 @@ mod tests {
         assert!(failed, "未恢复的旧损坏留证必须保持降级");
         let degraded = bindings_get_value(&runtime, &home).unwrap();
         assert_eq!(degraded["parseFailed"], true);
+    }
+
+    /// §41 legacy-degraded-permanent：旧版 home 级文件损坏 → agents_list
+    /// 结构化说明降级来源；「确认并归档」后移入 .recovered/、降级解除、
+    /// .recovered 不进 agent 列表。
+    #[test]
+    fn corrupt_legacy_store_is_reported_and_archivable() {
+        let (_dir, runtime, home) = temp_runtime();
+        register_agent(&runtime, &home, "pi", new_exec("exec-new")).unwrap();
+        let home_dir = layout::home_dir(&runtime, &home).unwrap();
+        let legacy = home_dir.join(format!("{}.json", "agents"));
+        std::fs::write(&legacy, "{ not json").unwrap();
+
+        let value = agents_list_value(&runtime, &home).unwrap();
+        assert_eq!(value["parseFailed"], true);
+        assert_eq!(value["agents"].as_array().unwrap().len(), 1, "列表并不为空");
+        let info = &value["legacyUnmigrated"];
+        assert_eq!(info["present"], true);
+        assert_eq!(info["parseable"], false);
+        assert!(info["path"].as_str().unwrap().ends_with(".json"), "{info}");
+        assert_eq!(value["corruptAgents"], serde_json::json!([]));
+
+        let moved = archive_legacy_store(&runtime, &home).unwrap();
+        assert_eq!(moved.len(), 1, "{moved:?}");
+        assert!(!legacy.exists());
+        let value = agents_list_value(&runtime, &home).unwrap();
+        assert_eq!(value["parseFailed"], false, "归档后冻结解除");
+        assert!(value["legacyUnmigrated"].is_null());
+        let recovered: Vec<_> = std::fs::read_dir(home_dir.join(".recovered"))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            layout::agent_ids(&runtime, &home).unwrap().len(),
+            1,
+            ".recovered 不是 agent"
+        );
+    }
+
+    /// 可解析的旧文件由启动迁移处理——拒绝归档（否则其中的 agent 会从列表
+    /// 消失）；损坏的单个 agent.json 进 corruptAgents（目录路径 + 留证文件名）。
+    #[test]
+    fn parseable_legacy_store_refuses_archive_and_corrupt_agents_are_listed() {
+        let (_dir, runtime, home) = temp_runtime();
+        let agent = register_agent(&runtime, &home, "pi", new_exec("exec-a")).unwrap();
+        let home_dir = layout::home_dir(&runtime, &home).unwrap();
+        let legacy = home_dir.join(format!("{}.json", "agents"));
+        std::fs::write(
+            &legacy,
+            serde_json::to_string(&AgentsFile::default()).unwrap(),
+        )
+        .unwrap();
+        let value = agents_list_value(&runtime, &home).unwrap();
+        assert_eq!(value["legacyUnmigrated"]["parseable"], true);
+        let err = archive_legacy_store(&runtime, &home).unwrap_err();
+        assert!(err.contains("自动迁移"), "{err}");
+        assert!(legacy.exists());
+
+        std::fs::remove_file(&legacy).unwrap();
+        std::fs::write(
+            layout::agent_file(&runtime, &home, &agent.id).unwrap(),
+            "{ broken",
+        )
+        .unwrap();
+        let value = agents_list_value(&runtime, &home).unwrap();
+        assert!(value["legacyUnmigrated"].is_null());
+        let corrupt = value["corruptAgents"].as_array().unwrap();
+        assert_eq!(corrupt.len(), 1, "{value}");
+        assert_eq!(corrupt[0]["agentId"], serde_json::json!(agent.id));
+        assert!(
+            corrupt[0]["dir"].as_str().unwrap().ends_with(&agent.id),
+            "{value}"
+        );
+        let evidence = corrupt[0]["evidence"][0].as_str().unwrap();
+        assert!(evidence.starts_with("agent.json.corrupt-"), "{value}");
+        // 解冻办法如横幅所说：删掉留证文件，下次读取即不再降级
+        let dir = layout::agent_dir(&runtime, &home, &agent.id).unwrap();
+        std::fs::remove_file(dir.join(evidence)).unwrap();
+        let value = agents_list_value(&runtime, &home).unwrap();
+        assert_eq!(value["parseFailed"], false);
+        assert_eq!(value["corruptAgents"], serde_json::json!([]));
     }
 
     #[test]

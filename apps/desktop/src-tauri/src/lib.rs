@@ -248,6 +248,7 @@ pub fn run() {
             harness::harness_list_models,
             agents::agents_list,
             agents::agents_delete,
+            agents::agents_archive_legacy,
             agents::bindings_get,
             agents::bindings_gc,
             executor::exec_start,

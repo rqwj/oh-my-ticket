@@ -160,10 +160,32 @@ export interface AgentRecord {
   parentAgentId?: string | null
 }
 
+/** §41：未能迁移的旧版 home 级 agents.json（损坏 / 尚未迁移 / 只剩 .corrupt-* 留证）。 */
+export interface LegacyUnmigrated {
+  path: string
+  /** 旧文件仍在原位 */
+  present: boolean
+  /** 可按旧格式解析（启动迁移会处理；不提供归档） */
+  parseable: boolean
+  /** 同目录的 `.corrupt-*` 留证文件名 */
+  corruptEvidence: string[]
+}
+
+/** §41：agent.json 已损坏的 agent——目录与留证文件名（解冻：删留证或改名回 agent.json）。 */
+export interface CorruptAgent {
+  agentId: string
+  dir: string
+  evidence: string[]
+}
+
 export interface AgentsListResult {
   agents: AgentRecord[]
   agentSeq: number
   parseFailed: boolean
+  /** §41：旧 fixture / 旧后端缺省按 null 处理 */
+  legacyUnmigrated?: LegacyUnmigrated | null
+  /** §41：缺省按空处理 */
+  corruptAgents?: CorruptAgent[]
 }
 
 // ── U9 Bindings（R-C；wire 契约 = bindings_get / bindings_gc 的 json! 投影）──

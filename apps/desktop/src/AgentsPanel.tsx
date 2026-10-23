@@ -11,7 +11,15 @@
  */
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { omtCall, type StopAllOutcome, type TranscriptEvent } from './bridge'
-import type { AgentRecord, ExecRecord, OmtNode, RunDetail, RunItemView } from './types'
+import type {
+  AgentRecord,
+  CorruptAgent,
+  ExecRecord,
+  LegacyUnmigrated,
+  OmtNode,
+  RunDetail,
+  RunItemView,
+} from './types'
 import { claimedCountForExec, danglingBindingsOf, nodeTitlesById } from './store'
 import {
   agentDisplayName,
@@ -21,6 +29,9 @@ import {
 } from './agentUi'
 import { TranscriptView } from './TranscriptView'
 import { DeleteIcon } from './icons'
+
+// §41：无降级时的稳定空表（默认参数；避免每渲染新建数组击穿下游 memo）
+const EMPTY_CORRUPT: CorruptAgent[] = []
 
 /** 最新 exec：lastExecId 指针优先，缺失时回退 execs[] 末位。 */
 function latestExecOf(agent: AgentRecord): ExecRecord | null {
@@ -79,9 +90,117 @@ function statsOf(detail: RunDetail): RunStat {
   }
 }
 
+/**
+ * §41 legacy-degraded-permanent：降级横幅如实说明来源——旧版 home 级文件
+ * 未迁移（损坏 / 尚未迁移 / 只剩留证）与单个 agent 记录损坏分别呈现。旧文案
+ * 「已降级为空列表（损坏文件已留证 .corrupt-*）」与事实不符：列表并不为空，
+ * 旧文件也没有被改名。
+ * - 旧文件不可解析：两步控件「确认并归档」→「确认归档」/「取消」（与
+ *   ConfirmStopAllButton 同形），进行中禁用；失败就地显示在按钮旁（不依赖
+ *   全局 error——其他刷新会清掉它）。成功提示由面板持有（横幅随降级解除消失）。
+ * - 单个 agent 损坏：写明目录与留证文件名，以及解冻办法。
+ */
+export function DegradedBanner({
+  legacy,
+  corruptAgents,
+  onArchive,
+}: {
+  legacy: LegacyUnmigrated | null
+  corruptAgents: CorruptAgent[]
+  onArchive?: () => Promise<void>
+}) {
+  const [step, setStep] = useState<'idle' | 'armed' | 'busy'>('idle')
+  const [archiveError, setArchiveError] = useState<string | null>(null)
+  const lines: string[] = []
+  if (legacy && legacy.parseable) {
+    lines.push(
+      `旧版 agents.json 尚未迁移（${legacy.path}）：重启桌面端会自动迁移；迁移完成前绑定清理已冻结。`,
+    )
+  } else if (legacy) {
+    const evidence =
+      legacy.corruptEvidence.length > 0 ? `；损坏留证：${legacy.corruptEvidence.join('、')}` : ''
+    lines.push(
+      legacy.present
+        ? `旧版 agents.json 已损坏、未能迁移（${legacy.path}${evidence}）：其中的 agent 不在下方列表中，为防误删，绑定清理已冻结。`
+        : `旧版 agents.json 曾损坏，留证尚未处理（${legacy.path}${evidence}）：为防误删，绑定清理已冻结。`,
+    )
+  }
+  for (const corrupt of corruptAgents) {
+    const evidence =
+      corrupt.evidence.length > 0 ? `留证 ${corrupt.evidence.join('、')}` : 'agent.json 无法解析'
+    lines.push(
+      `agent 记录已损坏：${corrupt.dir}（${evidence}），该 agent 未在列表中显示，绑定清理已冻结。删除该留证文件，或修复后改名回 agent.json，下次刷新即解冻。`,
+    )
+  }
+  if (lines.length === 0) lines.push('部分 agent 记录读取失败；绑定清理已冻结。')
+  const archivable = legacy !== null && !legacy.parseable && onArchive !== undefined
+  const runArchive = async () => {
+    if (!onArchive) return
+    setStep('busy')
+    setArchiveError(null)
+    try {
+      await onArchive()
+    } catch (err) {
+      setArchiveError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setStep('idle')
+    }
+  }
+  return (
+    <div className="error-banner degraded-banner" role="alert">
+      {lines.map(line => (
+        <p key={line}>{line}</p>
+      ))}
+      {archivable && (
+        <>
+          <p className="hm-hint">
+            「确认并归档」会把旧文件与留证移入同目录的 .recovered/，绑定清理随之解冻——指向这些旧 agent
+            的绑定会被视为失效。
+          </p>
+          <div className="chip-row">
+            {step === 'idle' && (
+              <button
+                className="chip"
+                onClick={() => {
+                  setArchiveError(null)
+                  setStep('armed')
+                }}
+              >
+                确认并归档
+              </button>
+            )}
+            {step === 'armed' && (
+              <>
+                <button className="chip active" onClick={() => void runArchive()}>
+                  确认归档
+                </button>
+                <button className="chip" onClick={() => setStep('idle')}>
+                  取消
+                </button>
+              </>
+            )}
+            {step === 'busy' && (
+              <button className="chip" disabled>
+                归档中…
+              </button>
+            )}
+            {archiveError && <span className="archive-error">归档失败：{archiveError}</span>}
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
 interface Props {
   agents: AgentRecord[]
   parseFailed: boolean
+  /** §41：旧版存储未迁移的说明（缺省 null） */
+  legacyUnmigrated?: LegacyUnmigrated | null
+  /** §41：agent.json 已损坏的 agent（缺省空） */
+  corruptAgents?: CorruptAgent[]
+  /** §41：「确认并归档」（App → store.archiveLegacyAgents），返回移走的文件名；失败抛出 */
+  onArchiveLegacy?: () => Promise<string[]>
   selectedAgentId: string | null
   nodes: OmtNode[]
   /** U9：显式绑定表 + 降级标志——悬空绑定计数与清理按钮的数据源 */
@@ -114,6 +233,9 @@ interface Props {
 export function AgentsPanel({
   agents,
   parseFailed,
+  legacyUnmigrated = null,
+  corruptAgents = EMPTY_CORRUPT,
+  onArchiveLegacy,
   selectedAgentId,
   nodes,
   bindings = {},
@@ -133,6 +255,8 @@ export function AgentsPanel({
   onGcBindings,
 }: Props) {
   const [stats, setStats] = useState<Record<string, RunStat>>({})
+  /** §41：归档成功提示（横幅随降级解除消失，提示由面板持有，手动关闭） */
+  const [archiveNotice, setArchiveNotice] = useState<string | null>(null)
   /** U10：一键续跑失败的就地报错（成功无需提示——事件流自己会出现） */
   const [resumeError, setResumeError] = useState<string | null>(null)
   /** U14：信任门弹窗动作报错 */
@@ -285,8 +409,33 @@ export function AgentsPanel({
     }
   }, [agents, fetchRun, homeId])
 
+  // §41：降级横幅（空列表分支与列表分支共用）。条件包含 corruptAgents——单个
+  // agent 损坏时 parseFailed 也为真，但横幅不依赖这一点
+  const handleArchive = onArchiveLegacy
+    ? async () => {
+        const archived = await onArchiveLegacy()
+        setArchiveNotice(`已归档 ${archived.length} 个文件到 .recovered/：${archived.join('、')}`)
+      }
+    : undefined
+  const degradedBanner =
+    parseFailed || legacyUnmigrated || corruptAgents.length > 0 ? (
+      <DegradedBanner
+        legacy={legacyUnmigrated}
+        corruptAgents={corruptAgents}
+        onArchive={handleArchive}
+      />
+    ) : null
+  const archiveStatus = archiveNotice ? (
+    <p className="agents-notice" role="status">
+      {archiveNotice}
+      <button className="chip" onClick={() => setArchiveNotice(null)}>
+        知道了
+      </button>
+    </p>
+  ) : null
+
   // U9：悬空绑定（agentId 不在当前 agents 列表）。降级期间冻结悬空判定
-  // （bindingsDegraded / parseFailed——降级空表会把全部绑定误判失效）。
+  //（bindingsDegraded / parseFailed——降级空表会把全部绑定误判失效）。
   const dangling = bindingsDegraded || parseFailed ? [] : danglingBindingsOf(bindings, agents)
   const gcBar =
     onGcBindings && dangling.length > 0 ? (
@@ -323,9 +472,8 @@ export function AgentsPanel({
   if (agents.length === 0) {
     return (
       <div className="agents-empty">
-        {parseFailed && (
-          <p className="error-banner">agents.json 解析失败——已降级为空列表（损坏文件已留证 .corrupt-*）</p>
-        )}
+        {degradedBanner}
+        {archiveStatus}
         <p className="empty-hint">尚无 Agent——在 ticket 详情点『运行』派发</p>
         {gatePopup}
         {gcBar}
@@ -472,9 +620,8 @@ export function AgentsPanel({
   return (
     <div className="agents-layout">
       <div className="agents-list">
-        {parseFailed && (
-          <p className="error-banner">agents.json 解析失败——已降级为空列表（损坏文件已留证 .corrupt-*）</p>
-        )}
+        {degradedBanner}
+        {archiveStatus}
         {gcBar}
         {onStopAll && groups.active.length > 0 && (
           <ConfirmStopAllButton

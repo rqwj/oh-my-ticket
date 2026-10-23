@@ -32,6 +32,7 @@ import {
 } from '@tauri-apps/plugin-notification'
 import { Channel, invoke } from '@tauri-apps/api/core'
 import {
+  agentsArchiveLegacy,
   agentsList,
   bindingsGet,
   bindingsGc,
@@ -49,7 +50,16 @@ import {
   type StopAllOutcome,
   type TranscriptEvent,
 } from './bridge'
-import type { AgentRecord, HomeInfo, OmtNode, RunDetail, RunSummary, SavedFilters } from './types'
+import type {
+  AgentRecord,
+  CorruptAgent,
+  HomeInfo,
+  LegacyUnmigrated,
+  OmtNode,
+  RunDetail,
+  RunSummary,
+  SavedFilters,
+} from './types'
 
 const FILTERS_KEY = 'tauri:ui' // KD3: surface-prefixed bag key
 const LAST_HOME_KEY = 'omt-desktop-last-home' // 启动恢复：最后选择的 workspace homeId
@@ -353,6 +363,10 @@ export interface TreeState {
   agents: AgentRecord[]
   /** agents.json 解析失败（前端提示降级；U9 据此冻结 GC） */
   parseFailed: boolean
+  /** §41：旧版存储未迁移的说明（横幅 + 「确认并归档」） */
+  legacyUnmigrated: LegacyUnmigrated | null
+  /** §41：agent.json 已损坏的 agent（目录 + 留证文件名） */
+  corruptAgents: CorruptAgent[]
   selectedAgentId: string | null
   /** 本 home 未查看的 Failed agent id（tab badge；选中即清除） */
   unviewedFailedIds: string[]
@@ -378,6 +392,8 @@ const INITIAL: TreeState = {
   runs: [],
   agents: [],
   parseFailed: false,
+  legacyUnmigrated: null,
+  corruptAgents: [],
   selectedAgentId: null,
   unviewedFailedIds: [],
   bindingsByHome: {},
@@ -507,6 +523,8 @@ export function useTreeStore() {
         ...s,
         agents,
         parseFailed: result.parseFailed ?? false,
+        legacyUnmigrated: result.legacyUnmigrated ?? null,
+        corruptAgents: result.corruptAgents ?? [],
         unviewedFailedIds: agents
           .filter(a => a.status === 'failed' && !viewedFailedRef.current.has(a.id))
           .map(a => a.id),
@@ -553,6 +571,18 @@ export function useTreeStore() {
       setState(s => ({ ...s, error: presentError(error) }))
     }
   }, [refreshBindings])
+
+  // §41：「确认并归档」旧版存储——成功后重拉 agents（降级解除）与绑定表
+  //（GC 冻结解除后悬空计数才可信），返回移走的文件名供面板显示。失败**抛出**、
+  // 不写 state.error：全局错误会被其他刷新清掉，归档失败由横幅就地呈现。
+  const archiveLegacyAgents = useCallback(async (): Promise<string[]> => {
+    const home = activeHomeRef.current
+    if (!home) throw new Error('无活动 workspace')
+    const { archived } = await agentsArchiveLegacy(home.homeId)
+    await refreshAgents()
+    await refreshBindings()
+    return archived
+  }, [refreshAgents, refreshBindings])
 
   // exit 后防抖重拉：本地乐观更新让 UI 即时反应，重拉收敛 Rust 落盘后的
   // 权威形态（exit code / failure detail）。
@@ -996,6 +1026,8 @@ export function useTreeStore() {
         // U5：切换 home 重置 agents 视图态（尾窗按 execId 键控，跨 home 保留）
         agents: [],
         parseFailed: false,
+        legacyUnmigrated: null,
+        corruptAgents: [],
         selectedAgentId: null,
         unviewedFailedIds: [],
         // U9：绑定降级标志随 home 切换重置（表按 home 键保留）
@@ -1156,6 +1188,7 @@ export function useTreeStore() {
     // ── U9：绑定切片（R-C）───────────────────────────────────────────────
     refreshBindings,
     gcBindings,
+    archiveLegacyAgents,
     /** 某 exec 的尾窗（无则空数组）；数组原地追加，UI 以 transcriptVersion 感知 */
     transcriptWindow: (execId: string): TranscriptEvent[] =>
       transcriptsRef.current.get(execId) ?? EMPTY_TRANSCRIPT,

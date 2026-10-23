@@ -902,7 +902,9 @@ describe('U5 AgentsPanel 列表', () => {
     const onOpenHarnessSettings = vi.fn()
     await renderPanel({ onOpenHarnessSettings, parseFailed: true })
     expect(screen.getByText(/尚无 Agent/)).toBeTruthy()
-    expect(screen.getByText(/agents\.json 解析失败/)).toBeTruthy()
+    // §41（B6）：parseFailed 的降级提示换成 DegradedBanner 的兜底文案
+    //（旧文案「已降级为空列表」与事实不符——列表并不为空）
+    expect(screen.getByText(/部分 agent 记录读取失败；绑定清理已冻结/)).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: '配置 Harness' }))
     expect(onOpenHarnessSettings).toHaveBeenCalled()
   })

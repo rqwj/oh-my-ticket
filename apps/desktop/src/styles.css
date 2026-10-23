@@ -572,3 +572,9 @@ body {
 .agent-failure {
   color: var(--danger, #cf222e);
 }
+
+/* §41：归档失败就地提示（降级横幅内、按钮旁） */
+.degraded-banner .archive-error {
+  margin-left: 8px;
+  font-weight: 600;
+}

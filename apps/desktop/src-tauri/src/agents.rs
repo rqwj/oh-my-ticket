@@ -65,3 +65,11 @@ pub fn bindings_get(home_id: String) -> Result<serde_json::Value, String> {
 pub fn bindings_gc(home_id: String) -> Result<serde_json::Value, String> {
     omt_exec::agents::bindings_gc_value(&daemon::runtime_dir(), &home_id)
 }
+
+/// §41 legacy-degraded-permanent：「确认并归档」未能迁移的旧版存储文件
+/// （见 omt_exec::agents::archive_legacy_store）。返回 `{ archived: [文件名] }`。
+#[tauri::command(async)]
+pub fn agents_archive_legacy(home_id: String) -> Result<serde_json::Value, String> {
+    let archived = omt_exec::agents::archive_legacy_store(&daemon::runtime_dir(), &home_id)?;
+    Ok(serde_json::json!({ "archived": archived }))
+}

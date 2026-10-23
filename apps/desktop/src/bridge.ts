@@ -202,6 +202,12 @@ export async function agentsList(homeId: string): Promise<AgentsListResult> {
   return invoke<AgentsListResult>('agents_list', { homeId })
 }
 
+/** §41：「确认并归档」未能迁移的旧版 agents.json（移入 `<home>/.recovered/`，
+ * 解除绑定清理冻结）。旧文件可解析时 Rust 侧拒绝（由启动迁移处理）。 */
+export async function agentsArchiveLegacy(homeId: string): Promise<{ archived: string[] }> {
+  return invoke<{ archived: string[] }>('agents_archive_legacy', { homeId })
+}
+
 // ── U9 绑定（R-C）─────────────────────────────────────────────────────────
 
 /**
