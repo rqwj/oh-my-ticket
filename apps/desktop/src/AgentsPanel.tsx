@@ -280,14 +280,25 @@ export function AgentsPanel({
   useEffect(() => {
     if (forceArming && !deleting) forceConfirmRef.current?.focus()
   }, [forceArming, deleting])
-  /** review F14（P-10）：停止全部的进行中状态与结果提示（5 秒后消失） */
+  /** review F14（P-10）/ §39：停止全部的进行中状态与结果。
+   * - 成功 / 无事可做：写入常驻挂载的 `role="status" aria-live="polite"` 区域，
+   *   只换文字（重新挂载的 live region 不会被读屏软件播报），5 秒后清空；
+   *   计时器按 seq 重置——同一文案连续出现时不会沿用上一次的计时器提前消失。
+   * - 含失败（调用失败 / 全部失败 / 部分失败）：进需手动关闭的 alert，不随 5 秒消失。 */
   const [stoppingAll, setStoppingAll] = useState(false)
-  const [stopAllNotice, setStopAllNotice] = useState<string | null>(null)
+  const [stopAllNotice, setStopAllNotice] = useState<{ text: string; seq: number } | null>(null)
+  const [stopAllAlert, setStopAllAlert] = useState<string | null>(null)
+  const noticeSeqRef = useRef(0)
+  const showStopAllNotice = (text: string) => {
+    noticeSeqRef.current += 1
+    setStopAllNotice({ text, seq: noticeSeqRef.current })
+  }
+  const noticeSeq = stopAllNotice?.seq
   useEffect(() => {
-    if (!stopAllNotice) return
+    if (noticeSeq === undefined) return
     const timer = setTimeout(() => setStopAllNotice(null), 5000)
     return () => clearTimeout(timer)
-  }, [stopAllNotice])
+  }, [noticeSeq])
   // U14：全面板待裁决项（底部弹窗）——跨所有已拉取的 run 聚合。普通计算
   //（不得用 useMemo——须位于提前 return 之前且避免 hooks 位点抖动；stats 规模小）
   const awaitingItems: Array<{ runId: string; nodeId: string; title?: string }> = []
@@ -503,23 +514,24 @@ export function AgentsPanel({
       const outcome = await onStopAll()
       const orphanNote =
         groups.orphan.length > 0 ? `；${groups.orphan.length} 个不受控 agent 需单独强制终止` : ''
-      // review R2-7 / F-EXEC-12 / §43 P3：全失败、无事可做、成功、部分失败
-      // 分开提示，且失败要带明细（此前只报计数，用户无从定位是哪个 agent）。
-      // §43 P3：outcome 携带 signaled=0 && failed>0 时也按失败处理——不得
-      // 只依赖 store 的 null 折算（面板对 outcome 原形状自卫）。
-      setStopAllNotice(
-        outcome === null
-          ? '停止失败，请重试'
-          : outcome.signaled === 0
-            ? outcome.failed.length > 0
-              ? `停止失败：${describeStopAllFailures(outcome.failed)}`
-              : '当前没有运行中的 agent'
-            : `已向 ${outcome.signaled} 个 agent 发出停止信号${
-                outcome.failed.length > 0
-                  ? `，${outcome.failed.length} 个停止失败：${describeStopAllFailures(outcome.failed)}`
-                  : ''
-              }${orphanNote}`,
-      )
+      // review R2-7 / F-EXEC-12 / §43 P3：全失败、无事可做、成功、部分失败分开
+      // 提示，失败带明细；outcome 携带 signaled=0 && failed>0 时也按失败处理。
+      // §39：含失败的结果进需手动关闭的 alert，其余进 5 秒的 status 区域。
+      if (outcome === null) {
+        setStopAllAlert('停止失败，请重试')
+      } else if (outcome.failed.length > 0) {
+        setStopAllAlert(
+          outcome.signaled === 0
+            ? `停止失败：${describeStopAllFailures(outcome.failed)}`
+            : `已向 ${outcome.signaled} 个 agent 发出停止信号，${outcome.failed.length} 个停止失败：${describeStopAllFailures(outcome.failed)}${orphanNote}`,
+        )
+      } else {
+        showStopAllNotice(
+          outcome.signaled === 0
+            ? '当前没有运行中的 agent'
+            : `已向 ${outcome.signaled} 个 agent 发出停止信号${orphanNote}`,
+        )
+      }
     } finally {
       setStoppingAll(false)
     }
@@ -631,7 +643,17 @@ export function AgentsPanel({
             onConfirm={() => void handleStopAll()}
           />
         )}
-        {stopAllNotice && <p className="agents-notice">{stopAllNotice}</p>}
+        <p className="agents-notice" role="status" aria-live="polite">
+          {stopAllNotice?.text ?? ''}
+        </p>
+        {stopAllAlert && (
+          <div className="error-banner" role="alert">
+            <p>{stopAllAlert}</p>
+            <button className="chip" onClick={() => setStopAllAlert(null)}>
+              知道了
+            </button>
+          </div>
+        )}
         {groups.active.length > 0 && <p className="agents-group-label">运行中</p>}
         {groups.active.map(renderRow)}
         {groups.orphan.length > 0 && <p className="agents-group-label">不受控（执行进程已丢失）</p>}

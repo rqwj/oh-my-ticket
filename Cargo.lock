@@ -2617,7 +2617,11 @@ dependencies = [
 name = "oh-my-ticket-desktop"
 version = "0.6.6"
 dependencies = [
+ "dispatch2",
  "libc",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
  "omt-client",
  "omt-exec",
  "omt-harness",

@@ -45,6 +45,7 @@ import {
   agentsDelete,
   omtCall,
   subscribeEvents,
+  type AgentsDeleteResult,
   type EventEnvelope,
   type ExecStartOutcome,
   type StopAllOutcome,
@@ -54,6 +55,7 @@ import type {
   AgentRecord,
   CorruptAgent,
   HomeInfo,
+  LeaseNotice,
   LegacyUnmigrated,
   OmtNode,
   RunDetail,
@@ -367,6 +369,8 @@ export interface TreeState {
   legacyUnmigrated: LegacyUnmigrated | null
   /** §41：agent.json 已损坏的 agent（目录 + 留证文件名） */
   corruptAgents: CorruptAgent[]
+  /** §47：强制删除时被放弃的租约通知（应用级，逐条关闭；换 home 不清） */
+  leaseNotices: LeaseNotice[]
   selectedAgentId: string | null
   /** 本 home 未查看的 Failed agent id（tab badge；选中即清除） */
   unviewedFailedIds: string[]
@@ -394,6 +398,7 @@ const INITIAL: TreeState = {
   parseFailed: false,
   legacyUnmigrated: null,
   corruptAgents: [],
+  leaseNotices: [],
   selectedAgentId: null,
   unviewedFailedIds: [],
   bindingsByHome: {},
@@ -430,6 +435,34 @@ export function claimedCountForExec(
 ): number {
   const suffix = `/exec:${execId}`
   return items.filter(i => typeof i.executorActor === 'string' && i.executorActor.endsWith(suffix)).length
+}
+
+/**
+ * §47 release-results-hidden：被放弃租约的通知文案。Rust 侧明细形如
+ * `exec <execId>: <err>`（force_release_agent_leases）；run id 从被删 agent
+ * 的 execs 反查；形状不符的明细原样列出。agent 记录已不在列表时退回 id。
+ */
+export function leaseNoticeOf(
+  agent: AgentRecord | undefined,
+  agentId: string,
+  homeId: string,
+  failures: string[],
+): LeaseNotice {
+  const runIds: string[] = []
+  const parts = failures.map(failure => {
+    const execId = /^exec (\S+): /.exec(failure)?.[1]
+    if (!execId) return failure
+    const runId = agent?.execs.find(e => e.execId === execId)?.runId
+    if (runId && !runIds.includes(runId)) runIds.push(runId)
+    return runId ? `${execId}（${runId}）` : execId
+  })
+  const name = agent ? (agent.title ?? agent.displayName) : agentId
+  return {
+    agentId,
+    homeId,
+    runIds,
+    text: `已删除 ${name}，但 ${failures.length} 个租约释放失败、已被放弃：${parts.join('；')}。对应 run item 可能一直显示运行中，请到 Runs 页手动取消该 run。`,
+  }
 }
 
 /** 尾窗入窗（有界：丢最旧；与选中无关，全部活跃 exec 都保）。 */
@@ -481,6 +514,10 @@ export function useTreeStore() {
   // review R2-9：派发进行中的计数（含续跑的就绪握手，最长 30s）——进行中不接回
   // 实时流，否则 exec_start 返回后会出现第二个跟随者，事件全部显示两次
   const dispatchingRef = useRef(0)
+  // §39 fe-resume-fail-reattach：派发进行中被推迟的接回请求（execId → homeId），
+  // 派发结束（成功或失败）后补接——此前失败路径不重拉列表，被跳过的 live
+  // agent 要等下一次列表重拉才接上
+  const deferredAttachRef = useRef<Map<string, string>>(new Map())
 
   const bumpTranscriptVersion = useCallback(() => {
     setState(s => ({ ...s, transcriptVersion: s.transcriptVersion + 1 }))
@@ -686,6 +723,38 @@ export function useTreeStore() {
     [scheduleFlush, applyExitLocal, scheduleAgentsRepull, bumpTranscriptVersion],
   )
 
+  /** P-10：重启后接回仍在运行的 exec。afterSeq 取本窗口最后一个事件的 seq。 */
+  const attachTranscript = useCallback(
+    (execId: string, homeId: string) => {
+      if (attachedRef.current.has(execId)) return
+      // review R2-9：派发进行中（续跑的就绪握手最长 30s）先不接——新 exec 的
+      // 跟随者会由 exec_start 建立。§39：记下来，派发结束后补接
+      if (dispatchingRef.current > 0) {
+        deferredAttachRef.current.set(execId, homeId)
+        return
+      }
+      attachedRef.current.add(execId)
+      const channel = new Channel<TranscriptEvent>()
+      channel.onmessage = ev => ingestTranscriptEvent(ev)
+      const existing = transcriptsRef.current.get(execId)
+      const last = existing && existing.length > 0 ? existing[existing.length - 1] : undefined
+      const afterSeq = last ? last.seq : null
+      void execAttach({ homeId, execId, afterSeq, channel }).catch(error => {
+        attachedRef.current.delete(execId)
+        setState(s => ({ ...s, error: presentError(error) }))
+      })
+    },
+    [ingestTranscriptEvent],
+  )
+
+  /** §39：所有派发结束后补接被推迟的 exec（新 exec 已在 attachedRef 里，自然跳过）。 */
+  const flushDeferredAttach = useCallback(() => {
+    if (dispatchingRef.current > 0) return
+    const pending = [...deferredAttachRef.current]
+    deferredAttachRef.current.clear()
+    for (const [execId, homeId] of pending) attachTranscript(execId, homeId)
+  }, [attachTranscript])
+
   // U6：Channel 由 startDispatch 按次创建（Rust 泵随子进程生命周期，KD-D3），
   // onmessage 直入归并管线；onEvent 兜底供调用方旁路观察。
   const startDispatch = useCallback(
@@ -705,7 +774,7 @@ export function useTreeStore() {
         options.onEvent?.(ev)
       }
       // review R2-9：派发进行中（就绪握手最长 30s）不计接回实时流——新 exec
-      // 的跟随者由 exec_start 建立；计数在 finally 归零
+      // 的跟随者由 exec_start 建立
       dispatchingRef.current += 1
       let outcome: ExecStartOutcome
       try {
@@ -720,17 +789,21 @@ export function useTreeStore() {
           agentId: options.agentId ?? null,
           channel,
         })
-      } finally {
+      } catch (error) {
         dispatchingRef.current -= 1
+        flushDeferredAttach()
+        throw error
       }
+      dispatchingRef.current -= 1
       // P-10：startDispatch 的 Channel 即本会话的实时跟随者——记入防重复 attach
       attachedRef.current.add(outcome.execId)
+      flushDeferredAttach()
       // pull 契约：派发后拉 agents_list（防抖等 Rust 侧 ⑤ 落盘收敛）；
       // 绑定表重拉由 App 的派发成功回调统一触发（单一落点，避免双拉）
       scheduleAgentsRepull()
       return outcome
     },
-    [ingestTranscriptEvent, scheduleAgentsRepull],
+    [ingestTranscriptEvent, scheduleAgentsRepull, flushDeferredAttach],
   )
 
   const selectAgent = useCallback((agentId: string) => {
@@ -772,21 +845,44 @@ export function useTreeStore() {
 
   /** F-DEL / F-EXEC-14(4)：删除 agent（终态守卫在服务端）。`force=true` =
    * 「放弃租约并删除」——只绕过待对账租约守卫（面板在常规删除被租约守卫
-   * 拒绝后以两段式确认提供该入口）；成功后清选中态并重拉列表。 */
+   * 拒绝后以两段式确认提供该入口）；成功后清选中态并重拉列表。
+   * §47 release-results-hidden：返回 agents_delete 的释放结果，释放失败的
+   * 租约登记为应用级通知（App 呈现，任何页面可见）。 */
   const deleteAgent = useCallback(
-    async (agentId: string, force?: boolean) => {
+    async (agentId: string, force?: boolean): Promise<AgentsDeleteResult> => {
       const home = activeHomeRef.current
       if (!home) throw new Error('无活动 workspace')
-      await agentsDelete(home.homeId, agentId, force ?? false)
+      const result = await agentsDelete(home.homeId, agentId, force ?? false)
+      const failures = result?.leaseReleaseFailures ?? []
       setState(s => ({
         ...s,
         selectedAgentId: s.selectedAgentId === agentId ? null : s.selectedAgentId,
         unviewedFailedIds: s.unviewedFailedIds.filter(id => id !== agentId),
+        // §47：被放弃的租约进应用级通知列表——按被删 agent 追加，不覆盖先前的
+        // 通知（updater 在 refreshAgents 之前执行，s.agents 里还有这条记录）
+        leaseNotices:
+          failures.length > 0
+            ? [
+              ...s.leaseNotices.filter(n => n.agentId !== agentId),
+              leaseNoticeOf(
+                s.agents.find(a => a.id === agentId),
+                agentId,
+                home.homeId,
+                failures,
+              ),
+            ]
+            : s.leaseNotices,
       }))
       await refreshAgents()
+      return result
     },
     [refreshAgents],
   )
+
+  /** §47：关闭一条被放弃租约的通知。 */
+  const dismissLeaseNotice = useCallback((agentId: string) => {
+    setState(s => ({ ...s, leaseNotices: s.leaseNotices.filter(n => n.agentId !== agentId) }))
+  }, [])
 
   const stopAgent = useCallback(async (execId: string) => {
     try {
@@ -795,27 +891,6 @@ export function useTreeStore() {
       setState(s => ({ ...s, error: presentError(error) }))
     }
   }, [])
-
-  /** P-10：重启后接回仍在运行的 exec。afterSeq 取本窗口最后一个事件的 seq。 */
-  const attachTranscript = useCallback(
-    (execId: string, homeId: string) => {
-      if (attachedRef.current.has(execId)) return
-      // review R2-9：派发进行中（续跑的就绪握手最长 30s）先不接——新 exec 的
-      // 跟随者会由 exec_start 建立；其余 exec 在派发结束后的下一次列表重拉时再接
-      if (dispatchingRef.current > 0) return
-      attachedRef.current.add(execId)
-      const channel = new Channel<TranscriptEvent>()
-      channel.onmessage = ev => ingestTranscriptEvent(ev)
-      const existing = transcriptsRef.current.get(execId)
-      const last = existing && existing.length > 0 ? existing[existing.length - 1] : undefined
-      const afterSeq = last ? last.seq : null
-      void execAttach({ homeId, execId, afterSeq, channel }).catch(error => {
-        attachedRef.current.delete(execId)
-        setState(s => ({ ...s, error: presentError(error) }))
-      })
-    },
-    [ingestTranscriptEvent],
-  )
 
   /** P-10 / review F14 / R2-7 / F-EXEC-12 / §43 P3：停止当前 home 的全部运行中
    * exec。返回 `{ signaled, failed }`（部分失败如实上抛供面板提示「N 个停止
@@ -1185,6 +1260,7 @@ export function useTreeStore() {
     resumeAgent,
     createNode,
     deleteAgent,
+    dismissLeaseNotice,
     // ── U9：绑定切片（R-C）───────────────────────────────────────────────
     refreshBindings,
     gcBindings,

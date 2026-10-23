@@ -578,3 +578,12 @@ body {
   margin-left: 8px;
   font-weight: 600;
 }
+/* §39：常驻的停止全部结果区域——无文字时不占位（仍挂载，live region 有效） */
+.agents-notice:empty {
+  margin: 0;
+  padding: 0;
+}
+/* §47：应用级的被放弃租约通知 */
+.lease-notices .lease-notice + .lease-notice {
+  margin-top: 8px;
+}

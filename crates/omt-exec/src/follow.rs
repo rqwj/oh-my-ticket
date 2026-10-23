@@ -5,6 +5,7 @@
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,6 +19,27 @@ const APPEAR_TIMEOUT: Duration = Duration::from_secs(30);
 /// 最大 seq + 1），返回要补推给 sink 的事件（通常是合成 exit），None 不推。
 pub type LostHook = Box<dyn FnOnce(u64) -> Option<serde_json::Value> + Send>;
 
+/// 跟随选项（§39）。
+/// - `appear_timeout`：文件尚不存在时，exec **已不活跃**之后最多再等多久；
+///   exec 仍活跃（shim 在、或仍在拉起宽限期内）就一直等——此前 launcher 的
+///   `Ready::Timeout`（30s）之后，跟随者的 30s 先到期就静默退出，shim 之后
+///   写出的事件再也接不回来。
+/// - `cancel`：置位后跟随者在下一次轮询（≤ POLL）退出，不调 `on_lost`——
+///   桌面端每个 exec 只保留一个跟随者，新的接管时取消旧的。
+pub struct FollowOptions {
+    pub appear_timeout: Duration,
+    pub cancel: Option<Arc<AtomicBool>>,
+}
+
+impl Default for FollowOptions {
+    fn default() -> Self {
+        Self {
+            appear_timeout: APPEAR_TIMEOUT,
+            cancel: None,
+        }
+    }
+}
+
 pub fn follow_jsonl(
     path: PathBuf,
     after_seq: Option<u64>,
@@ -25,13 +47,39 @@ pub fn follow_jsonl(
     active: Arc<dyn Fn() -> bool + Send + Sync>,
     on_lost: Option<LostHook>,
 ) -> std::thread::JoinHandle<()> {
+    follow_jsonl_with(
+        path,
+        after_seq,
+        sink,
+        active,
+        on_lost,
+        FollowOptions::default(),
+    )
+}
+
+pub fn follow_jsonl_with(
+    path: PathBuf,
+    after_seq: Option<u64>,
+    sink: EventSink,
+    active: Arc<dyn Fn() -> bool + Send + Sync>,
+    on_lost: Option<LostHook>,
+    opts: FollowOptions,
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut offset: u64 = 0;
         let mut next_seq: u64 = after_seq.map_or(0, |after| after + 1);
         let mut pending: Vec<u8> = Vec::new();
         let mut idle_inactive = 0u32;
-        let appear_deadline = std::time::Instant::now() + APPEAR_TIMEOUT;
+        let appear_deadline = std::time::Instant::now() + opts.appear_timeout;
         loop {
+            // §39：被新的跟随者接管——直接退出（不是执行丢失，不调 on_lost）
+            if opts
+                .cancel
+                .as_ref()
+                .is_some_and(|cancel| cancel.load(Ordering::SeqCst))
+            {
+                return;
+            }
             let mut grew = false;
             match std::fs::File::open(&path) {
                 Ok(mut file) => {
@@ -46,7 +94,9 @@ pub fn follow_jsonl(
                         }
                     }
                 }
-                Err(_) if std::time::Instant::now() < appear_deadline => {}
+                // §39：文件还没出现——exec 仍活跃就一直等；appear_timeout 只
+                // 约束已不活跃的情形
+                Err(_) if active() || std::time::Instant::now() < appear_deadline => {}
                 Err(_) => return,
             }
             while let Some(pos) = pending.iter().position(|b| *b == b'\n') {
@@ -203,5 +253,103 @@ mod tests {
             !called.load(std::sync::atomic::Ordering::SeqCst),
             "真实 exit 结束不得触发 on_lost"
         );
+    }
+
+    /// §39：Ready::Timeout 后文件迟迟不出现——exec 仍活跃就一直等，不因
+    /// appear_timeout 放弃；文件出现后照常推事件。
+    #[test]
+    fn waits_past_appear_timeout_while_exec_is_active() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("late.jsonl");
+        let (sink, seen) = collector();
+        let handle = follow_jsonl_with(
+            path.clone(),
+            None,
+            sink,
+            Arc::new(|| true),
+            None,
+            FollowOptions {
+                appear_timeout: Duration::from_millis(100),
+                cancel: None,
+            },
+        );
+        std::thread::sleep(Duration::from_millis(600));
+        std::fs::write(
+            &path,
+            "{\"kind\":\"session_start\",\"seq\":0}\n{\"kind\":\"exit\",\"seq\":1}\n",
+        )
+        .unwrap();
+        handle.join().unwrap();
+        let kinds: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|v| v["kind"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(kinds, vec!["session_start", "exit"]);
+    }
+
+    /// 反例（行为不变）：已不活跃且文件始终不出现——超过 appear_timeout 即结束。
+    #[test]
+    fn gives_up_on_missing_file_once_inactive_and_past_appear_timeout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (sink, seen) = collector();
+        let started = std::time::Instant::now();
+        follow_jsonl_with(
+            tmp.path().join("never.jsonl"),
+            None,
+            sink,
+            Arc::new(|| false),
+            None,
+            FollowOptions {
+                appear_timeout: Duration::from_millis(100),
+                cancel: None,
+            },
+        )
+        .join()
+        .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    /// §39：取消标志置位后跟随者在下一次轮询退出，且不调 on_lost（它不是
+    /// 「执行丢失」，只是被新的跟随者接管）。
+    #[test]
+    fn cancel_stops_the_follower_without_on_lost() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("e.jsonl");
+        std::fs::write(&path, "{\"kind\":\"raw\",\"seq\":0}\n").unwrap();
+        let (sink, seen) = collector();
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&called);
+        let hook: LostHook = Box::new(move |_| {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            None
+        });
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handle = follow_jsonl_with(
+            path,
+            None,
+            sink,
+            Arc::new(|| true),
+            Some(hook),
+            FollowOptions {
+                appear_timeout: APPEAR_TIMEOUT,
+                cancel: Some(cancel.clone()),
+            },
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !handle.is_finished() {
+            assert!(std::time::Instant::now() < deadline, "取消后 2s 内必须退出");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        handle.join().unwrap();
+        assert!(
+            !called.load(std::sync::atomic::Ordering::SeqCst),
+            "取消不是执行丢失"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 1);
     }
 }

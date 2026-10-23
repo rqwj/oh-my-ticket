@@ -224,3 +224,13 @@ export interface ExecPolicyView {
   path: string
   error?: string
 }
+
+/** §47 release-results-hidden：强制删除时释放失败（被放弃）的租约——全局
+ * 通知列表的一条，按被删 agent 键控，直到用户关闭。 */
+export interface LeaseNotice {
+  agentId: string
+  homeId: string
+  /** 被放弃租约所属的 run（文案里也写明，便于在 Runs 页定位） */
+  runIds: string[]
+  text: string
+}

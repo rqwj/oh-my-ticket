@@ -5,8 +5,8 @@
  * ExecutionDialog 从这里取符号，避免此前「面板模块当工具枢纽」造成的
  * TranscriptView ↔ AgentsPanel 循环导入。
  */
-import { useEffect, useState } from 'react'
-import type { AgentRecord } from './types'
+import { useEffect, useRef, useState } from 'react'
+import type { AgentRecord, LeaseNotice } from './types'
 
 /** 两段式确认的自动还原窗口（ConfirmStopButton / ConfirmStopAllButton 与
  * F-EXEC-14(4) 删除的「放弃租约并删除」第二步共用）。 */
@@ -88,11 +88,26 @@ export function ConfirmStopAllButton({
   onConfirm: () => void
 }) {
   const [arming, setArming] = useState(false)
+  // §39 fe-a11y-stopall：第二步出现时焦点落在「取消」（安全默认——回车不会
+  // 误触确认）；第二步结束（确认、取消、3s 自动复位）后焦点回到「停止全部」
+  // （确认时要等「停止中…」结束、按钮重新出现）；Esc 取消。
+  const cancelRef = useRef<HTMLButtonElement | null>(null)
+  const triggerRef = useRef<HTMLButtonElement | null>(null)
+  const restoreFocusRef = useRef(false)
   useEffect(() => {
     if (!arming) return
     const timer = setTimeout(() => setArming(false), CONFIRM_RESET_MS)
     return () => clearTimeout(timer)
   }, [arming])
+  useEffect(() => {
+    if (arming) {
+      restoreFocusRef.current = true
+      cancelRef.current?.focus()
+    } else if (!busy && restoreFocusRef.current) {
+      restoreFocusRef.current = false
+      triggerRef.current?.focus()
+    }
+  }, [arming, busy])
   if (busy) {
     return (
       <button type="button" className="chip agents-stop-all" disabled>
@@ -103,6 +118,7 @@ export function ConfirmStopAllButton({
   if (!arming) {
     return (
       <button
+        ref={triggerRef}
         type="button"
         className="chip agents-stop-all"
         title="只停止当前 workspace 中可控的 agent；不受控（orphan）的需单独强制终止"
@@ -113,7 +129,15 @@ export function ConfirmStopAllButton({
     )
   }
   return (
-    <span className="confirm-stop agents-stop-all">
+    <span
+      className="confirm-stop agents-stop-all"
+      onKeyDown={event => {
+        if (event.key === 'Escape') {
+          event.preventDefault()
+          setArming(false)
+        }
+      }}
+    >
       确认停止 {running} 个 agent{claimed !== null ? `，将释放 ${claimed} 个已认领项` : ''}
       <button
         type="button"
@@ -125,7 +149,7 @@ export function ConfirmStopAllButton({
       >
         确认
       </button>
-      <button type="button" className="chip" onClick={() => setArming(false)}>
+      <button ref={cancelRef} type="button" className="chip" onClick={() => setArming(false)}>
         取消
       </button>
     </span>
@@ -151,4 +175,38 @@ export function describeFailure(detail: string, canResume = true): string {
       : '应用重启时执行被中断（运行项会在对账时释放，请先强制终止后重新派发）'
   }
   return detail.length > 120 ? `${detail.slice(0, 120)}…` : detail
+}
+
+/**
+ * §47 release-results-hidden：强制删除时被放弃的租约——应用级通知列表（任何
+ * 页面都可见，直到逐条关闭）。每条带「前往 Runs」（切到 Runs 页手动取消
+ * 对应 run）与「知道了」。
+ */
+export function LeaseNoticeBanner({
+  notices,
+  onDismiss,
+  onOpenRuns,
+}: {
+  notices: LeaseNotice[]
+  onDismiss: (agentId: string) => void
+  onOpenRuns: () => void
+}) {
+  if (notices.length === 0) return null
+  return (
+    <div className="error-banner lease-notices" role="alert">
+      {notices.map(notice => (
+        <div className="lease-notice" key={notice.agentId}>
+          <p>{notice.text}</p>
+          <div className="chip-row">
+            <button className="chip" onClick={onOpenRuns}>
+              前往 Runs
+            </button>
+            <button className="chip" onClick={() => onDismiss(notice.agentId)}>
+              知道了
+            </button>
+          </div>
+        </div>
+      ))}
+    </div>
+  )
 }

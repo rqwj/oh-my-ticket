@@ -1816,14 +1816,40 @@ pub struct ForceReleaseOutcome {
 /// 继续）；只有 agent 记录本身读不出来（缺失/损坏）才整体 Err——那种形态
 /// 删除守卫也会拒绝。spec 缺失（旧记录 / 目录已被清）视作该目标的失败
 /// 如实上报，而非静默跳过——这是放弃租约前的最后一次尝试。
+/// §47 force-release-no-bound：force 删除前尽力释放的总时限。desktop 侧同步
+/// 等待——每个目标都要连接（拉起 daemon 最长 10s）加若干 30s 读超时，半卡死
+/// daemon 下「删除中…」可能持续数分钟且没有反馈。
+const FORCE_RELEASE_BUDGET: Duration = Duration::from_secs(30);
+
 pub fn force_release_agent_leases(
     runtime_dir: &Path,
     connector: &crate::daemon_link::Connector,
     home_id: &str,
     agent_id: &str,
 ) -> Result<ForceReleaseOutcome, String> {
+    force_release_agent_leases_within(
+        runtime_dir,
+        connector,
+        home_id,
+        agent_id,
+        FORCE_RELEASE_BUDGET,
+    )
+}
+
+/// `force_release_agent_leases` 的内芯（预算可注入）。每个目标的释放在
+/// `shim::run_bounded(剩余预算)` 里跑：超时按失败记（工作线程被放手，它
+/// 若之后成功释放，只是没有 mark_reconciled——记录随删除消失，无害）；预算
+/// 耗尽后剩余目标不再尝试，直接记为失败。
+pub(crate) fn force_release_agent_leases_within(
+    runtime_dir: &Path,
+    connector: &crate::daemon_link::Connector,
+    home_id: &str,
+    agent_id: &str,
+    budget: Duration,
+) -> Result<ForceReleaseOutcome, String> {
     let record = crate::agents::get_agent(runtime_dir, home_id, agent_id)?
         .ok_or_else(|| format!("agent {agent_id} 不存在"))?;
+    let deadline = Instant::now() + budget;
     let mut outcome = ForceReleaseOutcome::default();
     for exec in &record.execs {
         if !crate::agents::is_reconcile_target(exec) {
@@ -1836,16 +1862,33 @@ pub fn force_release_agent_leases(
             run_id: exec.run_id.clone().unwrap_or_default(),
             harness: record.harness.clone(),
         };
-        let release = || -> Result<(), String> {
-            let dir = crate::layout::agent_dir(runtime_dir, home_id, agent_id)?;
-            let spec_path =
-                crate::layout::exec_file(&dir, &exec.exec_id, crate::layout::ExecFile::Spec);
-            let spec = crate::spec::LaunchSpec::read(&spec_path)
-                .map_err(|err| format!("无 launch spec（{err}）——无法定位 home"))?;
-            let rpc = connector(&spec.home_path, home_id)?;
-            release_items_for_exec(&*rpc, home_id, &target.run_id, &exec.exec_id)
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            outcome.failures.push(format!(
+                "exec {}: 释放总时限（{}s）已到，未尝试",
+                exec.exec_id,
+                budget.as_secs()
+            ));
+            continue;
+        }
+        let release = {
+            let runtime_dir = runtime_dir.to_path_buf();
+            let connector = connector.clone();
+            let home_id = home_id.to_string();
+            let agent_id = agent_id.to_string();
+            let exec_id = exec.exec_id.clone();
+            let run_id = target.run_id.clone();
+            move || -> Result<(), String> {
+                let dir = crate::layout::agent_dir(&runtime_dir, &home_id, &agent_id)?;
+                let spec_path =
+                    crate::layout::exec_file(&dir, &exec_id, crate::layout::ExecFile::Spec);
+                let spec = crate::spec::LaunchSpec::read(&spec_path)
+                    .map_err(|err| format!("无 launch spec（{err}）——无法定位 home"))?;
+                let rpc = connector(&spec.home_path, &home_id)?;
+                release_items_for_exec(&*rpc, &home_id, &run_id, &exec_id)
+            }
         };
-        match release() {
+        match crate::shim::run_bounded(release, remaining) {
             Ok(()) => {
                 mark_reconciled(runtime_dir, &target);
                 outcome.released += 1;
@@ -5121,6 +5164,92 @@ mod tests {
 
         // agent 不存在：整体 Err（调用方原样上报，删除守卫随后也会拒绝）
         assert!(force_release_agent_leases(rt, &failing, "h_t", "agent-nope").is_err());
+    }
+
+    /// §47 force-release-no-bound：force 删除前的尽力释放有总时限——半卡死
+    /// daemon 下「删除中…」不得持续数分钟。超出预算的目标记为失败（不阻塞），
+    /// 预算耗尽后剩余目标不再尝试。
+    #[test]
+    fn force_release_is_bounded_by_an_overall_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = dir.path();
+        let target = crate::agents::register_agent(
+            rt,
+            "h_t",
+            "pi",
+            crate::agents::NewExec {
+                exec_id: "exec-budget".into(),
+                node_id: None,
+                run_id: Some("RUN-1".into()),
+                binary_path: None,
+                binary_args: vec![],
+                model: None,
+                launched_by: None,
+                parent_agent_id: None,
+            },
+        )
+        .unwrap();
+        crate::agents::update_exec(rt, "h_t", &target.id, "exec-budget", |e| {
+            e.lease_release_pending = true
+        })
+        .unwrap();
+        let mut spec = crate::spec::sample(&rt.join("ws").join(".omt"), Path::new("/bin/omt"));
+        spec.home_id = "h_t".into();
+        spec.agent_id = target.id.clone();
+        spec.exec_id = "exec-budget".into();
+        let adir = crate::layout::agent_dir(rt, "h_t", &target.id).unwrap();
+        spec.write(&crate::layout::exec_file(
+            &adir,
+            "exec-budget",
+            crate::layout::ExecFile::Spec,
+        ))
+        .unwrap();
+
+        let slow: crate::daemon_link::Connector = Arc::new(|_: &Path, _: &str| {
+            std::thread::sleep(Duration::from_secs(5));
+            Err("late".to_string())
+        });
+        let started = Instant::now();
+        let outcome = force_release_agent_leases_within(
+            rt,
+            &slow,
+            "h_t",
+            &target.id,
+            Duration::from_millis(300),
+        )
+        .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(outcome.released, 0);
+        assert_eq!(outcome.failures.len(), 1, "{outcome:?}");
+        assert!(
+            outcome.failures[0].contains("exec-budget") && outcome.failures[0].contains("超时"),
+            "{outcome:?}"
+        );
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        let counting: crate::daemon_link::Connector = Arc::new(move |_: &Path, _: &str| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            Err("unused".to_string())
+        });
+        let outcome =
+            force_release_agent_leases_within(rt, &counting, "h_t", &target.id, Duration::ZERO)
+                .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "预算耗尽后不再尝试");
+        assert!(outcome.failures[0].contains("未尝试"), "{outcome:?}");
+        assert!(
+            crate::agents::is_reconcile_target(
+                &crate::agents::get_agent(rt, "h_t", &target.id)
+                    .unwrap()
+                    .unwrap()
+                    .execs[0]
+            ),
+            "失败不标记——仍是对账目标"
+        );
     }
 
     /// U11：定向派发到既有 agent（追加 exec 不新建）+ 运行中守卫拒绝。

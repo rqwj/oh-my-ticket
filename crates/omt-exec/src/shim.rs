@@ -61,7 +61,7 @@ fn lease_timeout() -> Duration {
 ///（租约释放 → lease_release_pending），收尾绝不因 wedged 对端挂死。
 /// 工作线程超时后随句柄丢弃而 detach。每次租约释放（每 exec 恰一次）才
 /// 起一个线程，不在热路径。
-fn run_bounded<T: Send + 'static>(
+pub(crate) fn run_bounded<T: Send + 'static>(
     f: impl FnOnce() -> Result<T, String> + Send + 'static,
     timeout: Duration,
 ) -> Result<T, String> {

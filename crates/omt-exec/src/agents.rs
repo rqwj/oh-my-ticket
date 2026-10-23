@@ -653,6 +653,11 @@ pub fn delete_agent(
             trash.display()
         );
     }
+    // 验收「强制删除」注：指向已删除 agent 的绑定一并移除（失败只记日志——
+    // 删除本身已完成，悬空绑定仍可由用户的 bindings_gc 清理）
+    if let Err(err) = remove_bindings_to(runtime_dir, home_id, agent_id) {
+        eprintln!("删除 agent {agent_id}：移除绑定失败（{err}）");
+    }
     Ok(())
 }
 
@@ -950,6 +955,28 @@ pub fn write_binding(
     .map(|_| ())
 }
 
+/// 验收「强制删除」注：删除 agent 时移除指向它的绑定（nodeId → agentId 精确
+/// 匹配）。不受 GC 冻结约束——冻结防的是「无法证明 agent 表有效时批量
+/// 清空」，这里只删指向刚被删除的那个 agent 的项。返回移除数。
+pub fn remove_bindings_to(
+    runtime_dir: &Path,
+    home_id: &str,
+    agent_id: &str,
+) -> Result<usize, String> {
+    let path = bindings_path(runtime_dir, home_id)?;
+    if !path.is_file() {
+        return Ok(0);
+    }
+    let mut removed = 0usize;
+    update_json(&path, |bindings: &mut BTreeMap<String, String>| {
+        let before = bindings.len();
+        bindings.retain(|_, bound| bound != agent_id);
+        removed = before - bindings.len();
+        removed > 0
+    })?;
+    Ok(removed)
+}
+
 /// bindings 表的进程内读取（同 write_binding 的锁语义；不存在 → 空表）。
 fn read_bindings(runtime_dir: &Path, home_id: &str) -> Result<BTreeMap<String, String>, String> {
     let path = bindings_path(runtime_dir, home_id)?;
@@ -1060,6 +1087,22 @@ mod tests {
         assert!(err2.contains("不存在"), "{err2}");
         let file = snapshot(&runtime, "h_test");
         assert!(file.agents.is_empty());
+    }
+
+    /// 验收「强制删除」注：删除 agent 时一并移除指向它的绑定（此前留下
+    /// 悬空绑定，要用户手动触发 bindings_gc）；指向别的 agent 的绑定不动。
+    #[test]
+    fn delete_agent_drops_bindings_that_point_to_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        let a = exited_agent(&runtime, "exec-bind-a");
+        let b = exited_agent(&runtime, "exec-bind-b");
+        write_binding(&runtime, "h_test", "TICKET-1", &a.id).unwrap();
+        write_binding(&runtime, "h_test", "TICKET-2", &b.id).unwrap();
+        write_binding(&runtime, "h_test", "TICKET-3", &a.id).unwrap();
+        delete_agent(&runtime, "h_test", &a.id, false).unwrap();
+        let value = bindings_get_value(&runtime, "h_test").unwrap();
+        assert_eq!(value["bindings"], serde_json::json!({ "TICKET-2": b.id }));
     }
 
     fn new_exec(exec_id: &str) -> NewExec {

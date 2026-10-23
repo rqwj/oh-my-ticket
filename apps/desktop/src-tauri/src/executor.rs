@@ -2,6 +2,7 @@
 //! 负责把 SharedSession 适配成 RpcFn、把 Tauri Channel 适配成 EventSink。
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use omt_exec::executor::{EventSink, ExecStartOutcome, RpcFn};
@@ -38,6 +39,38 @@ pub(crate) fn release_reconcile_targets_in_background(label: &'static str) {
     });
 }
 
+/// §39 webview 重载后的双跟随者：本进程内每个 exec 至多一个跟随者。重载后
+/// 前端的 attachedRef 随页面重建而清空，会对同一 exec 再调 exec_attach——
+/// 新跟随者接管（它的 Channel 属于新页面），旧跟随者经取消标志在下一次轮询
+/// （≤200ms）退出，不再向已失效的 Channel 空推、空转。
+static FOLLOWERS: std::sync::Mutex<std::collections::BTreeMap<String, Arc<AtomicBool>>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn claim_follower(exec_id: &str) -> Arc<AtomicBool> {
+    let token = Arc::new(AtomicBool::new(false));
+    let previous = FOLLOWERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(exec_id.to_string(), token.clone());
+    if let Some(previous) = previous {
+        previous.store(true, Ordering::SeqCst);
+    }
+    token
+}
+
+/// 跟随者结束时摘掉登记——只摘自己那一条（已被接管的旧跟随者不动新登记）。
+fn release_follower(exec_id: &str, token: &Arc<AtomicBool>) {
+    let mut followers = FOLLOWERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if followers
+        .get(exec_id)
+        .is_some_and(|current| Arc::ptr_eq(current, token))
+    {
+        followers.remove(exec_id);
+    }
+}
+
 /// 尾随 `<agentDir>/<execId>.jsonl` 推送前端（KD-E3：取代进程内 Channel 泵）。
 /// F-EXEC-17：shim 已死却没写出 exit 行时，就地对账（落 Failed / Orphan）、
 /// 补推合成 exit 让前端收尾，并在后台经 shim 路径释放租约。
@@ -64,7 +97,24 @@ fn follow(
         Some(exit)
     });
     let active = Arc::new(move || omt_exec::control::exec_active(&runtime_dir, &h, &a, &e));
-    omt_exec::follow::follow_jsonl(path, after_seq, sink, active, Some(on_lost));
+    // §39：同一 exec 只保留一个跟随者（exec_start 与 exec_attach 共用本函数）
+    let cancel = claim_follower(exec_id);
+    let handle = omt_exec::follow::follow_jsonl_with(
+        path,
+        after_seq,
+        sink,
+        active,
+        Some(on_lost),
+        omt_exec::follow::FollowOptions {
+            cancel: Some(cancel.clone()),
+            ..Default::default()
+        },
+    );
+    let exec_key = exec_id.to_string();
+    std::thread::spawn(move || {
+        let _ = handle.join();
+        release_follower(&exec_key, &cancel);
+    });
     Ok(())
 }
 
@@ -253,5 +303,24 @@ mod tests {
         let clean = stop_all_value("h_x", &Default::default());
         assert_eq!(clean["signaled"], 0, "{clean}");
         assert_eq!(clean["failed"], serde_json::json!([]), "{clean}");
+    }
+
+    /// §39：同一 exec 的第二个跟随者（webview 重载后的 exec_attach）接管，
+    /// 第一个被取消；过期的 release 不得摘掉当前的登记。
+    #[test]
+    fn a_second_follower_for_the_same_exec_cancels_the_first() {
+        use std::sync::atomic::Ordering;
+        let first = claim_follower("exec-dup-test");
+        let second = claim_follower("exec-dup-test");
+        assert!(first.load(Ordering::SeqCst), "旧跟随者必须被取消");
+        assert!(!second.load(Ordering::SeqCst));
+        release_follower("exec-dup-test", &first); // 旧的结束：不得影响新的
+        assert!(FOLLOWERS
+            .lock()
+            .unwrap()
+            .get("exec-dup-test")
+            .is_some_and(|current| Arc::ptr_eq(current, &second)));
+        release_follower("exec-dup-test", &second);
+        assert!(!FOLLOWERS.lock().unwrap().contains_key("exec-dup-test"));
     }
 }

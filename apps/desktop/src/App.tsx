@@ -18,6 +18,7 @@ import { DetailPanel } from './DetailPanel'
 import { RunsPanel } from './RunsPanel'
 import { SettingsPanel } from './SettingsPanel'
 import { AgentsPanel } from './AgentsPanel'
+import { LeaseNoticeBanner } from './agentUi'
 import { ExecutionDialog } from './ExecutionDialog'
 import type { ExecStartOutcome } from './bridge'
 import './styles.css'
@@ -108,6 +109,11 @@ export function App() {
         </button>
       </nav>
       {state.error && <p className="error-banner">{state.error}</p>}
+      <LeaseNoticeBanner
+        notices={state.leaseNotices}
+        onDismiss={store.dismissLeaseNotice}
+        onOpenRuns={() => setView('runs')}
+      />
       <div className="content">
         {/* U8/R-D：树与 splitter 仅 Tickets 视图渲染——Runs/设置自然全宽 */}
         {view === 'detail' && state.activeHome && (
@@ -190,7 +196,7 @@ export function App() {
                     onSelectAgent={store.selectAgent}
                     onStopAgent={execId => void store.stopAgent(execId)}
                     onResumeAgent={store.resumeAgent}
-                    onDeleteAgent={(agent, force) => store.deleteAgent(agent.id, force)}
+                    onDeleteAgent={async (agent, force) => { await store.deleteAgent(agent.id, force) }}
                     onKillOrphan={(agentId, execId) => void store.killOrphan(agentId, execId)}
                     onGcBindings={() => void store.gcBindings()}
                     onOpenHarnessSettings={() => setView('settings')}
