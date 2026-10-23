@@ -969,7 +969,9 @@ pub fn process_start_identity(pid: u32) -> Result<String, String> {
 }
 
 /// Orphan 强制 kill：只接受持久化 agent/exec 身份，pid 与内核进程起始标识
-/// 均由 Rust 侧读取并比对。仅 SIGKILL 单 pid——重启后进程组归属不可信。
+/// 均由 Rust 侧读取并比对。验收 #7 遗留：harness spawn 时 `setpgid(0,0)`，
+/// pid 通过身份校验且仍是自己进程组的组首时整组 SIGKILL（MCP 桥 `omt mcp`
+/// 等同组子进程一并结束）；组首不是它（重新分组 / 旧记录）时退回单 pid。
 pub fn kill_orphan(
     runtime_dir: &Path,
     home_id: &str,
@@ -998,20 +1000,26 @@ pub fn kill_orphan(
         return Err(format!("pid {pid} 已被复用或身份不匹配，拒绝强制终止"));
     }
     let pid_i = i32::try_from(pid).map_err(|_| format!("pid 越界: {pid}"))?;
-    let rc = unsafe { libc::kill(pid_i, libc::SIGKILL) };
+    // SAFETY: 只查询进程组 / 发信号；pid 已通过内核起始身份校验
+    let pgid = unsafe { libc::getpgid(pid_i) };
+    let rc = if pgid == pid_i {
+        unsafe { libc::killpg(pid_i, libc::SIGKILL) }
+    } else {
+        unsafe { libc::kill(pid_i, libc::SIGKILL) }
+    };
     if rc != 0 {
         let err = std::io::Error::last_os_error();
         return Err(format!("kill({pid}, SIGKILL) 失败: {err}"));
     }
-    let _ = agents::update_agent_status(
-        runtime_dir,
-        home_id,
-        agent_id,
-        AgentRecordStatus::Killed,
-        AgentAttachment::None,
-    );
-    let _ = agents::update_exec(runtime_dir, home_id, agent_id, exec_id, |exec| {
-        exec.kill_reason = Some("orphan".to_string());
+    // §41 kill-orphan-two-step：status / attachment / kill_reason 同一事务——
+    // 读方不会看到「Killed 但 kill_reason 为空」
+    let _ = agents::update_agent(runtime_dir, home_id, agent_id, |record| {
+        record.status = AgentRecordStatus::Killed;
+        record.attachment = AgentAttachment::None;
+        if let Some(exec) = record.execs.iter_mut().find(|e| e.exec_id == exec_id) {
+            exec.kill_reason = Some("orphan".to_string());
+        }
+        true
     });
     Ok(())
 }
@@ -2992,6 +3000,82 @@ mod tests {
         );
         unsafe { libc::kill(pid as i32, libc::SIGKILL) };
         let _ = child.wait();
+    }
+
+    /// 验收 #7 遗留 + §41：orphan 强杀整个 harness 进程组（MCP 桥等同组子
+    /// 进程一并结束），且 status / attachment / kill_reason 一次写入。
+    #[test]
+    fn kill_orphan_kills_the_whole_harness_process_group() {
+        use std::io::BufRead as _;
+        use std::os::unix::process::CommandExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        let home_id = "h_test";
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg("sleep 30 & echo $!; wait")
+            .stdout(std::process::Stdio::piped());
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setpgid(0, 0);
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn().unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let grandchild: i64 = line.trim().parse().unwrap();
+        let pid = child.id();
+        let start_id = process_start_identity(pid).unwrap();
+        let agent = agents::register_agent(
+            &runtime,
+            home_id,
+            "fake",
+            NewExec {
+                exec_id: "exec-pg".into(),
+                node_id: None,
+                run_id: None,
+                binary_path: None,
+                binary_args: vec![],
+                model: None,
+                launched_by: None,
+                parent_agent_id: None,
+            },
+        )
+        .unwrap();
+        agents::update_exec(&runtime, home_id, &agent.id, "exec-pg", |exec| {
+            exec.pid = Some(pid);
+            exec.process_start_id = Some(start_id.clone());
+        })
+        .unwrap();
+        agents::update_agent_status(
+            &runtime,
+            home_id,
+            &agent.id,
+            AgentRecordStatus::Failed,
+            AgentAttachment::Orphan,
+        )
+        .unwrap();
+
+        kill_orphan(&runtime, home_id, &agent.id, "exec-pg").unwrap();
+        let status = child.wait().unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        let alive = wait_for(
+            || (!omt_client::pid_live(grandchild)).then_some(()),
+            Duration::from_secs(5),
+        );
+        assert!(
+            alive.is_some(),
+            "同组子进程（sleep {grandchild}）必须一并被杀"
+        );
+        let record = agents::get_agent(&runtime, home_id, &agent.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.status, AgentRecordStatus::Killed);
+        assert_eq!(record.attachment, AgentAttachment::None);
+        assert_eq!(record.execs[0].kill_reason.as_deref(), Some("orphan"));
     }
 
     #[test]

@@ -101,7 +101,16 @@ impl TempGrant {
 
 impl Drop for TempGrant {
     fn drop(&mut self) {
-        let _ = remove(&self.runtime_dir, &self.principal);
+        // §39 tempgrant-drop-leak：撤销失败时保留临时登记——启动清扫
+        // （sweep_dead_temp_grants）凭它在 pid 死后补删授权。先删登记会让
+        // admin 授权永久泄漏（pid 复用即提权窗口）。
+        if let Err(err) = remove(&self.runtime_dir, &self.principal) {
+            eprintln!(
+                "临时授权 {} 撤销失败（{err}），保留登记，留给启动清扫",
+                self.principal
+            );
+            return;
+        }
         let _ = update_json(
             &temp_registry(&self.runtime_dir),
             |list: &mut Vec<String>| {
@@ -195,5 +204,33 @@ mod tests {
             h.join().unwrap();
         }
         assert_eq!(principals(&dir).len(), 8);
+    }
+
+    /// §39 tempgrant-drop-leak：撤销（admin-grants.json 写回）失败时必须保留
+    /// 临时登记——启动清扫凭它在 pid 死后补删授权；此前登记被无条件删除，
+    /// 授权从此永久泄漏。手法：runtime 目录只读（admin-grants.json 的 tmp
+    /// 建不出来），exec/ 子目录仍可写（登记表在那里）。
+    #[test]
+    fn failed_revoke_keeps_the_temp_registry_entry() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = tmp.path().join("rt");
+        std::fs::create_dir_all(&rt).unwrap();
+        let grant = TempGrant::add(&rt, "cli:999999").unwrap();
+        std::fs::set_permissions(&rt, std::fs::Permissions::from_mode(0o555)).unwrap();
+        drop(grant);
+        std::fs::set_permissions(&rt, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            principals(&rt).contains(&"cli:999999".to_string()),
+            "前提：撤销确实失败了"
+        );
+        let (registry, _) = read_json::<Vec<String>>(&temp_registry(&rt)).unwrap();
+        assert!(
+            registry.contains(&"cli:999999".to_string()),
+            "撤销失败时登记必须保留: {registry:?}"
+        );
+        // 启动清扫据登记补删（999999 不是存活 pid）
+        assert_eq!(sweep_dead_temp_grants(&rt).unwrap(), 1);
+        assert!(!principals(&rt).contains(&"cli:999999".to_string()));
     }
 }

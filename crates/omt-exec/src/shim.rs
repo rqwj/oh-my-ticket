@@ -129,9 +129,14 @@ fn keepalive_every(runtime_dir: &Path) -> Option<Duration> {
     )
 }
 
+/// §39 keepalive-zero：保活间隔下限。间隔为 0（`OMT_SHIM_KEEPALIVE_MS=0`，或
+/// idleQuietMs 为 1 / 2 时 1/3 取整为 0）时内层等待一次都不执行，外层循环
+/// 忙等连 daemon，且永远看不到 done。取 100ms = 内层轮询粒度。
+const KEEPALIVE_FLOOR: Duration = Duration::from_millis(100);
+
 fn keepalive_every_from(runtime_dir: &Path, override_ms: Option<&str>) -> Option<Duration> {
     if let Some(ms) = override_ms.and_then(|v| v.parse::<u64>().ok()) {
-        return Some(Duration::from_millis(ms));
+        return Some(Duration::from_millis(ms).max(KEEPALIVE_FLOOR));
     }
     let idle_ms = std::fs::read_to_string(runtime_dir.join("daemon.json"))
         .ok()
@@ -141,9 +146,7 @@ fn keepalive_every_from(runtime_dir: &Path, override_ms: Option<&str>) -> Option
     if idle_ms <= 0 {
         return None;
     }
-    Some(Duration::from_millis(
-        (idle_ms as u64 / 3).min(5 * 60 * 1000),
-    ))
+    Some(Duration::from_millis((idle_ms as u64 / 3).min(5 * 60 * 1000)).max(KEEPALIVE_FLOOR))
 }
 
 /// 进程入口：安装停止信号处理后执行。返回进程退出码。
@@ -403,8 +406,14 @@ fn spawn_keepalive(
         let Some(every) = every else {
             return;
         };
+        // §39：调用方传入的间隔同样受下限约束（防御直接构造的 Some(0)）
+        let every = every.max(KEEPALIVE_FLOOR);
         let mut rpc: Option<RpcFn> = None;
         loop {
+            // §39：外层也查 done——内层等待被跳过时仍能退出
+            if done.load(Ordering::SeqCst) {
+                return;
+            }
             let deadline = Instant::now() + every;
             while Instant::now() < deadline {
                 if done.load(Ordering::SeqCst) {
@@ -636,6 +645,40 @@ mod tests {
             keepalive_every_from(rt, Some("250")),
             Some(Duration::from_millis(250))
         );
+    }
+
+    /// §39 keepalive-zero：间隔有下限（0 / idleQuietMs=2 不再忙等），保活
+    /// 线程在外层循环也检查 done——置 done 后能在界内退出，且连接次数有界。
+    #[test]
+    fn keepalive_has_a_floor_and_honours_done() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = tmp.path();
+        assert_eq!(keepalive_every_from(rt, Some("0")), Some(KEEPALIVE_FLOOR));
+        std::fs::write(rt.join("daemon.json"), r#"{"idleQuietMs": 2}"#).unwrap();
+        assert_eq!(keepalive_every_from(rt, None), Some(KEEPALIVE_FLOOR));
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        let connector: Connector = Arc::new(move |_: &Path, _: &str| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            Err("down".to_string())
+        });
+        let done = Arc::new(AtomicBool::new(false));
+        let keeper = spawn_keepalive(
+            Some(Duration::ZERO),
+            PathBuf::from("/nonexistent/.omt"),
+            "h_t".to_string(),
+            connector,
+            done.clone(),
+        );
+        std::thread::sleep(Duration::from_millis(350));
+        done.store(true, Ordering::SeqCst);
+        assert!(
+            join_bounded(keeper, Duration::from_secs(2)),
+            "置 done 后必须退出"
+        );
+        let n = calls.load(Ordering::SeqCst);
+        assert!(n <= 5, "不得忙等连接 daemon：350ms 内连了 {n} 次");
     }
 
     #[test]

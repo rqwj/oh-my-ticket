@@ -21,7 +21,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::executor::RpcFn;
 use crate::grants::TempGrant;
@@ -53,7 +53,31 @@ fn live_descriptor(runtime_dir: &Path) -> Option<omt_client::Descriptor> {
     (omt_client::pid_live(d.pid) && omt_client::endpoint_live(&d.endpoint)).then_some(d)
 }
 
-fn spawn_daemon(bin: &Path, runtime_dir: &Path) -> Result<omt_client::Descriptor, String> {
+/// §39 daemon-link-stale-descriptor：轮询**存活**的 descriptor（pid 存活 +
+/// endpoint 可连，与 `live_descriptor` 同一判据）。`omt_client::
+/// wait_for_descriptor` 只看文件存在，会接受崩溃 daemon 残留的旧
+/// descriptor，拉起后的第一次 connect 因此必然失败。
+fn wait_for_live_descriptor(
+    runtime_dir: &Path,
+    timeout: Duration,
+) -> Option<omt_client::Descriptor> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(descriptor) = live_descriptor(runtime_dir) {
+            return Some(descriptor);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// 以新会话拉起 daemon 并返回其 pid。§39 shim-daemon-zombie：起一个
+/// `wait()` 回收线程（同 `launch::spawn_shim`）——daemon 退出后不留僵尸
+/// （僵尸让 pid_live 恒真，`omt daemon-stop` 每次 stop-timeout）。shim 先
+/// 退出时线程随进程结束，daemon 由 launchd 收养。
+fn spawn_daemon_process(bin: &Path, runtime_dir: &Path) -> Result<u32, String> {
     use std::os::unix::process::CommandExt;
     let mut command = Command::new(bin);
     command
@@ -73,11 +97,20 @@ fn spawn_daemon(bin: &Path, runtime_dir: &Path) -> Result<omt_client::Descriptor
             Ok(())
         });
     }
-    command
+    let mut child = command
         .spawn()
         .map_err(|e| format!("spawn omt-daemon: {e}"))?;
-    omt_client::wait_for_descriptor(runtime_dir, Duration::from_secs(10))
-        .ok_or_else(|| "omt-daemon 10s 内未产出 descriptor".to_string())
+    let pid = child.id();
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(pid)
+}
+
+fn spawn_daemon(bin: &Path, runtime_dir: &Path) -> Result<omt_client::Descriptor, String> {
+    spawn_daemon_process(bin, runtime_dir)?;
+    wait_for_live_descriptor(runtime_dir, Duration::from_secs(10))
+        .ok_or_else(|| "omt-daemon 10s 内未产出可用的 descriptor".to_string())
 }
 
 impl DaemonLink {
@@ -362,5 +395,62 @@ mod tests {
             "enroll 应在 300ms 超时界内返回，实际 {:?}（err={err}）",
             started.elapsed()
         );
+    }
+
+    fn write_descriptor(runtime: &Path, endpoint: &Path, pid: u32) {
+        std::fs::create_dir_all(runtime).unwrap();
+        std::fs::write(
+            omt_client::descriptor_path(runtime),
+            serde_json::json!({
+                "schemaVersion": 1,
+                "endpoint": endpoint.display().to_string(),
+                "generation": 1,
+                "pid": pid,
+                "bootToken": "test",
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    /// §39 daemon-link-stale-descriptor：崩溃 daemon 残留的 descriptor（pid
+    /// 已死、socket 不可连）不算就绪——等待必须超时返回 None；pid 存活且
+    /// socket 可连才返回。
+    #[test]
+    fn wait_for_live_descriptor_ignores_stale_descriptors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = tmp.path().join("runtime");
+        let mut gone = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        let dead_pid = gone.id();
+        gone.wait().unwrap();
+        write_descriptor(&runtime, &tmp.path().join("missing.sock"), dead_pid);
+        assert!(
+            wait_for_live_descriptor(&runtime, Duration::from_millis(300)).is_none(),
+            "陈旧 descriptor 不得被当成就绪"
+        );
+        let socket = tmp.path().join("live.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        write_descriptor(&runtime, &socket, std::process::id());
+        assert!(wait_for_live_descriptor(&runtime, Duration::from_millis(300)).is_some());
+    }
+
+    /// §39 shim-daemon-zombie：shim 拉起的 daemon 退出后必须被回收——僵尸
+    /// 进程对 kill(pid, 0) 仍成功，pid_live 恒真。
+    #[test]
+    fn spawned_daemon_is_reaped_after_exit() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("fake-daemon");
+        std::fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let pid = spawn_daemon_process(&bin, &tmp.path().join("runtime")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while omt_client::pid_live(i64::from(pid)) {
+            assert!(
+                Instant::now() < deadline,
+                "daemon 退出后 5s 仍是僵尸（未回收）"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 }
