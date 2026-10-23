@@ -285,6 +285,38 @@ mod tests {
     }
 
     #[test]
+    fn local_tool_table_matches_parity_schema() {
+        let parity: Value =
+            serde_json::from_str(include_str!("../../../schema/parity.schema.json")).unwrap();
+        let entries = parity["$defs"]["LocalToolMatrix"]["default"]["entries"]
+            .as_array()
+            .expect("LocalToolMatrix");
+        let schema_tools: Vec<(&str, &str)> = entries
+            .iter()
+            .map(|e| {
+                (
+                    e["tool"].as_str().unwrap(),
+                    e["classification"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        let table: Vec<(&str, &str)> = LOCAL_TOOLS
+            .iter()
+            .map(|t| {
+                (
+                    t.action,
+                    if t.mutating {
+                        "local_exec"
+                    } else {
+                        "local_read"
+                    },
+                )
+            })
+            .collect();
+        assert_eq!(schema_tools, table);
+    }
+
+    #[test]
     fn cli_args_parse_into_tool_calls() {
         let call =
             |argv: &[&str]| parse_cli(&argv.iter().map(|s| s.to_string()).collect::<Vec<_>>());

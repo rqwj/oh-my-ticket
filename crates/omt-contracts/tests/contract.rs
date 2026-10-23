@@ -712,6 +712,37 @@ fn parity_matrix_seed_covers_whole_vocabulary() {
     assert_invalid(&parity, &json!("sometimes"), "no fourth class");
 }
 
+// ── local tool family (subproject 2, Q-11) ───────────────────────────────
+
+#[test]
+fn local_tool_matrix_is_disjoint_from_daemon_actions() {
+    let docs = load_docs();
+    let parity = &docs["parity.schema.json"];
+    let daemon: std::collections::BTreeSet<String> = parity["$defs"]["SeedActionParityMatrix"]
+        ["default"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["action"].as_str().unwrap().to_string())
+        .collect();
+    let local = parity["$defs"]["LocalToolMatrix"]["default"]["entries"]
+        .as_array()
+        .unwrap();
+    assert_eq!(local.len(), 8);
+    for entry in local {
+        let tool = entry["tool"].as_str().unwrap();
+        assert!(!daemon.contains(tool), "{tool} 不得与 daemon 方法同名");
+        assert!(
+            matches!(
+                entry["classification"].as_str(),
+                Some("local_read" | "local_exec")
+            ),
+            "{tool} classification outside the local tool enum"
+        );
+        assert_eq!(entry["since"], "v1");
+    }
+}
+
 // ── commands ↔ parity coherence ───────────────────────────────────────────
 
 #[test]
