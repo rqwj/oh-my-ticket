@@ -114,8 +114,8 @@ fn launch_returns_once_harness_is_spawned_and_exec_finishes_later() {
         .unwrap();
     assert_eq!(
         at_return.status,
-        omt_exec::agents::AgentRecordStatus::Starting,
-        "launcher 不应等执行结束"
+        omt_exec::agents::AgentRecordStatus::Running,
+        "launcher 不应等执行结束；harness 已 spawn 即 Running（P3-ACC-5）"
     );
     assert!(at_return.execs[0].pid.is_some(), "就绪 = harness 已 spawn");
     // F-EXEC-2：launcher 的 shim 身份落档是关键步骤——pid 与内核起始标识

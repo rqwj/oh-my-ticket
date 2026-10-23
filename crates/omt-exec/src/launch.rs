@@ -11,7 +11,9 @@ use omt_harness::atomic_json::OpenOptionsUnix;
 use omt_harness::harness;
 
 use crate::agents::{self, AgentRecordStatus};
-use crate::executor::{dispatch_daemon_side, fail_and_compensate, DaemonRpc, ExecStartOutcome};
+use crate::executor::{
+    compensate_new_run, dispatch_daemon_side, fail_and_compensate, DaemonRpc, ExecStartOutcome,
+};
 use crate::layout::{self, ExecFile};
 use crate::spec::{LaunchSpec, SPEC_SCHEMA_VERSION};
 
@@ -41,6 +43,8 @@ pub struct LaunchRequest<'a> {
 enum Ready {
     Spawned,
     Failed(String),
+    /// §41：harness 拉起前 agent 已被停止（Killed）——只补偿 run，不落 Failed
+    Stopped,
     Timeout,
 }
 
@@ -181,23 +185,15 @@ pub fn start(rpc: DaemonRpc<'_>, req: &LaunchRequest<'_>) -> Result<ExecStartOut
     // shim 无法被停止 / 存活检查安全追踪，只能不留它。shim 自己的第一动作
     // 也会写同一笔（自愈），但 launcher 无法区分「shim 已写好」与「记录
     // 损坏」，故本侧失败按失败处理。
-    let shim_start_id = match crate::executor::process_start_identity(shim_pid)
-        .or_else(|first| crate::executor::process_start_identity(shim_pid).map_err(|_| first))
-    {
-        Ok(id) => Some(id),
-        Err(err) => {
-            terminate_shim(shim_pid);
-            return Err(compensate(format!("读取 exec-shim 起始身份失败: {err}")));
-        }
-    };
-    if let Err(err) =
-        agents::update_exec(runtime_dir, home_id, &plan.agent.id, &plan.exec_id, |e| {
-            e.shim_pid = Some(shim_pid);
-            e.shim_start_id.clone_from(&shim_start_id);
-        })
-    {
-        terminate_shim(shim_pid);
-        return Err(compensate(format!("记录 exec-shim 身份失败: {err}")));
+    if let Err(err) = record_shim_identity(
+        runtime_dir,
+        home_id,
+        &plan.agent.id,
+        &plan.exec_id,
+        shim_pid,
+        &crate::executor::process_start_identity,
+    ) {
+        return Err(compensate(err));
     }
 
     // Q-6：⑧ 已完成（身份落档成功）——锁在此释放，wait_ready 的 30s 就绪
@@ -223,6 +219,10 @@ pub fn start(rpc: DaemonRpc<'_>, req: &LaunchRequest<'_>) -> Result<ExecStartOut
             // Failed 时补齐终态 + cancel 本次新建 run。
             return Err(compensate(detail));
         }
+        Ready::Stopped => {
+            compensate_new_run(rpc, home_id, &plan.run_id, plan.run_was_newly_created);
+            return Err("执行在 harness 拉起前已被停止".into());
+        }
         Ready::Timeout => warnings.push(format!(
             "exec-shim {}s 内未拉起 harness，执行仍在进行——稍后在 Agents 面板查看",
             READY_TIMEOUT.as_secs()
@@ -235,6 +235,54 @@ pub fn start(rpc: DaemonRpc<'_>, req: &LaunchRequest<'_>) -> Result<ExecStartOut
         run_id: plan.run_id,
         warnings,
     })
+}
+
+/// ⑧ 后半（F-EXEC-2 / §41）：记录 shim 身份。读取起始身份失败（重试一次，
+/// 覆盖 spawn 与 exec 之间的瞬时窗口）或写不进记录，都 SIGTERM 刚拉起的
+/// shim 并返回 Err，由调用方走补偿表。`update_exec` 得 Ok(false) 有两种
+/// 含义：shim 已自写了同一身份（成功），或记录不存在（失败）——落档后复核
+/// 区分。`read_identity` 是测试缝（生产 = `executor::process_start_identity`）。
+fn record_shim_identity(
+    runtime_dir: &Path,
+    home_id: &str,
+    agent_id: &str,
+    exec_id: &str,
+    shim_pid: u32,
+    read_identity: &dyn Fn(u32) -> Result<String, String>,
+) -> Result<(), String> {
+    let start_id =
+        match read_identity(shim_pid).or_else(|first| read_identity(shim_pid).map_err(|_| first)) {
+            Ok(id) => id,
+            Err(err) => {
+                terminate_shim(shim_pid);
+                return Err(format!("读取 exec-shim 起始身份失败: {err}"));
+            }
+        };
+    let written = agents::update_exec(runtime_dir, home_id, agent_id, exec_id, |e| {
+        e.shim_pid = Some(shim_pid);
+        e.shim_start_id = Some(start_id.clone());
+    });
+    let recorded = match written {
+        Ok(true) => true,
+        Ok(false) => agents::get_agent(runtime_dir, home_id, agent_id)
+            .ok()
+            .flatten()
+            .and_then(|agent| agent.execs.into_iter().find(|e| e.exec_id == exec_id))
+            .is_some_and(|e| {
+                e.shim_pid == Some(shim_pid)
+                    && e.shim_start_id.as_deref() == Some(start_id.as_str())
+            }),
+        Err(_) => false,
+    };
+    if !recorded {
+        terminate_shim(shim_pid);
+        let detail = match written {
+            Err(err) => err,
+            _ => "exec 记录不存在".to_string(),
+        };
+        return Err(format!("记录 exec-shim 身份失败: {detail}"));
+    }
+    Ok(())
 }
 
 /// F-EXEC-2(2)：就绪握手里的「shim 已死」判定——shim_pid 已记**且起始身份
@@ -272,6 +320,10 @@ fn wait_ready(
             if let Some(exec) = agent.execs.iter().find(|e| e.exec_id == exec_id) {
                 if exec.pid.is_some() {
                     return Ready::Spawned;
+                }
+                // §41：拉起前被停止（shim 落了 Killed、没有 pid）
+                if agent.status == AgentRecordStatus::Killed && exec.pid.is_none() {
+                    return Ready::Stopped;
                 }
                 if agent.status == AgentRecordStatus::Failed {
                     return Ready::Failed(
@@ -441,6 +493,85 @@ mod tests {
         assert!(!shim_reported_dead(&alive));
         let untracked = agents::ExecRecord::default(); // 尚未记录 shim pid
         assert!(!shim_reported_dead(&untracked));
+    }
+
+    fn sleeper() -> std::process::Child {
+        std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap()
+    }
+
+    fn terminated_by_sigterm(child: &mut std::process::Child) -> bool {
+        use std::os::unix::process::ExitStatusExt;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                return status.signal() == Some(libc::SIGTERM);
+            }
+            if Instant::now() >= deadline {
+                unsafe { libc::kill(child.id() as i32, libc::SIGKILL) };
+                let _ = child.wait();
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// §41（F-EXEC-2 的补偿分支）：读 shim 起始身份失败（含重试一次）→
+    /// SIGTERM 刚拉起的 shim 并返回 Err（调用方随即走 fail_and_compensate）。
+    #[test]
+    fn identity_read_failure_terminates_the_shim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = register(tmp.path(), "exec-idfail");
+        let mut shim = sleeper();
+        let failing = |_: u32| -> Result<String, String> { Err("proc_pidinfo: EPERM".into()) };
+        let err = record_shim_identity(
+            tmp.path(),
+            "h_t",
+            &agent.id,
+            "exec-idfail",
+            shim.id(),
+            &failing,
+        )
+        .expect_err("身份读不出必须失败");
+        assert!(err.contains("读取 exec-shim 起始身份失败"), "{err}");
+        assert!(terminated_by_sigterm(&mut shim), "shim 必须被 SIGTERM");
+    }
+
+    /// §41：身份写不进记录（记录已不存在——update_exec 得 Ok(false)）同样
+    /// SIGTERM shim 并返回 Err；shim 已自写了同一身份（Ok(false) 但记录一致）
+    /// 则视为成功、不发信号。
+    #[test]
+    fn identity_write_failure_terminates_the_shim_but_self_written_identity_is_ok() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut shim = sleeper();
+        let real = |pid: u32| crate::executor::process_start_identity(pid);
+        let err = record_shim_identity(
+            tmp.path(),
+            "h_t",
+            "agent-gone",
+            "exec-gone",
+            shim.id(),
+            &real,
+        )
+        .expect_err("记录不存在必须失败");
+        assert!(err.contains("记录 exec-shim 身份失败"), "{err}");
+        assert!(terminated_by_sigterm(&mut shim));
+
+        let agent = register(tmp.path(), "exec-self");
+        let mut shim = sleeper();
+        let start = crate::executor::process_start_identity(shim.id()).unwrap();
+        agents::update_exec(tmp.path(), "h_t", &agent.id, "exec-self", |e| {
+            e.shim_pid = Some(shim.id());
+            e.shim_start_id = Some(start.clone());
+        })
+        .unwrap();
+        record_shim_identity(tmp.path(), "h_t", &agent.id, "exec-self", shim.id(), &real)
+            .expect("shim 已自写同一身份 = 成功");
+        assert!(shim.try_wait().unwrap().is_none(), "成功路径不得发信号");
+        unsafe { libc::kill(shim.id() as i32, libc::SIGKILL) };
+        let _ = shim.wait();
     }
 }
 

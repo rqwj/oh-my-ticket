@@ -619,6 +619,55 @@ pub fn update_exec(
     .map(|(_, outcome)| outcome.changed)
 }
 
+/// 单事务读改写的公共入口（P3：compare-and-write）。`apply` 在 agent.json
+/// 的进程内锁 + flock 内拿到整条记录，可先复核当前状态再改；返回 true
+/// 才落盘。agent.json 不存在 / id 不符 → Ok(false)。
+pub fn update_agent(
+    runtime_dir: &Path,
+    home_id: &str,
+    agent_id: &str,
+    apply: impl FnOnce(&mut AgentRecord) -> bool,
+) -> Result<bool, String> {
+    let path = layout::agent_file(runtime_dir, home_id, agent_id)?;
+    if !path.is_file() {
+        return Ok(false);
+    }
+    update_json(&path, |agent: &mut AgentRecord| {
+        if agent.id != agent_id {
+            return false;
+        }
+        apply(agent)
+    })
+    .map(|(_, outcome)| outcome.changed)
+}
+
+/// P3-ACC-5：harness 已 spawn——同一事务写入 harness pid / 起始身份，并把
+/// agent 从 Starting 推进到 Running（此前执行器没有任何写 Running 的路径，
+/// 执行期间 agent.json 一直是 starting）。只在 agent 仍是 Starting 且该
+/// exec 是最新 exec 时推进：终态与旧 exec 都不回退。返回是否落盘。
+pub fn mark_exec_spawned(
+    runtime_dir: &Path,
+    home_id: &str,
+    agent_id: &str,
+    exec_id: &str,
+    pid: u32,
+    process_start_id: Option<String>,
+) -> Result<bool, String> {
+    update_agent(runtime_dir, home_id, agent_id, |agent| {
+        let Some(exec) = agent.execs.iter_mut().find(|e| e.exec_id == exec_id) else {
+            return false;
+        };
+        exec.pid = Some(pid);
+        exec.process_start_id = process_start_id;
+        if agent.status == AgentRecordStatus::Starting
+            && agent.last_exec_id.as_deref() == Some(exec_id)
+        {
+            agent.status = AgentRecordStatus::Running;
+        }
+        true
+    })
+}
+
 /// F-EXEC-11：exec 终态的**单事务**回写——agent 级字段（status/attachment/
 /// last_session_id 镜像）与匹配 exec 的终态字段在同一笔 update_json（进程内
 /// 锁 + flock + tmp/rename 原子替换）里落盘。此前 `update_agent_status` 与
@@ -1741,6 +1790,43 @@ mod tests {
         );
         delete_agent(&runtime, &home, &a.id, false).unwrap();
         assert!(get_agent(&runtime, &home, &a.id).unwrap().is_none());
+    }
+
+    /// P3-ACC-5：harness spawn 后同一事务写 pid / 起始身份并把 Starting
+    /// 推进到 Running；终态不回退，非最新 exec 不推进。
+    #[test]
+    fn mark_exec_spawned_promotes_starting_to_running_once() {
+        let (_dir, runtime, home) = temp_runtime();
+        let agent = register_agent(&runtime, &home, "pi", new_exec("exec-run")).unwrap();
+        assert!(mark_exec_spawned(
+            &runtime,
+            &home,
+            &agent.id,
+            "exec-run",
+            4242,
+            Some("macos:1:1".into())
+        )
+        .unwrap());
+        let rec = get_agent(&runtime, &home, &agent.id).unwrap().unwrap();
+        assert_eq!(rec.status, AgentRecordStatus::Running);
+        assert_eq!(rec.execs[0].pid, Some(4242));
+        assert_eq!(rec.execs[0].process_start_id.as_deref(), Some("macos:1:1"));
+        // 终态不回退
+        update_agent_status(
+            &runtime,
+            &home,
+            &agent.id,
+            AgentRecordStatus::Exited,
+            AgentAttachment::None,
+        )
+        .unwrap();
+        mark_exec_spawned(&runtime, &home, &agent.id, "exec-run", 4242, None).unwrap();
+        let rec = get_agent(&runtime, &home, &agent.id).unwrap().unwrap();
+        assert_eq!(
+            rec.status,
+            AgentRecordStatus::Exited,
+            "终态不得被推回 Running"
+        );
     }
 
     /// F-EXEC-14(4)：force=true = 「放弃租约并删除」——待对账守卫被绕过

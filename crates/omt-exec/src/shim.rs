@@ -111,6 +111,14 @@ fn install_stop_handler() {
     }
 }
 
+/// 测试缝（§41 / §41 test-env-var-parallel）：停止标志与租约释放上限从参数
+/// 注入——单测不再改进程级静态量或环境变量。生产入口 `execute` 用
+/// `STOP_REQUESTED` + `lease_timeout()`。
+pub(crate) struct ShimOptions<'a> {
+    pub stop: &'a AtomicBool,
+    pub lease_timeout: Duration,
+}
+
 /// 保活间隔（review R2-2）：从 daemon 读的同一个配置推导——`<runtime>/daemon.json`
 /// 的 idleQuietMs（缺省 30 分钟），取其 1/3 且不超过 5 分钟；idleQuietMs 为 0
 /// （daemon 不做 idle 退出）时不保活。环境变量 `OMT_SHIM_KEEPALIVE_MS` 优先（测试用）。
@@ -160,7 +168,38 @@ pub fn execute(
     lease: Leaser,
     keepalive: Connector,
 ) -> i32 {
-    match run_inner(runtime_dir, home_id, agent_id, exec_id, lease, keepalive) {
+    execute_with(
+        runtime_dir,
+        home_id,
+        agent_id,
+        exec_id,
+        lease,
+        keepalive,
+        ShimOptions {
+            stop: &STOP_REQUESTED,
+            lease_timeout: lease_timeout(),
+        },
+    )
+}
+
+pub(crate) fn execute_with(
+    runtime_dir: &Path,
+    home_id: &str,
+    agent_id: &str,
+    exec_id: &str,
+    lease: Leaser,
+    keepalive: Connector,
+    opts: ShimOptions<'_>,
+) -> i32 {
+    match run_inner(
+        runtime_dir,
+        home_id,
+        agent_id,
+        exec_id,
+        lease,
+        keepalive,
+        &opts,
+    ) {
         Ok(()) => 0,
         Err(detail) => {
             eprintln!("exec-shim {exec_id}: {detail}");
@@ -212,6 +251,26 @@ fn write_own_identity(
     })
 }
 
+/// §41：停止请求先于 harness spawn 到达——不再拉起 harness。只在 agent 仍处
+/// 活跃态时落 Killed(user)；launcher 已经 fail_and_compensate 落了 Failed 的
+/// 保持 Failed（此前 spawn 照常进行，最终 Killed 覆盖 Failed）。
+fn finish_stopped_before_spawn(runtime_dir: &Path, home_id: &str, agent_id: &str, exec_id: &str) {
+    let _ = agents::update_agent(runtime_dir, home_id, agent_id, |agent| {
+        if !matches!(
+            agent.status,
+            AgentRecordStatus::Starting | AgentRecordStatus::Running
+        ) {
+            return false;
+        }
+        agent.status = AgentRecordStatus::Killed;
+        agent.attachment = AgentAttachment::None;
+        if let Some(exec) = agent.execs.iter_mut().find(|e| e.exec_id == exec_id) {
+            exec.kill_reason = Some(crate::executor::KillReason::User.key());
+        }
+        true
+    });
+}
+
 fn run_inner(
     runtime_dir: &Path,
     home_id: &str,
@@ -219,6 +278,7 @@ fn run_inner(
     exec_id: &str,
     lease: Leaser,
     keepalive: Connector,
+    opts: &ShimOptions<'_>,
 ) -> Result<(), String> {
     layout::validate_segment("exec id", exec_id)?;
     let _ = write_own_identity(
@@ -246,6 +306,12 @@ fn run_inner(
         spec.resume_session.as_deref(),
     );
     let env_additions = plan.sanitized_env();
+    // §41：launcher 的 SIGTERM（身份落档失败）可能在这里之前就到了——不做
+    // MCP 注入、不拉起 harness
+    if opts.stop.load(Ordering::SeqCst) {
+        finish_stopped_before_spawn(runtime_dir, home_id, agent_id, exec_id);
+        return Ok(());
+    }
     let cwd = crate::executor::workspace_root_of(&spec.home_path);
     let mcp = crate::mcp_injection::prepare(
         &spec.omt_path,
@@ -267,6 +333,7 @@ fn run_inner(
         runtime_dir.to_path_buf(),
         spec.home_path.clone(),
         lease,
+        opts.lease_timeout,
     ));
     let request = SpawnRequest {
         exec_id: exec_id.to_string(),
@@ -282,6 +349,12 @@ fn run_inner(
         mcp,
         transcript_dir: agent_dir.clone(),
     };
+    // §41：MCP 注入与 prompt 落盘期间到达的停止——释放注入后退出，不 spawn
+    if opts.stop.load(Ordering::SeqCst) {
+        let _ = crate::mcp_injection::release(runtime_dir, &request.mcp);
+        finish_stopped_before_spawn(runtime_dir, home_id, agent_id, exec_id);
+        return Ok(());
+    }
     // 事件已由执行器写入 jsonl（KD-E3）；进程内 sink 无人消费
     let session = manager.spawn(runtime_dir, request, Arc::new(|_| {}))?;
     let done = Arc::new(AtomicBool::new(false));
@@ -306,7 +379,7 @@ fn run_inner(
             }
             return Ok(());
         }
-        if STOP_REQUESTED.swap(false, Ordering::SeqCst) {
+        if opts.stop.swap(false, Ordering::SeqCst) {
             manager.exec_stop(exec_id)?;
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -371,6 +444,7 @@ fn lease_releaser(
     runtime_dir: PathBuf,
     home_path: PathBuf,
     leaser: Leaser,
+    timeout: Duration,
 ) -> crate::executor::LeaseRelease {
     Arc::new(move |home_id: &str, run_id: &str, exec_id: &str| {
         let home_id = home_id.to_string();
@@ -395,7 +469,7 @@ fn lease_releaser(
                         crate::executor::release_items_for_exec(&*rpc, &home_id, &run_id, &exec_id)
                     }
                 };
-                let result = run_bounded(bounded, lease_timeout());
+                let result = run_bounded(bounded, timeout);
                 drop(grant); // 成功/失败/超时统一在此撤销临时授权
                 result
             }
@@ -889,5 +963,68 @@ mod tests {
             "临时登记表必须已清: {registry}"
         );
         drop(env_guard);
+    }
+
+    /// §41：停止请求先于 harness spawn 到达（launcher 身份落档失败后的
+    /// SIGTERM，或用户在拉起窗口里停止）——不得再拉起 harness；仍活跃的
+    /// agent 落 Killed(user)，MCP 注入已释放，jsonl 从未创建。
+    #[test]
+    fn stop_requested_before_spawn_does_not_launch_harness() {
+        let (_t, runtime, spec) = rig("echo SHOULD-NOT-RUN\nexit 0", Some("RUN-1"));
+        let stop = AtomicBool::new(true);
+        let code = execute_with(
+            &runtime,
+            "h_test",
+            &spec.agent_id,
+            "exec-s",
+            recording_leaser(Default::default(), &runtime),
+            idle_keepalive(),
+            ShimOptions {
+                stop: &stop,
+                lease_timeout: Duration::from_secs(5),
+            },
+        );
+        assert_eq!(code, 0);
+        let agent = crate::agents::get_agent(&runtime, "h_test", &spec.agent_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(agent.status, crate::agents::AgentRecordStatus::Killed);
+        assert_eq!(agent.execs[0].kill_reason.as_deref(), Some("user"));
+        assert!(agent.execs[0].pid.is_none(), "harness 不得被拉起");
+        let dir = crate::layout::agent_dir(&runtime, "h_test", &spec.agent_id).unwrap();
+        assert!(!crate::layout::exec_file(&dir, "exec-s", crate::layout::ExecFile::Jsonl).exists());
+    }
+
+    /// §41：launcher 已经 fail_and_compensate 落了 Failed——拉起前停止只退出，
+    /// 不把 Failed 覆盖成 Killed。
+    #[test]
+    fn stop_before_spawn_keeps_launcher_failed_status() {
+        let (_t, runtime, spec) = rig("exit 0", Some("RUN-1"));
+        crate::agents::update_agent_status(
+            &runtime,
+            "h_test",
+            &spec.agent_id,
+            crate::agents::AgentRecordStatus::Failed,
+            crate::agents::AgentAttachment::None,
+        )
+        .unwrap();
+        let stop = AtomicBool::new(true);
+        execute_with(
+            &runtime,
+            "h_test",
+            &spec.agent_id,
+            "exec-s",
+            recording_leaser(Default::default(), &runtime),
+            idle_keepalive(),
+            ShimOptions {
+                stop: &stop,
+                lease_timeout: Duration::from_secs(5),
+            },
+        );
+        let agent = crate::agents::get_agent(&runtime, "h_test", &spec.agent_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(agent.status, crate::agents::AgentRecordStatus::Failed);
+        assert!(agent.execs[0].kill_reason.is_none());
     }
 }

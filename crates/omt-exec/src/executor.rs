@@ -459,15 +459,15 @@ impl ExecutionManager {
         // kernel-derived process start identity. A pid alone is reusable and
         // therefore never sufficient authority to signal a process.
         let process_start_id = process_start_identity(pid).ok();
-        let _ = agents::update_exec(
+        // P3-ACC-5：pid / 起始身份与 Starting → Running 同一事务落盘——launcher
+        // 的就绪握手看到 pid 时状态已是 Running
+        let _ = agents::mark_exec_spawned(
             runtime_dir,
             &req.home_id,
             &req.agent_id,
             &req.exec_id,
-            |exec| {
-                exec.pid = Some(pid);
-                exec.process_start_id.clone_from(&process_start_id);
-            },
+            pid,
+            process_start_id,
         );
 
         // F-U2-6：session_start 与 raw/exit 同构——统一携带 seq/ts；
@@ -1094,6 +1094,29 @@ fn collect_members(
     Ok(members)
 }
 
+/// P3-ACC-4：「无未完成可执行成员」的可行动说明——派发 / 续跑目标本身就是
+/// 已完成（或已跳过）的 ticket 时直说是它完成了；其余情形保留原文案。
+fn no_members_error(node_id: &str, node: &serde_json::Value) -> String {
+    let node_type = node["type"].as_str().unwrap_or("");
+    let status = node["status"].as_str().unwrap_or("");
+    if matches!(node_type, "ticket" | "subticket") {
+        match status {
+            "done" => {
+                return format!(
+                    "关联的 ticket {node_id} 已完成（done），无需续跑；如需重做请先将其改回 open"
+                )
+            }
+            "skipped" => {
+                return format!(
+                    "关联的 ticket {node_id} 已跳过（skipped），无需续跑；如需重做请先将其改回 open"
+                )
+            }
+            _ => {}
+        }
+    }
+    "无未完成可执行成员".into()
+}
+
 /// Q-9：派发目标。Node = 与桌面端相同的成员收集 + run 复用；Run = 直接用给定 run。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaunchTarget<'a> {
@@ -1162,7 +1185,8 @@ pub(crate) fn dispatch_daemon_side(
             )?;
             let members = collect_members(rpc, home_id, node_id)?;
             if members.is_empty() {
-                return Err("无未完成可执行成员".into());
+                // P3-ACC-4：目标本身是已完成 / 已跳过的 ticket 时直说
+                return Err(no_members_error(node_id, &node_resp["node"]));
             }
             let run_links = node_resp["runs"].as_array().cloned().unwrap_or_default();
             let active_runs: Vec<String> = run_links
@@ -4082,6 +4106,67 @@ mod tests {
         };
         let members = collect_members(&rpc, "h_test", "epic-1").expect("应收集到成员");
         assert_eq!(members, vec!["ticket-a".to_string()]);
+    }
+
+    /// P3-ACC-4：派发 / 续跑的目标本身是已完成的 ticket 时，报错直说是它
+    /// 完成了（续跑沿用最后一个 exec 的 nodeId，旧文案「无未完成可执行成员」
+    /// 让人以为子树出了问题）；且在 ② node/execute 之前返回。非 ticket 目标
+    /// 子树全部完成时保留原文案。
+    #[test]
+    fn dispatch_on_done_ticket_explains_it_is_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        let fake = FakeDaemon::new(
+            node_get_shape("t1", "ticket", "done", false, &[]),
+            dispatch_run_get("running"),
+            "run-unused",
+        );
+        let rpc = |method: &str, params: serde_json::Value| fake.rpc(method, params);
+        let err = dispatch_daemon_side(
+            &rpc,
+            &runtime,
+            "h_test",
+            LaunchTarget::Node("t1"),
+            LaunchOrigin::Desktop,
+            "pi",
+            false,
+            None,
+            None,
+            Some("agent-x"),
+            None,
+        )
+        .expect_err("done ticket 不可派发");
+        assert_eq!(
+            err,
+            "关联的 ticket t1 已完成（done），无需续跑；如需重做请先将其改回 open"
+        );
+        assert!(
+            !fake.method_names().iter().any(|m| m == "node/execute"),
+            "预检失败必须先于 ②: {:?}",
+            fake.method_names()
+        );
+
+        let epic = FakeDaemon::new(
+            node_get_shape("e1", "epic", "open", false, &[]),
+            dispatch_run_get("running"),
+            "run-unused",
+        );
+        let rpc = |method: &str, params: serde_json::Value| epic.rpc(method, params);
+        let err = dispatch_daemon_side(
+            &rpc,
+            &runtime,
+            "h_test",
+            LaunchTarget::Node("e1"),
+            LaunchOrigin::Desktop,
+            "pi",
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect_err("空子树不可派发");
+        assert_eq!(err, "无未完成可执行成员");
     }
 
     /// F-PI-3：raw.log 尾部回载——前缀解析、截尾上限、无文件空返回。

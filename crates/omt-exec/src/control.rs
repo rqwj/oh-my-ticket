@@ -140,6 +140,12 @@ fn stop_exec_signaled(runtime_dir: &Path, exec_id: &str) -> Result<bool, String>
         signal_shim(loc.exec.shim_pid.unwrap_or(0))?;
         return Ok(true);
     }
+    // §39 grace-stop-noop：拉起宽限期内（shim 还没记下身份）没有可发信号的
+    // 目标，对账也会跳过它——此前直接返回 Ok，界面显示「已停止」而实际什么
+    // 也没停
+    if within_launch_grace(&loc.exec) {
+        return Err("执行仍在拉起中，请稍后再停止".to_string());
+    }
     reconcile_agent(runtime_dir, &loc.home_id, &loc.agent);
     Ok(false)
 }
@@ -702,5 +708,23 @@ mod tests {
             Some(libc::SIGTERM),
             "首个 agent 不可信号后，其余 agent 仍必须被停止"
         );
+    }
+
+    /// §39 grace-stop-noop：拉起宽限期内（shim 还没记下 pid）没有可发信号
+    /// 的目标——必须如实报错，而不是返回 Ok 让界面显示「已停止」。
+    #[test]
+    fn stop_during_launch_grace_reports_not_yet_stoppable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = reg(tmp.path(), "exec-fresh");
+        let err = stop_exec(tmp.path(), "exec-fresh").expect_err("宽限期内不得假装停止成功");
+        assert!(err.contains("仍在拉起中"), "{err}");
+        let a = crate::agents::get_agent(tmp.path(), "h_t", &id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.status, AgentRecordStatus::Starting, "记录不被改写");
+        let outcome = stop_all(tmp.path(), "h_t").unwrap();
+        assert_eq!(outcome.signaled_count, 0);
+        assert_eq!(outcome.errors.len(), 1, "{outcome:?}");
+        assert!(outcome.errors[0].contains("exec-fresh"), "{outcome:?}");
     }
 }

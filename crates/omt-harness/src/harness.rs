@@ -68,35 +68,44 @@ pub fn which_binary(name: &str) -> Option<PathBuf> {
 }
 
 /// `<binary> <probe_args>` 首行输出，带超时（F1：原 `.output()` 会永久挂起）。
-/// 超时后 kill 子进程；探针是 best-effort，失败只表现为无版本号。
+/// stdout 首行优先，空则回落 stderr 首行（F-U1-7：有的 CLI 把版本号打到
+/// stderr）。超时后 kill 子进程；探针是 best-effort，失败只表现为无版本号。
 pub fn probe_version(binary: &Path, args: &[&str], timeout_secs: u64) -> Option<String> {
     use std::io::Read;
     use std::process::{Command, Stdio};
     let mut child = Command::new(binary)
         .args(args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        // F-U1-7：stderr 也读——有的 CLI 把版本号打到 stderr
+        .stderr(Stdio::piped())
         .stdin(Stdio::null())
         .env("PATH", augmented_path())
         .spawn()
         .ok()?;
-    let mut pipe = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = pipe.read_to_string(&mut buf);
-        buf
-    });
+    // 两路各起一个读线程（先于等待退出——F-BENCH-21：退出后才读会在大输出时卡死）
+    let read_all = |mut pipe: Box<dyn Read + Send>| {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = pipe.read_to_string(&mut buf);
+            buf
+        })
+    };
+    let out_reader = read_all(Box::new(child.stdout.take()?));
+    let err_reader = read_all(Box::new(child.stderr.take()?));
+    let first_line = |text: String| {
+        text.lines()
+            .next()
+            .map(|line| line.trim().to_string())
+            .filter(|line| !line.is_empty())
+    };
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     let line = loop {
         match child.try_wait() {
-            // 进程已退出：stdout 落 EOF，读线程随即结束。
+            // 进程已退出：两路管道落 EOF，读线程随即结束。stdout 首行优先，
+            // 为空时回落 stderr 首行（F-U1-7）
             Ok(Some(_)) => {
-                break reader.join().ok().and_then(|text| {
-                    text.lines()
-                        .next()
-                        .map(|line| line.trim().to_string())
-                        .filter(|line| !line.is_empty())
-                })
+                let out = out_reader.join().ok().and_then(first_line);
+                break out.or_else(|| err_reader.join().ok().and_then(first_line));
             }
             Ok(None) if Instant::now() >= deadline => break None,
             Ok(None) => std::thread::sleep(Duration::from_millis(50)),
@@ -1025,6 +1034,30 @@ mod tests {
         assert!(
             hang_started.elapsed() < std::time::Duration::from_secs(10),
             "探针必须在超时后返回而不是永久挂起"
+        );
+    }
+
+    /// F-U1-7：把版本号打到 stderr 的 CLI（stdout 为空）——回落 stderr 首行，
+    /// 不再被判「待验证」；stdout 有内容时仍取 stdout（stderr 噪声不干扰）。
+    #[cfg(unix)]
+    #[test]
+    fn probe_version_falls_back_to_stderr_when_stdout_is_empty() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let stderr_only = dir.path().join("stderr-only");
+        std::fs::write(&stderr_only, "#!/bin/sh\necho 'tool 4.5.6' >&2\n").unwrap();
+        std::fs::set_permissions(&stderr_only, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // F-BENCH-22：现写脚本首跑可能有 exec 评估停顿，预算放宽到 20s
+        assert_eq!(
+            probe_version(&stderr_only, &["--version"], 20).as_deref(),
+            Some("tool 4.5.6")
+        );
+        let both = dir.path().join("both");
+        std::fs::write(&both, "#!/bin/sh\necho v1.0.0\necho 'warning: noise' >&2\n").unwrap();
+        std::fs::set_permissions(&both, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            probe_version(&both, &["--version"], 20).as_deref(),
+            Some("v1.0.0")
         );
     }
 
