@@ -110,6 +110,9 @@ pub struct ExecRecord {
     /// shim 收尾时租约释放失败（daemon 不可达等）——留给下次对账重试（设计 §5）。
     #[serde(default)]
     pub lease_release_pending: bool,
+    /// Q-7：本次派发的发起方（desktop / cli / mcp）；子项目 2 之前的旧记录为 None。
+    #[serde(default)]
+    pub launched_by: Option<crate::policy::LaunchOrigin>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -123,6 +126,9 @@ pub struct AgentRecord {
     pub attachment: AgentAttachment,
     pub last_exec_id: Option<String>,
     pub last_session_id: Option<String>,
+    /// Q-7：父 agent（主控）。只在新建 agent 时由显式参数写入；自动祖先链关联属子项目 3。
+    #[serde(default)]
+    pub parent_agent_id: Option<String>,
     /// P0 仅记录首个节点/最近 run 的归属（读侧展示用）；子树绑定在
     /// bindings.json（U9）。
     pub execs: Vec<ExecRecord>,
@@ -139,6 +145,7 @@ impl Default for AgentRecord {
             attachment: AgentAttachment::None,
             last_exec_id: None,
             last_session_id: None,
+            parent_agent_id: None,
             execs: Vec::new(),
         }
     }
@@ -255,6 +262,10 @@ pub struct NewExec {
     pub binary_args: Vec<String>,
     /// 本次派发选用的模型（F-VIEW3：续跑列表展示；未指定 None）
     pub model: Option<String>,
+    /// Q-7：发起方，写入 ExecRecord.launched_by。
+    pub launched_by: Option<crate::policy::LaunchOrigin>,
+    /// Q-7：仅 register_agent 使用（续跑沿用 agent 既有的父关系）。
+    pub parent_agent_id: Option<String>,
 }
 
 /// 注册新 Agent：分配持久单调序号（display_name = `Agent N`），以
@@ -288,6 +299,7 @@ pub fn register_agent(
             attachment: AgentAttachment::Live,
             last_exec_id: Some(new_exec.exec_id.clone()),
             last_session_id: None,
+            parent_agent_id: new_exec.parent_agent_id.clone(),
             execs: vec![ExecRecord {
                 exec_id: new_exec.exec_id.clone(),
                 node_id: new_exec.node_id.clone(),
@@ -296,6 +308,7 @@ pub fn register_agent(
                 binary_path: new_exec.binary_path.clone(),
                 binary_args: new_exec.binary_args.clone(),
                 model: new_exec.model.clone(),
+                launched_by: new_exec.launched_by,
                 ..Default::default()
             }],
         };
@@ -348,6 +361,7 @@ pub fn append_exec(
             binary_path: new_exec.binary_path.clone(),
             binary_args: new_exec.binary_args.clone(),
             model: new_exec.model.clone(),
+            launched_by: new_exec.launched_by,
             ..Default::default()
         });
         agent.status = AgentRecordStatus::Starting;
@@ -806,6 +820,8 @@ mod tests {
             binary_path: None,
             binary_args: vec![],
             model: None,
+            launched_by: None,
+            parent_agent_id: None,
         }
     }
 

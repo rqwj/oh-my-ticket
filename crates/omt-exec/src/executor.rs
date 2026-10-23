@@ -1090,6 +1090,22 @@ fn collect_members(
     Ok(members)
 }
 
+/// Q-9：派发目标。Node = 与桌面端相同的成员收集 + run 复用；Run = 直接用给定 run。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchTarget<'a> {
+    Node(&'a str),
+    Run(&'a str),
+}
+
+impl LaunchTarget<'_> {
+    pub fn node_id(&self) -> Option<&str> {
+        match self {
+            LaunchTarget::Node(id) => Some(id),
+            LaunchTarget::Run(_) => None,
+        }
+    }
+}
+
 /// dispatch_daemon_side 的产出（§3.3 ①–⑥）：launcher（launch::start）据此
 /// 走 ⑦ spec 落盘 → ⑧ 拉起 shim → ⑨ 就绪握手。
 #[derive(Debug)]
@@ -1118,12 +1134,14 @@ pub(crate) fn dispatch_daemon_side(
     rpc: DaemonRpc<'_>,
     runtime_dir: &Path,
     home_id: &str,
-    node_id: &str,
+    target: LaunchTarget<'_>,
+    origin: crate::policy::LaunchOrigin,
     provider_id: &str,
     unattended: bool,
     model: Option<&str>,
     resume_session: Option<&str>,
     target_agent_id: Option<&str>,
+    parent_agent_id: Option<&str>,
 ) -> Result<DispatchPlan, String> {
     let dispatch_id = format!(
         "d-{}-{}",
@@ -1131,36 +1149,46 @@ pub(crate) fn dispatch_daemon_side(
         omt_harness::atomic_json::unique_suffix()
     );
 
-    // ① 预检
-    let node_resp = rpc(
-        "node/get",
-        serde_json::json!({"homeId": home_id, "nodeId": node_id}),
-    )?;
-    let members = collect_members(rpc, home_id, node_id)?;
-    if members.is_empty() {
-        return Err("无未完成可执行成员".into());
-    }
-    let run_links = node_resp["runs"].as_array().cloned().unwrap_or_default();
-    let active_runs: Vec<String> = run_links
-        .iter()
-        .filter_map(|r| r["runId"].as_str().map(str::to_owned))
-        .collect();
-    // F-ACC-12：③ 将复用的 run 正在运行、且本节点 item 仍 pending（停止后
-    // 重新派发的典型形态）时，node/execute 置 in_progress 会触发 daemon 的
-    // 被动观察，以桌面端身份把该 item 激活成 running——exec 随后认领落空、
-    // item 卡死。此时跳过 ②，由 exec 自己 claim。
-    let reused_pending_item = run_links.first().is_some_and(|link| {
-        link["status"].as_str() == Some("running") && link["itemState"].as_str() == Some("pending")
-    });
+    // ① 预检（仅 Node 目标）；Run 目标的 run 由调用方给定，③ 直接使用
+    let (members, active_runs, reused_pending_item) = match target {
+        LaunchTarget::Node(node_id) => {
+            let node_resp = rpc(
+                "node/get",
+                serde_json::json!({"homeId": home_id, "nodeId": node_id}),
+            )?;
+            let members = collect_members(rpc, home_id, node_id)?;
+            if members.is_empty() {
+                return Err("无未完成可执行成员".into());
+            }
+            let run_links = node_resp["runs"].as_array().cloned().unwrap_or_default();
+            let active_runs: Vec<String> = run_links
+                .iter()
+                .filter_map(|r| r["runId"].as_str().map(str::to_owned))
+                .collect();
+            // F-ACC-12：③ 将复用的 run 正在运行、且本节点 item 仍 pending（停止后
+            // 重新派发的典型形态）时，node/execute 置 in_progress 会触发 daemon 的
+            // 被动观察，以桌面端身份把该 item 激活成 running——exec 随后认领落空、
+            // item 卡死。此时跳过 ②，由 exec 自己 claim。
+            let reused_pending_item = run_links.first().is_some_and(|link| {
+                link["status"].as_str() == Some("running")
+                    && link["itemState"].as_str() == Some("pending")
+            });
+            (members, active_runs, reused_pending_item)
+        }
+        LaunchTarget::Run(run_id) => (Vec::new(), vec![run_id.to_string()], false),
+    };
 
-    // ② node/execute（发起方是 desktop，adapter_only 可用；P-3）
-    if !reused_pending_item {
-        rpc(
-            "node/execute",
-            serde_json::json!({
-                "homeId": home_id, "nodeId": node_id, "commandId": format!("{dispatch_id}:execute"),
-            }),
-        )?;
+    // ② node/execute：仅桌面端（adapter_only，P-3）发起的 Node 目标调用；
+    // CLI/MCP 一律跳过，由 exec 自己 claim（Q-2）
+    if let (LaunchTarget::Node(node_id), crate::policy::LaunchOrigin::Desktop) = (target, origin) {
+        if !reused_pending_item {
+            rpc(
+                "node/execute",
+                serde_json::json!({
+                    "homeId": home_id, "nodeId": node_id, "commandId": format!("{dispatch_id}:execute"),
+                }),
+            )?;
+        }
     }
 
     // 启动参数（记录用；shim 会用同一输入重算，P-4）。F-EXEC-7：harness 解析、
@@ -1215,7 +1243,7 @@ pub(crate) fn dispatch_daemon_side(
         let resp = rpc(
             "run/create",
             serde_json::json!({
-                "homeId": home_id, "title": format!("dispatch {node_id}"),
+                "homeId": home_id, "title": format!("dispatch {}", target.node_id().unwrap_or_default()),
                 "nodeIds": members, "commandId": format!("{dispatch_id}:create"),
             }),
         )?;
@@ -1295,7 +1323,7 @@ pub(crate) fn dispatch_daemon_side(
     // ⑤ 注册 / 续接 agent。失败按补偿表 cancel 本次新建 run（不留记录）。
     let new_exec = crate::agents::NewExec {
         exec_id: exec_id.clone(),
-        node_id: Some(node_id.to_string()),
+        node_id: target.node_id().map(str::to_string),
         run_id: Some(run_id.clone()),
         binary_path: Some(plan.program.display().to_string()),
         // 与 transcript header 的 session_start args 镜像（含 prompt——
@@ -1303,6 +1331,8 @@ pub(crate) fn dispatch_daemon_side(
         binary_args: sanitize_args(&args),
         // F-VIEW3：续跑列表展示本次模型
         model: model.map(str::to_string),
+        launched_by: Some(origin),
+        parent_agent_id: parent_agent_id.map(str::to_string),
     };
     let registered = match target_agent_id {
         Some(target) => agents::append_exec(runtime_dir, home_id, target, provider_id, new_exec),
@@ -1316,12 +1346,17 @@ pub(crate) fn dispatch_daemon_side(
         }
     };
 
-    // ⑥ 绑定写入（写失败 → 警告不阻断）
-    let warnings: Vec<String> = agents::write_binding(runtime_dir, home_id, node_id, &agent.id)
-        .err()
-        .map(|e| format!("绑定写入失败：{e}"))
-        .into_iter()
-        .collect();
+    // ⑥ 绑定写入（写失败 → 警告不阻断）；Q-9：Run 目标不写 binding
+    let warnings: Vec<String> = match target {
+        LaunchTarget::Node(node_id) => {
+            agents::write_binding(runtime_dir, home_id, node_id, &agent.id)
+                .err()
+                .map(|e| format!("绑定写入失败：{e}"))
+                .into_iter()
+                .collect()
+        }
+        LaunchTarget::Run(_) => Vec::new(),
+    };
 
     Ok(DispatchPlan {
         agent,
@@ -1748,6 +1783,7 @@ fn held_running_nodes(resp: &serde_json::Value, exec_id: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::LaunchOrigin;
     use std::collections::BTreeMap;
     use std::sync::mpsc;
 
@@ -1935,6 +1971,8 @@ mod tests {
                 binary_path: None,
                 binary_args: vec![],
                 model: None,
+                launched_by: None,
+                parent_agent_id: None,
             },
         )
         .unwrap();
@@ -2040,6 +2078,8 @@ mod tests {
                 binary_path: None,
                 binary_args: vec![],
                 model: None,
+                launched_by: None,
+                parent_agent_id: None,
             },
         )
         .unwrap();
@@ -2112,6 +2152,8 @@ mod tests {
                 binary_path: None,
                 binary_args: vec![],
                 model: None,
+                launched_by: None,
+                parent_agent_id: None,
             },
         )
         .unwrap();
@@ -2188,6 +2230,8 @@ mod tests {
                 binary_path: None,
                 binary_args: vec![],
                 model: None,
+                launched_by: None,
+                parent_agent_id: None,
             },
         )
         .unwrap();
@@ -2251,6 +2295,8 @@ mod tests {
                 binary_path: None,
                 binary_args: vec![],
                 model: None,
+                launched_by: None,
+                parent_agent_id: None,
             },
         )
         .unwrap();
@@ -2318,6 +2364,8 @@ mod tests {
                     binary_path: None,
                     binary_args: vec![],
                     model: None,
+                    launched_by: None,
+                    parent_agent_id: None,
                 },
             )
             .unwrap();
@@ -2380,6 +2428,8 @@ mod tests {
                 binary_path: None,
                 binary_args: vec![],
                 model: None,
+                launched_by: None,
+                parent_agent_id: None,
             },
         )
         .unwrap();
@@ -2448,6 +2498,8 @@ mod tests {
                 binary_path: None,
                 binary_args: vec![],
                 model: None,
+                launched_by: None,
+                parent_agent_id: None,
             },
         )
         .unwrap();
@@ -2507,6 +2559,8 @@ mod tests {
                 binary_path: None,
                 binary_args: vec![],
                 model: None,
+                launched_by: None,
+                parent_agent_id: None,
             },
         )
         .unwrap();
@@ -2697,6 +2751,8 @@ mod tests {
                 binary_path: None,
                 binary_args: vec![],
                 model: None,
+                launched_by: None,
+                parent_agent_id: None,
             },
         )
         .unwrap();
@@ -2747,6 +2803,8 @@ mod tests {
                 binary_path: None,
                 binary_args: vec![],
                 model: None,
+                launched_by: None,
+                parent_agent_id: None,
             },
         )
         .unwrap();
@@ -3171,7 +3229,17 @@ mod tests {
         let rpc = |method: &str, params: serde_json::Value| fake.rpc(method, params);
 
         let result = dispatch_daemon_side(
-            &rpc, &runtime, "h_test", "t1", "omp", false, None, None, None,
+            &rpc,
+            &runtime,
+            "h_test",
+            LaunchTarget::Node("t1"),
+            LaunchOrigin::Desktop,
+            "omp",
+            false,
+            None,
+            None,
+            None,
+            None,
         );
         let err = result.expect_err("register_agent 写失败应使 dispatch_daemon_side 失败");
 
@@ -3211,7 +3279,17 @@ mod tests {
         let rpc = |method: &str, params: serde_json::Value| fake.rpc(method, params);
 
         let err = dispatch_daemon_side(
-            &rpc, &runtime, "h_test", "t1", "opencode", false, None, None, None,
+            &rpc,
+            &runtime,
+            "h_test",
+            LaunchTarget::Node("t1"),
+            LaunchOrigin::Desktop,
+            "opencode",
+            false,
+            None,
+            None,
+            None,
+            None,
         )
         .expect_err("run/control start 失败应使 dispatch_daemon_side 失败");
         assert_eq!(err, "daemon 拒绝 start", "错误消息应原样透传");
@@ -3246,7 +3324,17 @@ mod tests {
         let rpc = |method: &str, params: serde_json::Value| fake.rpc(method, params);
 
         let err = dispatch_daemon_side(
-            &rpc, &runtime, "h_test", "t1", "opencode", false, None, None, None,
+            &rpc,
+            &runtime,
+            "h_test",
+            LaunchTarget::Node("t1"),
+            LaunchOrigin::Desktop,
+            "opencode",
+            false,
+            None,
+            None,
+            None,
+            None,
         )
         .expect_err("paused run 应使 dispatch_daemon_side 失败");
         assert!(err.contains("paused"), "{err}");
@@ -3301,7 +3389,17 @@ mod tests {
         let rpc = |method: &str, params: serde_json::Value| fake.rpc(method, params);
 
         let plan = dispatch_daemon_side(
-            &rpc, &runtime, "h_test", "t1", "omp", false, None, None, None,
+            &rpc,
+            &runtime,
+            "h_test",
+            LaunchTarget::Node("t1"),
+            LaunchOrigin::Desktop,
+            "omp",
+            false,
+            None,
+            None,
+            None,
+            None,
         )
         .expect("daemon 侧步骤应成功（MCP 注入已移入 shim）");
 
@@ -3372,12 +3470,14 @@ mod tests {
                 omt_bin: &missing_omt,
                 home_id: "h_test",
                 home_path: &home_path,
-                node_id: "t1",
+                target: LaunchTarget::Node("t1"),
+                origin: LaunchOrigin::Desktop,
                 harness: "opencode",
                 unattended: false,
                 model: None,
                 resume_session: None,
                 target_agent_id: None,
+                parent_agent_id: None,
                 max_duration: DEFAULT_MAX_DURATION,
             },
         )
@@ -3438,12 +3538,14 @@ mod tests {
                 omt_bin: &old_omt,
                 home_id: "h_test",
                 home_path: &home_path,
-                node_id: "t1",
+                target: LaunchTarget::Node("t1"),
+                origin: LaunchOrigin::Desktop,
                 harness: "opencode",
                 unattended: false,
                 model: None,
                 resume_session: None,
                 target_agent_id: None,
+                parent_agent_id: None,
                 max_duration: DEFAULT_MAX_DURATION,
             },
         )
@@ -3487,7 +3589,17 @@ mod tests {
         let rpc = |method: &str, params: serde_json::Value| fake.rpc(method, params);
 
         let plan = dispatch_daemon_side(
-            &rpc, &runtime, "h_test", "t1", "omp", false, None, None, None,
+            &rpc,
+            &runtime,
+            "h_test",
+            LaunchTarget::Node("t1"),
+            LaunchOrigin::Desktop,
+            "omp",
+            false,
+            None,
+            None,
+            None,
+            None,
         )
         .expect("复用 run 的 daemon 侧步骤应成功");
         assert!(!plan.run_was_newly_created);
@@ -3544,7 +3656,17 @@ mod tests {
         let rpc = |method: &str, params: serde_json::Value| fake.rpc(method, params);
 
         let plan = dispatch_daemon_side(
-            &rpc, &runtime, "h_test", "t1", "pi", false, None, None, None,
+            &rpc,
+            &runtime,
+            "h_test",
+            LaunchTarget::Node("t1"),
+            LaunchOrigin::Desktop,
+            "pi",
+            false,
+            None,
+            None,
+            None,
+            None,
         )
         .expect("复用 run 派发应成功");
         assert_eq!(plan.run_id, "run-existing");
@@ -3553,6 +3675,124 @@ mod tests {
             "pending item 由 exec 自己认领，不得经 node/execute 被桌面端身份抢占: {:?}",
             fake.method_names()
         );
+    }
+
+    /// Q-2：CLI/MCP 发起时无论 run 新建与否都不调用 node/execute（adapter_only）。
+    #[test]
+    fn dispatch_from_cli_or_mcp_never_calls_node_execute() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = write_script(dir.path(), "cli-origin", "exit 0");
+        let (runtime, _home_path) = setup_dispatch_env(dir.path(), "pi", &program);
+        for origin in [LaunchOrigin::Cli, LaunchOrigin::Mcp] {
+            let fake = FakeDaemon::new(
+                dispatch_node_get(serde_json::json!([])),
+                dispatch_run_get("pending"),
+                "run-new",
+            );
+            let rpc = |method: &str, params: serde_json::Value| fake.rpc(method, params);
+            let plan = dispatch_daemon_side(
+                &rpc,
+                &runtime,
+                "h_test",
+                LaunchTarget::Node("t1"),
+                origin,
+                "pi",
+                false,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("派发应成功");
+            assert!(
+                !fake.method_names().iter().any(|m| m == "node/execute"),
+                "{origin:?}"
+            );
+            assert_eq!(plan.agent.execs[0].launched_by, Some(origin));
+        }
+    }
+
+    /// Q-9：Run 目标直接用已有 run——不收集成员、不 create、不写 binding；
+    /// pending 则 start。
+    #[test]
+    fn dispatch_run_target_reuses_given_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = write_script(dir.path(), "run-target", "exit 0");
+        let (runtime, _home_path) = setup_dispatch_env(dir.path(), "pi", &program);
+        let fake = FakeDaemon::new(
+            dispatch_node_get(serde_json::json!([])),
+            dispatch_run_get("pending"),
+            "run-should-not-be-created",
+        );
+        let rpc = |method: &str, params: serde_json::Value| fake.rpc(method, params);
+        let plan = dispatch_daemon_side(
+            &rpc,
+            &runtime,
+            "h_test",
+            LaunchTarget::Run("RUN-0042"),
+            LaunchOrigin::Mcp,
+            "pi",
+            false,
+            None,
+            None,
+            None,
+            Some("agent-master"),
+        )
+        .expect("Run 目标派发应成功");
+        assert_eq!(plan.run_id, "RUN-0042");
+        assert!(
+            !plan.run_was_newly_created,
+            "给定的 run 绝不能被补偿 cancel"
+        );
+        let names = fake.method_names();
+        assert!(
+            !names
+                .iter()
+                .any(|m| m == "node/get" || m == "run/create" || m == "node/execute"),
+            "{names:?}"
+        );
+        assert!(
+            names.iter().any(|m| m == "run/control"),
+            "pending run 需要 start: {names:?}"
+        );
+        assert_eq!(plan.agent.execs[0].node_id, None);
+        assert_eq!(plan.agent.parent_agent_id.as_deref(), Some("agent-master"));
+        assert!(plan.prompt.contains("RUN-0042"));
+    }
+
+    /// Q-9：Run 目标在 paused / interrupted / 终态时拒绝，且不 cancel 它。
+    #[test]
+    fn dispatch_run_target_rejects_non_startable_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = write_script(dir.path(), "run-bad", "exit 0");
+        let (runtime, _home_path) = setup_dispatch_env(dir.path(), "pi", &program);
+        for status in ["paused", "completed", "canceled"] {
+            let fake = FakeDaemon::new(
+                dispatch_node_get(serde_json::json!([])),
+                dispatch_run_get(status),
+                "unused",
+            );
+            let rpc = |method: &str, params: serde_json::Value| fake.rpc(method, params);
+            let err = dispatch_daemon_side(
+                &rpc,
+                &runtime,
+                "h_test",
+                LaunchTarget::Run("RUN-0042"),
+                LaunchOrigin::Cli,
+                "pi",
+                false,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect_err(status);
+            assert!(err.contains(status), "{err}");
+            assert!(
+                fake.cancel_params().is_empty(),
+                "{status}: 不得 cancel 调用方给定的 run"
+            );
+        }
     }
 
     /// 反例：新建 run（无活动 run）与复用 run 中本节点 item 已不在 pending
@@ -3573,7 +3813,17 @@ mod tests {
             );
             let rpc = |method: &str, params: serde_json::Value| fake.rpc(method, params);
             dispatch_daemon_side(
-                &rpc, &runtime, "h_test", "t1", "pi", false, None, None, None,
+                &rpc,
+                &runtime,
+                "h_test",
+                LaunchTarget::Node("t1"),
+                LaunchOrigin::Desktop,
+                "pi",
+                false,
+                None,
+                None,
+                None,
+                None,
             )
             .expect("派发应成功");
             assert!(
@@ -3601,7 +3851,17 @@ mod tests {
         let rpc = |method: &str, params: serde_json::Value| fake.rpc(method, params);
 
         let plan = dispatch_daemon_side(
-            &rpc, &runtime, "h_test", "t1", "opencode", false, None, None, None,
+            &rpc,
+            &runtime,
+            "h_test",
+            LaunchTarget::Node("t1"),
+            LaunchOrigin::Desktop,
+            "opencode",
+            false,
+            None,
+            None,
+            None,
+            None,
         )
         .expect("daemon 侧步骤应成功");
 
@@ -3830,6 +4090,8 @@ mod tests {
                 binary_path: None,
                 binary_args: vec![],
                 model: None,
+                launched_by: None,
+                parent_agent_id: None,
             },
         )
         .unwrap();
@@ -3848,6 +4110,8 @@ mod tests {
                 binary_path: None,
                 binary_args: vec![],
                 model: None,
+                launched_by: None,
+                parent_agent_id: None,
             },
         )
         .unwrap();
@@ -3949,6 +4213,8 @@ mod tests {
                 binary_path: None,
                 binary_args: vec![],
                 model: None,
+                launched_by: None,
+                parent_agent_id: None,
             },
         )
         .unwrap();
@@ -3990,6 +4256,8 @@ mod tests {
                 binary_path: None,
                 binary_args: vec![],
                 model: None,
+                launched_by: None,
+                parent_agent_id: None,
             },
         )
         .unwrap();
@@ -4059,6 +4327,8 @@ mod tests {
                 binary_path: None,
                 binary_args: vec![],
                 model: None,
+                launched_by: None,
+                parent_agent_id: None,
             },
         )
         .unwrap();
@@ -4137,6 +4407,8 @@ mod tests {
                 binary_path: None,
                 binary_args: vec![],
                 model: None,
+                launched_by: None,
+                parent_agent_id: None,
             },
         )
         .unwrap();
@@ -4197,6 +4469,8 @@ mod tests {
                 binary_path: None,
                 binary_args: vec![],
                 model: None,
+                launched_by: None,
+                parent_agent_id: None,
             },
         )
         .unwrap();
@@ -4231,6 +4505,8 @@ mod tests {
                 binary_path: None,
                 binary_args: vec![],
                 model: None,
+                launched_by: None,
+                parent_agent_id: None,
             },
         )
         .unwrap();
@@ -4298,6 +4574,8 @@ mod tests {
                 binary_path: None,
                 binary_args: vec![],
                 model: None,
+                launched_by: None,
+                parent_agent_id: None,
             },
         )
         .unwrap();
@@ -4348,6 +4626,8 @@ mod tests {
                 binary_path: None,
                 binary_args: vec![],
                 model: None,
+                launched_by: None,
+                parent_agent_id: None,
             },
         )
         .unwrap();
@@ -4385,6 +4665,8 @@ mod tests {
                 binary_path: None,
                 binary_args: vec![],
                 model: None,
+                launched_by: None,
+                parent_agent_id: None,
             },
         )
         .unwrap();
@@ -4416,12 +4698,14 @@ mod tests {
             &rpc,
             &runtime,
             "h_test",
-            "t1",
+            LaunchTarget::Node("t1"),
+            LaunchOrigin::Desktop,
             "opencode",
             false,
             None,
             None,
             Some(&agent.id),
+            None,
         )
         .unwrap_err();
         assert!(err.contains("仍在运行"), "{err}");
@@ -4438,12 +4722,14 @@ mod tests {
             &rpc,
             &runtime,
             "h_test",
-            "t1",
+            LaunchTarget::Node("t1"),
+            LaunchOrigin::Desktop,
             "opencode",
             false,
             None,
             None,
             Some(&agent.id),
+            None,
         )
         .expect("定向派发应成功");
         assert_eq!(plan.agent.id, agent.id, "不新建 agent");
@@ -4471,6 +4757,8 @@ mod tests {
                 binary_path: None,
                 binary_args: vec![],
                 model: None,
+                launched_by: None,
+                parent_agent_id: None,
             },
         )
         .unwrap();
@@ -4495,12 +4783,14 @@ mod tests {
             &rpc,
             &runtime,
             "h_test",
-            "t1",
+            LaunchTarget::Node("t1"),
+            LaunchOrigin::Desktop,
             "opencode",
             false,
             None,
             None,
             Some(&agent.id),
+            None,
         )
         .unwrap_err();
         assert!(err.contains("不受控"), "{err}");
@@ -4539,6 +4829,8 @@ mod tests {
                 binary_path: None,
                 binary_args: vec![],
                 model: None,
+                launched_by: None,
+                parent_agent_id: None,
             },
         )
         .unwrap();

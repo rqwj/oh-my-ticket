@@ -26,14 +26,19 @@ pub struct LaunchRequest<'a> {
     /// `omt` 二进制：既是 shim，也是注入给 harness 的 MCP 桥
     pub omt_bin: &'a Path,
     pub home_id: &'a str,
-    /// `.omt` 目录
+    /// `.omt` 目录（Q-3：CLI/MCP 发起时取自 daemon 的 homeId→path 映射）
     pub home_path: &'a Path,
-    pub node_id: &'a str,
+    /// Q-9：派发目标（取代原 node_id）
+    pub target: crate::executor::LaunchTarget<'a>,
+    /// Q-2 / Q-4：发起方；非 Desktop 时跳过 node/execute 并受 policy 约束（A3）
+    pub origin: crate::policy::LaunchOrigin,
     pub harness: &'a str,
     pub unattended: bool,
     pub model: Option<&'a str>,
     pub resume_session: Option<&'a str>,
     pub target_agent_id: Option<&'a str>,
+    /// Q-7：父 agent（仅新建 agent 时写入）
+    pub parent_agent_id: Option<&'a str>,
     pub max_duration: Duration,
 }
 
@@ -62,12 +67,14 @@ pub fn start(rpc: DaemonRpc<'_>, req: &LaunchRequest<'_>) -> Result<ExecStartOut
         rpc,
         runtime_dir,
         home_id,
-        req.node_id,
+        req.target,
+        req.origin,
         req.harness,
         req.unattended,
         req.model,
         req.resume_session,
         req.target_agent_id,
+        req.parent_agent_id,
     )?;
     // ⑤ 之后失败的补偿序列（补偿表：failure_detail 落档 + Agent 转 Failed +
     // 仅 cancel 本次新建 run）——⑦⑧ 两个失败点共用。
@@ -92,7 +99,7 @@ pub fn start(rpc: DaemonRpc<'_>, req: &LaunchRequest<'_>) -> Result<ExecStartOut
         agent_id: plan.agent.id.clone(),
         exec_id: plan.exec_id.clone(),
         harness: req.harness.to_string(),
-        node_id: Some(req.node_id.to_string()),
+        node_id: req.target.node_id().map(str::to_string),
         run_id: Some(plan.run_id.clone()),
         unattended: req.unattended,
         model: req.model.map(str::to_string),
@@ -316,6 +323,8 @@ mod tests {
                 binary_path: None,
                 binary_args: vec![],
                 model: None,
+                launched_by: None,
+                parent_agent_id: None,
             },
         )
         .unwrap()

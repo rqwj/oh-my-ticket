@@ -81,12 +81,14 @@ fn request<'a>(
         omt_bin,
         home_id: "h_test",
         home_path,
-        node_id: "TICKET-0001",
+        target: omt_exec::executor::LaunchTarget::Node("TICKET-0001"),
+        origin: omt_exec::policy::LaunchOrigin::Desktop,
         harness: "opencode",
         unattended: true,
         model: None,
         resume_session: None,
         target_agent_id: None,
+        parent_agent_id: None,
         max_duration: Duration::from_secs(60),
     }
 }

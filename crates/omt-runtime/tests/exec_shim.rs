@@ -58,6 +58,8 @@ fn rig_at(tmp: tempfile::TempDir, home_id: &str, harness_body: &str) -> Rig {
             binary_path: None,
             binary_args: vec![],
             model: None,
+            launched_by: None,
+            parent_agent_id: None,
         },
     )
     .unwrap();

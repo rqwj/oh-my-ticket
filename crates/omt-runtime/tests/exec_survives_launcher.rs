@@ -43,6 +43,8 @@ fn exec_completes_after_launcher_is_killed() {
             binary_path: None,
             binary_args: vec![],
             model: None,
+            launched_by: None,
+            parent_agent_id: None,
         },
     )
     .unwrap();
