@@ -257,7 +257,7 @@ desktop agents dispatch 已全量落地（PR #9），但 harness 的拉起、执
 | # | 子项目 | 验收 |
 |---|---|---|
 | 1 | **执行面下沉**：两个 crate、shim、存储拆分与迁移、前置修复、桌面端改走 crate | 桌面端功能不变（§3.4 验收门）；关闭桌面端后执行继续。**已完成（2026-10-21，实现序列 d6d07cd 起，自动化验证与待手工验收清单见 findings log「执行面子项目 1 验收」）** |
-| 2 | **CLI / MCP 本地工具族 + policy** | 主控经 MCP 查询 harness / 模型并派发一次 pi 冒烟，桌面端可见 |
+| 2 | **CLI / MCP 本地工具族 + policy** | 主控经 MCP 查询 harness / 模型并派发一次 pi 冒烟，桌面端可见。**已完成（2026-10-23，实现序列 ddb8ce3 起，自动化验证与待手工验收清单见 findings log「执行面子项目 2 验收」）** |
 | 3 | **主控附着（方案 B）** | Claude Code 会话出现在 Agents 面板，其派发的 exec 挂在其下 |
 | 4 | **编排文件与可视化** | 主控写入的编排在桌面端可视化，exec 与角色关联 |
 | 5 | **主控由 omt 拉起（方案 A）** | **暂缓**（§3.8） |
@@ -266,7 +266,7 @@ desktop agents dispatch 已全量落地（PR #9），但 harness 的拉起、执
 
 - **resume 后的 usage 语义**：pi / omp 续跑时 usage 是从零计还是延续 session 累计——决定 agent 级用量是「末值」还是「差分求和」（子项目 1）。**已实测（2026-10-22）**：pi、omp 均为逐消息计、续跑不延续累计，agent 级用量取各 exec 合计之和（数据见 findings log「执行面子项目 1 验收」§8 实测结果）。
 - **Claude Code resume 与 session id**：`claude --resume` 沿用原 session 文件还是新开 session id（子项目 3）。
-- **`run/claim` 是否置 node in_progress**：决定 CLI / MCP 派发能否完全绕开 `node/execute`（子项目 2）。
+- **`run/claim` 是否置 node in_progress**：决定 CLI / MCP 派发能否完全绕开 `node/execute`（子项目 2）。**已实测（2026-10-23）**：只激活祖先、不改节点本身；按 Q-2 接受现状。
 - **hook 进程祖先链**：hook 经 shell 执行，确认最近公共祖先稳定命中 Claude 进程（子项目 3）。
 
 ## 9. 与评测设计的关系

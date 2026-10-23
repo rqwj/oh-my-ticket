@@ -161,10 +161,69 @@ doctor  <home-path>     # local writer cohorts: ts-bridge live/stale markers,
                         # orphan recovery dirs, too-new schema; never steals
 ```
 
+Local tool verbs (exec-plane sub-project 2) need no daemon round-trip for
+reads; launches obey `<runtime-dir>/exec/policy.json` (next section):
+
+```
+harness list
+harness models <harness>
+exec start  --harness H (--node ID | --run ID) [--model M] [--agent AGENT_ID]
+            [--parent AGENT_ID] [--max-duration SECS]   (home: global --home PATH|ID)
+exec stop   <execId>
+exec status <execId>
+exec list   [--all-homes]
+exec tail   <execId> [--since SEQ] [--limit N]
+exec policy
+```
+
+CLI/MCP dispatch never calls `node/execute`: ticket state stays as-is during
+execution and the run path (`run/claim` → `run/report`) settles the final
+state. `harness list` on this path prints env KEY NAMES only (`envKeys`) and
+sanitized `extraArgs` — never env values.
+
 Contract: human summary on stdout (pretty JSON; `--json` for compact),
 Problem code/details on stderr, exit codes `0` ok · `2` usage · `3` problem
 · `130` canceled. Ctrl-C aborts the in-flight call (socket shutdown breaks
 the blocked read) and exits 130.
+
+## Dispatch policy (`exec/policy.json`, sub-project 2)
+
+Reads work without a daemon; `exec start` from the CLI or MCP is gated by
+`<runtime-dir>/exec/policy.json` (the desktop settings page "派发策略" edits
+the same file):
+
+- **File & defaults**: absent file = defaults
+  (`allowFromCli: true`, `allowFromMcp: false`,
+  `harnesses: ["pi","omp","opencode"]`, `workspaces: "homeWorkspaceOnly"`,
+  `maxConcurrent: 4`, `maxDurationSec: 1800`, `approvalMode: "inherit"`).
+  A present-but-unparsable file or unknown fields FAIL CLOSED: every CLI/MCP
+  dispatch is refused with `POLICY_INVALID`. A caller's `maxDurationSec` can
+  only tighten (min(request, policy)); harnesses outside the allowlist are
+  refused. Desktop-originated dispatches are NOT policy-gated (they still
+  count toward `maxConcurrent`).
+- **Stop is never policy-gated**: `exec stop` ignores `allowFrom*` and file
+  validity — refusing to start is the safe direction, refusing to stop a
+  runaway execution is not.
+- **CLI/MCP dispatch is ALWAYS unattended**: the harness descriptor's
+  unattended flags are appended automatically (pi `--auto`, omp
+  `--approval-mode=yolo`, …) — equivalent to a desktop dispatch but WITHOUT
+  the desktop confirmation dialog. `approvalMode: "inherit"` means "the
+  dispatcher cannot change it", not a harness-level switch (none exists).
+- **Disabling MCP alone stops no principal with a shell**: "allow via CLI"
+  covers ANY agent that can run a shell command (e.g. Claude Code's Bash) —
+  turning off `allowFromMcp` does not stop such masters; tighten
+  `allowFromCli` as well.
+- **Workspace homes only**: CLI/MCP dispatch accepts only a workspace `.omt`
+  home; a global home (handshake `kind: "global"`) or a workspace root equal
+  to the user's home dir is refused (`POLICY_DENIED`, field `workspaces`).
+- **Dispatched agents cannot dispatch or stop**: the shim injects the
+  reserved env var `OMT_EXEC_ID=<execId>`; in a process carrying it,
+  `exec start` / `exec stop` are refused (field `nestedDispatch`) and the
+  `omt mcp` injection bridge exposes no local tools.
+- **Threat model**: the policy gates agents acting THROUGH omt's own tool
+  surface (CLI/MCP) — defense in depth, NOT a security boundary between
+  processes of the same user (they can clear the env var or rewrite
+  `policy.json` / `admin-grants.json` in the runtime dir directly).
 
 ## Deviations (deliberate, revisited by later units)
 

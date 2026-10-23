@@ -1878,3 +1878,32 @@ F-BENCH-13 查证结论：4e960a2 提交说明声称的探针/capture/lib 改动
 **凡 mock 对端（daemon 响应形状 / MCP 测试客户端 / 任何协议测试替身），必须从规范或真实对端反推，不得从自己的实现反推**——本日志同类问题三次：F-ACC-1/4（字段名 mock 漂移）、F-ACC-9（分帧协议漂移）。真实对端接入（本地验收）是唯一能稳定暴露这类自洽错误的手段，应尽早纳入每个 provider 的 U 单元出口。
 
 **凡 mock daemon 响应形状，必须从 `views.rs` 序列化反推，不得从实现代码的读取端反推**——读取端错则 mock 跟着错，测试形同虚设。两个新契约测试把形状钉死在测试体里，后续字段变更会先红在这里。
+
+### 执行面子项目 2 验收（2026-10-23）
+
+实现序列 `ddb8ce3` 起（A1–A8 已提交；A9 本轮）。设计 §7 子项目 2 行已标「已完成」；§8 `run/claim` 一条已按实测结论改写（只激活祖先、不改节点本身，按 Q-2 接受现状）。
+
+**自动化验证（已全绿）**：`cargo test --workspace` 432 passed / 0 failed（较子项目 2 前基线 431 +1，即 A9 新增 `cli_exec_start_launches_tails_and_records_origin`——真 daemon + 假 harness 的 CLI 派发全链路：`exec start` 返回 `{agentId, execId, runId}` → `exec tail` 分页追到 `exit`、`done: true` → `exec status` 记录 `launchedBy: "cli"` → 节点未被 `node/execute` 改态、保持 `open`）；clippy `-D warnings`、fmt 干净；`nm -a target/debug/omt-daemon | grep -c -E 'omt_exec|omt_harness'` = 0（KD-E9）；桌面 vitest 167 passed（含 A8 新增 exec-policy.spec.tsx）+ `tsc --noEmit` 干净；根 vitest 447 passed。`local_tools_cli.rs` 共 5 例，另覆盖：无 daemon 的只读动词（`harness list` / `exec policy` 显示 `source: default`）、`allowFromCli: false` → exit 3 + `POLICY_DENIED`（field `allowFromCli`）、嵌套标记 `OMT_EXEC_ID` 拒 start/stop（field `nestedDispatch`，只读动词不受影响）、`exec list` 空态与 `exec status` 未知 id 的 `NOT_FOUND`。
+
+**验收环境与 CLI 复合链实测（`~/omt-accept/`，`/tmp` 之外——见子项目 1 验收环境注记）**：假 pi（Manual 脚本）+ 真 daemon。复合链全绿：`daemon-start`/`daemon-status` → `harness list`（pi enabled，`envKeys: []`、`extraArgs` 已脱敏）→ `harness models pi`（假二进制列不出模型，空表为预期）→ `create` epic→story→ticket → `exec start --harness pi --node TICKET-0001` 立即返回 `{agentId, execId, runId, warnings: []}` → `exec tail` 事件 `session_start / raw / exit`、`done: true` → `exec status` `launchedBy: "cli"`、agent `exited`、`exitCode 0` → `exec list --all-homes` 一条、`launchedBy: "cli"` → `show` 节点保持 `open`（Q-2）。策略反例：写 `{"allowFromCli": false}` 后 `exec start` → exit 3、`POLICY_DENIED`（field `allowFromCli`）；已还原默认并 `daemon-stop`。
+
+**待手工验收矩阵（plan A9 Step 4；验收环境 `~/omt-accept/`）**：
+
+| # | 场景 | 期望 | 结果 |
+|---|---|---|---|
+| 1 | 设置页「派发策略」：默认显示 MCP 关闭；打开并保存 | `exec/policy.json` 写出；`omt exec policy` 显示 `source: file`、`allowFromMcp: true` | 待验收 |
+| 2 | 主控（Claude Code 配置 `omt mcp`）调用 `harness__list`、`harness__models pi` | 返回已启用 harness 与 pi 的模型列表 | 待验收 |
+| 3 | 主控 `exec__start {homeId, harness: "pi", model: "kimi-coding/k3", nodeId: <快速 ticket>}`（ticket 在 workspace 内的 `.omt` 里） | 立即返回 `{agentId, execId, runId}`；**5 秒内**桌面端 Agents 面板出现新 agent，带 `MCP` 标签；选中它后实时 transcript 可见；跑完 run completed | 待验收 |
+| 4 | 主控 `exec__tail` 循环直到 `done` | 能拿到完整事件，末尾是 exit | 待验收 |
+| 5 | 设置页关闭 MCP 派发后，主控再 `exec__start`（不重启 MCP 会话）；再在设置页重新开启并再调一次 | 关闭时 `POLICY_DENIED`（field `allowFromMcp`）、`exec__start` 仍在 tools/list 中；重新开启后无需重启会话即可派发成功 | 待验收 |
+| 6 | 被派发的 harness 自己的 MCP 工具列表 | 不含任何 `harness__*` / `exec__*` | 待验收 |
+| 7 | `maxConcurrent: 1` 时连续两次 `omt exec start` | 第二次 `POLICY_DENIED`（field `maxConcurrent`） | 待验收 |
+| 8 | `omt exec stop <execId>` | 3 秒内 `killed`，item 回 pending | 待验收 |
+| 9 | 桌面端派发（任一 harness） | 与子项目 1 完全一致，不受 policy 影响 | 待验收 |
+| 10 | 故意写坏 `exec/policy.json` | 设置页显示「策略文件无效」并预填默认值；CLI/MCP 派发 `POLICY_INVALID`；`omt exec stop` 仍可用；桌面端派发不受影响 | 待验收 |
+| 11 | 被派发的 harness 在自己的 shell 里执行 `omt exec start …` 与 `omt exec stop …`（可让测试 ticket 要求它这样做） | 均 `POLICY_DENIED`（field `nestedDispatch`）；它的 MCP 工具列表里没有任何 `harness__*` / `exec__*` | 待验收 |
+| 12 | 设置页关闭 CLI 派发后，在终端执行 `omt exec start --harness pi --node <ticket>` | `POLICY_DENIED`（field `allowFromCli`）——同时证明关 MCP 不等于关掉 agent 经 shell 的派发 | 待验收 |
+| 13 | 对全局 home（`~/.omt`）里的 ticket 执行 `omt --home ~/.omt exec start …` | `POLICY_DENIED`（field `workspaces`），没有在用户主目录下拉起 harness | 待验收 |
+| 14 | 主控 `harness__list` | 返回的条目只有 `envKeys`（键名），看不到任何 env 值；`extraArgs` 已脱敏 | 待验收 |
+
+**自动化旁证**（不替代手工验收）：第 4 项的分页 tail 与 exit 收尾 = A9 e2e（CLI 路径）+ A4 `transcript_page` 单测；第 7 项 = A3 `check_capacity` 单测与跨进程锁测试；第 11 项 = `nested_dispatch_marker_denies_start_and_stop`（CLI）+ A6 mcp_spec 的注入桥不暴露断言；第 12 项 = `exec_start_denied_by_policy_exits_3_with_structured_problem` 与 `~/omt-accept/` 实测；第 13 项 = A4 `workspace_scope_denial` 单测（Q-13）；第 14 项 = A4 `list_value` 投影单测 + `~/omt-accept/` 实测输出。第 3/5 项的「tools/list 始终列出 8 个本地工具」由 A7 契约测试与 A6 mcp_spec 钉住。
