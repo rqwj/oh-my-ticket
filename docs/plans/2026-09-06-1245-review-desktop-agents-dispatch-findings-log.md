@@ -31,7 +31,7 @@ branch: feat/desktop-agents-dispatch
 | P3-ACC-4 | P3 | gated_auto | 执行面/验收 | `executor.rs::dispatch_daemon_side` ① | 已完成 ticket 续跑报「无未完成可执行成员」，不说明原因 | fixed(ed500ff) | — |
 | P3-ACC-5 | P3 | gated_auto | 执行面/验收 | `executor.rs::spawn_inner` / `agents.rs::mark_exec_spawned` | agent 状态从不进入 running | fixed(ed500ff) | — |
 | P3-ACC-6 | P3 | gated_auto | 桌面/验收 | `lib.rs` 退出 / 关窗确认框 | Esc 无效（rfd 无父窗口走 CFUserNotification，不绑 Esc） | fixed(a4f51e0)：macOS 直调 NSAlert、「取消」绑 Esc；Esc 手工验收见第 13 项 | — |
-| P3-ACC-7 | P3 | gated_auto | 工具链/验收 | `apps/desktop/scripts/copy-sidecar.mjs` | `copyFileSync` 带 provenance，tauri-build EPERM | fixed(<B8>)：字节流复制 + 临时名 rename | — |
+| P3-ACC-7 | P3 | gated_auto | 工具链/验收 | `apps/desktop/scripts/copy-sidecar.mjs` | `copyFileSync` 带 provenance，tauri-build EPERM | fixed(b7a514e)：字节流复制 + 临时名 rename | — |
 | P3-ACC-8 | P3 | gated_auto | 执行面/验收 | `executor.rs::release_items_for_exec` | 对已取消 run 释放 → retry CONFLICT，日志误报失败 | fixed(e3d770b) | — |
 | F-ACC-12 | P2 | gated_auto | 执行面/验收 | `executor.rs::dispatch_daemon_side` ② | 停止后重新派发同一 ticket，item 被桌面端身份激活后卡死 | fixed(5ce2750) | — |
 | F-EXEC-17 | P2 | gated_auto | 执行面/桌面 | `follow.rs` / `control.rs::settle_lost_exec` | app 运行期间 shim 崩溃不可见，租约持有到下次启动 | fixed(b2f8aca) | — |
@@ -71,11 +71,11 @@ branch: feat/desktop-agents-dispatch
 | F-BENCH-5 | P1 | manual | BENCH | `harness_probe.rs` / `harness-capture.rs` | 探针硬编码 binary 路径与 model_list_args，测的是自己的 registry 副本（违反 R-1，F-PI-2 类漂移测不出）（§27） | fixed(3192d60) | — |
 | F-BENCH-6 | P2 | gated_auto | BENCH | `harness-capture.rs` | omp `--version` 为 `omp/18.12.2` → 落到 `omp/omp/18.12.2/` | fixed(3192d60) | — |
 | F-BENCH-7 | P2 | gated_auto | BENCH | `harness-capture.rs` | 重跑 capture 覆盖手写 meta.json 出处 | fixed(3192d60)（三家 meta 出处已补回） | — |
-| F-BENCH-8 | P2 | gated_auto | BENCH | `fixtures_are_normalized` / `normalize` | 归一测试不含 omp 卷与 help/models；raw 内嵌时间戳未归一；未过 sanitize_line | fixed(2b8e036 + <B8>)：capture 先 sanitize_text 再归一 | — |
+| F-BENCH-8 | P2 | gated_auto | BENCH | `fixtures_are_normalized` / `normalize` | 归一测试不含 omp 卷与 help/models；raw 内嵌时间戳未归一；未过 sanitize_line | fixed(2b8e036 + b7a514e)：capture 先 sanitize_text 再归一 | — |
 | F-BENCH-9 | P2 | gated_auto | BENCH | `bench.rs` opencode 测试 | 注释过时（实为 3 次）且未断言 tool_calls==3 | fixed(4e960a2) | — |
 | F-BENCH-10 | P3 | gated_auto | BENCH | 探针 / capture | 裸 `.output()` 无超时（F1 教训） | fixed(3192d60)（余项见 F-BENCH-21） | — |
 | F-BENCH-11 | P3 | advisory | BENCH | omp 卷 | 无 usage 事件 → omp tokens/cost 恒 None | superseded(F-BENCH-14)（end 族提取已补，但取末值的口径本身是错的） | — |
-| F-BENCH-12 | P3 | advisory | BENCH | 注释 / §26 | 「MCP 握手」未实现、adapter-lines 文件名不符、「上两级」应为三级 | fixed：bench.rs「上两级」在 Task 1 搬迁后已与 ../../fixtures 一致；probe 模块注释已不提 MCP 握手（<B8> 核实） | — |
+| F-BENCH-12 | P3 | advisory | BENCH | 注释 / §26 | 「MCP 握手」未实现、adapter-lines 文件名不符、「上两级」应为三级 | fixed：bench.rs「上两级」在 Task 1 搬迁后已与 ../../fixtures 一致；probe 模块注释已不提 MCP 握手（b7a514e 核实） | — |
 | F-U3-15 | P1 | manual | U3 | `mcp_injection.rs::prepare_omp_with` :279→:283 | **merge 先于 state.json 写入**：二者之间崩溃 → 首个 exec 无 `workspace` 记录，sweep 跳过该目录且删光 launcher → 用户文件留悬空 `omt`；下次 prepare 把污染后的文件当"原件"备份，永远恢复不干净（556c1d2 引入，§8 漏检） | fixed(d53b191) | — |
 | F-U3-16 | P1 | manual | U3 | `mcp_injection.rs` :281/:304 | **writtenSha 每次 prepare 都重置基线**：两 exec 重叠期间用户改了文件 → 第二次 prepare 把改动吸进 S2 → 最后 release 比对 S2 相等 → 整体恢复到第一次 prepare 时的 backup，用户改动静默丢失（556c1d2 引入，§8 漏检） | fixed(d53b191) | — |
 | F-U3-11 | P2 | gated_auto | U3 | `mcp_injection.rs::finalize_release` :310/:323 | **b3500cb 回归**：user_modified 分支打印「备份保留于 …」后无条件 `remove_dir_all(state_dir)` 删掉 backup；外科手术 no-op（command 不匹配/文件不可解析）时用户文件仍被污染且唯一原件已毁 | fixed(d53b191) | — |
@@ -97,18 +97,18 @@ branch: feat/desktop-agents-dispatch
 | F-U2-17 | P2 | manual（设计） | U2 | `executor.rs:747` | 测试模块未拆分（1344 行，约 600 行测试） | open（设计项，人工排期） | — |
 | F-U2-18 | P3 | gated_auto | 本日志 :92 | F-U3-9 kill_all 半已随 12e4d91 完成，行与检查清单仍 open | fixed（F-U3-9 行翻转 fixed(12e4d91)，检查清单勾选） | — |
 | F-U2-6 | P3 | advisory | U2 | `executor.rs` 事件 | envelope 不统一：`session_start`/`exit` 无 `seq`/`ts`，与 design §5.3 `{seq, ts, execId, kind, payload}` 不符；U5 消费前统一 | open（U5 前） | — |
-| F-U2-7 | P3 | advisory | U2/U12 | 计划 §3.2 / design §5.6 | transcript `.jsonl`（header + 事件）写入未落地，仅 raw.log；U10 reconcile 依赖 header | fixed：spawn_inner 写 session_header + 事件 jsonl（F-U12-4 / KD-E3），<B8> 核实 | — |
+| F-U2-7 | P3 | advisory | U2/U12 | 计划 §3.2 / design §5.6 | transcript `.jsonl`（header + 事件）写入未落地，仅 raw.log；U10 reconcile 依赖 header | fixed：spawn_inner 写 session_header + 事件 jsonl（F-U12-4 / KD-E3），b7a514e 核实 | — |
 | F-U2-8 | P3 | gated_auto | U2 | `executor.rs::sanitize_line` / `session_start.args` | `to_lowercase()` 索引原串，非 ASCII 行偏移错位可能欠脱敏（改 `to_ascii_lowercase`）；`args` 事件/日志未脱敏（extra_args 可含 `--api-key`） | fixed(12e4d91)（sanitize_line 改 ascii lowercase；新增 sanitize_args 并用于 session_start 事件与会话记录） | — |
 | F-U2-9 | P3 | advisory | U2 | `agents::demote_live_agents` × dev 多实例 | `OMT_ALLOW_MULTI_INSTANCE` 下第二实例启动 demote 会把首实例的 Live agent 标 Failed；dev-notes 需补「同时隔离 `OMT_RUNTIME_DIR`」 | fixed(af28ca2)（dev-notes §1.4 已补 OMT_RUNTIME_DIR 隔离说明） | — |
 | F-U2-10 | P3 | gated_auto | U2 | `executor.rs::spawn` raw_log 路径 | `home_id` 未经 `validate_home_id` 即拼路径 | fixed(12e4d91)（spawn 入口复用 agents::validate_home_id（提为 pub(crate)）） | — |
 | F-U2-11 | P3 | advisory | U2 | `harness.rs::probe_descriptor` | 探针失败重试一次把 `harness_list` 最坏延迟翻倍（8s）；注释归因「fork→exec 卡死」需复现记录 | superseded（F-BENCH-25：根因已定性为 exec 评估停顿，probe_all 并行探测 + 梯子 2/6/6，e87a99a） | — |
-| F-U4a-1 | P2 | manual | U4a | `atomic_json::read_json_locked` / `agents::agents_list` | `parseFailed` 是**瞬态**信号（损坏文件被 rename 后第二次读即 false + 空列表），U9「解析失败期间冻结 GC」硬规则会失效并清空全部绑定 | fixed：parseFailed 粘性（has_unrecovered_corrupt + 旧版文件判定，F-EXEC-1），<B8> 核实 | — |
+| F-U4a-1 | P2 | manual | U4a | `atomic_json::read_json_locked` / `agents::agents_list` | `parseFailed` 是**瞬态**信号（损坏文件被 rename 后第二次读即 false + 空列表），U9「解析失败期间冻结 GC」硬规则会失效并清空全部绑定 | fixed：parseFailed 粘性（has_unrecovered_corrupt + 旧版文件判定，F-EXEC-1），b7a514e 核实 | — |
 | F-U4a-2 | P2 | gated_auto | U4a→U2 | `agents::register_agent` 写 `attachment: Live` | Live 持久化后跨重启失真：U10（P1）才 reconcile，P0 期间重启/崩溃后 `agents_list` 仍报 Live+Starting/Running | fixed(b8b00f8)（`demote_live_agents` + ExecutionManager::new 启动 demote + 测试） | — |
 | F-U4a-3 | P3 | gated_auto | U4a | `atomic_json::read_json` | 读路径的损坏 rename 不在 flock 内，与另一进程的写 rename 竞态可能把刚写好的文件挪成 `.corrupt` | fixed(cd2a0d4)：快路径 + 锁内复核（双侧测试：好内容不隔离、真损坏仍隔离），现位于 omt-harness | — |
 | F-U4a-4 | P3 | gated_auto | U4a | `atomic_json::write_tmp_and_rename` | rename 前无 `sync_all`，断电可能留下 0 字节文件 → 下次降级丢 agents 列表 | fixed(cd2a0d4)：tmp fsync + rename + 父目录 best-effort fsync | — |
 | F-U4a-5 | P3 | advisory | U4a | `atomic_json::STORE_LOCK` | 全局锁横跨所有 store 文件且持锁等 flock 最长 10s，未来 CLI 长持 agents 锁会连 harness config 保存一起阻塞 | resolved-by-design（按 agent 拆分后单文件即单 agent，b2057cc；跨进程由 companion flock 串行） | — |
 | F-U4a-6 | P3 | advisory | U4a | `agents::now_iso` / §3.2 | 函数名 iso 实为 epoch ms；transcript header `startedAt` 格式未定，U2 必须与 `execs[].startedAt` 同格式 | fixed(b8b00f8)（`now_epoch_ms` 改名；计划 §3.2 补「header 与 execs[] 同为 epoch ms 字符串」；header 本身尚未写入，见 F-U2-7） | — |
-| F-U4a-7 | P3 | advisory | U4a | `agents.rs` API | 无「向既有 Agent 追加 exec」入口；U11 续跑与 U6 add-members 需要 `append_exec` | fixed：agents::append_exec（U11），<B8> 核实 | — |
+| F-U4a-7 | P3 | advisory | U4a | `agents.rs` API | 无「向既有 Agent 追加 exec」入口；U11 续跑与 U6 add-members 需要 `append_exec` | fixed：agents::append_exec（U11），b7a514e 核实 | — |
 | F-U4a-8 | P3 | advisory | U4a | 计划 U4a Files | 列了 `bridge.ts` 但未动，`agents_list` 尚无 TS 封装 | fixed(b8b00f8)（计划记注：bridge.ts 移至 U5 Files） | — |
 | F-U1b-1 | P3 | advisory | U1b | 计划 U1b Files / 排期 | `store.ts` 的 `harness_list` 封装放在 U1b，但 U6 弹窗选择器先于 U1b 需要它——依赖倒置 | fixed(cf8a2c7)（封装移入 U6 Files，U1b 只留退役/迁移/接线） | — |
 | F-U1-8 | P3 | gated_auto | U1 | `harness.rs::upsert_config` | `CONFIG_LOCK` 一旦 poison，所有后续保存永久失败直至重启 | fixed(43bf89f)（写纪律收敛进 atomic_json，`STORE_LOCK` poison 容忍） | — |
@@ -139,7 +139,7 @@ branch: feat/desktop-agents-dispatch
 ## 待办的跨阶段事项（由 findings 派生）
 
 - [x] ~~U4a 落地时回看 F-U15-1~~ 已于 43bf89f 关闭（harness config + agents.json 两条已覆盖）。
-- [x] ~~U9 落地 bindings.json 时确认走 `atomic_json`（F-U15-1 的第三条写路径）；同时按 F-U4a-1 把 GC 冻结改为粘性判定~~ 已核（<B8>）：`write_binding` 走 `update_json`；粘性判定见 F-U4a-1。
+- [x] ~~U9 落地 bindings.json 时确认走 `atomic_json`（F-U15-1 的第三条写路径）；同时按 F-U4a-1 把 GC 冻结改为粘性判定~~ 已核（b7a514e）：`write_binding` 走 `update_json`；粘性判定见 F-U4a-1。
 - [x] ~~U2 开工时落地 F-U4a-2 与 F-U4a-6~~ 已于 b8b00f8 关闭。
 - [x] ~~U4 接线前修 F-U2-1（AppExit 落盘）与 F-U2-2（起动窗判据）~~ 已于 12e4d91 关闭。
 - [x] ~~计划定 transcript `.jsonl` header/事件写入的归属（F-U2-7），U10 之前必须存在~~ 已落地（F-U2-7 fixed）。
@@ -1919,7 +1919,7 @@ F-BENCH-13 查证结论：4e960a2 提交说明声称的探针/capture/lib 改动
 
 **自动化旁证**（不替代手工验收）：第 4 项的分页 tail 与 exit 收尾 = A9 e2e（CLI 路径）+ A4 `transcript_page` 单测；第 7 项 = A3 `check_capacity` 单测与跨进程锁测试；第 11 项 = `nested_dispatch_marker_denies_start_and_stop`（CLI）+ A6 mcp_spec 的注入桥不暴露断言；第 12 项 = `exec_start_denied_by_policy_exits_3_with_structured_problem` 与 `~/omt-accept/` 实测；第 13 项 = A4 `workspace_scope_denial` 单测（Q-13）；第 14 项 = A4 `list_value` 投影单测 + `~/omt-accept/` 实测输出。第 3/5 项的「tools/list 始终列出 8 个本地工具」由 A7 契约测试与 A6 mcp_spec 钉住。
 
-### §48. Part B · P3 清理（2026-10-23，0c1c29f..a4f51e0，B8 sha 待回填）
+### §48. Part B · P3 清理（2026-10-23，0c1c29f..b7a514e）
 
 按 Part B 分诊表落地：B1 daemon 缺 token 规则（P3-ACC-2）；B2 派发链与拉起（P3-ACC-4/5、§41 拉起前停止、§39 宽限期停止、§41 launcher 补偿分支测试、F-U1-7 版本探测回落 stderr）；B3 租约释放与对账（P3-ACC-8、§41 failed 残项、§39 快照回写、§39 对账器串行——进程内排队各跑一轮、跨进程跳过，§45/§47 假阴性按存活）；B4 daemon_link 与 shim（§39 陈旧 descriptor / daemon 僵尸 / 保活下限 / 授权泄漏，orphan 整组强杀 + 单事务）；B5 存储与安全（§39 tail 穿越与迁移中断回落、MCP 清扫锁内快照与 fsync，§41 删除四项 + 残留清扫）；B6 旧版 home 降级说明、损坏 agent 的解冻说明与两步「确认并归档」（§41）；B7 桌面 UI（P3-ACC-6 Esc、§47 应用级被放弃租约通知 + 前往 Runs 与总时限、删除时移除绑定、§39 前端三项、§39 清扫挪进 setup、§39 跟随者不提前放弃 / 每 exec 唯一）；B8 工具链与记账（P3-ACC-7、§41 测试环境变量、F-BENCH-8、F-BENCH-12 核实）。
 
