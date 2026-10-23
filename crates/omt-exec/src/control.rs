@@ -44,6 +44,27 @@ pub fn shim_alive(exec: &ExecRecord) -> bool {
     identity_alive(exec.shim_pid, exec.shim_start_id.as_deref())
 }
 
+/// §45/§47 double-release-false-negative：对账「是否跳过」用的保守判定——
+/// 宁可把死 shim 当活的（目标留到下一轮），也不把活 shim 当死的（双重
+/// 释放 + 陈旧快照的 admin report 误伤别的 exec 刚认领的 item）。与
+/// `shim_alive`（发信号前必须确知身份，未知 = 否）方向相反：
+/// - 无 shim_pid → 否；
+/// - 身份可读：匹配 → 是，不匹配 → 否（确已换人，pid 复用不算假阴性）；
+/// - start-id 缺失或 proc_pidinfo 读不出 → pid 仍存在即按「未知 → 存活」。
+pub fn shim_maybe_alive(exec: &ExecRecord) -> bool {
+    let Some(pid) = exec.shim_pid else {
+        return false;
+    };
+    let pid_alive = || omt_client::pid_live(i64::from(pid));
+    match exec.shim_start_id.as_deref() {
+        None => pid_alive(),
+        Some(expected) => match crate::executor::process_start_identity(pid) {
+            Ok(actual) => actual == expected,
+            Err(_) => pid_alive(),
+        },
+    }
+}
+
 fn is_active(agent: &AgentRecord) -> bool {
     matches!(
         agent.status,
@@ -218,42 +239,50 @@ fn stop_all_with(
 }
 
 /// 单个活跃 agent 的对账（P-8）。返回是否改成了终态。
+///
+/// §39 reconcile-snapshot-writeback：两个分支都是锁内 compare-and-write——
+/// `agent` 是调用方读到的快照，shim 可能在快照之后已落终态。存活分支只在
+/// 记录仍活跃时把 attachment 拉回 Live、绝不改 status（此前用快照的 status
+/// 回写，可能把 Exited 覆盖回 Running）；已死分支在锁内复核「仍活跃且最新
+/// exec 未变」后，才在同一事务里写 failure_detail + Failed + attachment。
 fn reconcile_agent(runtime_dir: &Path, home_id: &str, agent: &AgentRecord) -> bool {
     let Some(exec) = latest_exec(agent) else {
         return false;
     };
+    let exec_id = exec.exec_id.clone();
     if shim_alive(exec) {
-        let _ = agents::update_agent_status(
-            runtime_dir,
-            home_id,
-            &agent.id,
-            agent.status,
-            AgentAttachment::Live,
-        );
+        let _ = agents::update_agent(runtime_dir, home_id, &agent.id, |current| {
+            if !is_active(current) || current.attachment == AgentAttachment::Live {
+                return false;
+            }
+            current.attachment = AgentAttachment::Live;
+            true
+        });
         return false;
     }
     if within_launch_grace(exec) {
         return false;
     }
     let harness_alive = identity_alive(exec.pid, exec.process_start_id.as_deref());
-    let _ = agents::update_exec(runtime_dir, home_id, &agent.id, &exec.exec_id, |e| {
-        if e.failure_detail.is_none() {
-            e.failure_detail = Some(agents::SHIM_LOST_MARKER.to_string());
-        }
-    });
     let attachment = if harness_alive {
         AgentAttachment::Orphan
     } else {
         AgentAttachment::None
     };
-    let _ = agents::update_agent_status(
-        runtime_dir,
-        home_id,
-        &agent.id,
-        AgentRecordStatus::Failed,
-        attachment,
-    );
-    true
+    agents::update_agent(runtime_dir, home_id, &agent.id, |current| {
+        if !is_active(current) || current.last_exec_id.as_deref() != Some(exec_id.as_str()) {
+            return false;
+        }
+        if let Some(e) = current.execs.iter_mut().find(|e| e.exec_id == exec_id) {
+            if e.failure_detail.is_none() {
+                e.failure_detail = Some(agents::SHIM_LOST_MARKER.to_string());
+            }
+        }
+        current.status = AgentRecordStatus::Failed;
+        current.attachment = attachment;
+        true
+    })
+    .unwrap_or(false)
 }
 
 /// 启动对账：替代 demote。返回改为终态的 agent 数。
@@ -726,5 +755,96 @@ mod tests {
         assert_eq!(outcome.signaled_count, 0);
         assert_eq!(outcome.errors.len(), 1, "{outcome:?}");
         assert!(outcome.errors[0].contains("exec-fresh"), "{outcome:?}");
+    }
+
+    /// §39 reconcile-snapshot-writeback：shim 存活分支不得用过时快照回写
+    /// 状态——快照是 Running、磁盘上 shim 已落 Exited 时，对账后仍是 Exited。
+    #[test]
+    fn reconcile_alive_branch_does_not_write_back_a_stale_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = tmp.path();
+        let id = reg(rt, "exec-snap");
+        let me = std::process::id();
+        let start = crate::executor::process_start_identity(me).unwrap();
+        update_exec(rt, "h_t", &id, "exec-snap", |e| {
+            e.shim_pid = Some(me);
+            e.shim_start_id = Some(start.clone());
+        })
+        .unwrap();
+        crate::agents::update_agent_status(
+            rt,
+            "h_t",
+            &id,
+            AgentRecordStatus::Running,
+            crate::agents::AgentAttachment::Orphan,
+        )
+        .unwrap();
+        let snapshot = crate::agents::get_agent(rt, "h_t", &id).unwrap().unwrap();
+        // 快照之后 shim 收尾写了终态
+        crate::agents::update_agent_status(
+            rt,
+            "h_t",
+            &id,
+            AgentRecordStatus::Exited,
+            crate::agents::AgentAttachment::None,
+        )
+        .unwrap();
+        assert!(!reconcile_agent(rt, "h_t", &snapshot));
+        let now = crate::agents::get_agent(rt, "h_t", &id).unwrap().unwrap();
+        assert_eq!(
+            now.status,
+            AgentRecordStatus::Exited,
+            "不得被快照覆盖回 Running"
+        );
+        assert_eq!(now.attachment, crate::agents::AgentAttachment::None);
+    }
+
+    /// 同一问题的 shim 已死分支：快照活跃、磁盘已是终态（shim 写完终态后才
+    /// 退出）——锁内复核后不得改成 Failed + SHIM_LOST。
+    #[test]
+    fn reconcile_dead_branch_rechecks_status_under_the_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = tmp.path();
+        let id = reg(rt, "exec-done-late");
+        update_exec(rt, "h_t", &id, "exec-done-late", |e| {
+            e.shim_pid = Some(u32::MAX);
+            e.shim_start_id = Some("macos:0:0".into());
+        })
+        .unwrap();
+        backdate(rt, &id, "exec-done-late");
+        let snapshot = crate::agents::get_agent(rt, "h_t", &id).unwrap().unwrap();
+        crate::agents::update_agent_status(
+            rt,
+            "h_t",
+            &id,
+            AgentRecordStatus::Exited,
+            crate::agents::AgentAttachment::None,
+        )
+        .unwrap();
+        assert!(!reconcile_agent(rt, "h_t", &snapshot));
+        let now = crate::agents::get_agent(rt, "h_t", &id).unwrap().unwrap();
+        assert_eq!(now.status, AgentRecordStatus::Exited);
+        assert!(now.execs[0].failure_detail.is_none());
+    }
+
+    /// shim_maybe_alive 判定表：无 pid → 否；身份匹配 → 是；身份不匹配 →
+    /// 否；身份缺失但 pid 存在 → 是（未知按存活）；pid 已不存在 → 否。
+    #[test]
+    fn shim_maybe_alive_treats_unknown_identity_as_alive() {
+        let me = std::process::id();
+        let start = crate::executor::process_start_identity(me).unwrap();
+        let rec = |pid: Option<u32>, start: Option<&str>| ExecRecord {
+            shim_pid: pid,
+            shim_start_id: start.map(str::to_string),
+            ..Default::default()
+        };
+        assert!(!shim_maybe_alive(&rec(None, None)));
+        assert!(shim_maybe_alive(&rec(Some(me), Some(&start))));
+        assert!(!shim_maybe_alive(&rec(Some(me), Some("macos:0:0"))));
+        assert!(shim_maybe_alive(&rec(Some(me), None)));
+        let mut gone = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        let gone_pid = gone.id();
+        gone.wait().unwrap();
+        assert!(!shim_maybe_alive(&rec(Some(gone_pid), None)));
     }
 }

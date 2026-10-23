@@ -1573,6 +1573,50 @@ pub fn transcript_page(
     Ok(serde_json::json!({ "events": page, "nextSeq": next_seq, "done": done }))
 }
 
+/// §39 dual-startup-reconcilers：两条对账路径（shim 路径 / U10 会话路径）
+/// 在同一 desktop 进程里会并发（启动对账线程、首个会话建立后的 U10 线程、
+/// F-EXEC-17 的执行丢失收尾），dev 多实例时还会跨进程并发——同一目标被
+/// 两个对账器同时释放 = 双重释放。
+/// - 进程内：在 RECONCILE_IN_PROCESS 上排队（上限 60s），轮到后跑**自己的**
+///   一轮。每轮幂等——成功的目标已 mark_reconciled、不再是对账目标——排队
+///   既不会重复释放，也不会漏掉只有后到者处理得了的目标（无 spec 的旧
+///   记录只走 U10 路径）。
+/// - 跨进程：拿到进程内锁后再取 `<runtime>/exec/reconcile.lock` 的 flock，
+///   最多等 RECONCILE_CROSS_PROCESS_WAIT；仍被占用就跳过本轮（返回 0），
+///   目标留给下一次触发。进程内的竞争者已被互斥锁排开，这里的 flock 竞争
+///   只可能来自别的进程。
+static RECONCILE_IN_PROCESS: Mutex<()> = Mutex::new(());
+const RECONCILE_IN_PROCESS_WAIT: Duration = Duration::from_secs(60);
+const RECONCILE_CROSS_PROCESS_WAIT: Duration = Duration::from_secs(1);
+
+fn reconcile_single_flight(runtime_dir: &Path, pass: impl FnOnce() -> usize) -> usize {
+    let deadline = Instant::now() + RECONCILE_IN_PROCESS_WAIT;
+    let _in_process = loop {
+        match RECONCILE_IN_PROCESS.try_lock() {
+            Ok(guard) => break guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    eprintln!(
+                        "对账：等待本进程内另一轮对账超过 {}s，本轮跳过（目标留给下一次触发）",
+                        RECONCILE_IN_PROCESS_WAIT.as_secs()
+                    );
+                    return 0;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    };
+    let Ok(_cross_process) = omt_harness::atomic_json::lock_exclusive(
+        &runtime_dir.join("exec").join("reconcile"),
+        RECONCILE_CROSS_PROCESS_WAIT,
+    ) else {
+        eprintln!("对账：另一个进程正在对账，本轮跳过（目标留给下一次触发）");
+        return 0;
+    };
+    pass()
+}
+
 /// F-EXEC-14(3)：对账目标的 shim 身份仍存活 → 跳过且**不标记**——shim 自己
 /// 会收尾并释放租约（U10 对账与 shim 释放的竞态窗口里，desktop 此刻释放
 /// = 双重释放，陈旧快照的 admin report 可能误伤其他 exec 刚认领的 item）。
@@ -1582,7 +1626,9 @@ fn target_shim_alive(runtime_dir: &Path, t: &agents::ReconcileTarget) -> bool {
     agents::find_exec_in_home(runtime_dir, &t.home_id, &t.exec_id)
         .ok()
         .flatten()
-        .map(|(_, exec)| crate::control::shim_alive(&exec))
+        // §45/§47：身份未知（start-id 缺失 / proc_pidinfo 读不出）但 pid 仍在
+        // → 按存活跳过——宁可留到下一轮，也不双重释放
+        .map(|(_, exec)| crate::control::shim_maybe_alive(&exec))
         .unwrap_or(false)
 }
 
@@ -1597,28 +1643,30 @@ pub fn reconcile_interrupted_execs_with(
     rpc: &dyn Fn(&str, serde_json::Value) -> Result<serde_json::Value, String>,
     runtime_dir: &Path,
 ) -> usize {
-    let targets = match agents::list_reconcile_targets(runtime_dir) {
-        Ok(t) => t,
-        Err(_) => return 0,
-    };
-    let mut handled = 0usize;
-    for t in &targets {
-        // F-EXEC-14(3)：shim 仍存活的目标由 shim 自己收尾——跳过（不释放、
-        // 不标记），保持为下一轮的对账目标。
-        if target_shim_alive(runtime_dir, t) {
-            continue;
+    reconcile_single_flight(runtime_dir, || {
+        let targets = match agents::list_reconcile_targets(runtime_dir) {
+            Ok(t) => t,
+            Err(_) => return 0,
+        };
+        let mut handled = 0usize;
+        for t in &targets {
+            // F-EXEC-14(3)：shim 仍存活的目标由 shim 自己收尾——跳过（不释放、
+            // 不标记），保持为下一轮的对账目标。
+            if target_shim_alive(runtime_dir, t) {
+                continue;
+            }
+            if let Err(err) = release_items_for_exec(rpc, &t.home_id, &t.run_id, &t.exec_id) {
+                eprintln!(
+                    "对账：exec {} 租约释放失败（{err}），保留为对账目标",
+                    t.exec_id
+                );
+                continue;
+            }
+            mark_reconciled(runtime_dir, t);
+            handled += 1;
         }
-        if let Err(err) = release_items_for_exec(rpc, &t.home_id, &t.run_id, &t.exec_id) {
-            eprintln!(
-                "对账：exec {} 租约释放失败（{err}），保留为对账目标",
-                t.exec_id
-            );
-            continue;
-        }
-        mark_reconciled(runtime_dir, t);
-        handled += 1;
-    }
-    handled
+        handled
+    })
 }
 
 /// 租约已释放：置 reconciled、清待对账标记，并从 raw.log 回填 session id。
@@ -1679,36 +1727,39 @@ pub fn reconcile_with_connector(
     connector: &crate::daemon_link::Connector,
     runtime_dir: &Path,
 ) -> usize {
-    let Ok(targets) = agents::list_reconcile_targets(runtime_dir) else {
-        return 0;
-    };
-    let mut handled = 0usize;
-    for t in &targets {
-        // F-EXEC-14(3)：shim 仍存活的目标由 shim 自己收尾——跳过（不释放、
-        // 不标记），保持为下一轮的对账目标。
-        if target_shim_alive(runtime_dir, t) {
-            continue;
-        }
-        let Ok(dir) = crate::layout::agent_dir(runtime_dir, &t.home_id, &t.agent_id) else {
-            continue;
+    reconcile_single_flight(runtime_dir, || {
+        let Ok(targets) = agents::list_reconcile_targets(runtime_dir) else {
+            return 0;
         };
-        let spec_path = crate::layout::exec_file(&dir, &t.exec_id, crate::layout::ExecFile::Spec);
-        let Ok(spec) = crate::spec::LaunchSpec::read(&spec_path) else {
-            continue;
-        };
-        let outcome = connector(&spec.home_path, &t.home_id)
-            .and_then(|rpc| release_items_for_exec(&*rpc, &t.home_id, &t.run_id, &t.exec_id));
-        if let Err(err) = outcome {
-            eprintln!(
-                "对账：exec {} 经 shim 路径释放失败（{err}），保留为对账目标",
-                t.exec_id
-            );
-            continue;
+        let mut handled = 0usize;
+        for t in &targets {
+            // F-EXEC-14(3)：shim 仍存活的目标由 shim 自己收尾——跳过（不释放、
+            // 不标记），保持为下一轮的对账目标。
+            if target_shim_alive(runtime_dir, t) {
+                continue;
+            }
+            let Ok(dir) = crate::layout::agent_dir(runtime_dir, &t.home_id, &t.agent_id) else {
+                continue;
+            };
+            let spec_path =
+                crate::layout::exec_file(&dir, &t.exec_id, crate::layout::ExecFile::Spec);
+            let Ok(spec) = crate::spec::LaunchSpec::read(&spec_path) else {
+                continue;
+            };
+            let outcome = connector(&spec.home_path, &t.home_id)
+                .and_then(|rpc| release_items_for_exec(&*rpc, &t.home_id, &t.run_id, &t.exec_id));
+            if let Err(err) = outcome {
+                eprintln!(
+                    "对账：exec {} 经 shim 路径释放失败（{err}），保留为对账目标",
+                    t.exec_id
+                );
+                continue;
+            }
+            mark_reconciled(runtime_dir, t);
+            handled += 1;
         }
-        mark_reconciled(runtime_dir, t);
-        handled += 1;
-    }
-    handled
+        handled
+    })
 }
 
 /// F-EXEC-16 ① 尽力释放的结果：`released` = 成功释放并标记 reconciled 的
@@ -1786,6 +1837,13 @@ pub fn force_release_agent_leases(
     Ok(outcome)
 }
 
+/// 租约释放写进 item.lastError 的说明（run/report 的 note 原样落
+/// last_error）。`held_failed_by_release` 据此认出「本 exec 的上次释放已
+/// report failed、retry 未完成」的残项（§41）。
+fn release_note(exec_id: &str) -> String {
+    format!("exec {exec_id} terminated (kill/app-exit)")
+}
+
 /// run/get 挑出本 exec 仍持有的 running item 并逐个释放（admin report
 /// failed + retry 回 pending）。终态线程（shim 经 set_lease_release 注入的
 /// 租约释放）与启动对账（reconcile_interrupted_execs）共用。run/get 失败
@@ -1802,6 +1860,25 @@ pub fn release_items_for_exec(
         "run/get",
         serde_json::json!({"homeId": home_id, "runId": run_id}),
     )?;
+    // P3-ACC-8：run 已 canceled / completed——没有可释放的租约（canceled 上的
+    // retry 必然 CONFLICT），视为释放完成。completed_with_failures 不在此列：
+    // 它只能经逐项 retry 重开，下面的 failed 残项正需要 retry。
+    if matches!(
+        resp["run"]["status"].as_str(),
+        Some("canceled") | Some("completed")
+    ) {
+        return Ok(());
+    }
+    let note = release_note(exec_id);
+    let retry = |node_id: &str| {
+        rpc(
+            "run/control",
+            serde_json::json!({
+                "homeId": home_id, "runId": run_id,
+                "action": "retry", "nodeId": node_id,
+            }),
+        )
+    };
     let mut first_err: Option<String> = None;
     for node_id in held_running_nodes(&resp, exec_id) {
         // admin report failed（无 leaseToken，Administrator 授权路径）
@@ -1810,19 +1887,20 @@ pub fn release_items_for_exec(
             serde_json::json!({
                 "homeId": home_id, "runId": run_id, "nodeId": node_id,
                 "outcome": "failed",
-                "note": format!("exec {exec_id} terminated (kill/app-exit)"),
+                "note": note,
             }),
         ) {
             first_err.get_or_insert(e);
         }
         // retry 回 pending
-        if let Err(e) = rpc(
-            "run/control",
-            serde_json::json!({
-                "homeId": home_id, "runId": run_id,
-                "action": "retry", "nodeId": node_id,
-            }),
-        ) {
+        if let Err(e) = retry(&node_id) {
+            first_err.get_or_insert(e);
+        }
+    }
+    // §41：上一次释放 report 已成功、retry 超时 / 失败留下的 failed 残项——
+    // 只补 retry（此前对账只挑 running，残项永远停在 failed）
+    for node_id in held_failed_by_release(&resp, exec_id) {
+        if let Err(e) = retry(&node_id) {
             first_err.get_or_insert(e);
         }
     }
@@ -1846,6 +1924,29 @@ fn held_running_nodes(resp: &serde_json::Value, exec_id: &str) -> Vec<String> {
         })
         .filter_map(|item| item["nodeId"].as_str().map(str::to_owned))
         .collect()
+}
+
+/// §41：本 exec 的上一次释放留下的 failed 残项——actor 后缀匹配、state =
+/// failed、lastError 恰为释放说明（harness 自己报的 failed 不算）。
+fn held_failed_by_release(resp: &serde_json::Value, exec_id: &str) -> Vec<String> {
+    let suffix = format!("/exec:{exec_id}");
+    let note = release_note(exec_id);
+    resp["items"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| {
+                    item["executorActor"]
+                        .as_str()
+                        .is_some_and(|actor| actor.ends_with(&suffix))
+                        && item["state"].as_str() == Some("failed")
+                        && item["lastError"].as_str() == Some(note.as_str())
+                })
+                .filter_map(|item| item["nodeId"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -5164,6 +5265,262 @@ mod tests {
         assert_eq!(
             held_running_nodes(&resp, "exec-x"),
             vec!["node-1".to_string()]
+        );
+    }
+
+    /// 记账型 rpc 替身：run/get 返回给定响应，其余调用记 (method, action)。
+    #[allow(clippy::type_complexity)]
+    fn recording_release_rpc(
+        run_get: serde_json::Value,
+    ) -> (
+        Arc<Mutex<Vec<String>>>,
+        impl Fn(&str, serde_json::Value) -> Result<serde_json::Value, String>,
+    ) {
+        let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = calls.clone();
+        let rpc = move |method: &str, params: serde_json::Value| {
+            if method == "run/get" {
+                return Ok(run_get.clone());
+            }
+            let label = match params["action"].as_str() {
+                Some(action) => format!("{method}:{action}"),
+                None => method.to_string(),
+            };
+            seen.lock().unwrap().push(label);
+            Ok(serde_json::json!({}))
+        };
+        (calls, rpc)
+    }
+
+    /// P3-ACC-8：run 已 canceled / completed——没有可释放的租约，直接 Ok，
+    /// 不再 report + retry（retry 在 canceled run 上必然 CONFLICT，首条对账
+    /// 路径因此误记「释放失败，保留为对账目标」）。
+    #[test]
+    fn release_skips_terminal_runs() {
+        for status in ["canceled", "completed"] {
+            let (calls, rpc) = recording_release_rpc(serde_json::json!({
+                "run": { "runId": "RUN-1", "status": status },
+                "items": [{
+                    "nodeId": "node-1", "state": "running",
+                    "executorActor": "mcp:1/exec:exec-x",
+                }],
+            }));
+            release_items_for_exec(&rpc, "h_t", "RUN-1", "exec-x")
+                .unwrap_or_else(|e| panic!("{status}: {e}"));
+            assert!(
+                calls.lock().unwrap().is_empty(),
+                "{status}: {:?}",
+                calls.lock().unwrap()
+            );
+        }
+    }
+
+    /// §41 item-stuck-failed-after-retry-timeout：上次释放 report 成功、
+    /// retry 超时——item 停在 failed（lastError = 释放说明）。下一次释放只补
+    /// retry；harness 自己报的 failed（lastError 不同）不动。
+    /// completed_with_failures 仍会处理（它只能经逐项 retry 重开）。
+    #[test]
+    fn release_retries_items_failed_by_a_previous_release() {
+        let (calls, rpc) = recording_release_rpc(serde_json::json!({
+            "run": { "runId": "RUN-1", "status": "completed_with_failures" },
+            "items": [
+                {
+                    "nodeId": "node-stuck", "state": "failed",
+                    "executorActor": "mcp:1/exec:exec-x",
+                    "lastError": "exec exec-x terminated (kill/app-exit)",
+                },
+                {
+                    "nodeId": "node-own-fail", "state": "failed",
+                    "executorActor": "mcp:1/exec:exec-x",
+                    "lastError": "tests failed",
+                },
+            ],
+        }));
+        release_items_for_exec(&rpc, "h_t", "RUN-1", "exec-x").unwrap();
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            ["run/control:retry".to_string()],
+            "只对释放留下的 failed 残项补 retry"
+        );
+    }
+
+    /// pending 对账目标（无 spec——U10 会话路径）。
+    fn pending_target(rt: &Path, exec_id: &str) -> crate::agents::AgentRecord {
+        let agent = crate::agents::register_agent(
+            rt,
+            "h_t",
+            "pi",
+            crate::agents::NewExec {
+                exec_id: exec_id.into(),
+                node_id: None,
+                run_id: Some("RUN-1".into()),
+                binary_path: None,
+                binary_args: vec![],
+                model: None,
+                launched_by: None,
+                parent_agent_id: None,
+            },
+        )
+        .unwrap();
+        crate::agents::update_exec(rt, "h_t", &agent.id, exec_id, |e| {
+            e.lease_release_pending = true
+        })
+        .unwrap();
+        agent
+    }
+
+    /// 带 launch spec 的 pending 对账目标（shim 路径 reconcile_with_connector
+    /// 只处理有 spec 的目标）。
+    fn pending_target_with_spec(rt: &Path, exec_id: &str) -> crate::agents::AgentRecord {
+        let agent = pending_target(rt, exec_id);
+        let mut spec = crate::spec::sample(&rt.join("ws").join(".omt"), Path::new("/bin/omt"));
+        spec.home_id = "h_t".into();
+        spec.agent_id = agent.id.clone();
+        spec.exec_id = exec_id.into();
+        let adir = crate::layout::agent_dir(rt, "h_t", &agent.id).unwrap();
+        spec.write(&crate::layout::exec_file(
+            &adir,
+            exec_id,
+            crate::layout::ExecFile::Spec,
+        ))
+        .unwrap();
+        agent
+    }
+
+    /// §39 dual-startup-reconcilers（进程内）：shim 路径对账器正在跑时，U10
+    /// 会话对账器排队等它跑完，再跑**自己的一轮**——没有 spec 的旧目标只有
+    /// U10 路径处理得了，排队后必须照常处理；带 spec 的目标已被前一轮标记
+    /// reconciled，不会被二次释放。
+    #[test]
+    fn in_process_reconcilers_queue_and_each_runs_its_own_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = dir.path().to_path_buf();
+        pending_target_with_spec(&rt, "exec-spec");
+        pending_target(&rt, "exec-nospec");
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let entered_tx = Mutex::new(entered_tx);
+        let slow: crate::daemon_link::Connector = Arc::new(move |_: &Path, _: &str| {
+            let _ = entered_tx.lock().unwrap().send(());
+            std::thread::sleep(Duration::from_millis(500));
+            let rpc: RpcFn =
+                Arc::new(|_: &str, _: serde_json::Value| Ok(serde_json::json!({ "items": [] })));
+            Ok(rpc)
+        });
+        let rt_a = rt.clone();
+        let shim_path = std::thread::spawn(move || reconcile_with_connector(&slow, &rt_a));
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("shim 路径对账器应已持锁并开始释放");
+
+        let released = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = released.clone();
+        let rpc =
+            move |method: &str, params: serde_json::Value| -> Result<serde_json::Value, String> {
+                if method == "run/get" {
+                    seen.lock()
+                        .unwrap()
+                        .push(params["runId"].as_str().unwrap_or_default().to_string());
+                }
+                Ok(serde_json::json!({ "items": [] }))
+            };
+        let started = Instant::now();
+        let handled = reconcile_interrupted_execs_with(&rpc, &rt);
+        assert!(
+            started.elapsed() >= Duration::from_millis(300),
+            "U10 对账器必须排队等 shim 路径那一轮结束：{:?}",
+            started.elapsed()
+        );
+        assert_eq!(handled, 1, "排队后跑自己的一轮：只剩没有 spec 的目标");
+        assert_eq!(
+            released.lock().unwrap().len(),
+            1,
+            "带 spec 的目标不得被二次释放"
+        );
+        assert_eq!(shim_path.join().unwrap(), 1);
+        assert!(crate::agents::list_reconcile_targets(&rt)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// §39 dual-startup-reconcilers（跨进程）：别的进程持有 reconcile.lock
+    /// （测试用独立 fd 直接持 flock 模拟）时，两条对账路径都短等后跳过——
+    /// 不发 RPC、不标记；锁释放后照常处理。
+    #[test]
+    fn reconcile_skips_when_another_process_holds_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = dir.path();
+        pending_target(rt, "exec-xproc");
+        let held = omt_harness::atomic_json::lock_exclusive(
+            &rt.join("exec").join("reconcile"),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let calls = Arc::new(Mutex::new(0usize));
+        let seen = calls.clone();
+        let rpc = move |_: &str, _: serde_json::Value| -> Result<serde_json::Value, String> {
+            *seen.lock().unwrap() += 1;
+            Ok(serde_json::json!({ "items": [] }))
+        };
+        let started = Instant::now();
+        assert_eq!(
+            reconcile_interrupted_execs_with(&rpc, rt),
+            0,
+            "跨进程持锁时跳过"
+        );
+        let connector: crate::daemon_link::Connector =
+            Arc::new(|_: &Path, _: &str| Err("must not connect".to_string()));
+        assert_eq!(reconcile_with_connector(&connector, rt), 0);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "只短等：{:?}",
+            started.elapsed()
+        );
+        assert_eq!(*calls.lock().unwrap(), 0, "跳过的一方不得发 RPC");
+        drop(held);
+        assert_eq!(
+            reconcile_interrupted_execs_with(&rpc, rt),
+            1,
+            "锁释放后照常对账"
+        );
+        assert!(crate::agents::list_reconcile_targets(rt)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// §45/§47 double-release-false-negative：shim_pid 在、start-id 缺失（或
+    /// proc_pidinfo 读不出）且 pid 仍存在 → 按「未知 → 存活」跳过，绝不释放；
+    /// pid 已不存在 → 照常释放。
+    #[test]
+    fn reconcile_treats_unknown_shim_identity_as_alive() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = dir.path();
+        let agent = pending_target(rt, "exec-unknown");
+        crate::agents::update_exec(rt, "h_t", &agent.id, "exec-unknown", |e| {
+            e.shim_pid = Some(std::process::id()); // 存在的 pid
+            e.shim_start_id = None; // 身份缺失
+        })
+        .unwrap();
+        let ok = |_: &str, _: serde_json::Value| -> Result<serde_json::Value, String> {
+            Ok(serde_json::json!({ "items": [] }))
+        };
+        assert_eq!(
+            reconcile_interrupted_execs_with(&ok, rt),
+            0,
+            "身份未知必须跳过"
+        );
+        assert_eq!(crate::agents::list_reconcile_targets(rt).unwrap().len(), 1);
+
+        let mut gone = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        let gone_pid = gone.id();
+        gone.wait().unwrap(); // 已收割：pid 不再存在
+        crate::agents::update_exec(rt, "h_t", &agent.id, "exec-unknown", |e| {
+            e.shim_pid = Some(gone_pid);
+        })
+        .unwrap();
+        assert_eq!(
+            reconcile_interrupted_execs_with(&ok, rt),
+            1,
+            "pid 已不在 → 释放"
         );
     }
 }
