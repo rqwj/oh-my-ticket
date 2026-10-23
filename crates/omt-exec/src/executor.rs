@@ -1505,6 +1505,46 @@ pub fn transcript_tail_from(
     events
 }
 
+pub const TAIL_PAGE_DEFAULT: usize = 200;
+pub const TAIL_PAGE_MAX: usize = 1000;
+
+/// Q-8：按 seq 正向分页读取 `<execId>.jsonl`（不含 session_header 与畸形行）。
+/// `since` 不含；`nextSeq` = 本页最后一个 seq（无事件时回显 since）；`done` =
+/// 已读到 exit，或该 exec 已不活跃且本页之后再无事件。
+pub fn transcript_page(
+    runtime_dir: &Path,
+    home_id: &str,
+    exec_id: &str,
+    since: Option<u64>,
+    limit: usize,
+) -> Result<serde_json::Value, String> {
+    crate::layout::validate_segment("exec_id", exec_id)?;
+    let (agent, _) = crate::agents::find_exec_in_home(runtime_dir, home_id, exec_id)?
+        .ok_or_else(|| format!("exec {exec_id} 不存在"))?;
+    let dir = crate::layout::agent_dir(runtime_dir, home_id, &agent.id)?;
+    let path = crate::layout::exec_file(&dir, exec_id, crate::layout::ExecFile::Jsonl);
+    // 先判活、再读文件：读之前已不活跃 ⇒ 本次读到的内容已包含 shim 写出的全部事件
+    // （shim 先写 exit 行再退出）。反过来的顺序会在两步之间漏掉 exit 却报 done。
+    let active_before_read = crate::control::exec_active(runtime_dir, home_id, &agent.id, exec_id);
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let limit = limit.clamp(1, TAIL_PAGE_MAX);
+    let all: Vec<serde_json::Value> = text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|ev| ev["kind"].as_str().is_some_and(|k| k != "session_header"))
+        .filter(|ev| match (since, ev["seq"].as_u64()) {
+            (Some(after), Some(seq)) => seq > after,
+            _ => true,
+        })
+        .collect();
+    let more_after_page = all.len() > limit;
+    let page: Vec<serde_json::Value> = all.into_iter().take(limit).collect();
+    let saw_exit = page.iter().any(|ev| ev["kind"] == "exit");
+    let next_seq = page.last().and_then(|ev| ev["seq"].as_u64()).or(since);
+    let done = saw_exit || (!more_after_page && !active_before_read);
+    Ok(serde_json::json!({ "events": page, "nextSeq": next_seq, "done": done }))
+}
+
 /// F-EXEC-14(3)：对账目标的 shim 身份仍存活 → 跳过且**不标记**——shim 自己
 /// 会收尾并释放租约（U10 对账与 shim 释放的竞态窗口里，desktop 此刻释放
 /// = 双重释放，陈旧快照的 admin report 可能误伤其他 exec 刚认领的 item）。

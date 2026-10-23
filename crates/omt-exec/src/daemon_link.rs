@@ -272,6 +272,43 @@ pub fn plain_connector(runtime_dir: PathBuf, daemon_bin: Option<PathBuf>) -> Con
     })
 }
 
+/// Q-3：daemon 当前服务的 home（homeId, path）。daemon 不在线且给了二进制时拉起
+/// （与 connect 同语义，不带 --home）。CLI/MCP 据此把 homeId 映射为路径——spec
+/// 的 home_path 绝不取自调用方输入（P-12）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServedHome {
+    pub home_id: String,
+    pub path: PathBuf,
+    /// handshake 的 `kind`："workspace" | "global"（Q-13 据此拒绝全局 home）
+    pub kind: String,
+}
+
+pub fn served_homes(
+    runtime_dir: &Path,
+    daemon_bin: Option<&Path>,
+) -> Result<Vec<ServedHome>, String> {
+    if live_descriptor(runtime_dir).is_none() {
+        let bin = daemon_bin.ok_or("daemon 不在线，且没有可拉起的 omt-daemon")?;
+        spawn_daemon(bin, runtime_dir)?;
+    }
+    let link = DaemonLink::enroll(runtime_dir, "cli")?;
+    Ok(link.handshake["homes"]
+        .as_array()
+        .map(|homes| {
+            homes
+                .iter()
+                .filter_map(|h| {
+                    Some(ServedHome {
+                        home_id: h["homeId"].as_str()?.to_string(),
+                        path: PathBuf::from(h["path"].as_str()?),
+                        kind: h["kind"].as_str().unwrap_or("workspace").to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

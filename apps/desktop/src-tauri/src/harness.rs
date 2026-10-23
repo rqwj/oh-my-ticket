@@ -1,12 +1,12 @@
 //! 设置页 Harnesses 数据面的 tauri command 包装。内核在 omt_harness::harness
 //! （执行面设计 §3.1）；这里只负责 runtime dir 解析与登录终端拉起。
-
-use std::path::{Path, PathBuf};
+//! A4 起 `harness_list` / `harness_list_models` 直接转发共用投影
+//! （`omt_harness::harness::{list_value, models_value}`，与 `omt harness`
+//! 本地动词同源）。
 
 use omt_harness::harness::{
-    capture_with_timeout, descriptor_of, harness_entry, launch_preview_value, load_configs,
-    parse_models_output, probe_all, resolve_launch, upsert_config, validate_config, BinarySource,
-    HarnessUserConfig,
+    descriptor_of, harness_entry, launch_preview_value, load_configs, resolve_launch,
+    upsert_config, validate_config, HarnessUserConfig,
 };
 
 use crate::daemon;
@@ -23,29 +23,9 @@ pub fn harness_launch_preview(harness: String) -> Result<serde_json::Value, Stri
 // ---------------------------------------------------------------------------
 // 终端登录（F-ACC-13）：订阅/OAuth 认证无法在无头派发进程内完成——
 // 设置页「终端登录」按钮在本机 Terminal 里启动 harness 的交互命令。
+// binary 解析在 omt_harness::harness::resolve_listing_program（A4 下沉，
+// 不要求 enabled）。
 // ---------------------------------------------------------------------------
-
-/// 登录用的 binary 解析：与派发不同，**不要求 enabled**（用户通常先登录
-/// 再启用）。Manual 路径须存在；Detected 走增广 PATH 现场重探。
-fn resolve_login_program(runtime_dir: &Path, provider_id: &str) -> Result<PathBuf, String> {
-    let descriptor = descriptor_of(provider_id)
-        .ok_or_else(|| format!("unsupported harness type: {provider_id}"))?;
-    if let Some(cfg) = load_configs(runtime_dir).get(provider_id) {
-        if let BinarySource::Manual { path } = &cfg.binary {
-            let p = PathBuf::from(path);
-            if p.is_file() {
-                return Ok(p);
-            }
-            return Err(format!("Manual binary 不存在：{path}"));
-        }
-    }
-    omt_harness::which_binary(descriptor.binary_name).ok_or_else(|| {
-        format!(
-            "PATH 上未找到 {}，请先安装或在设置中手动指定",
-            descriptor.binary_name
-        )
-    })
-}
 
 /// POSIX 单引号 shell 转义：`'` → `'\''`（路径含空格/引号时保持单参数）。
 fn shell_quote(s: &str) -> String {
@@ -70,24 +50,12 @@ fn terminal_login_script(shell_command: &str) -> String {
 // 模型列表（执行弹窗下拉）
 // ---------------------------------------------------------------------------
 
-/// 执行弹窗「模型」下拉数据面（`harness_list_models`）：运行
-/// `<binary> models`（≤8s，失败/超时 → 可读 Err，弹窗降级隐藏下拉）。
+/// 执行弹窗「模型」下拉数据面（`harness_list_models`）：共用投影（A4），
+/// 运行 `<binary> <model_list_args>`（≤8s，失败/超时 → 可读 Err，弹窗降级
+/// 隐藏下拉；不要求 enabled——列模型是启用前的探查动作）。
 #[tauri::command(async)]
 pub fn harness_list_models(harness: String) -> Result<serde_json::Value, String> {
-    let runtime_dir = daemon::runtime_dir();
-    let program = resolve_login_program(&runtime_dir, &harness)?;
-    let descriptor =
-        descriptor_of(&harness).ok_or_else(|| format!("unsupported harness type: {harness}"))?;
-    let output =
-        capture_with_timeout(&program, descriptor.model_list_args, 8).ok_or_else(|| {
-            format!(
-                "运行 {} {} 失败（未安装/超时）——模型下拉不可用",
-                program.display(),
-                descriptor.model_list_args.join(" ")
-            )
-        })?;
-    let models = parse_models_output(&harness, &output);
-    Ok(serde_json::json!({ "models": models }))
+    omt_harness::harness::models_value(&daemon::runtime_dir(), &harness)
 }
 
 /// 设置页「终端登录」（`harness_open_login`）：在 Terminal 里运行
@@ -104,8 +72,8 @@ pub fn harness_open_login(harness: String) -> Result<serde_json::Value, String> 
     #[cfg(target_os = "macos")]
     {
         let runtime_dir = daemon::runtime_dir();
-        let program = resolve_login_program(&runtime_dir, &harness)?;
-        let descriptor = descriptor_of(&harness).expect("checked in resolve_login_program");
+        let program = omt_harness::harness::resolve_listing_program(&runtime_dir, &harness)?;
+        let descriptor = descriptor_of(&harness).expect("checked in resolve_listing_program");
         let mut shell_command = shell_quote(&program.display().to_string());
         for arg in descriptor.login_args {
             shell_command.push(' ');
@@ -125,14 +93,12 @@ pub fn harness_open_login(harness: String) -> Result<serde_json::Value, String> 
 // tauri commands（设置页数据面；三家并行探测、单家梯子最长 14s，必须 async）
 // ---------------------------------------------------------------------------
 
-/// 设置页 Harnesses tab 的数据面：类型表 × 探测 × 用户配置投影。
-///（三家并行探测——最坏 = 最慢单家而非叠加；仍 async：单家梯子最长 14s）
+/// 设置页 Harnesses tab 的数据面：类型表 × 探测 × 用户配置投影（A4 起与
+/// `omt harness list` 共用 `list_value`——三家并行探测，最坏 = 最慢单家而非
+/// 叠加；仍 async：单家梯子最长 14s）。
 #[tauri::command(async)]
 pub fn harness_list() -> Result<serde_json::Value, String> {
-    let runtime_dir = daemon::runtime_dir();
-    let configs = load_configs(&runtime_dir);
-    let harnesses = probe_all(|d| harness_entry(d, configs.get(d.id)))?;
-    Ok(serde_json::json!({ "harnesses": harnesses }))
+    omt_harness::harness::list_value(&daemon::runtime_dir())
 }
 
 /// 保存一个 provider 的用户配置：校验 id + 整份配置（Manual 空路径、env
@@ -191,45 +157,5 @@ mod tests {
             descriptor_of("opencode").unwrap().login_args,
             &["auth", "login"] as &[&str]
         );
-    }
-
-    /// F-ACC-13：登录解析不要求 enabled（先登录后启用是常态流）。
-    #[test]
-    fn resolve_login_program_works_without_enabled_config() {
-        let dir = tempfile::tempdir().unwrap();
-        let tool = dir.path().join("omp-tool");
-        std::fs::write(&tool, "#!/bin/sh\nexit 0\n").unwrap();
-        #[cfg(unix)]
-        std::fs::set_permissions(&tool, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-            .unwrap();
-        upsert_config(
-            dir.path(),
-            "omp",
-            HarnessUserConfig {
-                enabled: false,
-                binary: BinarySource::Manual {
-                    path: tool.display().to_string(),
-                },
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        let p = resolve_login_program(dir.path(), "omp").expect("未启用也应解析出登录 binary");
-        assert_eq!(p, tool);
-        // Manual 路径不存在 → 可读错误（不静默回落 Detected）
-        upsert_config(
-            dir.path(),
-            "omp",
-            HarnessUserConfig {
-                enabled: false,
-                binary: BinarySource::Manual {
-                    path: dir.path().join("nope").display().to_string(),
-                },
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        let err = resolve_login_program(dir.path(), "omp").unwrap_err();
-        assert!(err.contains("不存在"), "{err}");
     }
 }

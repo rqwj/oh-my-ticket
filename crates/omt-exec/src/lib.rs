@@ -9,6 +9,7 @@ pub mod follow;
 pub mod grants;
 pub mod launch;
 pub mod layout;
+pub mod local;
 pub mod mcp_injection;
 pub mod migrate;
 pub mod policy;

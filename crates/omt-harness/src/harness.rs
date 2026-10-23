@@ -765,6 +765,55 @@ pub fn probe_all<T: Send>(
     })
 }
 
+/// 登录/列模型用的 binary 解析（原桌面端 `resolve_login_program`，A4 下沉）：
+/// 与派发不同，**不要求 enabled**（用户通常先登录再启用；列模型是启用前的
+/// 探查动作）。Manual 路径须存在；Detected 走增广 PATH 现场重探。
+pub fn resolve_listing_program(runtime_dir: &Path, provider_id: &str) -> Result<PathBuf, String> {
+    let descriptor = descriptor_of(provider_id)
+        .ok_or_else(|| format!("unsupported harness type: {provider_id}"))?;
+    if let Some(cfg) = load_configs(runtime_dir).get(provider_id) {
+        if let BinarySource::Manual { path } = &cfg.binary {
+            let p = PathBuf::from(path);
+            if p.is_file() {
+                return Ok(p);
+            }
+            return Err(format!("Manual binary 不存在：{path}"));
+        }
+    }
+    which_binary(descriptor.binary_name).ok_or_else(|| {
+        format!(
+            "PATH 上未找到 {}，请先安装或在设置中手动指定",
+            descriptor.binary_name
+        )
+    })
+}
+
+/// 桌面端设置页与 `omt harness list` 共用的投影（A4）。
+pub fn list_value(runtime_dir: &Path) -> Result<serde_json::Value, String> {
+    let configs = load_configs(runtime_dir);
+    let harnesses = probe_all(|d| harness_entry(d, configs.get(d.id)))?;
+    Ok(serde_json::json!({ "harnesses": harnesses }))
+}
+
+const MODEL_LIST_TIMEOUT_SECS: u64 = 8;
+
+/// `omt harness models <id>` / 桌面端模型下拉共用（不要求 enabled——列模型
+/// 是启用前的探查动作，与原桌面端行为一致）。
+pub fn models_value(runtime_dir: &Path, harness: &str) -> Result<serde_json::Value, String> {
+    let d = descriptor_of(harness).ok_or_else(|| format!("unsupported harness type: {harness}"))?;
+    if d.model_list_args.is_empty() {
+        return Ok(serde_json::json!({ "models": [] }));
+    }
+    let program = resolve_listing_program(runtime_dir, harness)?;
+    let output = capture_with_timeout(&program, d.model_list_args, MODEL_LIST_TIMEOUT_SECS)
+        .ok_or_else(|| format!("{harness} 的模型列表命令 {MODEL_LIST_TIMEOUT_SECS}s 内无输出"))?;
+    let models: Vec<serde_json::Value> = parse_models_output(harness, &output)
+        .into_iter()
+        .map(|m| serde_json::json!({ "id": m.id, "group": m.group }))
+        .collect();
+    Ok(serde_json::json!({ "models": models }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1402,5 +1451,72 @@ mod tests {
             "Detected 投影：installed 与 state 必须自洽"
         );
         assert_eq!(projected["binarySource"], "detected");
+    }
+
+    #[test]
+    fn list_value_projects_every_registry_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let value = list_value(tmp.path()).unwrap();
+        let ids: Vec<&str> = value["harnesses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["id"].as_str().unwrap())
+            .collect();
+        let expected: Vec<&str> = REGISTRY.iter().map(|d| d.id).collect();
+        assert_eq!(ids, expected);
+        assert!(
+            value["harnesses"][0].get("env").is_some(),
+            "投影与桌面端 harness_list 同形"
+        );
+    }
+
+    #[test]
+    fn models_value_rejects_unknown_harness() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(models_value(tmp.path(), "nope")
+            .unwrap_err()
+            .contains("nope"));
+    }
+
+    /// F-ACC-13（自桌面端 harness.rs 移入，A4 下沉）：登录/列模型解析不要求
+    /// enabled（先登录后启用是常态流）。
+    #[test]
+    fn resolve_listing_program_works_without_enabled_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = dir.path().join("omp-tool");
+        std::fs::write(&tool, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&tool, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        upsert_config(
+            dir.path(),
+            "omp",
+            HarnessUserConfig {
+                enabled: false,
+                binary: BinarySource::Manual {
+                    path: tool.display().to_string(),
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let p = resolve_listing_program(dir.path(), "omp").expect("未启用也应解析出登录 binary");
+        assert_eq!(p, tool);
+        // Manual 路径不存在 → 可读错误（不静默回落 Detected）
+        upsert_config(
+            dir.path(),
+            "omp",
+            HarnessUserConfig {
+                enabled: false,
+                binary: BinarySource::Manual {
+                    path: dir.path().join("nope").display().to_string(),
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let err = resolve_listing_program(dir.path(), "omp").unwrap_err();
+        assert!(err.contains("不存在"), "{err}");
     }
 }
