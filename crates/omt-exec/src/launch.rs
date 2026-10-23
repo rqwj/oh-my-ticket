@@ -15,10 +15,6 @@ use crate::executor::{dispatch_daemon_side, fail_and_compensate, DaemonRpc, Exec
 use crate::layout::{self, ExecFile};
 use crate::spec::{LaunchSpec, SPEC_SCHEMA_VERSION};
 
-/// 进程内串行化派发（预检 + 建链，闭合读侧 TOCTOU §3.3；跨进程由子项目 2
-/// 处理）。
-static LAUNCH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct LaunchRequest<'a> {
@@ -48,6 +44,35 @@ enum Ready {
     Timeout,
 }
 
+const LAUNCH_LOCK_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// A3：policy 拒绝 / 无效时的错误文本前缀；LocalImpl 经
+/// problem_from_launch_error 还原为结构化 Problem。
+fn policy_err(problem: omt_domain::error::Problem) -> String {
+    format!("{}:{}", problem.code, problem.message)
+}
+
+fn denial_err(d: crate::policy::PolicyDenial) -> String {
+    format!("POLICY_DENIED:{}:{}", d.field, d.reason)
+}
+
+/// `"CODE:field:message"` / `"CODE:message"` / 其他 → ("LAUNCH_FAILED", 原文, None)。
+pub fn problem_from_launch_error(err: &str) -> (&'static str, String, Option<String>) {
+    if let Some(rest) = err.strip_prefix("POLICY_DENIED:") {
+        if let Some((field, message)) = rest.split_once(':') {
+            return (
+                "POLICY_DENIED",
+                message.to_string(),
+                Some(field.to_string()),
+            );
+        }
+    }
+    if let Some(rest) = err.strip_prefix("POLICY_INVALID:") {
+        return ("POLICY_INVALID", rest.to_string(), None);
+    }
+    ("LAUNCH_FAILED", err.to_string(), None)
+}
+
 pub fn start(rpc: DaemonRpc<'_>, req: &LaunchRequest<'_>) -> Result<ExecStartOutcome, String> {
     if let Some(model) = req.model {
         harness::validate_model_id(model)?;
@@ -55,11 +80,31 @@ pub fn start(rpc: DaemonRpc<'_>, req: &LaunchRequest<'_>) -> Result<ExecStartOut
     if let Some(session) = req.resume_session {
         harness::validate_model_id(session)?;
     }
-    let _guard = LAUNCH_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let runtime_dir = req.runtime_dir;
     let home_id = req.home_id;
+    // Q-4：policy 只约束 CLI/MCP；先于任何 daemon 调用判定（被拒不留痕）
+    let policy = match req.origin {
+        crate::policy::LaunchOrigin::Desktop => None,
+        _ => {
+            let policy = crate::policy::load(runtime_dir).map_err(policy_err)?;
+            crate::policy::check_launch(&policy, req.origin, req.harness).map_err(denial_err)?;
+            Some(policy)
+        }
+    };
+    let max_duration = match &policy {
+        Some(p) => crate::policy::effective_max_duration(p, Some(req.max_duration)),
+        None => req.max_duration,
+    };
+    // Q-6：跨进程派发锁——并发计数与登记、spawn_shim、身份记录同在锁内；
+    // wait_ready 之前释放（§39：锁不再覆盖 30s 就绪等待）
+    let launch_lock = omt_harness::atomic_json::lock_exclusive(
+        &layout::launch_lock_file(runtime_dir),
+        LAUNCH_LOCK_TIMEOUT,
+    )?;
+    if let Some(p) = &policy {
+        crate::policy::check_capacity(p, crate::control::active_exec_count(runtime_dir))
+            .map_err(denial_err)?;
+    }
 
     // ①–⑥ daemon 侧派发（executor.rs）：预检 → ensure-run → 注册/续接 →
     // 绑定，含补偿表。失败同步返回，不留半链状态。
@@ -105,7 +150,7 @@ pub fn start(rpc: DaemonRpc<'_>, req: &LaunchRequest<'_>) -> Result<ExecStartOut
         model: req.model.map(str::to_string),
         resume_session: req.resume_session.map(str::to_string),
         prompt: plan.prompt,
-        max_duration_secs: req.max_duration.as_secs(),
+        max_duration_secs: max_duration.as_secs(),
         omt_path: req.omt_bin.to_path_buf(),
     };
     if let Err(err) = spec.write(&layout::exec_file(
@@ -154,6 +199,10 @@ pub fn start(rpc: DaemonRpc<'_>, req: &LaunchRequest<'_>) -> Result<ExecStartOut
         terminate_shim(shim_pid);
         return Err(compensate(format!("记录 exec-shim 身份失败: {err}")));
     }
+
+    // Q-6：⑧ 已完成（身份落档成功）——锁在此释放，wait_ready 的 30s 就绪
+    // 等待不再占用派发锁（§39）。
+    drop(launch_lock);
 
     // ⑨ 就绪握手（P-5）
     let mut warnings = plan.warnings;
@@ -392,5 +441,101 @@ mod tests {
         assert!(!shim_reported_dead(&alive));
         let untracked = agents::ExecRecord::default(); // 尚未记录 shim pid
         assert!(!shim_reported_dead(&untracked));
+    }
+}
+
+#[cfg(test)]
+mod policy_gate_tests {
+    use super::*;
+    use crate::policy::{ExecPolicy, LaunchOrigin};
+
+    fn req<'a>(
+        rt: &'a Path,
+        home: &'a Path,
+        bin: &'a Path,
+        origin: LaunchOrigin,
+    ) -> LaunchRequest<'a> {
+        LaunchRequest {
+            runtime_dir: rt,
+            omt_bin: bin,
+            home_id: "h_test",
+            home_path: home,
+            target: crate::executor::LaunchTarget::Node("t1"),
+            origin,
+            harness: "pi",
+            unattended: true,
+            model: None,
+            resume_session: None,
+            target_agent_id: None,
+            parent_agent_id: None,
+            max_duration: crate::executor::DEFAULT_MAX_DURATION,
+        }
+    }
+
+    /// MCP 默认被拒，且被拒时不发出任何 daemon 调用。
+    #[test]
+    fn mcp_origin_denied_by_default_before_any_rpc() {
+        let tmp = tempfile::tempdir().unwrap();
+        let calls = std::sync::Mutex::new(Vec::<String>::new());
+        let rpc = |m: &str, _p: serde_json::Value| {
+            calls.lock().unwrap().push(m.to_string());
+            Err::<serde_json::Value, String>("unreachable".into())
+        };
+        let bin = tmp.path().join("omt");
+        let err = start(&rpc, &req(tmp.path(), tmp.path(), &bin, LaunchOrigin::Mcp)).unwrap_err();
+        assert!(err.starts_with("POLICY_DENIED:"), "{err}");
+        assert!(err.contains("allowFromMcp"), "{err}");
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    /// 无效 policy fail closed。
+    #[test]
+    fn invalid_policy_fails_closed_for_cli() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(crate::layout::exec_dir(tmp.path())).unwrap();
+        std::fs::write(crate::layout::policy_file(tmp.path()), "{bad").unwrap();
+        let rpc = |_m: &str, _p: serde_json::Value| Ok(serde_json::json!({}));
+        let bin = tmp.path().join("omt");
+        let err = start(&rpc, &req(tmp.path(), tmp.path(), &bin, LaunchOrigin::Cli)).unwrap_err();
+        assert!(err.starts_with("POLICY_INVALID:"), "{err}");
+    }
+
+    /// 桌面端豁免：policy 拒绝 CLI/MCP 时桌面端仍走原链（这里以 rpc 第一次被调用为证）。
+    #[test]
+    fn desktop_origin_ignores_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::policy::save(
+            tmp.path(),
+            &ExecPolicy {
+                allow_from_cli: false,
+                ..ExecPolicy::default()
+            },
+        )
+        .unwrap();
+        let first = std::sync::Mutex::new(None::<String>);
+        let rpc = |m: &str, _p: serde_json::Value| {
+            first.lock().unwrap().get_or_insert(m.to_string());
+            Err::<serde_json::Value, String>("stop here".into())
+        };
+        let bin = tmp.path().join("omt");
+        let err = start(
+            &rpc,
+            &req(tmp.path(), tmp.path(), &bin, LaunchOrigin::Desktop),
+        )
+        .unwrap_err();
+        assert_eq!(err, "stop here");
+        assert_eq!(first.lock().unwrap().as_deref(), Some("node/get"));
+    }
+
+    #[test]
+    fn launch_error_round_trips_to_problem_parts() {
+        let (code, message, field) =
+            problem_from_launch_error("POLICY_DENIED:maxConcurrent:已有 4 个运行中的执行");
+        assert_eq!(code, "POLICY_DENIED");
+        assert_eq!(field.as_deref(), Some("maxConcurrent"));
+        assert_eq!(message, "已有 4 个运行中的执行");
+        let (code, _, field) = problem_from_launch_error("无未完成可执行成员");
+        assert_eq!(code, "LAUNCH_FAILED");
+        assert!(field.is_none());
     }
 }

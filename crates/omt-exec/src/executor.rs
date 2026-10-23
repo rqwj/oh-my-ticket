@@ -1027,7 +1027,7 @@ pub fn wait_for<T>(mut check: impl FnMut() -> Option<T>, timeout: Duration) -> O
 }
 
 // ── U4: dispatch chain, daemon 侧（§3.3 ①–⑥）────────────────────────────
-// 进程内串行化（预检 + 建链）由 launch::start 的 LAUNCH_LOCK 提供。
+// 派发串行化（policy 并发检查 + 建链）由 launch::start 的跨进程派发锁提供。
 
 /// exec_start 的成功返回。
 #[derive(Debug, serde::Serialize)]
@@ -1126,7 +1126,7 @@ pub(crate) struct DispatchPlan {
 
 /// 派发链的 daemon 侧步骤（§3.3 ①–⑥）：预检 → node/execute → ensure-run →
 /// run/control start → 注册/续接 Agent → 绑定。由 launcher（launch::start）
-/// 在 `LAUNCH_LOCK` 内调用；链上执行（spec 落盘 / shim / MCP 注入 / spawn）
+/// 在跨进程派发锁内调用；链上执行（spec 落盘 / shim / MCP 注入 / spawn）
 /// 在 launch.rs 与 shim.rs。所有 daemon 交互（含补偿表的 cancel）经 `rpc`
 /// seam；失败同步返回，不留半链状态。
 #[allow(clippy::too_many_arguments)]

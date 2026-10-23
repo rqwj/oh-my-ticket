@@ -184,3 +184,48 @@ fn unspawnable_shim_fails_synchronously_and_cancels_new_run() {
         "应 cancel 新建 run：{calls:?}"
     );
 }
+
+/// A3（Q-6）：CLI 派发受 policy 的 maxConcurrent 约束——并发计数与登记在
+/// 同一把跨进程锁内，第一个执行存活期间第二个派发被拒（POLICY_DENIED）。
+#[test]
+fn cli_launches_respect_max_concurrent_across_calls() {
+    let (t, runtime, home_path) = setup("sleep 5\nexit 0");
+    let _serial = isolated(t.path());
+    let omt = PathBuf::from(env!("CARGO_BIN_EXE_omt"));
+    omt_exec::policy::save(
+        &runtime,
+        &omt_exec::policy::ExecPolicy {
+            max_concurrent: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let fake = FakeDaemon {
+        calls: Mutex::new(vec![]),
+    };
+    let rpc = |m: &str, p: serde_json::Value| fake.rpc(m, p);
+    let mut first = request(&runtime, &home_path, &omt);
+    first.origin = omt_exec::policy::LaunchOrigin::Cli;
+    let outcome = omt_exec::launch::start(&rpc, &first).expect("第一个在上限内");
+    let mut second = request(&runtime, &home_path, &omt);
+    second.origin = omt_exec::policy::LaunchOrigin::Cli;
+    let err = omt_exec::launch::start(&rpc, &second).unwrap_err();
+    assert!(err.starts_with("POLICY_DENIED:maxConcurrent"), "{err}");
+
+    // 收尾（review F2）：停止 → 等 shim 退出 → 停掉它为释放租约拉起的 daemon
+    let _ = omt_exec::control::stop_exec(&runtime, &outcome.exec_id);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let agent = omt_exec::agents::get_agent(&runtime, "h_test", &outcome.agent_id)
+            .unwrap()
+            .unwrap();
+        if !omt_exec::control::shim_alive(&agent.execs[0]) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "shim 未在 30s 内退出");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let _ = std::process::Command::new(&omt)
+        .args(["--runtime-dir", runtime.to_str().unwrap(), "daemon-stop"])
+        .status();
+}
