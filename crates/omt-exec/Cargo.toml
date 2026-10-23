@@ -7,6 +7,7 @@ description = "Exec plane: agent storage, MCP injection, executor, launcher and 
 
 [dependencies]
 omt-client = { path = "../omt-client" }
+omt-domain = { path = "../omt-domain" }
 omt-harness = { path = "../omt-harness" }
 libc = { workspace = true }
 serde = { workspace = true }

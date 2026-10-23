@@ -2669,6 +2669,7 @@ version = "0.6.6"
 dependencies = [
  "libc",
  "omt-client",
+ "omt-domain",
  "omt-harness",
  "serde",
  "serde_json",

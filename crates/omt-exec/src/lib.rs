@@ -11,5 +11,6 @@ pub mod launch;
 pub mod layout;
 pub mod mcp_injection;
 pub mod migrate;
+pub mod policy;
 pub mod shim;
 pub mod spec;

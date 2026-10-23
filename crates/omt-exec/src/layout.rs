@@ -105,6 +105,21 @@ pub fn agent_ids(runtime_dir: &Path, home_id: &str) -> Result<Vec<String>, Strin
     Ok(subdirs(&home_dir(runtime_dir, home_id)?))
 }
 
+/// 子项目 2：派发面的机器本地状态目录（policy / 跨进程派发锁 / 临时授权登记）。
+pub fn exec_dir(runtime_dir: &Path) -> PathBuf {
+    runtime_dir.join("exec")
+}
+
+/// 设计 §3.6：`<runtime>/exec/policy.json`。
+pub fn policy_file(runtime_dir: &Path) -> PathBuf {
+    exec_dir(runtime_dir).join("policy.json")
+}
+
+/// Q-6：跨进程派发锁的目标路径（`atomic_json::lock_exclusive` 在其 `.lock` 上加 flock）。
+pub fn launch_lock_file(runtime_dir: &Path) -> PathBuf {
+    exec_dir(runtime_dir).join("launch")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
