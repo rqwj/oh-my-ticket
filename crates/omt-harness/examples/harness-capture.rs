@@ -10,7 +10,7 @@
 //! - **版本串归一**（F-BENCH-6）：omp 报 `omp/18.12.2`——取末段建目录
 //! - **meta 合并**（F-BENCH-7）：已有字段保留只补缺——重跑不冲掉出处信息
 //! - **超时**（F-BENCH-10）：每命令 30s 兜底
-//! - 采样即归一（二轮评审 B）：HOME → `__HOME__` 让跨机器 diff 稳定
+//! - 采样即脱敏 + 归一（二轮评审 B / F-BENCH-8）：先 `sanitize_text`，再 HOME → `__HOME__`
 
 use omt_harness::{descriptor_of, which_binary};
 use std::io::Read;
@@ -134,11 +134,13 @@ fn capture(bin: &std::path::Path, args: &[&str]) -> String {
     }
 }
 
-/// 输出归一（二轮评审 B + F-BENCH-24）：HOME → __HOME__、ISO 时间戳 →
-/// __TS__、mcp:<pid> → mcp:__PID__——跨机器 diff 稳定，且不泄真实时间/
-/// pid（占位符与语料既有约定一致；到分钟精度即覆盖全部已知形态）。
+/// 输出归一（二轮评审 B / F-BENCH-8 / F-BENCH-24）：先逐行脱敏（F-BENCH-8，
+/// 设计 B——help / models 可能回显 env 里的 key），再 HOME → __HOME__、
+/// ISO 时间戳 → __TS__、mcp:<pid> → mcp:__PID__——跨机器 diff 稳定，且不泄
+/// 真实时间 / pid / 密钥（占位符与语料既有约定一致；到分钟精度即覆盖全部
+/// 已知形态）。
 fn normalize(text: &str) -> String {
-    let mut s = text.to_string();
+    let mut s = omt_harness::sanitize::sanitize_text(text);
     if let Ok(home) = std::env::var("HOME") {
         s = s.replace(&home, "__HOME__");
     }

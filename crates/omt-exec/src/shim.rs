@@ -574,11 +574,6 @@ mod tests {
         Arc::new(|_: &Path, _: &str| Err("keepalive not used in unit tests".to_string()))
     }
 
-    /// `OMT_SHIM_LEASE_TIMEOUT_MS` 是进程级 env——并行测试互相踩 set/remove
-    /// 会把另一方的界放大回 30s 默认（其「界内完成」断言随即失真）。所有
-    /// 改它的测试经此锁串行。
-    static LEASE_TIMEOUT_ENV_LOCK: Mutex<()> = Mutex::new(());
-
     /// F-EXEC-10：run_bounded——阻塞超过上限的闭包在界内按 Err 返回；
     /// 正常闭包透传 Ok/Err 载荷。
     #[test]
@@ -864,12 +859,11 @@ mod tests {
     }
 
     /// F-EXEC-10：wedged daemon（连接建立但 rpc 永不返回）不得挂死收尾——
-    /// 租约释放序列必须有界等待（生产默认 30s；`OMT_SHIM_LEASE_TIMEOUT_MS`
-    /// 调小），超时按失败处理：execute() 完成 + lease_release_pending 置位，
+    /// 租约释放序列必须有界等待（生产默认 30s；单测经 ShimOptions 注入
+    /// 200ms），超时按失败处理：execute() 完成 + lease_release_pending 置位，
     /// 留给 U10 对账。
     #[test]
     fn wedged_lease_rpc_completes_with_pending_marker() {
-        let env_guard = LEASE_TIMEOUT_ENV_LOCK.lock().unwrap();
         let (_t, runtime, spec) = rig("exit 0", Some("RUN-1"));
         let wedged: Leaser = Arc::new(|_: &Path, _: &str| {
             let rpc: RpcFn = Arc::new(|_: &str, _: serde_json::Value| {
@@ -878,17 +872,20 @@ mod tests {
             });
             Ok(rpc)
         });
-        std::env::set_var("OMT_SHIM_LEASE_TIMEOUT_MS", "200");
         let started = Instant::now();
-        let code = execute(
+        let stop = AtomicBool::new(false);
+        let code = execute_with(
             &runtime,
             "h_test",
             &spec.agent_id,
             "exec-s",
             wedged,
             idle_keepalive(),
+            ShimOptions {
+                stop: &stop,
+                lease_timeout: Duration::from_millis(200),
+            },
         );
-        std::env::remove_var("OMT_SHIM_LEASE_TIMEOUT_MS");
         assert_eq!(code, 0, "wedged rpc 下收尾仍须完成");
         assert!(
             started.elapsed() < Duration::from_secs(10),
@@ -903,7 +900,6 @@ mod tests {
             "超时的释放必须标记待对账：{:?}",
             agent.execs[0]
         );
-        drop(env_guard);
     }
 
     /// P3-b：租约释放超时（run_bounded 放弃其工作线程）后，临时 admin 授权
@@ -914,7 +910,6 @@ mod tests {
     /// releaser），与本测试进程同 pid。
     #[test]
     fn lease_timeout_revokes_temp_grant_immediately() {
-        let env_guard = LEASE_TIMEOUT_ENV_LOCK.lock().unwrap();
         let (_t, runtime, spec) = rig("exit 0", Some("RUN-1"));
         let wedged: Leaser = Arc::new(|_: &Path, _: &str| {
             let rpc: RpcFn = Arc::new(|_: &str, _: serde_json::Value| {
@@ -923,16 +918,19 @@ mod tests {
             });
             Ok(rpc)
         });
-        std::env::set_var("OMT_SHIM_LEASE_TIMEOUT_MS", "200");
-        let code = execute(
+        let stop = AtomicBool::new(false);
+        let code = execute_with(
             &runtime,
             "h_test",
             &spec.agent_id,
             "exec-s",
             wedged,
             idle_keepalive(),
+            ShimOptions {
+                stop: &stop,
+                lease_timeout: Duration::from_millis(200),
+            },
         );
-        std::env::remove_var("OMT_SHIM_LEASE_TIMEOUT_MS");
         assert_eq!(code, 0);
         let principal = format!("cli:{}", std::process::id());
         let principals = crate::grants::principals(&runtime);
@@ -946,7 +944,6 @@ mod tests {
             !registry.contains(&principal),
             "临时登记表必须已清: {registry}"
         );
-        drop(env_guard);
     }
 
     /// F-EXEC-15：Leaser 的 connect/enroll 本身慢（半卡死 daemon：accept 但
@@ -960,7 +957,6 @@ mod tests {
     /// 拉长；绿路径的工作线程在 200ms 界即被 detach，30s 沉睡不进测试时长。
     #[test]
     fn slow_leaser_connect_is_bounded_and_revokes_grant() {
-        let env_guard = LEASE_TIMEOUT_ENV_LOCK.lock().unwrap();
         let (_t, runtime, spec) = rig("exit 0", Some("RUN-1"));
         let slow: Leaser = Arc::new(|_: &Path, _: &str| {
             std::thread::sleep(Duration::from_secs(30));
@@ -968,17 +964,20 @@ mod tests {
                 Arc::new(|_: &str, _: serde_json::Value| Ok(serde_json::json!({ "items": [] })));
             Ok(rpc)
         });
-        std::env::set_var("OMT_SHIM_LEASE_TIMEOUT_MS", "200");
         let started = Instant::now();
-        let code = execute(
+        let stop = AtomicBool::new(false);
+        let code = execute_with(
             &runtime,
             "h_test",
             &spec.agent_id,
             "exec-s",
             slow,
             idle_keepalive(),
+            ShimOptions {
+                stop: &stop,
+                lease_timeout: Duration::from_millis(200),
+            },
         );
-        std::env::remove_var("OMT_SHIM_LEASE_TIMEOUT_MS");
         assert_eq!(code, 0, "慢 connect 下收尾仍须有界完成");
         assert!(
             started.elapsed() < Duration::from_secs(15),
@@ -1005,7 +1004,6 @@ mod tests {
             !registry.contains(&principal),
             "临时登记表必须已清: {registry}"
         );
-        drop(env_guard);
     }
 
     /// §41：停止请求先于 harness spawn 到达（launcher 身份落档失败后的

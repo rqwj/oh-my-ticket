@@ -208,6 +208,7 @@ pub fn start(rpc: DaemonRpc<'_>, req: &LaunchRequest<'_>) -> Result<ExecStartOut
         &plan.agent.id,
         &plan.exec_id,
         &shim_log,
+        ready_timeout(),
     ) {
         Ready::Spawned => {}
         Ready::Failed(detail) => {
@@ -313,8 +314,9 @@ fn wait_ready(
     agent_id: &str,
     exec_id: &str,
     shim_log: &Path,
+    timeout: Duration,
 ) -> Ready {
-    let deadline = Instant::now() + ready_timeout();
+    let deadline = Instant::now() + timeout;
     loop {
         if let Ok(Some(agent)) = agents::get_agent(runtime_dir, home_id, agent_id) {
             if let Some(exec) = agent.execs.iter().find(|e| e.exec_id == exec_id) {
@@ -436,7 +438,7 @@ mod tests {
     /// identity_alive 恒 false 判死，把还在启动的健康执行误取消，而 shim 本体
     /// 继续跑）。身份缺失的记录配一个真存活的 sleep 进程冒充 shim：身份缺失
     /// 应按「未知」处理——继续等直到超时（Timeout），而不是 Failed。
-    /// `OMT_LAUNCH_READY_TIMEOUT_MS` 把等待压到测试量级（生产缺省 30s 不变）。
+    /// 超时参数直接注入 300ms（生产缺省 30s 不变）。
     #[test]
     fn wait_ready_treats_missing_shim_start_id_as_unknown_not_dead() {
         let tmp = tempfile::tempdir().unwrap();
@@ -452,9 +454,14 @@ mod tests {
         })
         .unwrap();
         let log = runtime.join("shim.log");
-        std::env::set_var("OMT_LAUNCH_READY_TIMEOUT_MS", "300");
-        let ready = wait_ready(runtime, "h_t", &agent.id, "exec-nostart", &log);
-        std::env::remove_var("OMT_LAUNCH_READY_TIMEOUT_MS");
+        let ready = wait_ready(
+            runtime,
+            "h_t",
+            &agent.id,
+            "exec-nostart",
+            &log,
+            Duration::from_millis(300),
+        );
         assert!(
             matches!(ready, Ready::Timeout),
             "身份缺失应视为未知（继续等到超时），而非误报 shim 已死"

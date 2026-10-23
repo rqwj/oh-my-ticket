@@ -114,7 +114,7 @@ fn spawn_daemon(bin: &Path, runtime_dir: &Path) -> Result<omt_client::Descriptor
 }
 
 impl DaemonLink {
-    fn enroll(runtime_dir: &Path, kind: &str) -> Result<Self, String> {
+    fn enroll(runtime_dir: &Path, kind: &str, timeout: Duration) -> Result<Self, String> {
         let descriptor = live_descriptor(runtime_dir).ok_or("daemon descriptor 不可用")?;
         // F-EXEC-10：自行 connect 并先在 socket 上装读写超时，再经 omt_client
         // 公开的 from_stream + enroll 组装连接——`connect_and_enroll` 不带
@@ -124,7 +124,6 @@ impl DaemonLink {
         // 其他使用方（CLI/mcp）不走本路径，行为不变。
         let stream = std::os::unix::net::UnixStream::connect(&descriptor.endpoint)
             .map_err(|err| format!("endpoint connect: {err}"))?;
-        let timeout = rpc_timeout();
         stream
             .set_read_timeout(Some(timeout))
             .map_err(|err| format!("set read timeout: {err}"))?;
@@ -166,11 +165,31 @@ impl DaemonLink {
         home_path: &Path,
         expected_home_id: Option<&str>,
     ) -> Result<Self, String> {
+        Self::connect_with(
+            runtime_dir,
+            kind,
+            daemon_bin,
+            home_path,
+            expected_home_id,
+            rpc_timeout(),
+        )
+    }
+
+    /// `connect` 的内芯（§41 test-env-var-parallel：socket 超时从参数注入，
+    /// 单测不再 set_var `OMT_DAEMON_RPC_TIMEOUT_MS`）。
+    pub(crate) fn connect_with(
+        runtime_dir: &Path,
+        kind: &str,
+        daemon_bin: Option<&Path>,
+        home_path: &Path,
+        expected_home_id: Option<&str>,
+        rpc_timeout: Duration,
+    ) -> Result<Self, String> {
         if live_descriptor(runtime_dir).is_none() {
             let bin = daemon_bin.ok_or("daemon 不在线，且没有可拉起的 omt-daemon")?;
             spawn_daemon(bin, runtime_dir)?;
         }
-        let mut link = Self::enroll(runtime_dir, kind)?;
+        let mut link = Self::enroll(runtime_dir, kind, rpc_timeout)?;
         if link.home_id_for(home_path).is_none() {
             if expected_home_id.is_some() && !home_path.join("omt.db").is_file() {
                 return Err(format!(
@@ -184,7 +203,7 @@ impl DaemonLink {
                 "home/declare",
                 serde_json::json!({ "path": home_path.display().to_string() }),
             )?;
-            link = Self::enroll(runtime_dir, kind)?;
+            link = Self::enroll(runtime_dir, kind, rpc_timeout)?;
         }
         match (link.home_id_for(home_path), expected_home_id) {
             (None, _) => Err(format!(
@@ -324,7 +343,7 @@ pub fn served_homes(
         let bin = daemon_bin.ok_or("daemon 不在线，且没有可拉起的 omt-daemon")?;
         spawn_daemon(bin, runtime_dir)?;
     }
-    let link = DaemonLink::enroll(runtime_dir, "cli")?;
+    let link = DaemonLink::enroll(runtime_dir, "cli", rpc_timeout())?;
     Ok(link.handshake["homes"]
         .as_array()
         .map(|homes| {
@@ -348,8 +367,8 @@ mod tests {
     use std::time::Instant;
 
     /// F-EXEC-10：wedged daemon（accept UDS 连接但永不回复）不得挂死
-    /// DaemonLink——socket 必须带读写超时（生产默认 30s；测试经
-    /// `OMT_DAEMON_RPC_TIMEOUT_MS` 调小），enroll 在界内报错返回。
+    /// DaemonLink——socket 必须带读写超时（生产默认 30s；单测经
+    /// `connect_with` 直接注入 300ms，不 set_var），enroll 在界内报错返回。
     #[test]
     fn wedged_daemon_connection_times_out() {
         let tmp = tempfile::tempdir().unwrap();
@@ -382,13 +401,18 @@ mod tests {
         let home_path = tmp.path().join("ws").join(".omt");
         std::fs::create_dir_all(&home_path).unwrap();
 
-        std::env::set_var("OMT_DAEMON_RPC_TIMEOUT_MS", "300");
         let started = Instant::now();
-        let err = match DaemonLink::connect(&runtime, "cli", None, &home_path, Some("h_wedged")) {
+        let err = match DaemonLink::connect_with(
+            &runtime,
+            "cli",
+            None,
+            &home_path,
+            Some("h_wedged"),
+            Duration::from_millis(300),
+        ) {
             Ok(_) => panic!("wedged daemon 的 enroll 必须在界内报错"),
             Err(err) => err,
         };
-        std::env::remove_var("OMT_DAEMON_RPC_TIMEOUT_MS");
 
         assert!(
             started.elapsed() < Duration::from_secs(5),

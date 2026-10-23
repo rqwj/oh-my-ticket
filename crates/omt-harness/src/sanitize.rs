@@ -48,6 +48,22 @@ pub fn sanitize_line(line: &str) -> String {
     }
 }
 
+/// F-BENCH-8（评测设计 B）：语料采集的整段文本脱敏——逐行过 sanitize_line，
+/// 保留原有换行结构（含末尾换行）。help / models 输出可能回显 env 里的 key
+/// （如 `--api-key <KEY>  (current: sk-…)`），harness-capture 先调用本函数，
+/// 再做 HOME / 时间戳 / pid 归一。
+pub fn sanitize_text(text: &str) -> String {
+    let mut out = text
+        .lines()
+        .map(sanitize_line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if text.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
 pub fn sanitize_stderr_tail(tail: &str) -> String {
     let mut joined = tail
         .lines()
@@ -150,5 +166,19 @@ mod tests {
         assert!(sanitize_line("Authorization: Bearer abc.def").ends_with("***"));
         assert!(sanitize_line("password: hunter2").ends_with("***"));
         assert!(!sanitize_line("plain log line").contains("***"));
+    }
+
+    /// F-BENCH-8：整段脱敏——含密钥的行被截断，普通行与空行原样，行数与
+    /// 末尾换行保持不变。
+    #[test]
+    fn sanitize_text_masks_secret_lines_and_keeps_layout() {
+        let input =
+            "Usage: x [options]\n  --api-key <KEY>  (current: sk-live-abc123)\nAUTH_TOKEN=abc\n\nplain\n";
+        let out = sanitize_text(input);
+        assert!(!out.contains("abc123"), "{out}");
+        assert!(!out.contains("AUTH_TOKEN=abc"), "{out}");
+        assert!(out.starts_with("Usage: x [options]\n"), "{out}");
+        assert!(out.ends_with("plain\n"), "{out}");
+        assert_eq!(out.lines().count(), input.lines().count());
     }
 }
