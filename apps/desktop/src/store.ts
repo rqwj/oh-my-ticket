@@ -59,6 +59,9 @@ const RECENT_KEY = 'recent' // KD3's single shared cross-surface key (R4)
 const TRANSCRIPT_TAIL_CAP = 2000 // 每 exec 尾窗上限：丢最旧（内存上界 = agent 数 × cap）
 const RAW_FLUSH_MS = 50 // raw 行合并刷新窗口（避免每行一渲染）
 const EXIT_REPULL_MS = 400 // exit 后 agents_list 防抖重拉（等 Rust 侧落盘收敛）
+// A8 / Q-10：窗口可见时的 agents_list 静默轮询周期（外部 CLI / MCP 发起的
+// 执行由此在桌面端无需切换焦点即可见）
+const AGENTS_POLL_MS = 5_000
 
 const EMPTY_TRANSCRIPT: TranscriptEvent[] = []
 
@@ -485,7 +488,9 @@ export function useTreeStore() {
   // agents_list pull（§四）：tab 首开 / window focus / 派发后主动拉；
   // agents 是机器本地数据，不进 daemon 事件流。Failed badge 集合随 pull
   // 重算（viewedFailedRef 保证已查看的不复活）。
-  const refreshAgents = useCallback(async () => {
+  // A8 / Q-10：`silent` 时不清除全局错误——5s 定时轮询用它，避免错误
+  // 提示一闪而过；显式拉取（focus / 派发后）仍按原语义清错误。
+  const refreshAgents = useCallback(async (opts?: { silent?: boolean }) => {
     const home = activeHomeRef.current
     if (!home) return
     const requestSeq = ++agentsRequestSeqRef.current
@@ -505,7 +510,7 @@ export function useTreeStore() {
         unviewedFailedIds: agents
           .filter(a => a.status === 'failed' && !viewedFailedRef.current.has(a.id))
           .map(a => a.id),
-        error: null,
+        ...(opts?.silent ? {} : { error: null }),
       }))
     } catch {
       /* agents 面是补充面——拉取失败不打断主流程 */
@@ -1097,6 +1102,16 @@ export function useTreeStore() {
     window.addEventListener('focus', onFocus)
     return () => window.removeEventListener('focus', onFocus)
   }, [refreshHomes, loadRecent, refreshAgents, refreshBindings])
+
+  // Q-10：CLI / MCP 发起的执行在桌面端无需切换焦点即可见——窗口可见时每 5s
+  // 静默重拉 agents（不清除全局错误）。外部 agent 由此出现在列表中；选中后由
+  // AgentsPanel 的 P-10 effect 接回实时流。
+  useEffect(() => {
+    const timer = setInterval(() => {
+      if (document.visibilityState === 'visible') void refreshAgents({ silent: true })
+    }, AGENTS_POLL_MS)
+    return () => clearInterval(timer)
+  }, [refreshAgents])
 
   // Load per-home data whenever the active home changes.
   useEffect(() => {

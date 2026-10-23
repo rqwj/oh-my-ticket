@@ -28,6 +28,25 @@ function latestExecOf(agent: AgentRecord): ExecRecord | null {
   return agent.execs.find(e => e.execId === agent.lastExecId) ?? agent.execs[agent.execs.length - 1]
 }
 
+/** A8：发起方标签——按来源分别说明（cli / mcp）；desktop 与旧记录不显示 */
+export function originLabel(origin: 'cli' | 'mcp'): { text: string; title: string } {
+  return origin === 'mcp'
+    ? { text: 'MCP', title: '由 MCP（主控 agent）发起' }
+    : { text: 'CLI', title: '由 CLI 发起' }
+}
+
+/**
+ * A8 发起方小标签：只标 cli / mcp（desktop 派发是桌面自身的常规路径、旧
+ * 记录无该字段——两者都不标）。标签反映的是**当前显示的那次 exec**：
+ * 经 MCP 拉起、后来在桌面端续跑的 agent 标签会消失——如实反映「当前
+ * 这次执行由谁发起」。
+ */
+function OriginChip({ origin }: { origin?: 'desktop' | 'cli' | 'mcp' | null }) {
+  if (origin !== 'cli' && origin !== 'mcp') return null
+  const { text, title } = originLabel(origin)
+  return <span className="chip origin-chip" title={title} aria-label={title}>{text}</span>
+}
+
 /** 列表分组：活跃在前、Orphan（不受控）居中、终态殿后。 */
 function groupAgents(agents: AgentRecord[]): {
   active: AgentRecord[]
@@ -388,6 +407,8 @@ export function AgentsPanel({
       >
         <div className="agent-row-main">
           <span className="agent-name">{agentDisplayName(agent)}</span>
+          {/* A8：当前显示的最新 exec 的发起方（cli / mcp 才显示） */}
+          <OriginChip origin={exec?.launchedBy} />
           <span className={`chip agent-status st-${agent.status}`}>{agent.status}</span>
           {agent.attachment === 'orphan' && (
             <span
@@ -473,6 +494,8 @@ export function AgentsPanel({
       </div>
       <div className="agents-transcript">
         {resumeError && <p className="error-banner">{resumeError}</p>}
+        {/* A8：transcript 头部——当前显示的那次 exec 的发起方（cli / mcp 才显示） */}
+        {selected && selectedExec && <OriginChip origin={selectedExec.launchedBy} />}
         {selected && selectedExec ? (
           <TranscriptView
             key={selectedExec.execId}

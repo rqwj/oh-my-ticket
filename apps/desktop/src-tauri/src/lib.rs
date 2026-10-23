@@ -256,6 +256,8 @@ pub fn run() {
             executor::exec_kill_orphan,
             executor::exec_stop_all,
             executor::exec_attach,
+            executor::exec_policy_get,
+            executor::exec_policy_set,
         ])
         .build(tauri::generate_context!())
         .expect("error while building oh-my-ticket desktop")

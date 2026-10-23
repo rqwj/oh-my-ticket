@@ -809,6 +809,23 @@ describe('U5 AgentsPanel 列表', () => {
     expect(screen.getByText('Agent 2')).toBeTruthy()
   })
 
+  it('A8 发起方标签：最新 exec launchedBy=mcp 的行带标签；desktop / 缺省不出现', async () => {
+    const mcp = makeAgent('a-mcp', 'exec-m')
+    mcp.execs[0].launchedBy = 'mcp'
+    const desktop = makeAgent('a-dsk', 'exec-d')
+    desktop.execs[0].launchedBy = 'desktop'
+    const legacy = makeAgent('a-old', 'exec-o', { status: 'exited' })
+    await renderPanel({ agents: [mcp, desktop, legacy] })
+    expect(screen.getByLabelText('由 MCP（主控 agent）发起')).toBeTruthy()
+    expect(screen.queryByLabelText('由 CLI 发起')).toBeNull()
+  })
+
+  it('origin chip names who launched the displayed exec', async () => {
+    const { originLabel } = await import('../src/AgentsPanel')
+    expect(originLabel('mcp')).toEqual({ text: 'MCP', title: '由 MCP（主控 agent）发起' })
+    expect(originLabel('cli')).toEqual({ text: 'CLI', title: '由 CLI 发起' })
+  })
+
   it('run item 统计（完成 N / 失败 M）走 fetchRun 渲染', async () => {
     await renderPanel({
       agents: [makeAgent('a1', 'exec-a', { execs: [makeExec('exec-a', 'RUN-1')] })],

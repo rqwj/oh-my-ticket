@@ -7,7 +7,7 @@
 import { Channel, invoke } from '@tauri-apps/api/core'
 import { getVersion } from '@tauri-apps/api/app'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-import type { AgentsListResult, BindingsGcResult, BindingsResult } from './types'
+import type { AgentsListResult, BindingsGcResult, BindingsResult, ExecPolicy, ExecPolicyView } from './types'
 
 export interface DaemonStatus {
   running: boolean
@@ -376,4 +376,18 @@ export async function harnessListModels(harness: string): Promise<HarnessModelEn
  * 的全局存储，OMT 不经手。 */
 export async function harnessOpenLogin(harness: string): Promise<void> {
   await invoke<void>('harness_open_login', { harness })
+}
+
+// ── A8 派发策略（设置页「派发策略」；只约束 CLI / MCP 发起的派发）─────────
+
+/** 读当前策略视图：文件缺失 = 默认值（source: 'default'）；文件无效时
+ * `policy` 缺席、`error` 携带 `POLICY_INVALID: <原因>`——界面据此提示
+ * fail-closed 并预填文档默认值，不把错误伪装成文件内容。 */
+export async function execPolicyGet(): Promise<ExecPolicyView> {
+  return invoke<ExecPolicyView>('exec_policy_get')
+}
+
+/** 保存策略（Rust 侧校验 + 原子落盘），返回保存后的 exec_policy_get 结果。 */
+export async function execPolicySet(policy: ExecPolicy): Promise<ExecPolicyView> {
+  return invoke<ExecPolicyView>('exec_policy_set', { policy })
 }

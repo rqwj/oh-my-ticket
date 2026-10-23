@@ -140,6 +140,9 @@ export interface ExecRecord {
   shimStartId?: string | null
   /** shim 收尾时租约释放失败、待对账重试 */
   leaseReleasePending?: boolean
+  /** A8 / Q-7：本次派发的发起方（desktop 派发 / CLI / MCP 主控）；旧记录为
+   *  null/缺省。Agents 面板据此显示发起方标签（只标 cli / mcp）。 */
+  launchedBy?: 'desktop' | 'cli' | 'mcp' | null
 }
 
 export interface AgentRecord {
@@ -153,6 +156,8 @@ export interface AgentRecord {
   lastExecId: string | null
   lastSessionId: string | null
   execs: ExecRecord[]
+  /** A8 / Q-7：新建该 agent 的显式派发参数写入的父 agent id；旧记录缺省。 */
+  parentAgentId?: string | null
 }
 
 export interface AgentsListResult {
@@ -174,4 +179,26 @@ export interface BindingsResult {
 export interface BindingsGcResult {
   removed: number
   bindings: Record<string, string>
+}
+
+// ── A8 派发策略（设置页「派发策略」；wire = exec_policy_get/set 投影）─────
+
+/** A8：exec/policy.json（设计 §3.6）。只约束 CLI / MCP 发起的派发。 */
+export interface ExecPolicy {
+  allowFromCli: boolean
+  allowFromMcp: boolean
+  harnesses: string[]
+  workspaces: 'homeWorkspaceOnly'
+  maxConcurrent: number
+  maxDurationSec: number
+  approvalMode: 'inherit'
+}
+
+export interface ExecPolicyView {
+  policy?: ExecPolicy
+  /** ExecPolicy::default()（Rust 侧唯一来源） */
+  defaults: ExecPolicy
+  source?: 'file' | 'default'
+  path: string
+  error?: string
 }

@@ -200,6 +200,36 @@ pub fn exec_kill_orphan(home_id: String, agent_id: String, exec_id: String) -> R
     omt_exec::executor::kill_orphan(&daemon::runtime_dir(), &home_id, &agent_id, &exec_id)
 }
 
+/// A8：设置页「派发策略」。无效文件不报 Err——返回 {error, path, defaults} 让界面
+/// 提示「CLI/MCP 派发已全部拒绝」并预填文档默认值，绝不伪装成文件内容。
+#[tauri::command(async)]
+pub fn exec_policy_get() -> Result<serde_json::Value, String> {
+    let runtime_dir = daemon::runtime_dir();
+    let file = omt_exec::layout::policy_file(&runtime_dir);
+    let path = file.display().to_string();
+    let defaults = omt_exec::policy::ExecPolicy::default();
+    match omt_exec::policy::load(&runtime_dir) {
+        Ok(policy) => Ok(serde_json::json!({
+            "policy": policy,
+            "defaults": defaults,
+            "source": if file.is_file() { "file" } else { "default" },
+            "path": path,
+        })),
+        Err(problem) => Ok(serde_json::json!({
+            "error": format!("{}: {}", problem.code, problem.message),
+            "defaults": defaults,
+            "path": path,
+        })),
+    }
+}
+
+/// A8：保存派发策略（校验 + 原子落盘在 omt_exec::policy::save），回读最新视图。
+#[tauri::command(async)]
+pub fn exec_policy_set(policy: omt_exec::policy::ExecPolicy) -> Result<serde_json::Value, String> {
+    omt_exec::policy::save(&daemon::runtime_dir(), &policy)?;
+    exec_policy_get()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

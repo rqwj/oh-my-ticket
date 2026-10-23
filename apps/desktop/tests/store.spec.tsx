@@ -623,3 +623,43 @@ describe('启动恢复上次 workspace', () => {
     unmount()
   })
 })
+
+describe('Q-10 定时发现外部执行（5s 静默重拉 agents）', () => {
+  beforeEach(() => {
+    invokeMock.mockReset()
+    // jsdom 默认 visible——显式定义，防其他用例残留 hidden
+    Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true })
+  })
+
+  it('Q-10: refreshes agents every 5s while visible, without clearing a shown error', async () => {
+    vi.useFakeTimers()
+    try {
+      // 按本文件现有方式挂载 store 并选中一个 home；exec_stop 拒绝写 state.error
+      invokeMock.mockImplementation(async (cmd: string) => {
+        if (cmd === 'exec_stop') throw new Error('boom: exec 状态不可停止')
+        return {}
+      })
+      const { useTreeStore } = await import('../src/store')
+      const { renderHook, act } = await import('@testing-library/react')
+      const { result, unmount } = renderHook(() => useTreeStore())
+      await act(async () => {
+        await result.current.selectHome({ homeId: 'h1', kind: 'workspace', path: '/tmp/ws/.omt' })
+      })
+      await act(async () => { await result.current.stopAgent('exec-a') })
+      expect(result.current.state.error).not.toBeNull()
+      const before = invokeMock.mock.calls.filter(c => c[0] === 'agents_list').length
+      await act(async () => { await vi.advanceTimersByTimeAsync(5_000) })
+      const after = invokeMock.mock.calls.filter(c => c[0] === 'agents_list').length
+      expect(after).toBeGreaterThan(before)
+      expect(result.current.state.error).not.toBeNull()  // 静默轮询不清错误
+      Object.defineProperty(document, 'visibilityState', { value: 'hidden', configurable: true })
+      await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+      expect(invokeMock.mock.calls.filter(c => c[0] === 'agents_list').length).toBe(after)
+      Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true })
+      unmount()
+    } finally {
+      Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true })
+      vi.useRealTimers()
+    }
+  })
+})

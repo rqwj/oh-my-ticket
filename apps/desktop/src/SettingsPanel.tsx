@@ -5,6 +5,8 @@
  *
  * U7：内层分段「通用 | Harnesses」——R-A 的 Harnesses 完整管理面
  * （左类型列表右详情）在 HarnessManagerTab，挂载即拉 harness_list。
+ * A8：分段加「派发策略」——ExecPolicySection（exec/policy.json 的界面
+ * 编辑入口，只约束 CLI / MCP 发起的派发）。
  */
 import { useEffect, useState } from 'react'
 import { ask, open as openDialog } from '@tauri-apps/plugin-dialog'
@@ -22,9 +24,10 @@ import type { KnownHome } from './store'
 import { NOT_A_WORKSPACE_HINT, resolveHomeFromPickedDir } from './workspacePath'
 import { workspaceRootOf } from './homePath'
 import { HarnessManagerTab } from './HarnessManagerTab'
+import { ExecPolicySection } from './ExecPolicySection'
 
-/** 设置页内层分段（U7）：通用（daemon/DSH/workspaces/admin）+ Harnesses（R-A 一等区）。 */
-type SettingsSection = 'general' | 'harnesses'
+/** 设置页内层分段（U7 + A8）：通用 / Harnesses（R-A 一等区）/ 派发策略。 */
+type SettingsSection = 'general' | 'harnesses' | 'policy'
 
 interface Props {
   homes: HomeInfo[]
@@ -122,7 +125,7 @@ export function SettingsPanel({ homes, knownHomes, homeDir, legacyDshByHome, act
 
   return (
     <div className="settings-panel">
-      {/* U7：内层分段——R-A Harnesses 是设置页一等区（非弹窗） */}
+      {/* U7：内层分段——R-A Harnesses 是设置页一等区（非弹窗）；A8 加派发策略 */}
       <div className="inner-tabs">
         <button className={`inner-tab${section === 'general' ? ' active' : ''}`} onClick={() => setSection('general')}>
           通用
@@ -130,9 +133,14 @@ export function SettingsPanel({ homes, knownHomes, homeDir, legacyDshByHome, act
         <button className={`inner-tab${section === 'harnesses' ? ' active' : ''}`} onClick={() => setSection('harnesses')}>
           Harnesses
         </button>
+        <button className={`inner-tab${section === 'policy' ? ' active' : ''}`} onClick={() => setSection('policy')}>
+          派发策略
+        </button>
       </div>
       {section === 'harnesses' ? (
         <HarnessManagerTab homes={homes} />
+      ) : section === 'policy' ? (
+        <ExecPolicySection />
       ) : (
         <>
           <section>
