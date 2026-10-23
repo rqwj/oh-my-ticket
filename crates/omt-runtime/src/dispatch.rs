@@ -2292,6 +2292,8 @@ fn run_report(ctx: &mut Ctx, params: &Value) -> Result<Value> {
                     reason: "admin-grant".to_string(),
                 }
             } else {
+                // P3-ACC-2：空 token = 未传 leaseToken——authorize_report 据此
+                // 报 `lease-token-missing`（点名参数来源），而不是 token 不匹配。
                 omt_domain::runs::ReportAuthority::ExecutorLease {
                     token: String::new(),
                     actor: ctx.auth.actor_namespace.clone(),

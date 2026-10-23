@@ -124,6 +124,8 @@ pub enum ReportVerdict {
 /// - not in flight → `report-state-gate`;
 /// - administrator override → allowed regardless of lease state, returning
 ///   [`ReportVerdict::AdminAuthorized`] so callers can audit it distinctly;
+/// - executor presented no token (empty) → `lease-token-missing` (P3-ACC-2:
+///   names the missing `leaseToken` parameter instead of a fence mismatch);
 /// - missing/expired grant → `lease-stale`;
 /// - wrong attempt (stale attempt-one token against attempt-two work) →
 ///   `lease-attempt`;
@@ -154,6 +156,15 @@ pub fn authorize_report(
     match authority {
         ReportAuthority::Administrator { .. } => Ok(ReportVerdict::AdminAuthorized),
         ReportAuthority::ExecutorLease { token, actor } => {
+            // P3-ACC-2：非管理员没带 leaseToken 时 dispatch 传入空串——单列
+            // 规则并点名参数来源，不再按空串与存储 token 比对后报「token
+            // 不匹配」。合法 token 恒为非空，空串只可能是「没传」。
+            if token.is_empty() {
+                return Err(conflict_rule(
+                    "lease-token-missing",
+                    "run/report requires leaseToken: pass the lease.token returned by run/claim (only an administrator may report without one)",
+                ));
+            }
             let Some(grant) = grant else {
                 return Err(conflict_rule(
                     "lease-stale",

@@ -241,7 +241,7 @@ a normal `cargo test -p omt-runtime`:
   connections asserting zero duplicate committed commandIds, zero lost
   accepted updates (read-your-write + gap-free revision chains), revision
   CONFLICT exactly when a concurrent winner exists, lease-fencing negatives
-  (`lease-stale`/`lease-attempt`/`lease-token`/`actor-mismatch`/
+  (`lease-stale`/`lease-attempt`/`lease-token`/`lease-token-missing`/`actor-mismatch`/
   `report-state-gate`), and per-home SQL invariants. Scale is env-tunable:
   `OMT_ENV_HOMES/_NODES/_CLIENTS/_RUNS/_RUN_ITEMS/_ITERS`, or
   `OMT_ENV_FULL=1` for the full envelope. The default is the plan's blocking
