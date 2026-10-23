@@ -635,6 +635,11 @@ pub fn startup_housekeeping(runtime_dir: &Path) {
         Err(err) => eprintln!("MCP 注入残留清扫失败：{err}"),
         _ => {}
     }
+    // §41 trash-never-swept：删除失败遗留的 .trash-* 与竞争败方的空目录
+    let residue = crate::agents::sweep_agent_residue(runtime_dir);
+    if residue > 0 {
+        eprintln!("启动清扫：清理了 {residue} 个 agent 删除残留目录");
+    }
 }
 
 /// F-U12-4：向 `<execId>.jsonl` 追加一行统一事件（打开-写-关的简单实现
@@ -1468,14 +1473,28 @@ pub fn transcript_tail_from(
     exec_id: &str,
     max_lines: Option<usize>,
 ) -> Vec<serde_json::Value> {
-    // KD-E2：新布局按 exec 定位 agent 目录；找不到（迁移前的旧数据）回落
-    // 旧的 transcripts/<home>/ 目录。
-    let dir = match crate::agents::find_exec_in_home(runtime_dir, home_id, exec_id) {
-        Ok(Some((agent, _))) => match crate::layout::agent_dir(runtime_dir, home_id, &agent.id) {
-            Ok(dir) => dir,
-            Err(_) => return Vec::new(),
-        },
-        _ => legacy_transcripts_dir(runtime_dir, home_id),
+    // §39 transcript-tail-traversal：路径段先校验——旧目录回落分支直接拼
+    // home_id / exec_id，`..` 可穿越读取任意 *.jsonl / *.raw.log（改造前既有）
+    if crate::layout::validate_segment("home id", home_id).is_err()
+        || crate::layout::validate_segment("exec id", exec_id).is_err()
+    {
+        return Vec::new();
+    }
+    // KD-E2：新布局按 exec 定位 agent 目录；§39：候选目录依次为 agent 目录、
+    // 旧 transcripts/<home>/，取第一个有 jsonl 或 raw.log 的——迁移中断
+    // （agent.json 已写、文件还没搬）时回落旧目录
+    let mut candidates = Vec::new();
+    if let Ok(Some((agent, _))) = crate::agents::find_exec_in_home(runtime_dir, home_id, exec_id) {
+        if let Ok(dir) = crate::layout::agent_dir(runtime_dir, home_id, &agent.id) {
+            candidates.push(dir);
+        }
+    }
+    candidates.push(legacy_transcripts_dir(runtime_dir, home_id));
+    let Some(dir) = candidates.into_iter().find(|dir| {
+        dir.join(format!("{exec_id}.jsonl")).is_file()
+            || dir.join(format!("{exec_id}.raw.log")).is_file()
+    }) else {
+        return Vec::new(); // 无日志（未产出/已清理）→ 空
     };
     let jsonl = dir.join(format!("{exec_id}.jsonl"));
     if let Ok(text) = std::fs::read_to_string(&jsonl) {
@@ -4412,6 +4431,61 @@ mod tests {
             vec!["session_start", "assistant_text", "exit"],
             "header 剔除、raw 干扰不可见"
         );
+    }
+
+    /// §39 transcript-tail-traversal：home_id / exec_id 必须先过
+    /// validate_segment——旧目录回落分支直接拼路径，`..` 可以读到
+    /// transcripts/<home>/ 之外的 *.jsonl / *.raw.log。
+    #[test]
+    fn transcript_tail_rejects_path_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        let event = r#"{"kind":"assistant_text","execId":"x","seq":1,"ts":"1","text":"SECRET"}"#;
+        // exec_id 穿越：transcripts/h_t/../secret.jsonl
+        std::fs::create_dir_all(runtime.join("transcripts").join("h_t")).unwrap();
+        std::fs::write(
+            runtime.join("transcripts").join("secret.jsonl"),
+            format!("{event}\n"),
+        )
+        .unwrap();
+        assert!(transcript_tail_from(&runtime, "h_t", "../secret", None).is_empty());
+        // home_id 穿越：transcripts/../exec-esc.jsonl
+        std::fs::write(runtime.join("exec-esc.jsonl"), format!("{event}\n")).unwrap();
+        assert!(transcript_tail_from(&runtime, "..", "exec-esc", None).is_empty());
+    }
+
+    /// §39 tail-no-legacy-fallback-midmigration：迁移中断——agent.json 已在新
+    /// 布局，transcript 文件还留在旧 transcripts/<home>/——回放回落旧目录。
+    #[test]
+    fn transcript_tail_falls_back_to_legacy_dir_mid_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        crate::agents::register_agent(
+            &runtime,
+            "h_m",
+            "pi",
+            NewExec {
+                exec_id: "exec-mid".into(),
+                node_id: None,
+                run_id: None,
+                binary_path: None,
+                binary_args: vec![],
+                model: None,
+                launched_by: None,
+                parent_agent_id: None,
+            },
+        )
+        .unwrap();
+        let legacy = legacy_transcripts_dir(&runtime, "h_m");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(
+            legacy.join("exec-mid.jsonl"),
+            r#"{"kind":"assistant_text","execId":"exec-mid","seq":1,"ts":"1","text":"OLD"}"#,
+        )
+        .unwrap();
+        let events = transcript_tail_from(&runtime, "h_m", "exec-mid", None);
+        assert_eq!(events.len(), 1, "新目录无文件时必须回落旧目录");
+        assert_eq!(events[0]["text"], "OLD");
     }
 
     /// F-BENCH-20：UsageTotals 累计与合计的直接单测（三形态）。

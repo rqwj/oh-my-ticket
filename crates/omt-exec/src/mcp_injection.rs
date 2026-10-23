@@ -217,8 +217,12 @@ fn single_quote(path: &str) -> String {
     format!("'{}'", path.replace('\'', "'\\''"))
 }
 
-/// 原子写：同目录 tmp + rename（F-U3-8——用户工作区文件不能半截写坏）。
+/// 原子写：同目录 tmp + fsync + rename（F-U3-8——用户工作区文件不能半截写
+/// 坏）。§39 mcp-write-atomic-fsync：rename 前 `sync_all`（F-U4a-4 同款），
+/// 断电不留 0 字节的 backup.json / state.json / 用户 mcp.json；rename 后
+/// best-effort 同步目录项。权限保持默认（用户工作区文件，不套 0600）。
 fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
+    use std::io::Write as _;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("create dir: {e}"))?;
     }
@@ -227,13 +231,26 @@ fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
         path.extension().and_then(|e| e.to_str()).unwrap_or("json"),
         std::process::id()
     ));
-    std::fs::write(&tmp, text).map_err(|e| format!("write tmp: {e}"))?;
+    let written = std::fs::File::create(&tmp).and_then(|mut file| {
+        file.write_all(text.as_bytes())?;
+        file.sync_all()
+    });
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("write tmp: {e}"));
+    }
     std::fs::rename(&tmp, path).map_err(|e| {
         // F-U3-13：rename 失败不留 tmp——否则每次失败都在用户工作区（或
         // state 目录）多一个孤儿文件。
         let _ = std::fs::remove_file(&tmp);
         format!("rename: {e}")
-    })
+    })?;
+    if let Some(dir) = path.parent() {
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+    Ok(())
 }
 
 /// 写 launcher：`omt [--actor <actor>] mcp` 的包装脚本（omp 的 mcp.json 是
@@ -670,6 +687,15 @@ fn sweep_spec_crash_residue(
     let Ok(entries) = std::fs::read_dir(&root) else {
         return Ok(0);
     };
+    // §39 mcp-sweep-snapshot-race：state 快照必须在锁内读取——此前先读
+    // state.json 再拿锁，等锁期间另一个 shim 的 prepare 已把新 exec 记进
+    // launchers，清扫仍按旧快照判「无存活 exec」并 finalize_release，摘掉
+    // 正在运行的 exec 的注入。整个清扫持有进程内锁 + flock（只在启动时跑
+    // 一次；孤儿 launcher 的兜底清扫也在锁内）。
+    let _guard = PROJECT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _flock = project_flock(runtime_dir, spec)?;
     let mut swept = 0usize;
     for entry in entries.flatten() {
         if !entry.path().is_dir() {
@@ -687,10 +713,6 @@ fn sweep_spec_crash_residue(
         if has_live {
             continue; // 该 workspace 仍被存活 exec 使用，由其 shim 收尾时释放
         }
-        let _guard = PROJECT_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _flock = project_flock(runtime_dir, spec)?;
         match finalize_release(
             runtime_dir,
             &entry.path(),
@@ -705,7 +727,6 @@ fn sweep_spec_crash_residue(
                 entry.path().display()
             ),
         }
-        drop(_guard);
     }
     // 上面每个 workspace 的 finalize_release 已经清了自己追踪到的
     // launcher；这里只兜底真正的孤儿（例如 state 目录在记录 `workspace`
@@ -1446,6 +1467,48 @@ mod tests {
         let swept = sweep_crash_residue(&rig.runtime, &|_| false).unwrap();
         assert_eq!(swept, 1);
         drop(inj);
+    }
+
+    /// §39 mcp-sweep-snapshot-race：清扫必须在锁内读 state 快照。持锁期间
+    /// 另一个 shim 的 prepare 把新 exec 记进 launchers——清扫拿到锁后必须看到
+    /// 它并跳过该 workspace；此前清扫在拿锁前读快照，按旧快照把正在运行的
+    /// exec 的注入摘掉。
+    #[test]
+    fn sweep_reads_state_under_the_lock() {
+        let rig = rig();
+        let _inj = prepare(
+            &rig.fake_omt,
+            &rig.runtime,
+            &rig.workspace,
+            "omp",
+            "exec-old",
+            false,
+        )
+        .unwrap();
+        let mcp = rig.workspace.join(".omp").join("mcp.json");
+        let state_file = state_dir(&rig.runtime, &rig.workspace, OMP_SPEC).join("state.json");
+        let held = project_flock(&rig.runtime, OMP_SPEC).unwrap();
+        let runtime = rig.runtime.clone();
+        let sweeper =
+            std::thread::spawn(move || sweep_crash_residue(&runtime, &|id| id == "exec-new"));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let mut state: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&state_file).unwrap()).unwrap();
+        state["launchers"]
+            .as_array_mut()
+            .expect("launchers 数组")
+            .push(serde_json::json!("exec-new"));
+        std::fs::write(&state_file, state.to_string()).unwrap();
+        drop(held);
+        assert_eq!(
+            sweeper.join().unwrap().unwrap(),
+            0,
+            "存活 exec 的 workspace 必须跳过"
+        );
+        assert!(
+            std::fs::read_to_string(&mcp).unwrap().contains("omt"),
+            "存活 exec 的注入必须保留"
+        );
     }
 
     /// P-9：跨进程锁——持锁期间另一个 prepare 必须等待而不是并发改写 state。

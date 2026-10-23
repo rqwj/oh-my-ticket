@@ -370,6 +370,14 @@ pub fn append_exec(
         true
     })?;
     if !outcome.changed {
+        // §41：并发删除赢了——记录在等锁期间被移走，本方的 update_json 在原
+        // 位置重建了只含锁文件的空目录。报「不存在」并清掉它
+        if !path.is_file() {
+            if let Some(dir) = path.parent() {
+                remove_residue_dir(dir);
+            }
+            return Err(format!("append_exec: agent {agent_id} 不存在"));
+        }
         if orphan_rejected {
             return Err(format!(
                 "append_exec: agent {agent_id} 处于不受控态（pid 存活）——请先强制终止再续跑"
@@ -456,6 +464,72 @@ pub fn get_agent(
     Ok((!record.id.is_empty()).then_some(record))
 }
 
+/// 删除残留目录判定的最小年龄：锁文件这么久没动才算残留（更新的可能是
+/// 一次正在进行的 register_agent——update_json 先建目录与锁、后写 agent.json）。
+const RESIDUE_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// §41 delete-loser-empty-dir：只含 companion 锁文件（无 agent.json、无
+/// `.corrupt-*` 留证）的 agent 目录是竞争残留——删锁文件后 `remove_dir`
+/// （目录非空即失败，不会误删）。
+fn remove_residue_dir(dir: &Path) {
+    let file = dir.join("agent.json");
+    if file.exists() || has_unrecovered_corrupt(&file) {
+        return;
+    }
+    let _ = std::fs::remove_file(dir.join("agent.json.lock"));
+    let _ = std::fs::remove_dir(dir);
+}
+
+fn is_stale_residue(dir: &Path) -> bool {
+    let only_lock = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .all(|e| e.file_name().to_string_lossy() == "agent.json.lock")
+        })
+        .unwrap_or(false);
+    only_lock
+        && std::fs::metadata(dir.join("agent.json.lock"))
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|mtime| mtime.elapsed().ok())
+            .is_some_and(|age| age >= RESIDUE_MIN_AGE)
+}
+
+/// §41 trash-never-swept：启动清扫——各 home 下删除失败遗留的 `.trash-*`
+/// 目录，以及竞争败方留下的、锁文件超过 RESIDUE_MIN_AGE 未动的空 agent
+/// 目录。返回清掉的目录数；单项失败 `eprintln!` 后继续。
+pub fn sweep_agent_residue(runtime_dir: &Path) -> usize {
+    let mut swept = 0usize;
+    for home_id in layout::home_ids(runtime_dir) {
+        let Ok(home) = layout::home_dir(runtime_dir, &home_id) else {
+            continue;
+        };
+        let Ok(entries) = std::fs::read_dir(&home) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(".trash-") {
+                match std::fs::remove_dir_all(&path) {
+                    Ok(()) => swept += 1,
+                    Err(err) => eprintln!("启动清扫：删除 {} 失败：{err}", path.display()),
+                }
+            } else if !name.starts_with('.') && is_stale_residue(&path) {
+                remove_residue_dir(&path);
+                if !path.exists() {
+                    swept += 1;
+                }
+            }
+        }
+    }
+    swept
+}
+
 /// F-DEL：删除一个 agent（列表项右上角删除入口）。守卫：starting/running
 /// 拒绝（先停止再删）；attachment=orphan 拒绝（pid 仍存活，先强制终止）。
 ///
@@ -476,8 +550,8 @@ pub fn get_agent(
 /// 租约永不释放。锁内复核用 `fs::read` + `from_slice` 直接读字节：**不能**
 /// 调 read_json——损坏路径会再取同一把 flock，空等 10s（§39）。消失以
 /// 「改名为点前缀的 `.trash-<agentId>-<ts>`」达成（`subdirs()` 跳过点前缀，
-/// 对列表瞬间不可见），改名后仍在锁内 best-effort 移除；移除失败只留下对
-/// 列表隐形的 .trash 残留，不报错。
+/// 对列表瞬间不可见），改名后立即放锁，再 best-effort 移除；移除失败记日志，
+/// `.trash-*` 由启动清扫兜底。
 pub fn delete_agent(
     runtime_dir: &Path,
     home_id: &str,
@@ -485,19 +559,26 @@ pub fn delete_agent(
     force: bool,
 ) -> Result<(), String> {
     let agent_file = layout::agent_file(runtime_dir, home_id, agent_id)?;
-    if !agent_file.is_file() {
-        return Err(format!("agent {agent_id} 不存在"));
-    }
-    let _guard = lock_exclusive(&agent_file, LOCK_ACQUIRE_TIMEOUT)?;
-    // 锁内复核：文件可能已被并发删除赢走，或损坏（含粘性留证）——后者拒绝
-    // 删除，与 get_agent 的语义一致（无法证明进程身份就不动它）。
-    let corrupt = has_unrecovered_corrupt(&agent_file);
+    let dir = layout::agent_dir(runtime_dir, home_id, agent_id)?;
     let corrupt_err = || {
         format!(
             "删除失败：{} 已损坏，拒绝解析进程身份",
             agent_file.display()
         )
     };
+    if !agent_file.is_file() {
+        // §41 quarantined-delete-says-missing：agent.json 已被隔离为
+        // .corrupt-* 时报「已损坏」而不是「不存在」
+        if has_unrecovered_corrupt(&agent_file) {
+            return Err(corrupt_err());
+        }
+        remove_residue_dir(&dir);
+        return Err(format!("agent {agent_id} 不存在"));
+    }
+    let guard = lock_exclusive(&agent_file, LOCK_ACQUIRE_TIMEOUT)?;
+    // 锁内复核：文件可能已被并发删除赢走，或损坏（含粘性留证）——后者拒绝
+    // 删除，与 get_agent 的语义一致（无法证明进程身份就不动它）。
+    let corrupt = has_unrecovered_corrupt(&agent_file);
     let record = match std::fs::read(&agent_file) {
         Ok(bytes) => match serde_json::from_slice::<AgentRecord>(&bytes) {
             Ok(record) => record,
@@ -507,6 +588,10 @@ pub fn delete_agent(
             if corrupt {
                 return Err(corrupt_err());
             }
+            // §41 delete-loser-empty-dir：并发删除的胜方已把目录改名，本方的
+            // lock_exclusive（create_dir_all + 建锁文件）在原位置重建了只含
+            // 锁文件的空目录——锁内清掉
+            remove_residue_dir(&dir);
             return Err(format!("agent {agent_id} 不存在"));
         }
         Err(e) => return Err(format!("删除失败：read agent.json: {e}")),
@@ -548,7 +633,6 @@ pub fn delete_agent(
     }
     // P-7：按 agent 拆目录后，transcript 随 agent 一起删除。改名仍在锁内：
     // append_exec 在锁的另一侧只会看到「文件不存在」，不会写进将删的目录。
-    let dir = layout::agent_dir(runtime_dir, home_id, agent_id)?;
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
@@ -558,7 +642,17 @@ pub fn delete_agent(
         .ok_or_else(|| format!("删除失败：invalid agent dir {}", dir.display()))?;
     let trash = parent.join(format!(".trash-{agent_id}-{ts}"));
     std::fs::rename(&dir, &trash).map_err(|e| format!("删除失败：rename: {e}"))?;
-    let _ = std::fs::remove_dir_all(&trash); // best-effort；失败留隐形残留
+    // §41 remove-dir-under-lock：改名完成即放锁——remove_dir_all 可能很慢，
+    // 持锁期间同进程的 update_json 会拿着全局 STORE_LOCK 干等
+    drop(guard);
+    if let Err(err) = std::fs::remove_dir_all(&trash) {
+        // §41 trash-never-swept：失败不再静默——由 startup_housekeeping 的
+        // sweep_agent_residue 清扫
+        eprintln!(
+            "删除 agent {agent_id}：清理 {} 失败（{err}），留给启动清扫",
+            trash.display()
+        );
+    }
     Ok(())
 }
 
@@ -872,6 +966,114 @@ mod tests {
             launched_by: None,
             parent_agent_id: None,
         }
+    }
+
+    fn exited_agent(runtime: &Path, exec_id: &str) -> AgentRecord {
+        let agent = register_agent(runtime, "h_test", "pi", new_exec(exec_id)).unwrap();
+        update_agent_status(
+            runtime,
+            "h_test",
+            &agent.id,
+            AgentRecordStatus::Exited,
+            AgentAttachment::None,
+        )
+        .unwrap();
+        agent
+    }
+
+    /// 模拟「胜方已把记录移走」：测试持有 agent.json 的 flock，败方在锁上
+    /// 等待；期间删掉 agent.json，再放锁。
+    fn race_against_removal<T: Send + 'static>(
+        runtime: &Path,
+        agent_id: &str,
+        loser: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let file = layout::agent_file(runtime, "h_test", agent_id).unwrap();
+        let held = lock_exclusive(&file, LOCK_ACQUIRE_TIMEOUT).unwrap();
+        let handle = std::thread::spawn(loser);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        std::fs::remove_file(&file).unwrap();
+        drop(held);
+        handle.join().unwrap()
+    }
+
+    /// §41 delete-loser-empty-dir：并发删除的败方报「不存在」，且不留下只含
+    /// 锁文件的空 agent 目录。
+    #[test]
+    fn delete_loser_reports_missing_and_leaves_no_residue_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        let agent = exited_agent(&runtime, "exec-race");
+        let adir = layout::agent_dir(&runtime, "h_test", &agent.id).unwrap();
+        let (rt, id) = (runtime.clone(), agent.id.clone());
+        let err = race_against_removal(&runtime, &agent.id, move || {
+            delete_agent(&rt, "h_test", &id, false)
+        })
+        .unwrap_err();
+        assert!(err.contains("不存在"), "{err}");
+        assert!(!adir.exists(), "败方不得留下空目录");
+    }
+
+    /// §41：落败的 append_exec 报「不存在」（此前报「不可追加（harness 不
+    /// 一致/运行中）」），同样不留空目录。
+    #[test]
+    fn append_loser_reports_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        let agent = exited_agent(&runtime, "exec-race2");
+        let adir = layout::agent_dir(&runtime, "h_test", &agent.id).unwrap();
+        let (rt, id) = (runtime.clone(), agent.id.clone());
+        let err = race_against_removal(&runtime, &agent.id, move || {
+            append_exec(&rt, "h_test", &id, "pi", new_exec("exec-late"))
+        })
+        .unwrap_err();
+        assert!(err.contains("不存在"), "{err}");
+        assert!(!adir.exists());
+    }
+
+    /// §41 quarantined-delete-says-missing：agent.json 已被隔离为 .corrupt-*
+    /// 时，删除报「已损坏」（修复前报「不存在」，以前的实现报「已损坏」）。
+    #[test]
+    fn deleting_a_quarantined_agent_says_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        let agent = exited_agent(&runtime, "exec-q");
+        let file = layout::agent_file(&runtime, "h_test", &agent.id).unwrap();
+        std::fs::rename(&file, file.with_file_name("agent.json.corrupt-1")).unwrap();
+        let err = delete_agent(&runtime, "h_test", &agent.id, false).unwrap_err();
+        assert!(err.contains("已损坏"), "{err}");
+    }
+
+    /// §41 trash-never-swept + 残留：启动清扫删掉 `.trash-*` 与锁文件超过
+    /// 60s 未动的空 agent 目录；刚建的（可能正在注册）与健康 agent 不动。
+    #[test]
+    fn sweep_agent_residue_removes_trash_and_stale_lock_only_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        let keep = exited_agent(&runtime, "exec-keep");
+        let home = layout::home_dir(&runtime, "h_test").unwrap();
+        let trash = home.join(".trash-agent-exec-x-1");
+        std::fs::create_dir_all(trash.join("nested")).unwrap();
+        std::fs::write(trash.join("nested").join("exec-x.jsonl"), "x").unwrap();
+        let stale = home.join("agent-exec-gone");
+        std::fs::create_dir_all(&stale).unwrap();
+        let stale_lock = stale.join("agent.json.lock");
+        std::fs::write(&stale_lock, "").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&stale_lock)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(120))
+            .unwrap();
+        let fresh = home.join("agent-exec-fresh");
+        std::fs::create_dir_all(&fresh).unwrap();
+        std::fs::write(fresh.join("agent.json.lock"), "").unwrap();
+
+        assert_eq!(sweep_agent_residue(&runtime), 2);
+        assert!(!trash.exists());
+        assert!(!stale.exists());
+        assert!(fresh.exists(), "刚建的目录可能正在注册，不动");
+        assert!(get_agent(&runtime, "h_test", &keep.id).unwrap().is_some());
     }
 
     #[test]
