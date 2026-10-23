@@ -6,13 +6,21 @@
 //! The dispatch also has to precede `cli::real_run_code` — the library's
 //! `signal::install` masks SIGTERM/SIGINT on every thread and consumes them
 //! from a sigwait thread, so the shim's own handler would never fire (F1).
+//!
+//! 子项目 2（A5 / Q-1）：本地工具族的执行面实现同样只属于本二进制——
+//! `mod local_impl;` 不进 lib.rs，omt-daemon 不编译不链接它（KD-E9）。
+
+mod local_impl;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(code) = exec_shim_entry(&args) {
         std::process::exit(code);
     }
-    std::process::exit(omt_runtime::cli::real_run_code());
+    let runtime_dir =
+        omt_runtime::paths::resolve(omt_runtime::cli::runtime_dir_arg(&args).as_deref());
+    let local = local_impl::LocalImpl::new(runtime_dir);
+    std::process::exit(omt_runtime::cli::real_run_code_with(Some(&local)));
 }
 
 /// `omt [--runtime-dir <d>] exec-shim <homeId> <agentId> <execId>`：每 exec

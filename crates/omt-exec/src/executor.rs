@@ -328,13 +328,15 @@ impl ExecutionManager {
     ) -> Result<Arc<ExecSession>, String> {
         // F-U2-10：home_id 拼路径前与 agents_path 同规则校验
         agents::validate_home_id(&req.home_id)?;
-        if req
-            .env_additions
-            .keys()
-            .any(|k| matches!(k.as_str(), "OMT_RUNTIME_DIR" | "OMT_HOME" | "PATH"))
-        {
+        if req.env_additions.keys().any(|k| {
+            matches!(
+                k.as_str(),
+                "OMT_RUNTIME_DIR" | "OMT_HOME" | "PATH" | "OMT_EXEC_ID"
+            )
+        }) {
             return Err(
-                "env_additions 含保留键（PATH/OMT_RUNTIME_DIR/OMT_HOME 由 desktop 注入）".into(),
+                "env_additions 含保留键（PATH/OMT_RUNTIME_DIR/OMT_HOME/OMT_EXEC_ID 由执行面注入）"
+                    .into(),
             );
         }
         let cwd = workspace_root_of(&req.home_path);
@@ -386,7 +388,9 @@ impl ExecutionManager {
             .stderr(std::process::Stdio::piped())
             .stdin(std::process::Stdio::null())
             .env("PATH", harness::augmented_path())
-            .env("OMT_RUNTIME_DIR", runtime_dir);
+            .env("OMT_RUNTIME_DIR", runtime_dir)
+            // Q-12：被派发的 harness 及其子进程（含注入的 omt mcp 桥）凭它识别自己
+            .env("OMT_EXEC_ID", &req.exec_id);
         for (k, v) in &req.env_additions {
             cmd.env(k, v);
         }
@@ -2952,6 +2956,93 @@ mod tests {
         );
         assert_eq!(seen.as_deref(), Some(runtime.to_str().unwrap()));
         let _ = manager.exec_stop("exec-env");
+    }
+
+    /// Q-12：spawn 注入保留变量 `OMT_EXEC_ID=<execId>`——被派发的 harness 及其
+    /// 子进程凭它拒绝嵌套派发/停止；用户 env 不得覆盖（保留键）。
+    #[test]
+    fn spawn_injects_nested_dispatch_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        let home_path = dir.path().join("ws").join(".omt");
+        std::fs::create_dir_all(&home_path).unwrap();
+        let manager = ExecutionManager::with_limits(STARTUP_WINDOW, DEFAULT_MAX_DURATION);
+        let script = write_script(
+            dir.path(),
+            "execpeek",
+            "echo \"EXEC=$OMT_EXEC_ID\"\nkill -TERM $$\n",
+        );
+        let (tx, rx) = mpsc::channel();
+        let sink: EventSink = Arc::new(move |v| {
+            let _ = tx.send(v);
+        });
+
+        // OMT_EXEC_ID 是保留键：env_additions 携带它必须被拒绝
+        let mut env = BTreeMap::new();
+        env.insert("OMT_EXEC_ID".to_string(), "exec-evil".to_string());
+        let rejected = manager.spawn(
+            &runtime,
+            SpawnRequest {
+                exec_id: "exec-marker".into(),
+                agent_id: "agent-marker".into(),
+                home_id: "h_test".into(),
+                home_path: home_path.clone(),
+                harness: "fake".into(),
+                node_id: None,
+                run_id: None,
+                program: script.clone(),
+                args: vec![],
+                env_additions: env,
+                mcp: McpInjection::None,
+                transcript_dir: runtime.join("agents").join("h_test").join("agent-marker"),
+            },
+            sink.clone(),
+        );
+        assert!(
+            rejected.is_err()
+                && rejected
+                    .err()
+                    .map(|e| e.contains("保留键"))
+                    .unwrap_or(false),
+            "OMT_EXEC_ID 必须作为保留键被拒绝"
+        );
+
+        // 注入生效：子进程看到的 OMT_EXEC_ID 是本次 exec_id
+        let _session = manager
+            .spawn(
+                &runtime,
+                SpawnRequest {
+                    exec_id: "exec-marker".into(),
+                    agent_id: "agent-marker".into(),
+                    home_id: "h_test".into(),
+                    home_path: home_path.clone(),
+                    harness: "fake".into(),
+                    node_id: None,
+                    run_id: None,
+                    program: script,
+                    args: vec![],
+                    env_additions: BTreeMap::new(),
+                    mcp: McpInjection::None,
+                    transcript_dir: runtime.join("agents").join("h_test").join("agent-marker"),
+                },
+                sink,
+            )
+            .unwrap();
+        let seen = wait_for(
+            || {
+                while let Ok(event) = rx.try_recv() {
+                    if let Some(text) = event["text"].as_str() {
+                        if let Some(marker) = text.strip_prefix("EXEC=") {
+                            return Some(marker.to_string());
+                        }
+                    }
+                }
+                None
+            },
+            Duration::from_secs(15),
+        );
+        assert_eq!(seen.as_deref(), Some("exec-marker"));
+        let _ = manager.exec_stop("exec-marker");
     }
 
     #[test]

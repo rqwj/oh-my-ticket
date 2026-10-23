@@ -285,8 +285,9 @@ pub struct HarnessUserConfig {
 }
 
 /// 保留键：用户设了会破坏探测/MCP 连接（§3.1 spawn env 合并规则——进程 env →
-/// augmented PATH → 用户 env → 强制 OMT_RUNTIME_DIR，用户值绝不覆盖这三类）。
-const RESERVED_ENV_KEYS: &[&str] = &["OMT_RUNTIME_DIR", "OMT_HOME", "PATH"];
+/// augmented PATH → 用户 env → 强制 OMT_RUNTIME_DIR / OMT_EXEC_ID，用户值绝不
+/// 覆盖这些）。`OMT_EXEC_ID` 是 Q-12 的嵌套派发标记，由执行面注入。
+const RESERVED_ENV_KEYS: &[&str] = &["OMT_RUNTIME_DIR", "OMT_HOME", "PATH", "OMT_EXEC_ID"];
 
 pub fn validate_env(env: &BTreeMap<String, String>) -> Result<(), String> {
     for key in env.keys() {
@@ -843,7 +844,7 @@ mod tests {
     #[test]
     fn env_validation_rejects_reserved_and_illegal_keys() {
         let mut env = BTreeMap::new();
-        for reserved in ["OMT_RUNTIME_DIR", "OMT_HOME", "PATH"] {
+        for reserved in ["OMT_RUNTIME_DIR", "OMT_HOME", "PATH", "OMT_EXEC_ID"] {
             env.insert(reserved.to_string(), "x".to_string());
             assert!(validate_env(&env).is_err(), "{reserved} 应为保留键");
             env.clear();

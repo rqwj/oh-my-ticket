@@ -66,7 +66,15 @@ fn action_of(wire: &str) -> Option<&'static str> {
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
 /// Run the stdio MCP server loop until stdin closes.
-pub fn serve(globals: &GlobalArgs) -> Result<i32, Problem> {
+///
+/// `local`（子项目 2 A5 引入的形参）：本地工具族实现，A6 起按 Q-5 暴露与
+/// 路由；`omt` 二进制传入 `LocalImpl`，lib 侧调用方（如有）传 None。
+pub fn serve(
+    globals: &GlobalArgs,
+    local: Option<&dyn crate::local_tools::LocalTools>,
+) -> Result<i32, Problem> {
+    // A6 接线前的占位：保留参数以稳定调用面（Q-1），避免 A5/A6 两步都改签名。
+    let _ = local;
     let runtime_dir = crate::paths::resolve(globals.runtime_dir.as_deref());
     // Bounded readiness wait: harnesses legitimately launch the mcp
     // process immediately after daemon-start, while the winner may still

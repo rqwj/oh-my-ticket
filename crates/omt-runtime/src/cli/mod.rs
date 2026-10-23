@@ -53,6 +53,17 @@ ONLINE VERBS (connect to the serving daemon; enrollment is persisted at
   daemon-stop
   daemon-status
 
+LOCAL TOOLS (no daemon round-trip for reads; launches obey <runtime-dir>/exec/policy.json):
+  harness list
+  harness models <harness>
+  exec start  --harness H (--node ID | --run ID) [--model M] [--agent AGENT_ID]
+              [--parent AGENT_ID] [--max-duration SECS]   (home: global --home PATH|ID)
+  exec stop   <execId>
+  exec status <execId>
+  exec list   [--all-homes]
+  exec tail   <execId> [--since SEQ] [--limit N]
+  exec policy
+
 OFFLINE MAINTENANCE (refuses while a daemon serves the home):
   reindex   <home-path>
   doctor    <home-path>
@@ -76,16 +87,21 @@ impl MillisClock for SystemClock {
 // ── entry ───────────────────────────────────────────────────────────────
 
 pub fn run() -> std::process::ExitCode {
-    let code = real_run();
+    let code = real_run_with(None);
     std::process::ExitCode::from(code as u8)
 }
 
 /// Integer exit-code surface for the thin `omt` binary entry.
 pub fn real_run_code() -> i32 {
-    real_run()
+    real_run_with(None)
 }
 
-fn real_run() -> i32 {
+/// 子项目 2：`omt` 二进制注入本地工具实现（omt-daemon 链接的 lib 不构造它，KD-E9）。
+pub fn real_run_code_with(local: Option<&dyn crate::local_tools::LocalTools>) -> i32 {
+    real_run_with(local)
+}
+
+fn real_run_with(local: Option<&dyn crate::local_tools::LocalTools>) -> i32 {
     // Arm SIGINT/SIGTERM handling: the wake closure flips CANCELED and
     // shuts the active socket down so a blocked call aborts promptly.
     // (`omt exec-shim` is dispatched in cli_main.rs BEFORE this runs — the
@@ -100,7 +116,7 @@ fn real_run() -> i32 {
     }));
 
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match dispatch_args(args) {
+    match dispatch_args(args, local) {
         Ok(()) => EXIT_OK,
         Err(CliError::Usage(message)) => {
             eprintln!("{message}\n\n{USAGE}");
@@ -248,6 +264,11 @@ fn split_globals(args: &[String]) -> CliResult<Split> {
     Ok(Split { globals, rest })
 }
 
+/// cli_main.rs 构造 LocalImpl 需要 runtime dir：只取全局 `--runtime-dir`。
+pub fn runtime_dir_arg(args: &[String]) -> Option<String> {
+    split_globals(args).ok().and_then(|s| s.globals.runtime_dir)
+}
+
 fn flag_value(args: &mut std::collections::VecDeque<String>, name: &str) -> CliResult<String> {
     args.pop_front()
         .ok_or_else(|| usage_err(format!("missing value for {name}")))
@@ -263,7 +284,10 @@ fn parse_bool(raw: &str) -> CliResult<bool> {
 
 // ── verb dispatch ───────────────────────────────────────────────────────
 
-fn dispatch_args(all: Vec<String>) -> CliResult<()> {
+fn dispatch_args(
+    all: Vec<String>,
+    local: Option<&dyn crate::local_tools::LocalTools>,
+) -> CliResult<()> {
     // U1 (R22): `--version` short-circuits before any verb/runtime-dir work —
     // the anchor for install smoke (`./omt --version`) and brew formula checks.
     if all.iter().any(|a| a == "--version") {
@@ -315,7 +339,30 @@ fn dispatch_args(all: Vec<String>) -> CliResult<()> {
         "reindex" => offline_reindex(&split.globals, rest.make_contiguous()),
         "doctor" => offline_doctor(&split.globals, rest.make_contiguous()),
         "takeover" => offline_takeover(&split.globals, rest.make_contiguous()),
-        "mcp" => crate::mcp::serve(&split.globals)
+        // 子项目 2（A5）：本地工具族动词（harness / exec）。lib 只解析与转发；
+        // 实现由 `omt` 二进制经 real_run_code_with 注入（Q-1 / KD-E9）。
+        "harness" | "exec" => {
+            let local = local.ok_or_else(|| usage_err("本地工具族只在 omt 二进制中可用"))?;
+            let mut argv = vec![verb.clone()];
+            argv.extend(rest.drain(..));
+            let (action, mut args) = crate::local_tools::parse_cli(&argv).map_err(usage_err)?;
+            // 全局 --home（路径或 homeId）承载 home 选择（Q-3）
+            if matches!(action, "exec/start") {
+                if let Some(home) = split.globals.homes.first() {
+                    args["home"] = serde_json::json!(home);
+                }
+            }
+            if action == "exec/list" && args.get("allHomes").is_none() {
+                if let Some(home) = split.globals.homes.first() {
+                    args["home"] = serde_json::json!(home);
+                }
+            }
+            let result = local
+                .call(crate::local_tools::LocalCaller::Cli, action, args)
+                .map_err(CliError::Problem)?;
+            print_result(result, split.globals.json)
+        }
+        "mcp" => crate::mcp::serve(&split.globals, local)
             .map(|_| ())
             .map_err(CliError::Problem),
         "run-create" => online(&split.globals, |client, home_id| {
