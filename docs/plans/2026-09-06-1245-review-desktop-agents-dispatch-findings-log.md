@@ -36,6 +36,8 @@ branch: feat/desktop-agents-dispatch
 | F-ACC-12 | P2 | gated_auto | 执行面/验收 | `executor.rs::dispatch_daemon_side` ② | 停止后重新派发同一 ticket，item 被桌面端身份激活后卡死 | fixed(5ce2750) | — |
 | F-EXEC-17 | P2 | gated_auto | 执行面/桌面 | `follow.rs` / `control.rs::settle_lost_exec` | app 运行期间 shim 崩溃不可见，租约持有到下次启动 | fixed(b2f8aca) | — |
 | F-DAEMON-1 | P1 | gated_auto | daemon | `server.rs` / `events.rs` | events/resume 每次调用新增一个永不撤销的订阅与转发线程 | fixed(4e8c92e) | — |
+| F-SP2-1 | P2 | gated_auto | 执行面 | `executor.rs::transcript_page`（按 seq 分页）+ stdout/stderr 读线程的取号与追加 | 取 seq 与追加 jsonl 不是原子的，文件顺序 ≠ seq 顺序，`exec tail` 按 `since` 分页会永久漏掉或重复事件 | open（§49） | — |
+| F-SP2-2 | P2 | gated_auto | 执行面 | `control.rs::shim_maybe_alive` / `executor.rs::target_shim_alive` | 身份读取失败一律视为「可能存活」，EPERM（pid 被其他用户进程复用）也被算作存活，对账永远跳过，租约无限期卡住 | open（§49） | — |
 | F-BENCH-18 | P1 | gated_auto | BENCH | `.gitignore:26` / `fixtures/harness/*/raw.log` | **raw.log 语料未入库**：`*.log` 规则把三份 raw.log 全部忽略，只存在于本机。`raw_log_replay_matches_recorded_events` 在干净 clone / CI 上会 panic（「raw.log 应存在」），CI rust 任务必红；F-BENCH-15 在仓库里实际未关闭（§30） | fixed(55a8e55 + 2b8e036)：入库 + 必需文件清单入测（缺一即红）；「时间戳已清洗」「≥12 下限」两项不实声明由 F-BENCH-24 在 2b8e036 兑现 | — |
 | F-BENCH-19 | P1 | gated_auto | BENCH/U12 | `adapters.rs::parse_opencode` step_finish | **opencode 的 usage 也是逐步的值，被误标为累计**：语料 4 个 step_finish 各带不同 messageID，每个 total = 该步 input + output + reasoning + cache.read（如 1518+45+109+23040 = 24712）。按「累计取末值」报 25460，实为 98225（少报约 3.9 倍）；本卷免费档 cost=0 掩盖了问题，付费 provider 会少报费用（§30） | fixed(55a8e55)：opencode 标 message，98225 入测 | — |
 | F-BENCH-20 | P3 | testing-gap | BENCH/U12 | `executor.rs::UsageTotals` | `record` / `final_totals` 无直接单测（混合 scope、全零、历史无 scope 事件）；修复前归档的 ExecRecord 用量仍是旧口径，未重算也未标注 | fixed(55a8e55 + e87a99a)：UsageTotals 四形态单测；口径自描述——ExecRecord.usageCaliber（"message-sum"，旧 JSON 兼容读 None = 末条口径）+ 归档直达测试 + TS 类型；不重算（usageTokens/usageCost 无 UI 消费点，标注路线即关闭，§34） | — |
@@ -1930,3 +1932,56 @@ F-BENCH-13 查证结论：4e960a2 提交说明声称的探针/capture/lib 改动
 **待手工验收**：ACC-14；ACC-6 的 UI 确认；B7 Step 9（Esc / 第二实例无清扫日志 / 重载后不重复推事件）。
 
 **验证**：fmt、clippy `-D warnings` 干净；`cargo test --workspace` 三遍全绿；`nm -a target/debug/omt-daemon | grep -c -E 'omt_exec|omt_harness'` = 0（KD-E9）；桌面 vitest 全绿、tsc 干净。
+
+### §49. 子项目 2 实现 · code review（2026-10-24，`ddb8ce3..0754660`）
+
+**范围与方法**：17 个提交（A1–A9、B1–B8），64 个文件，约 +16.3k / −0.6k 行。xterm 相关调研不在本轮范围。4 个并行评审：① A 部分执行面核心（policy / launch 锁 / 派发链 / local / served_homes / 分页 tail）；② CLI / MCP / parity / 安全闸门；③ B 部分执行面与 daemon 修复（B1–B5、B8）；④ 桌面端（A8 / B6 / B7）。各评审使用独立的 `CARGO_TARGET_DIR`。
+
+**验证**（本轮重跑）：fmt、clippy `-D warnings` 干净；`cargo test --workspace` 三遍各 472 passed / 0 failed；`nm` 检查 omt-daemon 中 `omt_exec|omt_harness` = 0，omt 中 `omt_exec` = 6078（KD-E9）；`pnpm gen` 无差异，根 tsc 通过；根 vitest 447 passed；桌面 vitest 187 passed，tsc 干净；desktop crate 10 passed。
+
+**结论**：没有 P1。2 条 P2 与约 22 条 P3。计划中最关键的闸门经各评审核实成立：policy 默认值与 fail closed、停止不受 policy 约束（Q-4）、CLI/MCP 不调 `node/execute`（Q-2）、Run 目标绝不 cancel 调用方的 run（Q-9）、跨进程派发锁在 `wait_ready` 前释放且无死锁（Q-6）、全局 home 被拒（Q-13）、MCP 不能声明 home（Q-3）、`OMT_EXEC_ID` 嵌套派发闸门（Q-12）、`harness__list` 不输出 env 值、execId 路径穿越被拒、KD-E9 符号门。桌面端派发链除「锁更早释放」与「60s 锁超时」外与子项目 1 一致。
+
+#### F-SP2-1 · P2 · `exec tail` 按 seq 分页会丢 / 重复事件（评审 ①，置信度 75）
+
+- **机制**：stdout 与 stderr 两个读线程各自 `session.seq.fetch_add` 取号，中间经过 `on_event`，再 `append_event_line` 写入 jsonl；取号与追加不是原子的，文件顺序可能是 `[4, 6, 5, 7]`。`transcript_page` 假定 seq 随文件顺序递增：过滤 `seq > since`、`nextSeq` = 本页文件顺序最后一个事件的 seq。
+- **场景**：读到 `[4, 6]` 返回 `nextSeq=6`，下一页 `since=6` 把 seq 5 永久滤掉；页边界落在乱序行之后时 `nextSeq` 倒退，事件被重复返回。桌面端 `follow.rs` 按字节偏移尾随，不受影响。
+- **建议**：在 `ExecSession` 里用一把锁把「取号 + 追加」包成原子操作，使文件顺序 = seq 顺序；补乱序场景测试。
+
+#### F-SP2-2 · P2 · EPERM 被当作「shim 可能存活」，租约可无限期卡住（评审 ③，机制置信度 100，频率 75）
+
+- **机制**：B3 的 `shim_maybe_alive` 在 `process_start_identity` 失败时回落 `pid_live`，而 `pid_live` 把 EPERM 视为存活。macOS 的 `proc_pidinfo(PROC_PIDTBSDINFO)` 对其他用户的进程直接返回 EPERM（实测 pid 1）。
+- **场景**：shim 崩溃 / 重启后其 pid 被 root 或系统用户进程复用 → 启动对账（严格 `shim_alive`）标 Failed + `SHIM_LOST_MARKER` → 之后每轮对账 `shim_maybe_alive` 得 EPERM → 判存活 → 跳过 → run item 永远 `running`，daemon 又没有过期租约回收（janitor 为后续项）。
+- **超出已接受的代价**：计划只接受了「缺 start-id 且 pid 被复用」，这里带 start-id 的记录也会中招。
+- **建议**：shim 总以当前用户运行，EPERM（来自 `proc_pidinfo` 或 `kill(pid, 0)`）即「不是我们的 shim」→ 判死；只有其他错误或缺 start-id 时才按「可能存活」。
+
+#### P3（按领域）
+
+**执行面 / CLI / MCP**
+- **`maxDurationSec` 未校验**（评审 ①②）：0 或 <60 被接受，watchdog 首个 tick 即以 MaxDuration 杀掉，run 无人认领；非整数（`"600"`、`30.5`、`-1`）被静默忽略、改用 policy 上限。建议 `exec_start` 对 <60 与非整数报 `INVALID_INPUT`（field `maxDurationSec`）。
+- **Q-13 在 CLI 声明之后才判、kind 缺失时按 workspace 放行**（评审 ①②）：`omt --home ~/.omt exec start …` 若该 home 未被服务，会先 `home/declare` 再被 `POLICY_DENIED`，被拒的请求在 daemon 里留下已登记的 home；`served_homes` 与二次查询都 `unwrap_or("workspace")`（fail open）。建议声明前先对规范路径做 `workspace_scope_denial`，kind 未知视为拒绝（或取声明连接自身 handshake 的 kind）。
+- **MCP 的 `homeId` 也按路径匹配**（评审 ①）：`{"homeId": "/Users/x/proj/.omt"}` 能解析到已服务的 home，偏离「MCP 只认 homeId」；无声明、影响低。建议路径匹配只对 CLI。
+- **Q-3 的 MCP 测试守不住**（评审 ②）：`mcp_exec_start_cannot_declare_an_unserved_home` 同时传了 `home` 与 `homeId`，`homeId` 优先，即使去掉防护也通过。建议只传 `home`，断言 `INVALID_INPUT` 且未声明。
+- **`harness_list` / `exec status` 脱敏漏网**（评审 ①）：`sanitize_args` 只看 key/token/secret/password 结尾的 flag，`["--auth", "sk-abc"]`、`["-H", "Authorization: Bearer xyz"]` 原样输出到主控上下文。建议本地工具路径对每个 arg 再过 `sanitize_line`。
+- **本地动词期间 Ctrl-C / SIGTERM 无效**（评审 ②，实测）：`real_run_with` 装了 sigwait 处理，但 `harness` / `exec` 分支不登记 fd、不检查 `CANCELED`；`omt harness models` 对挂起的二进制收到 SIGINT 后仍跑满 8s，退出码 3 而非 130。建议本地动词不装 sigwait，或检查 `CANCELED` 后 `exit(130)`。
+- **`omt --home .omt exec list` 报 `invalid home id`**（评审 ②，实测）：`resolve_home_id` 以「含不含 `/`」区分路径与 homeId，相对路径被当成 homeId；`exec start` 同样参数却能工作。建议按 `resolve_home` 的方式先按 homeId、再按规范路径匹配。
+- **MCP stdio 循环单线程阻塞**（评审 ②）：`exec__start`（最长 60s 锁等待 + 30s 就绪）、`harness__list`（~14s）期间 `ping` 无响应；客户端超时放弃后 shim 已拉起，调用方拿不到 execId。建议本地调用放到工作线程，或在文档写明阻塞与 `exec__list` 找回路径。
+- **parity 摘要写着 `exec/stop`「policy 约束」**（评审 ②）：与 Q-4 矛盾。改为「停止执行（不受 policy 约束；被派发 agent 不可用）」后 `pnpm gen`。
+- **跨进程派发锁把桌面端卡死的 daemon 传导给 CLI/MCP**（评审 ①）：桌面端派发的 RPC（`omt_client` 无读超时）在 daemon 卡死时无限期持有 `exec/launch.lock`，CLI/MCP 每次 60s 后 `LAUNCH_FAILED`。不是死锁，但是新的跨进程耦合。建议桌面端派发 RPC 加读超时或持锁期间的总时限。
+- **并发计数把读不出的 home 当 0**（评审 ①）：`active_exec_count` 对 `list_agents` 的 Err 计 0，锁超时 / IO 错误时可超额派发。建议容量检查传播错误并拒绝，退出确认框保留宽松计数。
+- **`transcript_page` 没有旧目录回落**（评审 ①）：迁移中断（agent.json 已迁、文件未移）时返回 `{events: [], done: true}`。建议复用 `transcript_tail_from` 的候选目录查找。
+- **临时管理员授权无引用计数**（评审 ③）：强制删除与后台对账同进程并发时共用 `cli:<desktop pid>`，先结束的一方 `Drop` 撤销授权，另一方的管理员 `run/report` 被拒（`lease-token-missing`），强删路径随后删掉 agent、租约被放弃；B7 超时后脱离的 worker 还会晚些撤销。改造前既有。建议按 principal 在进程内引用计数，和 / 或让 `force_release_agent_leases` 也进单飞。
+- **启动失败可能记成 `failed` + `killReason: user`**（评审 ③，置信度 50）：launcher 记录身份失败后 SIGTERM shim，shim 若先于补偿写 Killed(user)，补偿再覆盖为 Failed 但不清 `kill_reason`。建议 `fail_and_compensate` 清 `kill_reason` 或比较后写。
+
+**桌面端**
+- **5s 轮询导致每次都重跑两个副作用**（评审 ④，置信度 100）：`refreshAgents({silent})` 每次都 `setState` 一个新数组，Agents 面板每 5s 多一次 `run/list` RPC；选中的终态 agent 若 transcript 为空会反复 `exec_transcript_tail`；`exec_attach` 持续失败时每 5s 重试并重写 `state.error`。建议结构未变时跳过 `setState`。
+- **停止全部 3s 自动复位抢焦点**（评审 ④）：复位时无条件把焦点拉回「停止全部」，打断用户正在进行的操作。建议只在焦点仍在确认区或 body 时恢复。
+- **停止失败警告 / 归档结果跨 home 残留**（评审 ④）：`AgentsPanel` 未按 home 设 key，B7 的持久警告切到 B home 后仍显示 A home 的失败。建议 home 变化时清空，或 `key={homeId}`。
+- **租约通知的「前往 Runs」不切换 home**（评审 ④）：通知跨 home 保留，但按钮只打开当前 home 的 Runs，文案也不写 home。建议带上 `notice.homeId` 先切 home，或在文案里写明 workspace。
+- **退出 / 关窗确认的回调改到主线程执行**（评审 ④）：直调 NSAlert 后 `on_choice` 在 GCD 主队列里跑，「全部停止后退出」时 `stop_all_execs`（逐 agent flock + 对账）阻塞主 run loop，锁竞争下会转圈；随后即退出，影响小。建议 Stop 分支放到 `std::thread::spawn`。
+- **策略设置测试不再守「默认来源」提示**（评审 ④）：文案改为「出厂默认」后，`getByText(/默认值/)` 只匹配到「恢复默认值」按钮。建议断言 `/出厂默认/` 并补 `source: 'file'` 时不出现的用例。
+- **归档成功提示的播报区域带着内容挂载**（评审 ④）：与 B7 修掉的停止提示同一反模式，读屏可能不播报。建议常驻 `role="status"` 只改文字（计划文本本身的缺口）。
+
+**测试缺口**（评审 ①）：派发锁在 `wait_ready` 前释放（第二个派发不必等第一个就绪）；桌面端发起的 exec 计入 CLI 的并发上限；真正并发的跨进程容量测试（现有为顺序）；Q-13 经 `exec_start` 的集成测试；seq 乱序分页。
+
+**建议**：两条 P2 修复都很小（F-SP2-1 加一把锁、F-SP2-2 区分 EPERM），建议先修再做子项目 2 手工验收（§「执行面子项目 2 验收」矩阵）。P3 中优先：`maxDurationSec` 校验、Q-13 先判后声明、脱敏漏网、Ctrl-C、5s 轮询的无谓重跑、Q-3 测试；其余可随后续小项处理。
+
