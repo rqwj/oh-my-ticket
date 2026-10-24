@@ -45,8 +45,8 @@ branch: feat/desktop-agents-dispatch
 | F-SP2-7 | P2 | gated_auto | 桌面 | `state.rs::handshake_homes` / `rpc_bridge.rs::daemon_homes`（§52 惰性重建） | 超时丢弃连接后，重建失败被吞成 `homes: []` → 切换器清空且清掉「daemon 无响应」错误条；同步命令在主线程重建（最长 30s）会转圈 | fixed(2b77285) | — |
 | F-SP2-8 | P2 | gated_auto | 执行面/脱敏 | `sanitize.rs::sanitize_line`（§54 dash 例外 + Authorization 冒号紧跟） | dash 例外不止放过 `--monkey=banana`：`--apiKey=S`、`-Dpassword=S`、`-ePASSWORD=S`、`-PGPASSWORD=S` 旧版脱敏、新版泄漏；「冒号紧跟」规则让 JSON 形态 `"Authorization":"Basic S"` 重新泄漏 | fixed(26df96c) | — |
 | F-SP2-9 | P2 | gated_auto | 桌面 | `rpc_bridge.rs::events_subscribe` / `daemon_ensure`（同步命令持会话锁） | async 的 `daemon_homes`/`omt_call` 持会话锁做 30s 重建时，切 home 触发同步 `events_subscribe` 在主线程等同一把锁 → 仍会转圈（既有，F-SP2-7「不卡主线程」未闭合） | fixed(26df96c) | — |
-| F-SP2-10 | P2 | gated_auto | 桌面 | `rpc_bridge.rs::events_subscribe`（§56 改 async） | 先在会话锁上排队、拿到锁才 `set_target`；`std::sync::Mutex` 非 FIFO，快速切 home A→B 时 A 可能后拿锁 → 事件泵停在 A，B 的树不再随外部改动刷新，前端 `.catch(() => {})` 静默（回归） | open（§57） | — |
-| F-SP2-11 | P2 | gated_auto | 桌面 | `store.ts::refreshAgents`（§56 超时提示保留） | 窗口聚焦与 home 加载都会调非静默 `refreshAgents()`，`agents_list` 只读文件系统、daemon 卡死也成功 → `error: null` 照样清掉「结果未知」提示，§56 的保留规则在它针对的触发点上失效 | open（§57） | — |
+| F-SP2-10 | P2 | gated_auto | 桌面 | `rpc_bridge.rs::events_subscribe`（§56 改 async） | 先在会话锁上排队、拿到锁才 `set_target`；`std::sync::Mutex` 非 FIFO，快速切 home A→B 时 A 可能后拿锁 → 事件泵停在 A，B 的树不再随外部改动刷新，前端 `.catch(() => {})` 静默（回归） | fixed(da867c5) | — |
+| F-SP2-11 | P2 | gated_auto | 桌面 | `store.ts::refreshAgents`（§56 超时提示保留） | 窗口聚焦与 home 加载都会调非静默 `refreshAgents()`，`agents_list` 只读文件系统、daemon 卡死也成功 → `error: null` 照样清掉「结果未知」提示，§56 的保留规则在它针对的触发点上失效 | fixed(da867c5) | — |
 | F-BENCH-18 | P1 | gated_auto | BENCH | `.gitignore:26` / `fixtures/harness/*/raw.log` | **raw.log 语料未入库**：`*.log` 规则把三份 raw.log 全部忽略，只存在于本机。`raw_log_replay_matches_recorded_events` 在干净 clone / CI 上会 panic（「raw.log 应存在」），CI rust 任务必红；F-BENCH-15 在仓库里实际未关闭（§30） | fixed(55a8e55 + 2b8e036)：入库 + 必需文件清单入测（缺一即红）；「时间戳已清洗」「≥12 下限」两项不实声明由 F-BENCH-24 在 2b8e036 兑现 | — |
 | F-BENCH-19 | P1 | gated_auto | BENCH/U12 | `adapters.rs::parse_opencode` step_finish | **opencode 的 usage 也是逐步的值，被误标为累计**：语料 4 个 step_finish 各带不同 messageID，每个 total = 该步 input + output + reasoning + cache.read（如 1518+45+109+23040 = 24712）。按「累计取末值」报 25460，实为 98225（少报约 3.9 倍）；本卷免费档 cost=0 掩盖了问题，付费 provider 会少报费用（§30） | fixed(55a8e55)：opencode 标 message，98225 入测 | — |
 | F-BENCH-20 | P3 | testing-gap | BENCH/U12 | `executor.rs::UsageTotals` | `record` / `final_totals` 无直接单测（混合 scope、全零、历史无 scope 事件）；修复前归档的 ExecRecord 用量仍是旧口径，未重算也未标注 | fixed(55a8e55 + e87a99a)：UsageTotals 四形态单测；口径自描述——ExecRecord.usageCaliber（"message-sum"，旧 JSON 兼容读 None = 末条口径）+ 归档直达测试 + TS 类型；不重算（usageTokens/usageCost 无 UI 消费点，标注路线即关闭，§34） | — |
@@ -2236,3 +2236,13 @@ F-BENCH-13 查证结论：4e960a2 提交说明声称的探针/capture/lib 改动
 
 **建议**：修 2 条桌面端 P2（F-SP2-10 去掉 `events_subscribe` 的会话锁；F-SP2-11 超时提示改独立字段、只由 `refreshNodes` 成功清除），顺带订阅 effect 的监听器泄漏、STOP 分支 `return` 断言、`with_session` 断言加最少命中数。sanitize 已收敛，Authorization 已知 scheme 白名单与 `\` 跳过两条 P3 改动小，可一并做；其余进后续脱敏专项。
 
+
+### §58. §57 修复（2026-10-24，03bcead）
+
+- **F-SP2-10**：`events_subscribe` 改回**同步**且完全不碰会话锁（runtime dir 直接取，`with_session`/State 参数删除；泵自行连接退避）——主线程按到达顺序执行，set_target 代次恢复请求序，卡死 daemon 的锁队列不再把订阅停在旧 home；前端订阅失败不再 `.catch(() => {})` 吞掉，进错误状态。顺带消除既有问题（订阅失败不 set_target、泵留在旧 home 无重试）。
+- **F-SP2-11**：超时提示移入独立 `timeoutNotice` 字段，由 Rust 侧 `[daemon-timeout] ` **机器标记**触发（跨语言锁定测试，不再靠中文文案子串分类——`isTimeoutNotice` 删除），**只有 `refreshNodes` 成功才清除**；聚焦时的 `refreshAgents`（本地读、daemon 卡死也成功）与 home 加载的 Promise.all 不再抹掉提示。`presentError` 补 `enroll: request write:` 超时形态；重建失败文案不再算超时提示（读路径、无未知后果语义）。
+- **便宜 P3**：订阅 effect 在 dispose 后到达的 unlisten 立即调用、push-only 的 `disposers` 死状态整体删除（每次切 home 泄漏一个监听器的口子闭合）；退出 Keep 分支自带 `QUIT_CONFIRMED.store + exit(0)`、共享尾部删除（STOP 落入尾部的回归**结构性不可能**，全形态断言覆盖 `.store`/`.swap` 等写法）；`with_session` 源码断言改 attribute 边界 + 压空白 + **≥3 下限**（改名零命中即红，私有同步 fn 不再被算进前面的 async 边界）；脱敏：Authorization 首 token 仅命中已知 scheme 白名单（basic/bearer/token/digest/negotiate/ntlm/dpop/apikey/aws4-hmac-sha256）才保留，裸 token 形态整体脱敏；`skip_sep_ws` 加 `\`/`` ` ``/`*`（转义 JSON 闭合）；usage 计数字段入完好列锁定。
+
+**验证**：workspace 519 ×3 连续全绿（517 基线 +2；首轮一次 401/1 为并发编译负载早停 flake，即刻复跑三连绿）；前端 212（+5）、tsc 干净；根 vitest 447；clippy/fmt 干净；nm daemon 双零。台账 F-SP2-10/11 翻 fixed(03bcead)。
+
+**未做（§57 其余 P3，留后续）**：async 命令包 `spawn_blocking`（既有）、`sanitize.rs` 头注释过时、注释「exit 恒为 jsonl 末行」的 drain 超时例外、`{"key":…}` 类 JSON 键截断的进一步细分（已入可接受误伤列）。
