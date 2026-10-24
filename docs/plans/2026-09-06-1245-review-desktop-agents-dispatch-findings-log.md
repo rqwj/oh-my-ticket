@@ -38,9 +38,9 @@ branch: feat/desktop-agents-dispatch
 | F-DAEMON-1 | P1 | gated_auto | daemon | `server.rs` / `events.rs` | events/resume 每次调用新增一个永不撤销的订阅与转发线程 | fixed(4e8c92e) | — |
 | F-SP2-1 | P2 | gated_auto | 执行面 | `executor.rs::transcript_page`（按 seq 分页）+ stdout/stderr 读线程的取号与追加 | 取 seq 与追加 jsonl 不是原子的，文件顺序 ≠ seq 顺序，`exec tail` 按 `since` 分页会永久漏掉或重复事件 | fixed(df5049c) | — |
 | F-SP2-2 | P2 | gated_auto | 执行面 | `control.rs::shim_maybe_alive` / `executor.rs::target_shim_alive` | 身份读取失败一律视为「可能存活」，EPERM（pid 被其他用户进程复用）也被算作存活，对账永远跳过，租约无限期卡住 | fixed(df5049c) | — |
-| F-SP2-3 | P2 | gated_auto | 执行面 | `grants.rs::TempGrant`（§50 引用计数） | 计数归零与撤销之间无互斥：A 归零后、`remove()` 前 B `add` 见授权仍在而不重登记，随后 A 撤销 → B 持守卫却无授权（§49 原症状的窄窗口版） | open（§51） | — |
-| F-SP2-4 | P2 | gated_auto | 桌面 | `lib.rs` 退出 STOP 分支（§50 移出主线程） | `QUIT_CONFIRMED` 在 stop 开始前置位，stop 期间再按 ⌘Q 直接放行退出，剩余 agent 收不到停止信号继续运行 | open（§51） | — |
-| F-SP2-5 | P2 | gated_auto | CLI/MCP | `local_impl.rs::resolve_home_id`（§50 相对路径修复） | `exec list --home <homeId>` 改为要求 home 当前被服务：idle 关闭的 home 报 NOT_FOUND，只读动词还会拉起 daemon（回归） | open（§51） | — |
+| F-SP2-3 | P2 | gated_auto | 执行面 | `grants.rs::TempGrant`（§50 引用计数） | 计数归零与撤销之间无互斥：A 归零后、`remove()` 前 B `add` 见授权仍在而不重登记，随后 A 撤销 → B 持守卫却无授权（§49 原症状的窄窗口版） | fixed(17b3a96) | — |
+| F-SP2-4 | P2 | gated_auto | 桌面 | `lib.rs` 退出 STOP 分支（§50 移出主线程） | `QUIT_CONFIRMED` 在 stop 开始前置位，stop 期间再按 ⌘Q 直接放行退出，剩余 agent 收不到停止信号继续运行 | fixed(17b3a96) | — |
+| F-SP2-5 | P2 | gated_auto | CLI/MCP | `local_impl.rs::resolve_home_id`（§50 相对路径修复） | `exec list --home <homeId>` 改为要求 home 当前被服务：idle 关闭的 home 报 NOT_FOUND，只读动词还会拉起 daemon（回归） | fixed(17b3a96) | — |
 | F-BENCH-18 | P1 | gated_auto | BENCH | `.gitignore:26` / `fixtures/harness/*/raw.log` | **raw.log 语料未入库**：`*.log` 规则把三份 raw.log 全部忽略，只存在于本机。`raw_log_replay_matches_recorded_events` 在干净 clone / CI 上会 panic（「raw.log 应存在」），CI rust 任务必红；F-BENCH-15 在仓库里实际未关闭（§30） | fixed(55a8e55 + 2b8e036)：入库 + 必需文件清单入测（缺一即红）；「时间戳已清洗」「≥12 下限」两项不实声明由 F-BENCH-24 在 2b8e036 兑现 | — |
 | F-BENCH-19 | P1 | gated_auto | BENCH/U12 | `adapters.rs::parse_opencode` step_finish | **opencode 的 usage 也是逐步的值，被误标为累计**：语料 4 个 step_finish 各带不同 messageID，每个 total = 该步 input + output + reasoning + cache.read（如 1518+45+109+23040 = 24712）。按「累计取末值」报 25460，实为 98225（少报约 3.9 倍）；本卷免费档 cost=0 掩盖了问题，付费 provider 会少报费用（§30） | fixed(55a8e55)：opencode 标 message，98225 入测 | — |
 | F-BENCH-20 | P3 | testing-gap | BENCH/U12 | `executor.rs::UsageTotals` | `record` / `final_totals` 无直接单测（混合 scope、全零、历史无 scope 事件）；修复前归档的 ExecRecord 用量仍是旧口径，未重算也未标注 | fixed(55a8e55 + e87a99a)：UsageTotals 四形态单测；口径自描述——ExecRecord.usageCaliber（"message-sum"，旧 JSON 兼容读 None = 末条口径）+ 归档直达测试 + TS 类型；不重算（usageTokens/usageCost 无 UI 消费点，标注路线即关闭，§34） | — |
@@ -2058,3 +2058,16 @@ F-BENCH-13 查证结论：4e960a2 提交说明声称的探针/capture/lib 改动
 
 **建议**：先修 3 条 P2（F-SP2-3 锁内完成计数与文件操作；F-SP2-4 挪 `QUIT_CONFIRMED` 置位点 + panic 兜底；F-SP2-5 先查磁盘 home_ids），连同便宜的 P3：MCP 通知不回包、`sanitize_line` 词首匹配与 Authorization 整体脱敏、`want.is_some()`、超时不重放、切 home 时丢弃在途结果、attach 失败重试。其余 P3 可留到后续。
 
+
+### §52. §51 修复（2026-10-24，17b3a96）
+
+按 §51 建议顺序全部 TDD（回退即红取证）：
+
+- **F-SP2-3**：`TempGrant::add`（计数+登记/授权）与 `Drop`（计数+撤销）在**同一把**引用计数互斥锁内完成（锁序恒为计数锁→文件 flock）；计数键规范化 runtime dir。交错测试用 `#[cfg(test)]` 撤销延迟缝钉死「A 归零→B add→A 撤销」两个方向。
+- **F-SP2-4**：`QUIT_CONFIRMED` 移到 worker `exit()` 前一刻置位（两处 STOP 分支）；`catch_unwind` + 兜底 exit（panic 不再卡死 DIALOG_OPEN）；窗口标题「停止中…」。worker 逻辑抽为可测的 `run_quit_stop_worker`（两个测试：置位时机 + panic 兜底）。
+- **F-SP2-5**：`resolve_home_id` 先查 `layout::home_ids`（非路径形状且磁盘存在→直接用，零 daemon 接触——idle 关闭的 home 可列出、只读动词不再拉起 daemon）；规范路径匹配要求 `want.is_some()`；MCP `exec__list` 拒路径形状 homeId（与 exec_start 同款 INVALID_INPUT）。
+- **便宜 P3**：MCP 通知形式 `tools/call` 不再回 `{"id":null}`；`sanitize_line` 词首匹配（--ask-for-approval/--task-file/URL/--monkey=banana 不再误伤）+ `Authorization:` 按 scheme 整体脱敏（Basic/token 泄漏闭合）+ `sanitize_args` 对 `--auth`/`-H` 的值脱敏；桌面 30s 读超时识别为 WouldBlock/TimedOut——丢弃连接惰性重连但**不重放**（慢而活的 daemon 上非幂等写不再重复提交，报「daemon 无响应（30s）」）；切 home 后在途 stop-all/归档结果丢弃（发起时捕获 homeId、回来时比对）；`exec_attach` 失败后有界重试（3×5s，仅当 exec 仍活跃未接上）；`agentsSigRef` 在切 home/applyExitLocal 时重置；ping 测试 id 卫生。
+
+**验证**：workspace 503 ×多轮全绿（490 基线 +13）；前端 200（+5）、tsc 干净；根 vitest 447；clippy/fmt 干净；nm daemon 双零。
+
+**未做（§51 其余 P3，留后续）**：补偿清 kill_reason 与 shim 写入的交错、严格计数对损坏 agent 宽松、transcript_page 回落与迁移竞争、exit 末行注释修正、Linux hidepid、MCP worker 队列取消/有界、Q-13 双环境 OMT_HOME 不一致、Ctrl-C 打断派发链临界区、exec status prompt 截断（显示层）、DetailPanel 相对时间变旧、焦点恢复范围、p49 spec 第二参数。台账 F-SP2-3/4/5 已翻 fixed(17b3a96)。
