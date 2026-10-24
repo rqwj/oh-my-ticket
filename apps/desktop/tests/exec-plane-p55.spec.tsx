@@ -13,6 +13,7 @@
  */
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 import { act, cleanup } from '@testing-library/react'
+import { extractDaemonTimeoutMessage } from './daemon-timeout-message'
 
 afterEach(() => {
   cleanup()
@@ -100,15 +101,12 @@ describe('§55 daemon_homes 拒绝 / 超时错误条', () => {
     await act(async () => {
       await result.current.refreshHomes()
     })
-    expect(result.current.state.homes.map(h => h.homeId)).toEqual(
-      ['h_a', 'h_b'],
+    expect(
+      result.current.state.homes.map(h => h.homeId),
       '重建失败不得清空 home 列表（切换器必须保住既有 homes）',
-    )
-    expect(result.current.state.activeHome?.homeId).toBe(
-      'h_a',
-      '重建失败不得清掉活动 home',
-    )
-    expect(result.current.state.error).toBeTruthy('重建失败必须置全局 error')
+    ).toEqual(['h_a', 'h_b'])
+    expect(result.current.state.activeHome?.homeId, '重建失败不得清掉活动 home').toBe('h_a')
+    expect(result.current.state.error, '重建失败必须置全局 error').toBeTruthy()
   })
 
   it('重建失败映射为友好文案（不得原样透出 enroll: connection closed）', async () => {
@@ -120,13 +118,11 @@ describe('§55 daemon_homes 拒绝 / 超时错误条', () => {
     await act(async () => {
       await result.current.refreshHomes()
     })
-    expect(result.current.state.error).toContain(
+    expect(result.current.state.error, '超时形态的重建失败要映射为友好文案（含 daemon 无响应标记）').toContain(
       'daemon 无响应',
-      '超时形态的重建失败要映射为友好文案（含 daemon 无响应标记）',
     )
-    expect(result.current.state.error).not.toContain(
+    expect(result.current.state.error, '原始 enroll 报错不得直接怼给用户（§55 P3）').not.toContain(
       'enroll: connection closed',
-      '原始 enroll 报错不得直接怼给用户（§55 P3）',
     )
   })
 
@@ -153,20 +149,18 @@ describe('§55 daemon_homes 拒绝 / 超时错误条', () => {
     await act(async () => {
       await result.current.refreshHomes()
     })
-    expect(result.current.state.homes.length).toBe(2, 'homes 照常刷新')
-    expect(result.current.state.error).toBeNull(
+    expect(result.current.state.homes.length, 'homes 照常刷新').toBe(2)
+    expect(
+      result.current.state.error,
       '§57：重建失败文案随 homes 恢复照常清除（它没有结果未知语义）',
-    )
+    ).toBeNull()
     expect(result.current.state.timeoutNotice).toBeNull()
-    // ③ 真正的超时写提示（Rust DAEMON_TIMEOUT_MESSAGE 原文，带机器前缀）
-    // → 独立粘性字段；refreshHomes / 非静默 refreshAgents 的成功路径都不清
+    // ③ 真正的超时写提示（Rust DAEMON_TIMEOUT_MESSAGE 原文，带机器前缀；
+    // §59 P3-1 起从 daemon.rs 源码抽取，不再手抄整句）→ 独立粘性字段；
+    // refreshHomes / 非静默 refreshAgents 的成功路径都不清
     invokeMock.mockImplementation((cmd: string, args?: { method?: string }) => {
       if (cmd === 'omt_call' && args?.method === 'node/tree') {
-        return Promise.reject(
-          new Error(
-            '[daemon-timeout] daemon 无响应（30s）：请求结果未知、可能已生效——为避免重复提交未自动重试；请刷新确认结果后再决定是否重试（连接已丢弃，下次调用将重建）',
-          ),
-        )
+        return Promise.reject(new Error(extractDaemonTimeoutMessage()))
       }
       if (cmd === 'agents_list') return Promise.resolve({ agents: [], parseFailed: false })
       return Promise.resolve({})
@@ -194,7 +188,7 @@ describe('§55 daemon_homes 拒绝 / 超时错误条', () => {
     await act(async () => {
       await result.current.refreshNodes(result.current.state.activeHome!)
     })
-    expect(result.current.state.timeoutNotice).toBeNull('成功的节点拉取清除超时提示')
+    expect(result.current.state.timeoutNotice, '成功的节点拉取清除超时提示').toBeNull()
     expect(result.current.state.error).toBeNull()
   })
 
@@ -209,7 +203,7 @@ describe('§55 daemon_homes 拒绝 / 超时错误条', () => {
     await act(async () => {
       await result.current.refreshHomes()
     })
-    expect(result.current.state.error).toBeTruthy('配额错误照常置 error')
+    expect(result.current.state.error, '配额错误照常置 error').toBeTruthy()
     invokeMock.mockImplementation((cmd: string) => {
       if (cmd === 'daemon_homes') {
         return Promise.resolve({ homes: [homeA, homeB], homeDir: '/Users/test' })
@@ -219,8 +213,6 @@ describe('§55 daemon_homes 拒绝 / 超时错误条', () => {
     await act(async () => {
       await result.current.refreshHomes()
     })
-    expect(result.current.state.error).toBeNull(
-      '非超时类错误在 refreshHomes 成功后照常清除',
-    )
+    expect(result.current.state.error, '非超时类错误在 refreshHomes 成功后照常清除').toBeNull()
   })
 })

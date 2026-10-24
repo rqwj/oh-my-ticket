@@ -678,20 +678,27 @@ mod tests {
         );
     }
 
-    /// §55 P3 → §57 P3 修订：源文本断言守 run() 的两个 STOP 分支（与
-    /// rpc_bridge 的 daemon_homes_tests 同法）——helper 级测试
+    /// §55 P3 → §57 P3 → §59 P3 修订：源文本断言守 run() 的两个 STOP 分支
+    /// （与 rpc_bridge 的 daemon_homes_tests 同法）——helper 级测试
     /// （quit_stop_branch / run_quit_stop_worker）锁不住调用点。
     /// §57 发现旧断言只扫 `QuitChoice::Stop =>` 到 `quit_stop_branch(`
-    /// 之间：ExitRequested 分支里 helper 调用之后的 `return;` 被删掉
-    /// （落入共享尾部 `QUIT_CONFIRMED.store(true); handle.exit(0);`——
-    /// 即 §51 F-SP2-4 复发）时断言仍绿；`QUIT_CONFIRMED\n.store` /
-    /// `.swap(true` 形态也绕过 needle。修订（配合生产代码重构——共享
-    /// 尾部删除、Keep 分支自带确认+退出）：
-    /// - Stop 分支整段（到下一个 `QuitChoice::` 分支）做**去空白**扫描：
-    ///   不得出现 `QUIT_CONFIRMED` 的任何引用（store / swap / compare_/
-    ///   跨行拼接全部命中），且必须经 quit_stop_branch 收尾；
-    /// - 至少一个 Keep 分支自带 `QUIT_CONFIRMED.store` + `.exit(0)`
-    ///   （把尾部挪回 match 之后会让该分支变空 → 本断言红）。
+    /// 之间；§58 重构（共享尾部删除、Keep 分支自带确认+退出）后扫描改为
+    /// arm 整段。§59 变异确认仍漏两种回归：
+    /// - 最后一个 QuitChoice arm 之后的代码从不被扫描：在 ExitRequested 的
+    ///   match 之后加回共享尾部（store + exit(0)）→ Stop/Cancel 落入尾部
+    ///   （§51 F-SP2-4 复现）而测试仍绿；
+    /// - `keep_owns_exit >= 1` 区分不了两处 Keep：给 CloseRequested 的 Keep
+    ///   （本应只隐藏窗口、后台继续）加 store + exit(0) 仍绿。
+    ///
+    /// §59 修订：两个 on_choice 闭包**到闭包结束**整体入扫（含 match 之后
+    /// 的任何尾部）——`QUIT_CONFIRMED.<method>`（任何形态）与 `.exit(0`
+    /// 只允许出现在各自的 arm 里：
+    /// - CloseRequested（关窗）：Keep 只隐藏窗口——两者皆无；Stop 经
+    ///   quit_stop_branch；除 Stop 分支外整个闭包无 `.exit(0`、无
+    ///   `QUIT_CONFIRMED.`（任何形态）；
+    /// - ExitRequested（⌘Q）：Keep 必须自带 `QUIT_CONFIRMED.store` +
+    ///   `.exit(0`；除 Keep（store）与 Stop（helper 的 exit 闭包）外，
+    ///   闭包其余部分（含 Cancel 与 match 之后的尾部）两者皆无。
     ///
     ///（needle 运行时拼接，避免本测的字面量被自己扫到。）
     #[test]
@@ -703,7 +710,6 @@ mod tests {
         let test_module = ["#[cfg(", "test)]"].join("");
         let src = &full[..full.find(&test_module).expect("lib.rs 应有测试模块")];
         let stop_arm = ["QuitChoice::Stop", "=>"].join(" ");
-        let keep_arm = ["QuitChoice::Keep", "=>"].join(" ");
         let next_choice = ["QuitChoice", "::"].join("");
         let helper = ["quit_stop_branch", "("].join("");
         // 代码形态 needle：`QUIT_CONFIRMED.<method>`（去空白后）——命中
@@ -747,25 +753,90 @@ mod tests {
             stop_arms >= 2,
             "应锁定 CloseRequested / ExitRequested 两个 STOP 分支，实际找到 {stop_arms} 个"
         );
-        // Keep 分支自带确认+退出（§57 重构后无共享尾部可落入）
+        // ── §59 P3：两个 on_choice 闭包整体（到闭包结束）入扫，区分两处 Keep ──
+        // 闭包区结束锚：CloseRequested（on_window_event 内）之后是 `.menu(`
+        // builder 调用；ExitRequested（run 事件 arm 内）之后是 Reopen 事件臂
+        let choice_head = ["move |choice", "|"].join("");
+        let keep_arm_c = ["QuitChoice::Keep", "=>"].concat();
+        let stop_arm_c = ["QuitChoice::Stop", "=>"].concat();
+        // 区间会延伸到闭包结束锚（下一个 builder 调用 / 下一个事件臂），
+        // 中间的说明注释（如菜单 Quit 的 `app.exit(0)` 说明）不是代码——
+        // 扫描前剥掉行注释（本文件生产区不用块注释，字符串里无 `//`）
+        let strip_comments = |text: &str| -> String {
+            text.lines()
+                .map(|line| match line.find("//") {
+                    Some(at) => &line[..at],
+                    None => line,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let mut closure_regions: Vec<String> = Vec::new();
         let mut rest = src;
-        let mut keep_owns_exit = 0usize;
-        while let Some(idx) = rest.find(&keep_arm) {
-            let arm = arm_region(&rest[idx..]);
-            if arm.contains(&confirm_store) && arm.contains(&exit_call) {
-                keep_owns_exit += 1;
-            }
-            let from = &rest[idx..];
-            let end = from[next_choice.len()..]
-                .find(&next_choice)
-                .map(|off| next_choice.len() + off)
-                .unwrap_or(from.len());
-            rest = &from[end..];
+        while let Some(idx) = rest.find(&choice_head) {
+            let tail = &rest[idx..];
+            let end = tail
+                .find(".menu(")
+                .or_else(|| tail.find("RunEvent::Reopen"))
+                .expect("§59：on_choice 闭包区应有结束锚（.menu( / RunEvent::Reopen）");
+            closure_regions.push(collapse(&strip_comments(&rest[idx..idx + end])));
+            rest = &rest[idx + end..];
         }
         assert!(
-            keep_owns_exit >= 1,
-            "ExitRequested 的 Keep 分支必须自带 QUIT_CONFIRMED.store + exit(0)\
-             （共享尾部已删——把确认+退出挪回 match 之后是 §57 点名的回归位点）"
+            closure_regions.len() >= 2,
+            "应锁定 CloseRequested / ExitRequested 两个 on_choice 闭包，实际 {} 个",
+            closure_regions.len()
+        );
+        // arm 子区（去空白后的 needle；闭包区内到下一个 QuitChoice::）
+        let arm_in = |region: &str, arm: &str| -> String {
+            let start = region
+                .find(arm)
+                .unwrap_or_else(|| panic!("on_choice 闭包区应有 {arm}"));
+            let end = region[start + arm.len()..]
+                .find(&next_choice)
+                .map(|off| start + arm.len() + off)
+                .unwrap_or(region.len());
+            region[start..end].to_string()
+        };
+        // 去掉 Keep / Stop 两个 arm 后的闭包剩余（闭包头 / Cancel arm /
+        // match 之后的任何尾部——§59 变异确认的共享尾部落点）
+        let remainder_of = |region: &str| -> String {
+            let keep = arm_in(region, &keep_arm_c);
+            let stop = arm_in(region, &stop_arm_c);
+            region.replacen(&keep, "", 1).replacen(&stop, "", 1)
+        };
+        // CloseRequested（关窗）：Keep 只隐藏窗口——无 store 无 exit(0)
+        let close_requested = &closure_regions[0];
+        let close_keep = arm_in(close_requested, &keep_arm_c);
+        assert!(
+            !close_keep.contains(&exit_call),
+            "CloseRequested 的 Keep 分支只隐藏窗口、后台继续——不得 exit（§59 变异：\
+             给它加 store+exit 曾让旧断言仍绿）"
+        );
+        assert!(
+            !close_keep.contains(&confirm_ref),
+            "CloseRequested 的 Keep 分支不得触碰 QUIT_CONFIRMED（任何形态）"
+        );
+        let close_remainder = remainder_of(close_requested);
+        assert!(
+            !close_remainder.contains(&exit_call) && !close_remainder.contains(&confirm_ref),
+            "CloseRequested 的 on_choice 闭包除 Stop 分支外不得出现 .exit(0 / \
+             QUIT_CONFIRMED（任何形态，含 match 之后的尾部）"
+        );
+        // ExitRequested（⌘Q）：Keep 自带确认+退出；其余（含尾部）两者皆无
+        let exit_requested = &closure_regions[1];
+        let exit_keep = arm_in(exit_requested, &keep_arm_c);
+        assert!(
+            exit_keep.contains(&confirm_store) && exit_keep.contains(&exit_call),
+            "ExitRequested 的 Keep 分支必须自带 QUIT_CONFIRMED.store + exit(0)（§57 重构后\
+             无共享尾部可落入——把确认+退出挪回 match 之后是 §57/§59 点名的回归位点）"
+        );
+        let exit_remainder = remainder_of(exit_requested);
+        assert!(
+            !exit_remainder.contains(&confirm_ref) && !exit_remainder.contains(&exit_call),
+            "ExitRequested 的 on_choice 闭包除 Keep/Stop 分支外不得出现 .exit(0 / \
+             QUIT_CONFIRMED（任何形态）——match 之后加回共享尾部（§59 变异确认的\
+             漏网位点，Stop/Cancel 落入即 F-SP2-4 复现）必须被抓"
         );
     }
 }

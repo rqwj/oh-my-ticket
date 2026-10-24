@@ -17,8 +17,69 @@ export interface DaemonStatus {
   spawned_by_us: boolean
 }
 
+/**
+ * §57 F-SP2-11 / §59 P3-1：Rust 超时文案（daemon.rs `DAEMON_TIMEOUT_MESSAGE`）
+ * 的机器前缀——跨语言锁定（vitest 直接读 daemon.rs 源码断言
+ * DAEMON_TIMEOUT_MESSAGE 以本常量开头、Rust 侧 `DAEMON_TIMEOUT_MARKER`
+ * 与之同值；Rust 改前缀会让测试红，而不是前端静默退回普通 error）。
+ */
+export const DAEMON_TIMEOUT_MARKER = '[daemon-timeout]'
+
+/**
+ * §59 F-SP2-12：daemon 写路径超时的类型化错误——bridge 出口（omtCall /
+ * execStart）把 Rust `DAEMON_TIMEOUT_MESSAGE`（`[daemon-timeout] ` 机器前缀）
+ * 转成本类后上抛：
+ * - `text` 为剥前缀后的展示文案（Rust 常量仍是文案唯一来源），
+ *   `daemonTimeout = true` 供 store 按类型分流到粘性 timeoutNotice
+ *   （不再靠字符串回判——此前前缀只在 presentErrorWithKind 的调用点剥掉，
+ *   组件层 `String(err)` 的展示面全在覆盖之外）；
+ * - `toString()` 返回剥前缀文案——TreePanel / ExecutionDialog / RunsPanel /
+ *   DetailPanel / AgentsPanel 的就地错误态（`String(err)`）自动拿到干净
+ *   文案，无需逐点替换。
+ */
+export class DaemonTimeoutError extends Error {
+  readonly daemonTimeout = true
+
+  constructor(
+    /** 剥掉机器前缀后的展示文案 */
+    readonly text: string,
+  ) {
+    super(text)
+    this.name = 'DaemonTimeoutError'
+  }
+
+  override toString(): string {
+    return this.text
+  }
+}
+
+/**
+ * §59 F-SP2-12：类型化超时错误的读取缝——是 bridge 出口整形过的 daemon
+ * 超时则返回剥前缀文案，否则 null（store 据此分流，不 import 类本体）。
+ */
+export function daemonTimeoutText(error: unknown): string | null {
+  return error instanceof DaemonTimeoutError ? error.text : null
+}
+
+/**
+ * §59 F-SP2-12：bridge 出口的统一错误整形——超时类（机器前缀命中）转
+ * {@link DaemonTimeoutError}（剥前缀 + 类型分流），其余原样上抛（既有
+ * 文案语义不变）。
+ */
+function presentInvokeError(error: unknown): never {
+  const raw = String(error).replace(/^Error:\s*/, '')
+  if (raw.startsWith(DAEMON_TIMEOUT_MARKER)) {
+    throw new DaemonTimeoutError(raw.slice(DAEMON_TIMEOUT_MARKER.length).trim())
+  }
+  throw error
+}
+
 export async function omtCall<T = unknown>(method: string, params: Record<string, unknown> = {}): Promise<T> {
-  return invoke<T>('omt_call', { method, params })
+  try {
+    return await invoke<T>('omt_call', { method, params })
+  } catch (error) {
+    presentInvokeError(error)
+  }
 }
 
 export async function daemonStatus(): Promise<DaemonStatus> {
@@ -302,17 +363,23 @@ export async function execStart(options: {
   agentId?: string | null
   channel: Channel<TranscriptEvent>
 }): Promise<ExecStartOutcome> {
-  return invoke<ExecStartOutcome>('exec_start', {
-    homeId: options.homeId,
-    homePath: options.homePath,
-    nodeId: options.nodeId,
-    harness: options.harness,
-    unattended: options.unattended,
-    model: options.model ?? null,
-    resumeSession: options.resumeSession ?? null,
-    agentId: options.agentId ?? null,
-    channel: options.channel,
-  })
+  try {
+    return await invoke<ExecStartOutcome>('exec_start', {
+      homeId: options.homeId,
+      homePath: options.homePath,
+      nodeId: options.nodeId,
+      harness: options.harness,
+      unattended: options.unattended,
+      model: options.model ?? null,
+      resumeSession: options.resumeSession ?? null,
+      agentId: options.agentId ?? null,
+      channel: options.channel,
+    })
+  } catch (error) {
+    // §59 F-SP2-12：exec_start 经 rpc_of → launch::start 同样上抛
+    // DAEMON_TIMEOUT_MESSAGE（无 commandId 的写）——出口统一整形
+    presentInvokeError(error)
+  }
 }
 
 /**

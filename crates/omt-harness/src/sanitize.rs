@@ -78,6 +78,16 @@ pub fn sanitize_line(line: &str) -> String {
     // 反引号与 `*`（markdown / 强调包裹的同构形态，宁枉勿纵）。
     let skip_sep_ws =
         |c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '\\' || c == '`' || c == '*';
+    // §59 P3-3：**值起点**用窄集合——不含 `*`、也不含反引号。宽集合会把已
+    // 脱敏输出里的掩码 `***` 当「分隔符前缀」整体跳过 → 值起点找不到 →
+    // 截点落行尾 → 再追加一个 ` ***`（`API_KEY= ***` → `API_KEY= *** ***`、
+    // `--token=***` 尾巴多一个 ` ***`、`Authorization: Bearer ***` 连 scheme
+    // 一起丢）——脱敏不再幂等，而 `sanitize_args_deep`
+    // （omt-exec/src/local.rs）对 `sanitize_args` 的输出**再跑一遍**
+    // sanitize_line，harness_list 工具输出实测踩中。掩码值本身当普通值
+    // 命中（截点落在 `*` 上）即恢复幂等；`` ` `` 同理不入值起点集合
+    //（`**password**: ***` 的重脱敏路径）。
+    let skip_value_edge = |c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '\\';
     for kw in KEYWORDS {
         // §53：遍历全部命中——词中命中、或词首但非键值（`--key-file`）都
         // 不得挡住同串后面的真键值形态（`--key-file /x --key=SECRET`）。
@@ -88,10 +98,12 @@ pub fn sanitize_line(line: &str) -> String {
             let ws = after.len() - rest.len();
             let is_kv = rest.starts_with('=') || rest.starts_with(':');
             if is_kv {
-                // 值起点：跳过连续的分隔符/空白/引号（§55：引号也跳——
-                // `{"token":"abc"}` 的值从 abc 起截）
+                // 值起点：跳过连续的分隔符/空白/引号/`\`（§55 引号、§57 转义
+                // JSON；`{"token":"abc"}` 的值从 abc 起截）。§59 P3-3：用窄
+                // 集合（不含 `*`/反引号）——掩码 `***` 是合法值起点，脱敏
+                // 保持幂等（见 skip_value_edge 注释）
                 let value_start = rest
-                    .find(|c: char| !skip_sep_ws(c) && c != '=' && c != ':')
+                    .find(|c: char| !skip_value_edge(c) && c != '=' && c != ':')
                     .map(|off| pos + kw.len() + ws + off)
                     .unwrap_or(line.len());
                 note(value_start);
@@ -125,11 +137,13 @@ pub fn sanitize_line(line: &str) -> String {
             break;
         }
     }
-    // §51/§53：Authorization: 后按 scheme 脱敏（任意 scheme）——scheme 词
-    // 保留，其后的值整体替换；`Authorization: <单段值>`（无 scheme 形态）
-    // 从冒号后直接整体替换。§53：遍历命中且冒号必须紧跟关键字；§55：
-    // 关键字与冒号之间允许空白**和引号**（`"Authorization":"Basic …"`、
-    // `'authorization': 'Basic …'`），scheme 值前也跳过引号。
+    // §51/§53：Authorization: 后按 scheme 脱敏——scheme 词**只有命中已知
+    // 白名单**（is_known_auth_scheme）才保留，其后的值整体替换；
+    // `Authorization: <单段值>`（无 scheme 形态）从冒号后直接整体替换。
+    // §53：遍历命中且冒号必须紧跟关键字；§55：关键字与冒号之间允许空白
+    // **和引号**（`"Authorization":"Basic …"`、`'authorization': 'Basic …'`），
+    // scheme 值前也跳过引号。§59 P3-3：值起点/跟随跳过用窄集合
+    //（skip_value_edge——掩码 `***` 是合法值起点，重脱敏幂等）。
     for (pos, _) in lower.match_indices("authorization") {
         if !is_word_start(pos) {
             continue;
@@ -142,7 +156,7 @@ pub fn sanitize_line(line: &str) -> String {
             continue;
         }
         let credentials = &trimmed[1..];
-        if let Some(mut value_start) = credentials.find(|c: char| !skip_sep_ws(c)) {
+        if let Some(mut value_start) = credentials.find(|c: char| !skip_value_edge(c)) {
             // 跳过一个 scheme 词（Basic / Bearer / token …）再取值；
             // §57 P3：scheme 词只有命中已知白名单才保留——首个空白分隔
             // token 无条件保留会把无 scheme 形态的第一个机密词留下
@@ -153,7 +167,7 @@ pub fn sanitize_line(line: &str) -> String {
                 .unwrap_or(scheme_and_rest.len());
             let scheme_token = &scheme_and_rest[..scheme_len];
             let after_scheme = &scheme_and_rest[scheme_len..];
-            if let Some(follow) = after_scheme.find(|c: char| !skip_sep_ws(c)) {
+            if let Some(follow) = after_scheme.find(|c: char| !skip_value_edge(c)) {
                 if is_known_auth_scheme(scheme_token) {
                     value_start += scheme_len + follow;
                 }
@@ -386,10 +400,11 @@ mod tests {
         }
     }
 
-    /// §51 泄网样本：`Authorization:` 后按 scheme 脱敏（任意 scheme——
-    /// Basic / token 此前完全漏网；scheme 词保留、值整体替换）。
+    /// §51 泄网样本：`Authorization:` 后按 scheme 脱敏——scheme 词命中已知
+    /// 白名单（§57 P3：basic / bearer / token …，见 is_known_auth_scheme）
+    /// 才保留，值整体替换；无 scheme 的单段值形态从冒号后整体替换。
     #[test]
-    fn sanitize_line_redacts_the_value_after_authorization_any_scheme() {
+    fn sanitize_line_redacts_the_value_after_authorization_known_schemes() {
         assert_eq!(
             sanitize_line("Authorization: Basic dXNlcjpwYXNz"),
             "Authorization: Basic ***"
@@ -508,9 +523,16 @@ mod tests {
             ),
             // §57 P3（转义 JSON）：skip_sep_ws 未跳 `\`——Node 错误转储 /
             // 日志里的请求体 / 单 argv JSON 都是 `\"key\": \"v\"` 形态，
-            // 三版都漏
-            (r#"{\"api_key\": \"S\"}"#, "S\""),
-            (r#"\"Authorization\":\"Basic S\""#, "Basic S"),
+            // 三版都漏。§59 P3-4：断言收紧到裸 `"S"`（输入里没有其它
+            // 大写 S——部分脱敏的变异形态不得借 `S\"`/`Basic S` 的宽断言存活）
+            (r#"{\"api_key\": \"S\"}"#, "S"),
+            (r#"\"Authorization\":\"Basic S\""#, "S"),
+            // §59 P3-4：§59 变异确认——去掉 skip_sep_ws 的反引号 / `*` 两个
+            // 变异都存活（各自只被本表的其它形态间接挡住）。这两行分别锁
+            // 反引号（`` `token`=S9 ``：关键字与分隔符之间的反引号跳过）与
+            // `*`（`**password**: S9`：markdown 加粗键名的星号跳过）。
+            ("**password**: S9", "S9"),
+            ("`token`=S9", "S9"),
         ];
         for (input, secret) in LEAKS {
             let out = sanitize_line(input);
@@ -521,6 +543,17 @@ mod tests {
             assert!(
                 out.contains("***"),
                 "§53 泄漏列：{input:?} 必须被脱敏，实际输出 {out:?}"
+            );
+            // §59 P3-3：幂等——已脱敏输出再次过 sanitize_line 不得变形。
+            // §57 把 `*` 并入值起点跳过集后，已是掩码的值找不到起点 → 截点
+            // 落行尾 → 再追加一个 ` ***`（`API_KEY= ***` → `API_KEY= *** ***`、
+            // `Authorization: Bearer ***` 丢 scheme）；harness_list 的
+            // sanitize_args_deep（sanitize_args 输出再跑 sanitize_line）踩中。
+            // 值起点必须用不含 `*`/反引号的窄集合（见 sanitize_line 内注释）。
+            let twice = sanitize_line(&out);
+            assert_eq!(
+                twice, out,
+                "§59 幂等：{input:?} 的脱敏输出 {out:?} 二次脱敏变形为 {twice:?}"
             );
         }
     }

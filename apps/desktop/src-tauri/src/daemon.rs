@@ -179,17 +179,26 @@ pub fn is_read_timeout(problem_message: &str, problem_code: &str) -> bool {
             || problem_message.to_ascii_lowercase().contains("timed out"))
 }
 
+/// §57 F-SP2-11 / §59 P3-1：超时文案开头的机器可读前缀——前端 bridge.ts
+/// 的 `DAEMON_TIMEOUT_MARKER` 据此把超时类失败分流到独立的 timeoutNotice
+/// 状态。真正的跨语言锁定在前端：vitest（daemon-timeout-message.ts 与
+/// exec-plane-p59.spec）直接读本文件抽取本常量与
+/// [`DAEMON_TIMEOUT_MESSAGE`] 的字面量，断言 message 以 TS 侧 marker 开头、
+/// 两边 marker 同值——改任何一边，测试即红（此前两边各写一份硬编码、
+/// 各自对自己的拷贝断言，Rust 侧连前缀带测试一起改前端会静默退回）。
+// crate 内只有测试引用本常量（消费方在前端）；staticlib/cdylib 目标会把
+// 无生产引用的 pub const 当死码——显式标注。
+#[allow(dead_code)]
+pub const DAEMON_TIMEOUT_MARKER: &str = "[daemon-timeout]";
+
 /// §51 timeout-no-replay：超时路径的统一错误文案（与 daemon 已断的重连+
 /// 重放相区分）。连接在 state.rs 侧被丢弃，下次调用惰性重建。
 /// §53 P3：如实说明**结果未知、可能已生效**——读超时时 daemon 通常仍会
 /// 完成写入，「已放弃且未重试」会诱导用户立即重试（正是要避免的
 /// 重复提交）；引导先刷新确认结果再重试。
-/// §57 F-SP2-11：开头带机器可读前缀 `[daemon-timeout]`——前端 store 以它
-/// 把超时类失败分流到**独立的 timeoutNotice 状态**（此前按中文文案子串
-/// 分类，改文案即静默改变前端行为）。前缀在展示层剥掉，友好文案仍以
-/// 本常量为唯一来源（前端不复制文案）；前缀由
-/// `daemon_timeout_message_carries_machine_marker` 跨语言锁定（与前端
-/// store.ts 的 DAEMON_TIMEOUT_MARKER 同值）。
+/// §57 F-SP2-11：开头带机器可读前缀 [`DAEMON_TIMEOUT_MARKER`]——前端在
+/// bridge 出口（omtCall / execStart，§59 F-SP2-12）剥掉前缀并按类型分流；
+/// 友好文案仍以本常量为唯一来源（前端不复制文案）。
 pub const DAEMON_TIMEOUT_MESSAGE: &str =
     "[daemon-timeout] daemon 无响应（30s）：请求结果未知、可能已生效——\
      为避免重复提交未自动重试；请刷新确认结果后再决定是否重试（连接已丢弃，下次调用将重建）";
@@ -407,15 +416,17 @@ mod tests {
         );
     }
 
-    /// §57 F-SP2-11：超时文案必须带机器可读前缀——前端 store 据此把超时
-    /// 类失败分流到独立的 timeoutNotice 状态（中文文案子串分类是 §57
-    /// 点名的脆弱点：改文案静默改变前端行为）。前缀与文案的绑定在此
-    /// 跨语言锁定（前端 store.ts 的 DAEMON_TIMEOUT_MARKER 与之同值）。
+    /// §57 F-SP2-11 → §59 P3-1：超时文案必须带机器可读前缀（本 crate 内
+    /// message↔marker 一致性）——跨语言方向由前端 vitest 锁定：它直接读
+    /// 本文件抽取两个常量的字面量，断言 message 以 TS 侧 marker 开头、
+    /// marker 两边同值（此前本测试硬编码 `"[daemon-timeout] "`，与前端
+    /// 各自对自己的拷贝断言——Rust 侧连前缀带测试一起改前端会静默退回）。
     #[test]
     fn daemon_timeout_message_carries_machine_marker() {
         assert!(
-            DAEMON_TIMEOUT_MESSAGE.starts_with("[daemon-timeout] "),
-            "超时文案必须以 [daemon-timeout] 开头（前端 store.ts 依赖此前缀分流）：{DAEMON_TIMEOUT_MESSAGE}"
+            DAEMON_TIMEOUT_MESSAGE.starts_with(DAEMON_TIMEOUT_MARKER),
+            "超时文案必须以 {DAEMON_TIMEOUT_MARKER} 开头（前端 bridge.ts 依赖此前缀分流）：\
+             {DAEMON_TIMEOUT_MESSAGE}"
         );
     }
 

@@ -18,6 +18,7 @@
  */
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 import { act, cleanup } from '@testing-library/react'
+import { extractDaemonTimeoutMessage } from './daemon-timeout-message'
 
 afterEach(() => {
   cleanup()
@@ -51,9 +52,10 @@ vi.mock('@tauri-apps/plugin-dialog', () => ({
 const homeA = { homeId: 'h_a', kind: 'workspace', path: '/tmp/a/.omt' } as const
 const homeB = { homeId: 'h_b', kind: 'workspace', path: '/tmp/b/.omt' } as const
 
-/** §57 F-SP2-11：Rust DAEMON_TIMEOUT_MESSAGE 原文（含机器前缀）。 */
-const RUST_TIMEOUT_MESSAGE =
-  '[daemon-timeout] daemon 无响应（30s）：请求结果未知、可能已生效——为避免重复提交未自动重试；请刷新确认结果后再决定是否重试（连接已丢弃，下次调用将重建）'
+/** §57 F-SP2-11：Rust DAEMON_TIMEOUT_MESSAGE 原文（含机器前缀）。
+ * §59 P3-1：从 daemon.rs 源码抽取（不再手抄——Rust 改前缀/文案时由
+ * exec-plane-p59 的跨语言锁定断言兜红，本文件随抽取值同步）。 */
+const RUST_TIMEOUT_MESSAGE = extractDaemonTimeoutMessage()
 
 /** 假时钟下等 store 的 boot 链（homes → 自动选中 → per-home 装载）收敛。 */
 async function advanceUntil(predicate: () => boolean, steps = 50): Promise<void> {
@@ -135,10 +137,10 @@ describe('§57 订阅通道（F-SP2-10 / 监听器泄漏）', () => {
       void result.current.selectHome(result.current.state.homes[1])
     })
     await flush()
-    expect(result.current.state.error).toContain(
-      '订阅通道建立失败',
+    expect(
+      result.current.state.error,
       'F-SP2-10：订阅失败必须可见——泵停在旧 home 时外部 CLI 改动不再刷新树',
-    )
+    ).toContain('订阅通道建立失败')
     // 后续刷新成功——普通 error 的既有清除语义照常（订阅失败是常规
     // error，非粘性提示）
     await act(async () => {
@@ -179,18 +181,18 @@ describe('§57 订阅通道（F-SP2-10 / 监听器泄漏）', () => {
     })
     expect(subscribeCalls).toBe(2)
     await flush()
-    expect(unlistens).toHaveLength(1, 'h_b 的 invoke 已 resolve，其 listen 已返回')
+    expect(unlistens, 'h_b 的 invoke 已 resolve，其 listen 已返回').toHaveLength(1)
     // h_a 的 invoke 此刻才 resolve → 其 listen 返回的 unlisten（下标 1）
     // 到达时 effect 已销毁——必须被立即执行
     await act(async () => {
       resolveFirst({})
     })
     await flush()
-    expect(unlistens).toHaveLength(2, 'h_a 的迟到订阅也调用了 listen')
-    expect(unlistens[1]).toHaveBeenCalledTimes(
-      1,
+    expect(unlistens, 'h_a 的迟到订阅也调用了 listen').toHaveLength(2)
+    expect(
+      unlistens[1],
       '§57 P3：effect 销毁后才到达的 unlisten 必须立即执行（不得丢进只进不出的 disposers）',
-    )
+    ).toHaveBeenCalledTimes(1)
     // 活跃 effect（h_b）的 unlisten（下标 0）尚未执行——仍在订阅中
     expect(unlistens[0]).not.toHaveBeenCalled()
     // 卸载 → cleanup 调用保存的 unlisten
@@ -223,36 +225,36 @@ describe('§57 超时提示独立字段（F-SP2-11）', () => {
       await result.current.refreshNodes(result.current.state.activeHome!)
     })
     expect(result.current.state.timeoutNotice).toContain('结果未知')
-    expect(result.current.state.timeoutNotice).not.toContain(
+    expect(result.current.state.timeoutNotice, '机器前缀是分流契约，不得展示给用户').not.toContain(
       '[daemon-timeout]',
-      '机器前缀是分流契约，不得展示给用户',
     )
-    expect(result.current.state.error).toBeNull(
+    expect(
+      result.current.state.error,
       '超时类只进粘性 timeoutNotice——error 会被常规刷新的 error:null 抹掉',
-    )
+    ).toBeNull()
     // F-SP2-11 的触发点：窗口聚焦路径的非静默 refreshAgents()（agents_list
     // 只读本地文件，daemon 卡死时也成功）
     await act(async () => {
       await result.current.refreshAgents()
     })
-    expect(result.current.state.timeoutNotice).toContain(
-      '结果未知',
+    expect(
+      result.current.state.timeoutNotice,
       'F-SP2-11：非静默 refreshAgents 成功不得抹掉超时提示',
-    )
+    ).toContain('结果未知')
     // homes 刷新成功同样不清
     await act(async () => {
       await result.current.refreshHomes()
     })
-    expect(result.current.state.timeoutNotice).toContain(
-      '结果未知',
+    expect(
+      result.current.state.timeoutNotice,
       'homes 拉回来了不等于节点树刷新过——用户还没确认上次写入是否生效',
-    )
+    ).toContain('结果未知')
     // 成功的节点拉取（用户确认过实际状态）才清
     invokeMock.mockImplementation(() => Promise.resolve({}))
     await act(async () => {
       await result.current.refreshNodes(result.current.state.activeHome!)
     })
-    expect(result.current.state.timeoutNotice).toBeNull('成功的节点拉取清除粘性提示')
+    expect(result.current.state.timeoutNotice, '成功的节点拉取清除粘性提示').toBeNull()
     expect(result.current.state.error).toBeNull()
   })
 
@@ -271,11 +273,11 @@ describe('§57 超时提示独立字段（F-SP2-11）', () => {
       await result.current.refreshNodes(result.current.state.activeHome!)
     })
     expect(result.current.state.error).toContain('配额上限')
-    expect(result.current.state.timeoutNotice).toBeNull('非超时失败不进粘性提示')
+    expect(result.current.state.timeoutNotice, '非超时失败不进粘性提示').toBeNull()
     await act(async () => {
       await result.current.refreshAgents()
     })
-    expect(result.current.state.error).toBeNull('非超时 error 的既有清除语义不变')
+    expect(result.current.state.error, '非超时 error 的既有清除语义不变').toBeNull()
   })
 
   it('enroll: request write 超时形态也映射友好文案（§57 P3 补齐）', async () => {
@@ -289,10 +291,10 @@ describe('§57 超时提示独立字段（F-SP2-11）', () => {
     await act(async () => {
       await result.current.refreshHomes()
     })
-    expect(result.current.state.error).toContain(
-      'daemon 无响应',
+    expect(
+      result.current.state.error,
       '写超时形态的重建失败同样要映射友好文案（此前只匹配 connection closed）',
-    )
+    ).toContain('daemon 无响应')
     expect(result.current.state.error).not.toContain('enroll: request write')
   })
 })

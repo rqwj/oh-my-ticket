@@ -36,6 +36,8 @@ import {
   agentsList,
   bindingsGet,
   bindingsGc,
+  daemonTimeoutText,
+  DAEMON_TIMEOUT_MARKER,
   execAttach,
   execKillOrphan,
   execStart,
@@ -424,26 +426,26 @@ const INITIAL: TreeState = {
 }
 
 /**
- * §57 F-SP2-11：Rust 超时文案（daemon.rs `DAEMON_TIMEOUT_MESSAGE`）的机器
- * 前缀 `DAEMON_TIMEOUT_MARKER`——跨语言锁定（Rust 侧
- * `daemon_timeout_message_carries_machine_marker` 断言同值）。超时类失败
- * 据此在**产生友好文案的同一个映射点**分流到独立的 timeoutNotice 状态，
- * 不再按中文文案子串回判（§57 P3：Rust 改文案会静默改变前端行为）。
- */
-const DAEMON_TIMEOUT_MARKER = '[daemon-timeout]'
-
-/**
  * presentError 的结构化伴生（§57 F-SP2-11）：text = 展示文案；
  * daemonTimeout = 超时类失败（结果未知、可能已生效——Rust 超时原文带
  * 机器前缀），供错误写入点分流（超时类 → 粘性 timeoutNotice，只有
  * refreshNodes 成功才清；其余照旧进可被常规刷新清除的 error）。
+ * §59 F-SP2-12：bridge 出口（omtCall / execStart）已把超时类失败整形为
+ * DaemonTimeoutError（text 剥前缀）——这里优先按**类型**分流（错误到达
+ * 时前缀已剥，字符串匹配不再命中）；字符串回判保留为不经 bridge 出口的
+ * 防御路径。
  */
 export function presentErrorWithKind(error: unknown): { text: string; daemonTimeout: boolean } {
+  // §59 F-SP2-12：类型化路径——bridge 出口的 DaemonTimeoutError
+  const typed = daemonTimeoutText(error)
+  if (typed !== null) {
+    return { text: typed, daemonTimeout: true }
+  }
   const text = String(error)
-  // §57 F-SP2-11：Rust 超时原文（state.rs 丢弃连接后原样上抛；tauri 命令
-  // 错误以字符串拒绝，但调用方/测试也可能包一层 Error —— `Error: ` 前缀
-  // 容忍）。剥前缀展示（文案仍以 Rust 常量为唯一来源），flag 分流到粘性
-  // 提示
+  // §57 F-SP2-11（防御路径）：不经 bridge 出口整形的 Rust 超时原文（tauri
+  // 命令错误以字符串拒绝，但调用方/测试也可能包一层 Error —— `Error: `
+  // 前缀容忍）。剥前缀展示（文案仍以 Rust 常量为唯一来源），flag 分流到
+  // 粘性提示
   const bare = text.replace(/^Error:\s*/, '')
   if (bare.startsWith(DAEMON_TIMEOUT_MARKER)) {
     return { text: bare.slice(DAEMON_TIMEOUT_MARKER.length).trim(), daemonTimeout: true }
@@ -609,6 +611,19 @@ export function useTreeStore() {
       ...extra,
       ...(daemonTimeout ? { timeoutNotice: text } : { error: text }),
     }))
+  }, [])
+
+  /**
+   * §59 F-SP2-12：**写路径**超时 → 粘性提示的统一落点。createNode /
+   * startDispatch 这类把拒绝值抛给组件就地展示（`String(err)`）的写路径，
+   * 此前从不进 timeoutNotice——错误留在组件本地状态里，结果未知、可能已
+   * 生效的语义丢失。出口（omtCall / execStart）已把超时整形为类型化错误
+   * （daemonTimeout flag），这里按类型路由：超时 → 粘性提示（只有
+   * refreshNodes 成功才清）；非超时静默（就地错误已是全部语义）。
+   */
+  const noteTimeout = useCallback((error: unknown) => {
+    const typed = daemonTimeoutText(error)
+    if (typed !== null) setState(s => ({ ...s, timeoutNotice: typed }))
   }, [])
 
   const flushPendingRaw = useCallback(() => {
@@ -925,6 +940,9 @@ export function useTreeStore() {
       } catch (error) {
         dispatchingRef.current -= 1
         flushDeferredAttach()
+        // §59 F-SP2-12：exec_start 是不带 commandId 的写——超时 = 结果未知、
+        // 可能已生效，拒绝值抛给弹窗就地展示的同时落粘性提示
+        noteTimeout(error)
         throw error
       }
       dispatchingRef.current -= 1
@@ -937,7 +955,7 @@ export function useTreeStore() {
       scheduleAgentsRepull()
       return outcome
     },
-    [ingestTranscriptEvent, scheduleAgentsRepull, flushDeferredAttach],
+    [ingestTranscriptEvent, scheduleAgentsRepull, flushDeferredAttach, noteTimeout],
   )
 
   const selectAgent = useCallback((agentId: string) => {
@@ -1267,24 +1285,33 @@ export function useTreeStore() {
     [refreshNodes, refreshRuns, loadFilters, refreshAgents, refreshBindings, migrateHarnessBag],
   )
 
-  /** 新建节点（树面板入口）：node/create → 刷新树 → 选中新节点。 */
+  /** 新建节点（树面板入口）：node/create → 刷新树 → 选中新节点。
+   * §59 F-SP2-12：node/create 不带 commandId——超时 = 结果未知、可能已生效
+   * （state.rs 点名的重复提交风险路径），拒绝值抛给表单就地展示的同时经
+   * noteTimeout 落粘性提示。 */
   const createNode = useCallback(
     async (input: { type: string; title: string; body?: string; parentId: string | null }) => {
       const home = activeHomeRef.current
       if (!home) throw new Error('无活动 workspace')
-      const result = await omtCall<{ node?: { nodeId?: string } }>('node/create', {
-        homeId: home.homeId,
-        type: input.type,
-        title: input.title,
-        ...(input.parentId ? { parentId: input.parentId } : {}),
-        ...(input.body !== undefined ? { body: input.body } : {}),
-      })
+      let result: { node?: { nodeId?: string } }
+      try {
+        result = await omtCall<{ node?: { nodeId?: string } }>('node/create', {
+          homeId: home.homeId,
+          type: input.type,
+          title: input.title,
+          ...(input.parentId ? { parentId: input.parentId } : {}),
+          ...(input.body !== undefined ? { body: input.body } : {}),
+        })
+      } catch (error) {
+        noteTimeout(error)
+        throw error
+      }
       await refreshNodes(home)
       const newId = result.node?.nodeId
       if (newId) selectNode(newId)
       return newId ?? ''
     },
-    [refreshNodes],
+    [refreshNodes, noteTimeout],
   )
 
   // Declare flow (U5 consumer): register an unregistered home directory,
