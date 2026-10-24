@@ -1985,3 +1985,18 @@ F-BENCH-13 查证结论：4e960a2 提交说明声称的探针/capture/lib 改动
 
 **建议**：两条 P2 修复都很小（F-SP2-1 加一把锁、F-SP2-2 区分 EPERM），建议先修再做子项目 2 手工验收（§「执行面子项目 2 验收」矩阵）。P3 中优先：`maxDurationSec` 校验、Q-13 先判后声明、脱敏漏网、Ctrl-C、5s 轮询的无谓重跑、Q-3 测试；其余可随后续小项处理。
 
+### §50. §49 修复（2026-10-24，df5049c + 5d359b3）
+
+两批修复（批 1：F-SP2-1/2 + 7 条优先 P3；批 2：其余 14 条 P3），全部 TDD 先红后绿：
+
+- **F-SP2-1**：`ExecSession.events_write` 一把锁包住「取 seq + 盖 envelope + 追加 jsonl」（sink 在锁外）——文件顺序恒等于 seq 顺序；并发追加了乱序不变式测试（关闭锁复现 [5,4,2,1,0,3,…] 即红）。
+- **F-SP2-2**：`process_start_identity_detailed` 带 errno；EPERM/EACCES（pid 已属他人）在 start-id 存在时判死，不再回落 pid_live——pid 被系统进程复用后租约不再永久卡住（launchd pid-1 实测钉死）。
+- **优先 P3（df5049c）**：maxDurationSec <60/非整数 → `INVALID_INPUT`；Q-13 规范路径先判后声明（kind 取自声明连接自身 handshake，未知即拒，消除 daemon 留登记 home）；本地路径逐参过 sanitize_line（--auth sk-…/Authorization 头实测不再泄漏）；本地动词不装 sigwait（Ctrl-C 即时退出 130，实测钉死）；5s 静默轮询结构未变跳过 setState（引用稳定，run/list、tail、attach 副作用不再空转）；Q-3 MCP 测试改为只传 `home`（变异验证旧测试空洞）；相对 `--home .omt` 按 homeId→规范路径解析。
+- **批 2（5d359b3）**：MCP 路径形状 homeId → `INVALID_INPUT`（CLI 路径匹配保留）；本地工具调用移入单工作线程（ping 阻塞期间毫秒级应答，实测）；parity `exec/stop` 摘要与 Q-4 对齐；桌面会话 socket 30s 超时（卡死 daemon 持派发锁从无限期 → 有界）；并发计数失败关闭（退出确认保持宽松）；transcript_page 迁移中断回落旧目录；TempGrant 按 principal 进程内引用计数（强删+对账并发共享授权安全）；补偿清除残留 kill_reason；停止全部复位不再抢焦点；警告/归档提示按 home 清空；「前往 Runs」先切 home；退出 STOP 分支移出主线程；策略设置测试改守「出厂默认」；归档提示并入常驻 status 区。
+
+**验证**：workspace 490 ×多轮全绿（472 基线 +18 新测试）；前端 195（+8）、tsc 干净；根 vitest 447、`pnpm gen` 无差异；clippy/fmt 干净；nm daemon 双零。
+
+**未做（§49 测试缺口 + 接受项）**：派发锁 wait_ready 前释放的专门测试、真正并发的跨进程容量测试、MCP stdio 文档化阻塞说明（已用工作线程消除）之外的三项测试缺口留待后续；§49 的「桌面端发起 exec 计入 CLI 并发上限」已有顺序测试，真并发测试待做。
+
+### 残留状态核查（第二轮验收后）
+
