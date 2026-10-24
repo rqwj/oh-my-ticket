@@ -43,8 +43,8 @@ branch: feat/desktop-agents-dispatch
 | F-SP2-5 | P2 | gated_auto | CLI/MCP | `local_impl.rs::resolve_home_id`（§50 相对路径修复） | `exec list --home <homeId>` 改为要求 home 当前被服务：idle 关闭的 home 报 NOT_FOUND，只读动词还会拉起 daemon（回归） | fixed(17b3a96) | — |
 | F-SP2-6 | P2 | gated_auto | 执行面/脱敏 | `omt-harness/src/sanitize.rs::sanitize_line`（§52 词首匹配） | 修误伤时削弱了脱敏：`sk-` 只看首次命中（`task-… sk-live-x` 泄漏）、`=`/`:` 前有空格不再算键值（`password = x` 泄漏）、键值形态也要求词首（`apiKey=`、`accessToken=`、`PGPASSWORD=` 泄漏） | fixed(2b77285) | — |
 | F-SP2-7 | P2 | gated_auto | 桌面 | `state.rs::handshake_homes` / `rpc_bridge.rs::daemon_homes`（§52 惰性重建） | 超时丢弃连接后，重建失败被吞成 `homes: []` → 切换器清空且清掉「daemon 无响应」错误条；同步命令在主线程重建（最长 30s）会转圈 | fixed(2b77285) | — |
-| F-SP2-8 | P2 | gated_auto | 执行面/脱敏 | `sanitize.rs::sanitize_line`（§54 dash 例外 + Authorization 冒号紧跟） | dash 例外不止放过 `--monkey=banana`：`--apiKey=S`、`-Dpassword=S`、`-ePASSWORD=S`、`-PGPASSWORD=S` 旧版脱敏、新版泄漏；「冒号紧跟」规则让 JSON 形态 `"Authorization":"Basic S"` 重新泄漏 | open（§55） | — |
-| F-SP2-9 | P2 | gated_auto | 桌面 | `rpc_bridge.rs::events_subscribe` / `daemon_ensure`（同步命令持会话锁） | async 的 `daemon_homes`/`omt_call` 持会话锁做 30s 重建时，切 home 触发同步 `events_subscribe` 在主线程等同一把锁 → 仍会转圈（既有，F-SP2-7「不卡主线程」未闭合） | open（§55） | — |
+| F-SP2-8 | P2 | gated_auto | 执行面/脱敏 | `sanitize.rs::sanitize_line`（§54 dash 例外 + Authorization 冒号紧跟） | dash 例外不止放过 `--monkey=banana`：`--apiKey=S`、`-Dpassword=S`、`-ePASSWORD=S`、`-PGPASSWORD=S` 旧版脱敏、新版泄漏；「冒号紧跟」规则让 JSON 形态 `"Authorization":"Basic S"` 重新泄漏 | fixed(26df96c) | — |
+| F-SP2-9 | P2 | gated_auto | 桌面 | `rpc_bridge.rs::events_subscribe` / `daemon_ensure`（同步命令持会话锁） | async 的 `daemon_homes`/`omt_call` 持会话锁做 30s 重建时，切 home 触发同步 `events_subscribe` 在主线程等同一把锁 → 仍会转圈（既有，F-SP2-7「不卡主线程」未闭合） | fixed(26df96c) | — |
 | F-BENCH-18 | P1 | gated_auto | BENCH | `.gitignore:26` / `fixtures/harness/*/raw.log` | **raw.log 语料未入库**：`*.log` 规则把三份 raw.log 全部忽略，只存在于本机。`raw_log_replay_matches_recorded_events` 在干净 clone / CI 上会 panic（「raw.log 应存在」），CI rust 任务必红；F-BENCH-15 在仓库里实际未关闭（§30） | fixed(55a8e55 + 2b8e036)：入库 + 必需文件清单入测（缺一即红）；「时间戳已清洗」「≥12 下限」两项不实声明由 F-BENCH-24 在 2b8e036 兑现 | — |
 | F-BENCH-19 | P1 | gated_auto | BENCH/U12 | `adapters.rs::parse_opencode` step_finish | **opencode 的 usage 也是逐步的值，被误标为累计**：语料 4 个 step_finish 各带不同 messageID，每个 total = 该步 input + output + reasoning + cache.read（如 1518+45+109+23040 = 24712）。按「累计取末值」报 25460，实为 98225（少报约 3.9 倍）；本卷免费档 cost=0 掩盖了问题，付费 provider 会少报费用（§30） | fixed(55a8e55)：opencode 标 message，98225 入测 | — |
 | F-BENCH-20 | P3 | testing-gap | BENCH/U12 | `executor.rs::UsageTotals` | `record` / `final_totals` 无直接单测（混合 scope、全零、历史无 scope 事件）；修复前归档的 ExecRecord 用量仍是旧口径，未重算也未标注 | fixed(55a8e55 + e87a99a)：UsageTotals 四形态单测；口径自描述——ExecRecord.usageCaliber（"message-sum"，旧 JSON 兼容读 None = 末条口径）+ 归档直达测试 + TS 类型；不重算（usageTokens/usageCost 无 UI 消费点，标注路线即关闭，§34） | — |
@@ -2184,3 +2184,13 @@ F-BENCH-13 查证结论：4e960a2 提交说明声称的探针/capture/lib 改动
 
 **建议**：修 F-SP2-8（删 dash 例外 + 引号容忍的冒号判定 + `trim_start()`，泄漏列补本节全部样例）与 F-SP2-9（两个同步命令改 async）。顺带便宜 P3：`QUIT_STOPPING` 同步置位、测试拿 `QUIT_TEST_LOCK`、源码文本断言守 STOP 分支、超时错误不被 `refreshHomes` 清掉、header 前缀精确匹配。其余 P3 与「从未覆盖」项可留给后续的脱敏专项。
 
+
+### §56. §55 修复（2026-10-24，26df96c）
+
+- **F-SP2-8**（按 §55 处方取最简方案）：**删除 dash 例外**——9 条 dash 形泄漏（`--apiKey=`/`--accessToken=`/`--clientSecret=`/`--dbPassword=`/java `-D`/docker `-e`/gradle `-P`/diff `-PGPASSWORD=`）全部闭合；`--monkey=banana` 移入**可接受误伤列**（三列表驱动：泄漏/完好/可接受误伤）；键值与 Authorization 的分隔判定跳过 Unicode 空白**和引号**（char 级 `trim_start_matches`，偏移保持字符边界——NBSP/U+3000/CR 三条 + 引号 JSON 形态 `{"Authorization":"Basic …"}`、`{"apiKey": "…"}` 闭合）；`sanitize_args` 的 header 匹配改精确（`--header`/`--header=` 保留 `=`、`--headers`/`--header-file` 不误伤、`-H…` 连写保持）。泄漏列新增 16 条 §55 样例，修复前 16/16 失败（实测取证）。`--bearer-token SECRET` 如实留在未覆盖清单（非键值形态，删例外不影响它，非本轮回归）。
+- **F-SP2-9**：`events_subscribe` 与 `daemon_ensure` 改 `#[tauri::command(async)]`；源码断言测试锁住「全部 4 个 `with_session` 调用点都在 async fn 里」——主线程不再有任何同步命令碰会话锁。
+- **便宜 P3**：`QUIT_STOPPING` 在 `quit_stop_branch` 内 spawn 前同步置位（微秒窗口闭合，worker 首行置位移除并有测试锁「worker 不得置位」）；`stop_and_exit` 测试拿 `QUIT_TEST_LOCK`；STOP 分支加源码文本断言（变异验证：把原 bug 加回调用点即红）；`refreshHomes` 成功不清超时类错误（含「结果未知/daemon 无响应」判定，`refreshNodes` 成功才清）+ 重建失败映射友好文案；F-SP2-7 补 TS 覆盖（daemon_homes 拒绝时 homes/activeHome 保留 + 错误设置）。
+
+**验证**：workspace 517 ×2 连续全绿（513 基线 +4）；前端 207（+4）、tsc 干净；根 vitest 447；clippy/fmt 干净；nm daemon 双零；`pnpm gen` 无差异。台账 F-SP2-8/9 翻 fixed(26df96c)。
+
+**未做（§55 其余 P3，留后续脱敏专项/桌面小项）**：`--bearer-token` 空格分隔形态、`Cookie:`/`set-cookie`/URL 内嵌凭证/`ghp_`/`sk_live_`、全角冒号、`-sH`/`--authorization`/`-u user:pass`/`--cookie` argv 形态；async 命令包 `spawn_blocking`；`events_subscribe` 源码断言之外的路径覆盖；grants symlink 平台别名；p49/p51/p53 spec 第二参数。
