@@ -237,12 +237,16 @@ pub fn daemon_status() -> Result<daemon::DaemonStatus, String> {
 /// (pull-based freshness — the store re-invokes on window focus; v1 has
 /// no cross-surface push signal and homes-changed deliberately never
 /// enters the per-home outbox).
-#[tauri::command]
-pub fn daemon_homes(shared: State<'_, SharedSession>) -> Result<serde_json::Value, String> {
+/// §53 F-SP2-7：改 async 命令——惰性重建（连接 + 握手最长 30s，或 sidecar
+/// 拉起等待 10s）跑在主线程会卡 UI；且重建失败经 `?` 上抛（此前吞成
+/// `homes: []`，home 切换器清空、前端 `error: null` 抹掉超时提示）。
+#[tauri::command(async)]
+pub async fn daemon_homes(shared: State<'_, SharedSession>) -> Result<serde_json::Value, String> {
     with_session(&shared, |session| {
         Ok(serde_json::json!({
-            // §51：经 session 的惰性重建缝（超时丢弃连接后也能恢复）
-            "homes": session.handshake_homes(),
+            // §51：经 session 的惰性重建缝（超时丢弃连接后也能恢复）；
+            // §53：重建失败必须上抛（`?`），不得回落成空列表
+            "homes": session.handshake_homes()?,
             "homeDir": std::env::var("HOME").unwrap_or_default(),
         }))
     })
@@ -257,8 +261,11 @@ pub fn daemon_ensure(shared: State<'_, SharedSession>) -> Result<daemon::DaemonS
 /// Force a FRESH session (drop the cached enrollment and re-handshake) —
 /// used after home/declare so the new home enters the credential's scoped
 /// grant (requiresRehandshake semantics, KTD3 client half).
-#[tauri::command]
-pub fn daemon_reconnect(shared: State<'_, SharedSession>) -> Result<serde_json::Value, String> {
+/// §53 F-SP2-7：随 daemon_homes 一并 async（重握手同样可能等 30s/10s）。
+#[tauri::command(async)]
+pub async fn daemon_reconnect(
+    shared: State<'_, SharedSession>,
+) -> Result<serde_json::Value, String> {
     {
         let mut guard = shared
             .0
@@ -266,7 +273,7 @@ pub fn daemon_reconnect(shared: State<'_, SharedSession>) -> Result<serde_json::
             .map_err(|_| "session lock poisoned".to_string())?;
         *guard = None;
     }
-    daemon_homes(shared)
+    daemon_homes(shared).await
 }
 
 // ---------------------------------------------------------------------------
@@ -459,3 +466,25 @@ mod subscription_tests {
 
 #[cfg(test)]
 mod other_tests_placeholder {}
+
+#[cfg(test)]
+mod daemon_homes_tests {
+    /// §53 F-SP2-7：`daemon_homes` 必须是 `#[tauri::command(async)]`——
+    /// 惰性重建（连接 + 握手最长 30s，或 sidecar 拉起等待 10s）跑在主线程
+    /// 会卡 UI（同步命令在主线程执行）。tauri 胶水无运行时缝，按源文本
+    /// 锁定属性；`?` 透传由 state.rs 的缝级测试覆盖。
+    #[test]
+    fn daemon_homes_command_is_async_attributed() {
+        let src =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/rpc_bridge.rs"))
+                .expect("read rpc_bridge.rs source");
+        assert!(
+            src.contains("#[tauri::command(async)]\npub async fn daemon_homes"),
+            "daemon_homes 必须保持 #[tauri::command(async)]（重建不得跑主线程）"
+        );
+        assert!(
+            src.contains("session.handshake_homes()?"),
+            "daemon_homes 必须透传 handshake_homes 的错误（§53 F-SP2-7）"
+        );
+    }
+}

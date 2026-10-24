@@ -71,10 +71,12 @@ impl DaemonSession {
     }
 
     /// handshake 的 homes 投影（daemon_homes 命令用；必要时先惰性重建）。
-    pub fn handshake_homes(&mut self) -> serde_json::Value {
-        self.enrollment_mut()
-            .map(|enrollment| enrollment.handshake["homes"].clone())
-            .unwrap_or_else(|_| serde_json::json!([]))
+    /// §53 F-SP2-7：重建失败必须**上抛**——此前 Err 被吞成 `json!([])`，
+    /// rpc_bridge 据此返回 `Ok({homes: []})`：home 切换器被清空，且前端
+    /// 成功路径的 `error: null` 抹掉刚显示的「daemon 无响应（30s）」。
+    pub fn handshake_homes(&mut self) -> Result<serde_json::Value, String> {
+        let enrollment = self.enrollment_mut()?;
+        Ok(enrollment.handshake["homes"].clone())
     }
 
     /// One authenticated call with single-shot daemon-gone recovery.
@@ -130,5 +132,31 @@ pub struct SharedSession(pub Arc<Mutex<Option<DaemonSession>>>);
 impl SharedSession {
     pub fn new() -> Self {
         Self(Arc::new(Mutex::new(None)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// §53 F-SP2-7：`handshake_homes` 的惰性重建失败必须上抛——此前 Err
+    /// 被吞成 `json!([])`，rpc_bridge 据此返回 `Ok({homes: []})`：home
+    /// 切换器被清空，且前端成功路径的 `error: null` 抹掉刚显示的
+    /// 「daemon 无响应（30s）」。缝级测试：连接已被丢弃（enrollment =
+    /// None）、重建注定失败（runtime 目录不存在 → 探活失败 → 测试二进制
+    /// 旁无 omt-daemon sidecar → spawn 失败）——错误必须穿透出来。
+    #[test]
+    fn handshake_homes_propagates_reestablishment_failure() {
+        let mut session = DaemonSession {
+            enrollment: None,
+            runtime_dir: PathBuf::from("/nonexistent-omt-53/runtime"),
+        };
+        let err = session
+            .handshake_homes()
+            .expect_err("重建失败必须上抛（§53 F-SP2-7），不得回落空 homes");
+        assert!(
+            !err.is_empty(),
+            "错误信息非空（前端要靠它呈现 daemon 无响应）"
+        );
     }
 }

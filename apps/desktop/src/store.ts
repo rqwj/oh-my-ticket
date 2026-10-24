@@ -964,7 +964,10 @@ export function useTreeStore() {
    * - 部分失败（signaled>0 且有 failed）→ 返回结果本身，面板拼接
    *   「已向 N 个 agent 发出停止信号，M 个停止失败」。
    * §43 P3：repull 在映射前无条件执行——全失败路径此前跳过重拉，行内残留
-   * 的运行态不会被刷新（对账收尾后 agents.json 已变，UI 需要跟上）。 */
+   * 的运行态不会被刷新（对账收尾后 agents.json 已变，UI 需要跟上）。
+   * §53 stop-all-error：整条失败路径（invoke 拒绝 / 全失败）的**全局 error
+   * 只写回发起时的 home**——§52 的切 home 守卫只覆盖面板提示；结果回来时
+   * 已切走，A home 的错误不得写进 B home 的错误条。 */
   const stopAll = useCallback(async (): Promise<StopAllOutcome | null> => {
     const home = activeHomeRef.current
     if (!home) return null
@@ -972,11 +975,13 @@ export function useTreeStore() {
       const outcome = await execStopAll(home.homeId)
       scheduleAgentsRepull()
       if (outcome.failed.length > 0 && outcome.signaled === 0) {
+        if (activeHomeRef.current?.homeId !== home.homeId) return null
         setState(s => ({ ...s, error: presentError(outcome.failed.join('；')) }))
         return null
       }
       return outcome
     } catch (error) {
+      if (activeHomeRef.current?.homeId !== home.homeId) return null
       setState(s => ({ ...s, error: presentError(error) }))
       return null
     }

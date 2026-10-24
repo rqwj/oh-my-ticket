@@ -24,6 +24,13 @@ use tauri::Manager;
 /// 中途放行退出（剩余 agent 的分离 shim 会漏掉停止信号）。
 static QUIT_CONFIRMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// §53 P3-11：停止 worker 进行中（起跑置位、`exit()` 前清零）。两个退出
+/// handler（CloseRequested / ExitRequested）**先查它**、直接 prevent——
+/// 不在主线程跑 `active_exec_count`（它经 STORE_LOCK 逐 home 读
+/// agents.json，worker 持锁等 flock 最长 10s，主线程会卡；且读失败按 0
+/// 计会放行退出）。worker 结束时自己 `exit()`，prevent 只挡中途退出。
+static QUIT_STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// F-EXEC-6 残留：确认框重入守卫。重复 ⌘Q / 关窗会叠出多个模态框，且旧框
 /// 的选择会作用于弹框时刻的过时状态快照——已有确认框在场时，后来的退出/
 /// 关窗请求只 prevent 不再叠框。
@@ -57,28 +64,51 @@ fn stop_all_execs(runtime_dir: &Path) {
 /// §49 quit-stop-off-main：Stop 分支的「停止全部 → 退出」序列放到工作线程。
 /// 确认框的 `on_choice` 在 GCD 主队列里跑（quit_dialog.rs），而
 /// stop_all_execs（逐 agent flock + 对账 + 停止信号）可能耗时数秒——在主
-/// 队列里同步跑会阻塞主 run loop（锁竞争下转圈）。退出动作以闭包注入
-/// （生产 = `AppHandle::exit(0)`；测试注入记线程 id 的探针，证明序列不在
-/// 调用线程上执行）。真正的序列体在 [`run_quit_stop_worker`]（stop 也注入，
-/// 测确认位时序与 panic 兜底）。
-fn stop_and_exit_off_main(runtime_dir: &Path, exit: impl FnOnce() + Send + 'static) {
+/// 队列里同步跑会阻塞主 run loop（锁竞争下转圈）。stop 与退出动作均以
+/// 闭包注入（生产 = `stop_all_execs` / `AppHandle::exit(0)`；测试注入探
+/// 针，证明序列不在调用线程上执行、测确认位时序与 panic 兜底）。真正的
+/// 序列体在 [`run_quit_stop_worker`]。
+fn stop_and_exit_off_main(
+    runtime_dir: &Path,
+    stop: impl FnOnce(&Path) + Send + 'static,
+    exit: impl FnOnce() + Send + 'static,
+) {
     let runtime_dir = runtime_dir.to_path_buf();
-    std::thread::spawn(move || run_quit_stop_worker(&runtime_dir, stop_all_execs, exit));
+    std::thread::spawn(move || run_quit_stop_worker(&runtime_dir, stop, exit));
+}
+
+/// §53 P3-12：两个 STOP 分支（CloseRequested / ExitRequested 的
+/// `QuitChoice::Stop`）的共用体：「标记停止中 → 停止全部 → 退出（off
+/// main）」。§51 F-SP2-4 的置位契约由 [`run_quit_stop_worker`] 承担——本
+/// 函数**不得**触碰 `QUIT_CONFIRMED`（原 bug 就在分支内提前置位；抽出
+/// 共用体后由 `quit_stop_branch_keeps_confirm_false_during_stop` 锁定）。
+fn quit_stop_branch(
+    runtime_dir: &Path,
+    stop: impl FnOnce(&Path) + Send + 'static,
+    mark_stopping: impl FnOnce(),
+    exit: impl FnOnce() + Send + 'static,
+) {
+    mark_stopping();
+    stop_and_exit_off_main(runtime_dir, stop, exit);
 }
 
 /// §51 F-SP2-4：停止+退出序列的可测内芯。
-/// - `QUIT_CONFIRMED` 只在 `exit()` 前一刻置位——stop 进行期间再按 ⌘Q 不得
+/// - `QUIT_CONFIRMED` 只在 `exit()` 前一刻置位——stop 进行中再按 ⌘Q 不得
 ///   中途放行（此前在 stop 开始前置位，第二次退出请求直接穿透，剩余 agent
 ///   的分离 shim 收不到停止信号继续运行）。stop 期间的重入由 `DIALOG_OPEN`
 ///   挡住（全程置位：prevent 且不叠框）。
+/// - §53 P3-11：起跑即置 `QUIT_STOPPING`、`exit()` 前清零——两个退出
+///   handler 凭它直接 prevent，不在主线程跑 `active_exec_count`。
 /// - panic 兜底：`stop` panic 时也必须置位并退出——否则 `DIALOG_OPEN` 永远
 ///   卡在 true，窗口再也关不掉。
 fn run_quit_stop_worker(runtime_dir: &Path, stop: impl FnOnce(&Path), exit: impl FnOnce()) {
+    QUIT_STOPPING.store(true, Ordering::SeqCst);
     if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| stop(runtime_dir)))
     {
         eprintln!("退出停止 panic（{panic:?}）——跳过剩余停止，强制退出");
     }
     QUIT_CONFIRMED.store(true, Ordering::SeqCst);
+    QUIT_STOPPING.store(false, Ordering::SeqCst);
     exit();
 }
 
@@ -155,6 +185,13 @@ pub fn run() {
             let tauri::WindowEvent::CloseRequested { api, .. } = event else {
                 return;
             };
+            // §53 P3-11：停止 worker 进行中直接 prevent_close——先于
+            // active_exec_count 检查（worker 持 STORE_LOCK 等 flock 最长
+            // 10s，主线程读计数会卡；读失败按 0 计会放行退出）。
+            if QUIT_STOPPING.load(Ordering::SeqCst) {
+                api.prevent_close();
+                return;
+            }
             let runtime_dir = daemon::runtime_dir();
             let running = omt_exec::control::active_exec_count(&runtime_dir);
             if running == 0 {
@@ -186,15 +223,17 @@ pub fn run() {
                     }
                     QuitChoice::Stop => {
                         // 退出路径（P3-a）：DIALOG_OPEN 保持置位直到进程退出。
-                        // §49 quit-stop-off-main：停止+退出序列放到工作线程——
-                        // on_choice 在 GCD 主队列里跑，stop_all_execs（逐 agent
-                        // flock + 对账）不得阻塞主 run loop。§51 F-SP2-4：
-                        // QUIT_CONFIRMED 不在这里置位——改由 worker 在 exit 前
-                        // 一刻置位，stop 期间再按 ⌘Q 由 DIALOG_OPEN 挡住（prevent
-                        // 且不叠框），不得中途放行退出。
-                        mark_stopping(&handle);
+                        // §53 P3-12：分支主体抽为共用的 quit_stop_branch（两个
+                        // STOP 分支同体）；QUIT_CONFIRMED 的置位时序由
+                        // run_quit_stop_worker 承担（§51 F-SP2-4）。
+                        let stopping_handle = handle.clone();
                         let exit_handle = handle.clone();
-                        stop_and_exit_off_main(&runtime_dir, move || exit_handle.exit(0));
+                        quit_stop_branch(
+                            &runtime_dir,
+                            stop_all_execs,
+                            move || mark_stopping(&stopping_handle),
+                            move || exit_handle.exit(0),
+                        );
                     }
                     // 取消 / Esc：窗口保持原样（close 已被 prevent）——回到正常
                     // 运行，清 DIALOG_OPEN
@@ -297,6 +336,15 @@ pub fn run() {
                     if QUIT_CONFIRMED.load(Ordering::SeqCst) {
                         return;
                     }
+                    // §53 P3-11：停止 worker 进行中直接 prevent_exit——先于
+                    // code 判断（code:None 的自然退出请求同样不得在 stop
+                    // 中途放行），也不在主线程跑 active_exec_count（worker
+                    // 持 STORE_LOCK 等 flock 最长 10s，主线程会卡；读失败
+                    // 按 0 计会放行退出）。worker 结束自己 exit()。
+                    if QUIT_STOPPING.load(Ordering::SeqCst) {
+                        api.prevent_exit();
+                        return;
+                    }
                     // F-EXEC-6：code None = 最后一个窗口关闭后的自然退出请求。
                     // 窗口关闭已在 CloseRequested 处把关（有运行中 exec 时
                     // prevent 并弹确认），能走到这里说明没有需要确认的执行
@@ -331,17 +379,18 @@ pub fn run() {
                                 // KEEP / STOP 都是退出路径（P3-a）：DIALOG_OPEN
                                 // 保持置位直到进程退出
                                 QuitChoice::Keep => {}
-                                // §49 quit-stop-off-main：停止+退出序列放工作
-                                // 线程（on_choice 在 GCD 主队列里跑，逐 agent
-                                // flock + 对账不得阻塞主 run loop）。§51
-                                // F-SP2-4：QUIT_CONFIRMED 由 worker 在 exit 前
-                                // 一刻置位——stop 期间再按 ⌘Q 不得中途放行
+                                // §53 P3-12：分支主体抽为共用的 quit_stop_branch
+                                //（两个 STOP 分支同体）；QUIT_CONFIRMED 的置位
+                                // 时序由 run_quit_stop_worker 承担（§51 F-SP2-4）
                                 QuitChoice::Stop => {
-                                    mark_stopping(&handle);
+                                    let stopping_handle = handle.clone();
                                     let exit_handle = handle.clone();
-                                    stop_and_exit_off_main(&runtime_dir, move || {
-                                        exit_handle.exit(0)
-                                    });
+                                    quit_stop_branch(
+                                        &runtime_dir,
+                                        stop_all_execs,
+                                        move || mark_stopping(&stopping_handle),
+                                        move || exit_handle.exit(0),
+                                    );
                                     return;
                                 }
                                 // 取消 / Esc：不退出——只有回到正常运行的分支
@@ -381,12 +430,13 @@ fn parse_allow_multi_instance(v: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_allow_multi_instance, run_quit_stop_worker, stop_and_exit_off_main, QUIT_CONFIRMED,
+        parse_allow_multi_instance, quit_stop_branch, run_quit_stop_worker, stop_all_execs,
+        stop_and_exit_off_main, QUIT_CONFIRMED, QUIT_STOPPING,
     };
     use std::sync::atomic::Ordering;
 
-    /// QUIT_CONFIRMED 是进程级静态——两个 worker 时序测试共用它，串行化
-    /// 防止并行测试互相污染读数。
+    /// QUIT_CONFIRMED / QUIT_STOPPING 是进程级静态——worker 时序测试共用
+    /// 它们，串行化防止并行测试互相污染读数。
     static QUIT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
@@ -411,7 +461,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         let caller_thread = std::thread::current().id();
-        stop_and_exit_off_main(dir.path(), move || {
+        stop_and_exit_off_main(dir.path(), stop_all_execs, move || {
             tx.send(std::thread::current().id()).unwrap();
         });
         let worker_thread = rx
@@ -459,14 +509,112 @@ mod tests {
         assert!(seen[1], "exit 前必须置位（随后的 ExitRequested 直接放行）");
     }
 
+    /// §53 P3-11：QUIT_STOPPING 起跑置位、exit 前清零——stop 进行中两个
+    /// 退出 handler 凭它直接 prevent（不在主线程跑 active_exec_count）；
+    /// exit 时必须已清零（进程即将退出，静态位卫生）。
+    #[test]
+    fn quit_stop_worker_sets_stopping_during_stop_and_clears_before_exit() {
+        let _guard = QUIT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        QUIT_CONFIRMED.store(false, Ordering::SeqCst);
+        QUIT_STOPPING.store(false, Ordering::SeqCst);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let probe_stop = seen.clone();
+        let probe_exit = seen.clone();
+        run_quit_stop_worker(
+            std::path::Path::new("/nonexistent-rt"),
+            move |_dir| {
+                probe_stop
+                    .lock()
+                    .unwrap()
+                    .push(QUIT_STOPPING.load(Ordering::SeqCst));
+            },
+            move || {
+                probe_exit
+                    .lock()
+                    .unwrap()
+                    .push(QUIT_STOPPING.load(Ordering::SeqCst));
+            },
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "stop 与 exit 探针都应执行: {seen:?}");
+        assert!(
+            seen[0],
+            "stop 进行中 QUIT_STOPPING 必须为 true（退出 handler 凭它 prevent）"
+        );
+        assert!(!seen[1], "exit 前必须清零 QUIT_STOPPING（进程即将退出）");
+    }
+
+    /// §53 P3-12：STOP 分支共用体 quit_stop_branch 的时序契约——分支自身
+    /// **不得**触碰 QUIT_CONFIRMED（§51 F-SP2-4 原始 bug 就在分支内提前
+    /// 置位；把 `QUIT_CONFIRMED.store(true)` 加回本函数本测即红）：
+    /// 标记「停止中」同步执行；stop 时 confirm=false、stopping=true；
+    /// exit 时 confirm=true、stopping=false。
+    #[test]
+    fn quit_stop_branch_keeps_confirm_false_during_stop() {
+        let _guard = QUIT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        QUIT_CONFIRMED.store(false, Ordering::SeqCst);
+        QUIT_STOPPING.store(false, Ordering::SeqCst);
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let marked = events.clone();
+        let stop_events = events.clone();
+        let exit_events = events.clone();
+        quit_stop_branch(
+            std::path::Path::new("/nonexistent-rt"),
+            move |_dir| {
+                stop_events.lock().unwrap().push((
+                    "stop",
+                    QUIT_CONFIRMED.load(Ordering::SeqCst),
+                    QUIT_STOPPING.load(Ordering::SeqCst),
+                ));
+            },
+            || {
+                marked.lock().unwrap().push(("mark", false, false));
+            },
+            move || {
+                exit_events.lock().unwrap().push((
+                    "exit",
+                    QUIT_CONFIRMED.load(Ordering::SeqCst),
+                    QUIT_STOPPING.load(Ordering::SeqCst),
+                ));
+            },
+        );
+        // worker 是异步的——等 exit 探针落地（有界）
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while events.lock().unwrap().len() < 3 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "分支应驱动 mark → stop → exit 全序列"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let events = events.lock().unwrap();
+        assert_eq!(events[0].0, "mark", "标记「停止中」最先（同步）执行");
+        assert_eq!(events[1].0, "stop");
+        assert_eq!(events[2].0, "exit");
+        assert!(
+            !events[1].1,
+            "stop 进行中 QUIT_CONFIRMED 必须为 false（分支不得提前置位）"
+        );
+        assert!(events[1].2, "stop 进行中 QUIT_STOPPING 必须为 true");
+        assert!(events[2].1, "exit 前必须置位 QUIT_CONFIRMED");
+        assert!(!events[2].2, "exit 前 QUIT_STOPPING 已清零");
+    }
+
     /// §51 F-SP2-4 panic 兜底：stop_all_execs panic 时也必须置位并退出——
     /// 否则进程永不退出且 DIALOG_OPEN 卡 true，窗口再也关不掉。
+    /// §53 P3-11：panic 路径同样要清 QUIT_STOPPING（否则 exit 后静态位
+    /// 残留 true，后续关窗被永远 prevent）。
     #[test]
     fn quit_stop_worker_exits_even_when_stop_panics() {
         let _guard = QUIT_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         QUIT_CONFIRMED.store(false, Ordering::SeqCst);
+        QUIT_STOPPING.store(false, Ordering::SeqCst);
         let exited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let probe = exited.clone();
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -486,6 +634,10 @@ mod tests {
         assert!(
             QUIT_CONFIRMED.load(Ordering::SeqCst),
             "panic 路径同样要在退出前置位"
+        );
+        assert!(
+            !QUIT_STOPPING.load(Ordering::SeqCst),
+            "panic 路径同样要清 QUIT_STOPPING（防静态位残留）"
         );
     }
 }

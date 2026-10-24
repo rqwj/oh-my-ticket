@@ -167,17 +167,25 @@ pub fn discover_or_spawn_and_enroll(dir: &Path) -> Result<(Enrollment, bool), St
 /// 一族，此前恰好命中 is_daemon_gone 的 "connection closed" 子串，触发
 /// 「重连 + 重放一次」：不带 commandId 的写（node/create、run/create、
 /// node/update …）会被重复提交。
+/// §53 P3：规则限定在**会话 socket 自身**的错误形态（`connection closed:`
+/// / `request write:` 前缀，含写超时）——此前作用于任何 `code == "IO"`
+/// 的问题，daemon 回传的 IO 错误（message 含「timed out」）会被误判为
+/// 本地超时而无谓断连。
 pub fn is_read_timeout(problem_message: &str, problem_code: &str) -> bool {
     problem_code == "IO"
+        && (problem_message.starts_with("connection closed:")
+            || problem_message.starts_with("request write:"))
         && (problem_message.contains("Resource temporarily unavailable")
             || problem_message.to_ascii_lowercase().contains("timed out"))
 }
 
-/// §51 timeout-no-replay：超时路径的统一错误文案——如实说明「已放弃且
-/// 未重试」（与 daemon 已断的重连+重放相区分）。连接在 state.rs 侧被
-/// 丢弃，下次调用惰性重建。
-pub const DAEMON_TIMEOUT_MESSAGE: &str =
-    "daemon 无响应（30s）：本次请求已放弃且未重试（避免重复提交），连接已丢弃，下次调用将重建";
+/// §51 timeout-no-replay：超时路径的统一错误文案（与 daemon 已断的重连+
+/// 重放相区分）。连接在 state.rs 侧被丢弃，下次调用惰性重建。
+/// §53 P3：如实说明**结果未知、可能已生效**——读超时时 daemon 通常仍会
+/// 完成写入，「已放弃且未重试」会诱导用户立即手动重试（正是要避免的
+/// 重复提交）；引导先刷新确认结果再重试。
+pub const DAEMON_TIMEOUT_MESSAGE: &str = "daemon 无响应（30s）：请求结果未知、可能已生效——\
+     为避免重复提交未自动重试；请刷新确认结果后再决定是否重试（连接已丢弃，下次调用将重建）";
 
 /// Whether an IO-shaped failure means "the daemon is gone — rediscover"
 /// (legal idle exit, crash, generation rotation): connection closed /
@@ -335,6 +343,61 @@ mod tests {
             "Operation timed out somewhere",
             "FORBIDDEN"
         ));
+    }
+
+    /// §53 P3：超时判定限定在**会话 socket 自身**的错误形态（`connection
+    /// closed:` / `request write:` 前缀——omt_client 的读/写错误文案）。
+    /// 此前规则作用于任何 `code == "IO"` 的问题：daemon 回传的 IO 错误只要
+    /// message 里含「timed out」就被误判为本地读超时 → 无谓丢弃连接 +
+    /// 「daemon 无响应」提示。
+    #[test]
+    fn timeout_classification_is_scoped_to_session_socket_shapes() {
+        // 会话 socket 自身的读/写超时形态（§51 实测的文案）
+        assert!(is_read_timeout(
+            "connection closed: Resource temporarily unavailable",
+            "IO"
+        ));
+        assert!(is_read_timeout("connection closed: read timed out", "IO"));
+        assert!(is_read_timeout(
+            "request write: Resource temporarily unavailable",
+            "IO"
+        ));
+        assert!(is_read_timeout("request write: Operation timed out", "IO"));
+        // daemon 回传的 IO 错误（非 socket 形态）：含 timed out 也不得误判
+        assert!(
+            !is_read_timeout("node snapshot io timed out", "IO"),
+            "daemon 回传的 IO 错误不得误判为本地读超时"
+        );
+        assert!(!is_read_timeout("lock wait timed out on agents.json", "IO"));
+        assert!(!is_read_timeout("something timed out mid-write", "IO"));
+        // 前缀不符的连接类文案：交给 daemon-gone / 普通错误路径分类
+        assert!(!is_read_timeout(
+            "endpoint connect: Operation timed out",
+            "IO"
+        ));
+    }
+
+    /// §53 P3：超时提示如实说明**结果未知**——「已放弃且未重试」会诱导
+    /// 用户立即手动重试（读超时时 daemon 通常仍会完成写入，重试正是要
+    /// 避免的重复提交）。
+    #[test]
+    fn daemon_timeout_message_is_honest_about_unknown_outcome() {
+        assert!(
+            DAEMON_TIMEOUT_MESSAGE.contains("结果未知"),
+            "提示必须如实说明结果未知：{DAEMON_TIMEOUT_MESSAGE}"
+        );
+        assert!(
+            DAEMON_TIMEOUT_MESSAGE.contains("可能已生效"),
+            "提示必须说明可能已生效：{DAEMON_TIMEOUT_MESSAGE}"
+        );
+        assert!(
+            DAEMON_TIMEOUT_MESSAGE.contains("刷新"),
+            "提示必须引导先刷新确认再重试：{DAEMON_TIMEOUT_MESSAGE}"
+        );
+        assert!(
+            !DAEMON_TIMEOUT_MESSAGE.contains("已放弃"),
+            "「已放弃」诱导用户立即重试（重复提交）：{DAEMON_TIMEOUT_MESSAGE}"
+        );
     }
 
     /// §49「跨进程派发锁把桌面端卡死的 daemon 传导给 CLI/MCP」：desktop 会话

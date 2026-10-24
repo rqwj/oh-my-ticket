@@ -327,27 +327,28 @@ mod tests {
 
     /// §51 F-SP2-3 顺带：计数键按 canonicalize 后的 runtime 目录——同一
     /// 目录的两种拼写（macOS 上 /var 与 /private/var）是同一把计数。
+    /// §53 P3：此前 `alias` 与 `rt` 拼写相同（测试是空的——去掉规范化也
+    /// 通过）；现在一侧用未规范化的别名拼写、另一侧用 `canonicalize` 后的
+    /// 拼写，两者相同（环境给的就是规范形态）则跳过。
     #[test]
     fn temp_grant_refcount_key_is_canonicalized() {
         let tmp = tempfile::tempdir().unwrap();
         let rt = tmp.path().join("rt");
         std::fs::create_dir_all(&rt).unwrap();
-        let alias = {
-            // macOS 的 $TMPDIR 形如 /var/folders/...，canonicalize 后是
-            // /private/var/...——构造出同一目录的未规范化拼写
-            let canonical = std::fs::canonicalize(&rt).unwrap();
-            let raw = rt.display().to_string();
-            if canonical.display().to_string() == raw {
-                // 环境给的就是规范形态：跳过（不是本测的目标平台形态）
-                return;
-            }
-            std::path::PathBuf::from(raw)
-        };
-        let a = TempGrant::add(&rt, "cli:7000").unwrap();
+        // macOS 的 $TMPDIR 形如 /var/folders/...，canonicalize 后是
+        // /private/var/...——构造出同一目录的未规范化拼写
+        let canonical = std::fs::canonicalize(&rt).unwrap();
+        let raw = rt.display().to_string();
+        if canonical.display().to_string() == raw {
+            // 环境给的就是规范形态：跳过（不是本测的目标平台形态）
+            return;
+        }
+        let alias = std::path::PathBuf::from(raw);
+        let a = TempGrant::add(&alias, "cli:7000").unwrap();
         {
-            // 经别名拼写 add：旧键语义下这是「另一个 runtime 目录」的独立
-            // 计数，drop 时会立即撤销；规范化后应计 2，drop 不撤销
-            let _b = TempGrant::add(&alias, "cli:7000").unwrap();
+            // 经 canonical 拼写 add：旧键语义下这是「另一个 runtime 目录」的
+            // 独立计数，drop 时会立即撤销；规范化后应计 2，drop 不撤销
+            let _b = TempGrant::add(&canonical, "cli:7000").unwrap();
             drop(a);
             assert!(
                 principals(&rt).contains(&"cli:7000".to_string()),
