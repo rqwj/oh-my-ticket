@@ -102,20 +102,30 @@ pub fn real_run_code_with(local: Option<&dyn crate::local_tools::LocalTools>) ->
 }
 
 fn real_run_with(local: Option<&dyn crate::local_tools::LocalTools>) -> i32 {
-    // Arm SIGINT/SIGTERM handling: the wake closure flips CANCELED and
-    // shuts the active socket down so a blocked call aborts promptly.
-    // (`omt exec-shim` is dispatched in cli_main.rs BEFORE this runs — the
-    // shim must keep the default signal mask for its own handler, F1.)
-    crate::signal::install(Box::new(|| {
-        CANCELED.store(true, Ordering::SeqCst);
-        if let Some(fd) = *ACTIVE_FD.lock().expect("fd slot") {
-            unsafe {
-                libc::shutdown(fd, libc::SHUT_RD);
-            }
-        }
-    }));
-
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // §49「本地动词期间 Ctrl-C 无效」：harness / exec 本地动词不装 sigwait
+    // 处理——它们不登记 ACTIVE_FD、不检查 CANCELED，装了只会把 SIGINT 吞掉
+    //（`omt harness models` 对挂起的二进制要跑满 8s 探测超时、以 exit 3 收
+    // 场）。保持默认信号语义：Ctrl-C 立即终止（shell 报 130）。在线动词与
+    // `mcp` 保留优雅取消路径（shutdown 活动 socket + CANCELED）。
+    // （`omt exec-shim` is dispatched in cli_main.rs BEFORE this runs — the
+    // shim keeps the default signal mask for its own handler, F1.)
+    let local_verb = split_globals(&args)
+        .ok()
+        .and_then(|split| split.rest.first().cloned())
+        .is_some_and(|verb| verb == "harness" || verb == "exec");
+    if !local_verb {
+        // Arm SIGINT/SIGTERM handling: the wake closure flips CANCELED and
+        // shuts the active socket down so a blocked call aborts promptly.
+        crate::signal::install(Box::new(|| {
+            CANCELED.store(true, Ordering::SeqCst);
+            if let Some(fd) = *ACTIVE_FD.lock().expect("fd slot") {
+                unsafe {
+                    libc::shutdown(fd, libc::SHUT_RD);
+                }
+            }
+        }));
+    }
     match dispatch_args(args, local) {
         Ok(()) => EXIT_OK,
         Err(CliError::Usage(message)) => {

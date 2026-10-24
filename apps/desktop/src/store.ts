@@ -509,6 +509,11 @@ export function useTreeStore() {
   const repullTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   // 已查看过的 Failed agent（选中即记入）：badge 重算时不复活
   const viewedFailedRef = useRef<Set<string>>(new Set())
+  // §49 5s-poll-side-effects：上一次 refreshAgents 落账结果的结构签名——
+  // silent 轮询结果结构未变时跳过 setState（保持 agents 引用稳定，
+  // AgentsPanel 键在 [agents] 上的 effect——run/list 兜底扫描、历史尾部
+  // 回载、exec_attach 重试——不再每 5s 重跑）
+  const agentsSigRef = useRef<string | null>(null)
   // P-10：本会话已接上实时流的 execId（startDispatch 的 Channel 也算）——防重复 attach
   const attachedRef = useRef<Set<string>>(new Set())
   // review R2-9：派发进行中的计数（含续跑的就绪握手，最长 30s）——进行中不接回
@@ -556,6 +561,17 @@ export function useTreeStore() {
       // 归一化放 setState 之外：updater 在 React 渲染期执行，落到本函数
       // try/catch 之外（测试 mock 返回 {} 时不得炸渲染）
       const agents = result.agents ?? []
+      // §49 5s-poll-side-effects：silent 轮询结果与上次落账结构相同 → 跳过
+      // setState（引用稳定压住 AgentsPanel 的 effect 重跑）。非 silent 调用
+      // 仍走原路径（focus / 派发后重拉要清全局 error）。
+      const signature = JSON.stringify({
+        agents,
+        parseFailed: result.parseFailed ?? false,
+        legacyUnmigrated: result.legacyUnmigrated ?? null,
+        corruptAgents: result.corruptAgents ?? [],
+      })
+      if (opts?.silent && signature === agentsSigRef.current) return
+      agentsSigRef.current = signature
       setState(s => ({
         ...s,
         agents,

@@ -196,6 +196,10 @@ pub struct ExecSession {
     /// kind, ...}`）。计数器随 ExecSession 创建（session_start 发出前），
     /// session_start 恒为 seq 0，之后严格递增。
     seq: AtomicU64,
+    /// F-SP2-1：「取 seq 号 + 追加 jsonl」的原子区锁——两个 reader
+    /// （stdout/stderr）与终态线程并发取号落盘时，取号与追加之间的窗口
+    /// 会让文件顺序偏离 seq 顺序（transcript_page 按 seq 分页会丢/重事件）。
+    events_write: Mutex<()>,
     first_event_seen: AtomicBool,
     /// F-BENCH-26(a)：终态收口进行中（幂等 guard）。`terminal` 要等全部
     /// 落账完成才发布，不能再用 terminal.is_some() 当 guard。
@@ -206,6 +210,23 @@ pub struct ExecSession {
 }
 
 impl ExecSession {
+    /// F-SP2-1：事件入档的原子区——锁内取号、补齐 envelope（execId/seq/ts）、
+    /// 追加 jsonl，保证**文件顺序 == seq 顺序**。`transcript_page` 按
+    /// `seq > since` 过滤并以页尾 seq 作 nextSeq，乱序文件会把事件永久跳过
+    /// 或重复返回。sink 回调留在锁外（慢 sink 不拖住另一个 reader 的落盘）。
+    fn stamp_seq_and_append(&self, mut part: serde_json::Value) -> serde_json::Value {
+        let _guard = self
+            .events_write
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let n = self.seq.fetch_add(1, Ordering::Relaxed);
+        part["execId"] = serde_json::json!(self.exec_id);
+        part["seq"] = serde_json::json!(n);
+        part["ts"] = serde_json::json!(agents::now_epoch_ms());
+        append_event_line(self, &part);
+        part
+    }
+
     pub fn terminal(&self) -> Option<Terminal> {
         self.terminal
             .lock()
@@ -445,6 +466,7 @@ impl ExecutionManager {
             events_log,
             sink: on_event.clone(),
             seq: AtomicU64::new(0),
+            events_write: Mutex::new(()),
             first_event_seen: AtomicBool::new(false),
             finishing: AtomicBool::new(false),
             stop_reason: Mutex::new(None),
@@ -471,21 +493,17 @@ impl ExecutionManager {
         );
 
         // F-U2-6：session_start 与 raw/exit 同构——统一携带 seq/ts；
-        // F-U12-4：同时落 jsonl（事件日志与实时流同源同序）
-        let start_seq = session.seq.fetch_add(1, Ordering::Relaxed);
-        let start_event = serde_json::json!({
-            "execId": req.exec_id,
-            "seq": start_seq,
-            "ts": agents::now_epoch_ms(),
+        // F-U12-4：同时落 jsonl（事件日志与实时流同源同序）；
+        // F-SP2-1：取号 + 落盘走原子区（文件顺序 == seq 顺序）
+        let start_event = session.stamp_seq_and_append(serde_json::json!({
             "kind": "session_start",
             "harness": req.harness,
             "program": session.program.display().to_string(),
             "args": session.args,
             "cwd": cwd.display().to_string(),
             "pid": pid,
-        });
-        on_event(start_event.clone());
-        append_event_line(&session, &start_event);
+        }));
+        on_event(start_event);
 
         // stdout/stderr 读线程：逐行 → 事件回调 + raw.log 追加。
         let mut readers = Vec::new();
@@ -695,7 +713,7 @@ fn spawn_reader(
                     "text": line,
                 })];
             }
-            for mut part in parts {
+            for part in parts {
                 // F-BENCH-14：usage 记账（message 求和 / cumulative 末值）。
                 // 事件照常发出——adapter 已停发 message_update 快照（F-U12-3
                 // 刷屏源），现在每条 = 一条消息的定值，per-turn 展示正合适。
@@ -706,12 +724,10 @@ fn spawn_reader(
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .record(&part);
                 }
-                let n = session.seq.fetch_add(1, Ordering::Relaxed);
-                part["execId"] = serde_json::json!(session.exec_id);
-                part["seq"] = serde_json::json!(n);
-                part["ts"] = serde_json::json!(agents::now_epoch_ms());
-                on_event(part.clone());
-                append_event_line(&session, &part);
+                // F-SP2-1：取号 + 落盘原子（两个 reader 并发时文件顺序 ==
+                // seq 顺序），sink 在锁外
+                let part = session.stamp_seq_and_append(part);
+                on_event(part);
             }
             if let Some(log) = log.as_mut() {
                 let _ = writeln!(log, "[{stream}] {line}");
@@ -871,12 +887,9 @@ fn finish_terminal(session: &ExecSession, terminal: &Terminal) {
         );
     }
     let duration_ms = session.started.elapsed().as_millis() as u64;
-    // F-U2-6：exit 事件同样携带 seq/ts（与 session_start、raw 同构）
-    let exit_seq = session.seq.fetch_add(1, Ordering::Relaxed);
-    let exit_event = serde_json::json!({
-        "execId": session.exec_id,
-        "seq": exit_seq,
-        "ts": agents::now_epoch_ms(),
+    // F-U2-6：exit 事件同样携带 seq/ts（与 session_start、raw 同构）；
+    // F-SP2-1：取号 + 落盘走原子区（exit 恒为 jsonl 末行）
+    let exit_event = session.stamp_seq_and_append(serde_json::json!({
         "kind": "exit",
         "status": match status {
             AgentRecordStatus::Exited => "exited",
@@ -893,10 +906,8 @@ fn finish_terminal(session: &ExecSession, terminal: &Terminal) {
             _ => None,
         },
         "durationMs": duration_ms,
-    });
-    (session.sink)(exit_event.clone());
-    // F-U12-4：exit 事件同样落 jsonl（回放含终态行）
-    append_event_line(session, &exit_event);
+    }));
+    (session.sink)(exit_event);
     // F-BENCH-26(a)：terminal 最后发布——此刻全部落账已完成
     *session
         .terminal
@@ -924,9 +935,39 @@ fn drain_readers(readers: &mut Vec<std::thread::JoinHandle<()>>, timeout: Durati
     }
 }
 
+/// F-SP2-2：`process_start_identity` 的 errno 携带版错误——权限类失败
+/// （EPERM/EACCES）意味着 pid 已属于**其他用户**的进程（macOS 的
+/// proc_pidinfo 对跨用户进程返回 EPERM；kill(pid,0) 同样）。shim 恒以当前
+/// 用户运行，权限类失败 = 「不是我们的 shim」→ 存活判定据此判死，租约
+/// 不会无限期卡在对账「可能存活」的跳过分支里。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessIdentityError {
+    pub message: String,
+    /// 底层 errno（proc_pidinfo / 文件读取失败时携带；解析类失败为 None）
+    pub errno: Option<i32>,
+}
+
+impl ProcessIdentityError {
+    /// 权限类失败（EPERM/EACCES）——pid 属其他用户的进程。
+    pub fn is_permission(&self) -> bool {
+        matches!(self.errno, Some(libc::EPERM) | Some(libc::EACCES))
+    }
+}
+
+impl std::fmt::Display for ProcessIdentityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// errno 携带版（F-SP2-2）；`process_start_identity` 是它的 String 投影
+/// （launch.rs 的 `read_identity` 测试缝沿用 String）。
 #[cfg(target_os = "macos")]
-pub fn process_start_identity(pid: u32) -> Result<String, String> {
-    let pid_i = i32::try_from(pid).map_err(|_| format!("pid 越界: {pid}"))?;
+pub fn process_start_identity_detailed(pid: u32) -> Result<String, ProcessIdentityError> {
+    let pid_i = i32::try_from(pid).map_err(|_| ProcessIdentityError {
+        message: format!("pid 越界: {pid}"),
+        errno: None,
+    })?;
     let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
     let size = std::mem::size_of::<libc::proc_bsdinfo>();
     let read = unsafe {
@@ -939,10 +980,11 @@ pub fn process_start_identity(pid: u32) -> Result<String, String> {
         )
     };
     if read != size as i32 {
-        return Err(format!(
-            "读取 pid {pid} 起始身份失败: {}",
-            std::io::Error::last_os_error()
-        ));
+        let err = std::io::Error::last_os_error();
+        return Err(ProcessIdentityError {
+            message: format!("读取 pid {pid} 起始身份失败: {err}"),
+            errno: err.raw_os_error(),
+        });
     }
     let info = unsafe { info.assume_init() };
     Ok(format!(
@@ -952,25 +994,54 @@ pub fn process_start_identity(pid: u32) -> Result<String, String> {
 }
 
 #[cfg(target_os = "linux")]
-pub fn process_start_identity(pid: u32) -> Result<String, String> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
-        .map_err(|err| format!("读取 pid {pid} 起始身份失败: {err}"))?;
+pub fn process_start_identity_detailed(pid: u32) -> Result<String, ProcessIdentityError> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).map_err(|err| {
+        ProcessIdentityError {
+            message: format!("读取 pid {pid} 起始身份失败: {err}"),
+            errno: err.raw_os_error(),
+        }
+    })?;
     // comm 被括号包围且可含空格；从最后一个 ')' 后开始，字段 3(state)
     // 到字段 22(starttime) 的零基偏移为 19。
     let after_comm = stat
         .rfind(')')
         .and_then(|end| stat.get(end + 1..))
-        .ok_or_else(|| format!("pid {pid} stat 格式无效"))?;
-    let start_ticks = after_comm
-        .split_whitespace()
-        .nth(19)
-        .ok_or_else(|| format!("pid {pid} stat 缺少 starttime"))?;
+        .ok_or_else(|| ProcessIdentityError {
+            message: format!("pid {pid} stat 格式无效"),
+            errno: None,
+        })?;
+    let start_ticks =
+        after_comm
+            .split_whitespace()
+            .nth(19)
+            .ok_or_else(|| ProcessIdentityError {
+                message: format!("pid {pid} stat 缺少 starttime"),
+                errno: None,
+            })?;
     Ok(format!("linux:{start_ticks}"))
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn process_start_identity_detailed(pid: u32) -> Result<String, ProcessIdentityError> {
+    Err(ProcessIdentityError {
+        message: format!("当前平台不支持验证 pid {pid} 的起始身份"),
+        errno: None,
+    })
+}
+
+#[cfg(target_os = "macos")]
 pub fn process_start_identity(pid: u32) -> Result<String, String> {
-    Err(format!("当前平台不支持验证 pid {pid} 的起始身份"))
+    process_start_identity_detailed(pid).map_err(|e| e.to_string())
+}
+
+#[cfg(target_os = "linux")]
+pub fn process_start_identity(pid: u32) -> Result<String, String> {
+    process_start_identity_detailed(pid).map_err(|e| e.to_string())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn process_start_identity(pid: u32) -> Result<String, String> {
+    process_start_identity_detailed(pid).map_err(|e| e.to_string())
 }
 
 /// Orphan 强制 kill：只接受持久化 agent/exec 身份，pid 与内核进程起始标识
@@ -2353,6 +2424,7 @@ mod tests {
             started: Instant::now(),
             sink: Arc::new(|_| {}),
             seq: AtomicU64::new(0),
+            events_write: Mutex::new(()),
             first_event_seen: AtomicBool::new(true),
             finishing: AtomicBool::new(false),
             stop_reason: Mutex::new(Some(KillReason::User)),
@@ -2427,6 +2499,7 @@ mod tests {
             ),
             sink: Arc::new(|_| {}),
             seq: AtomicU64::new(0),
+            events_write: Mutex::new(()),
             first_event_seen: AtomicBool::new(true),
             finishing: AtomicBool::new(false),
             stop_reason: Mutex::new(Some(KillReason::User)),
@@ -2898,6 +2971,85 @@ mod tests {
             "session_start 的 args 必须脱敏"
         );
         let _ = manager.exec_stop("exec-args");
+    }
+
+    /// F-SP2-1：seq 取号与 jsonl 落盘必须原子——文件顺序 == seq 顺序。
+    /// 两个 reader（stdout/stderr）与终态线程并发经 `stamp_seq_and_append`
+    /// 入档时，取号与追加之间的窗口会让文件顺序变成 [4,6,5,7]；
+    /// `transcript_page` 过滤 `seq > since` 且以页尾 seq 作 nextSeq，乱序
+    /// 文件会把 seq 5 永久跳过 / 让事件跨页重复返回。
+    #[test]
+    fn concurrent_event_appends_keep_file_order_equal_to_seq_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        std::fs::create_dir_all(&runtime).unwrap();
+        let events_log = runtime.join("exec-seq.jsonl");
+        std::fs::write(&events_log, "{\"kind\":\"session_header\"}\n").unwrap();
+        let session = ExecSession {
+            exec_id: "exec-seq".into(),
+            agent_id: "agent-seq".into(),
+            home_id: "h_test".into(),
+            harness: "fake".into(),
+            node_id: None,
+            run_id: None,
+            pid: u32::MAX,
+            pgid: i32::MAX,
+            program: PathBuf::from("/bin/echo"),
+            args: vec![],
+            cwd: PathBuf::from("/"),
+            started_at_epoch_ms: agents::now_epoch_ms(),
+            raw_log: runtime.join("exec-seq.raw.log"),
+            runtime_dir: runtime.clone(),
+            mcp: McpInjection::None,
+            lease_release: None,
+            started: Instant::now(),
+            usage_totals: std::sync::Mutex::new(UsageTotals::default()),
+            harness_session_id: std::sync::Mutex::new(None),
+            events_log: events_log.clone(),
+            sink: Arc::new(|_| {}),
+            seq: AtomicU64::new(0),
+            events_write: Mutex::new(()),
+            first_event_seen: AtomicBool::new(true),
+            finishing: AtomicBool::new(false),
+            stop_reason: Mutex::new(None),
+            terminal: Mutex::new(None),
+        };
+        const THREADS: usize = 6;
+        const PER_THREAD: usize = 150;
+        let session = Arc::new(session);
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let session = session.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait(); // 最大化并发窗口
+                    for i in 0..PER_THREAD {
+                        let _ = session.stamp_seq_and_append(serde_json::json!({
+                            "kind": "raw",
+                            "stream": "stdout",
+                            "text": format!("t{t}-{i}"),
+                        }));
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let text = std::fs::read_to_string(&events_log).unwrap();
+        let seqs: Vec<u64> = text
+            .lines()
+            .skip(1) // session_header
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter_map(|event| event["seq"].as_u64())
+            .collect();
+        assert_eq!(seqs.len(), THREADS * PER_THREAD, "全部事件都应落盘");
+        assert!(
+            seqs.windows(2).all(|w| w[0] < w[1]),
+            "文件顺序必须严格等于 seq 顺序（F-SP2-1）：前 20 = {:?}",
+            &seqs[..seqs.len().min(20)],
+        );
     }
 
     #[test]

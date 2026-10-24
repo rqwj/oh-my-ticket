@@ -40,6 +40,18 @@ fn opt_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
         .filter(|s| !s.is_empty())
 }
 
+/// 本地工具路径的 argv 脱敏（§49 sanitize 漏网）：`sanitize_args` 只看以
+/// key/token/secret/password 结尾的 flag，`["--auth", "sk-abc"]`、
+/// `["-H", "Authorization: Bearer xyz"]` 会原样漏出。本地工具的输出直接进
+/// 主控 agent 的上下文——在 `sanitize_args` 之上再逐词过 `sanitize_line`
+///（sk- 前缀 / Bearer / key=value 形态），宁枉勿纵。
+fn sanitize_args_deep(args: &[String]) -> Vec<String> {
+    omt_harness::sanitize::sanitize_args(args)
+        .into_iter()
+        .map(|arg| omt_harness::sanitize::sanitize_line(&arg))
+        .collect()
+}
+
 /// 本地工具路径的 harness 投影：与桌面端设置页同源，但 env 只给键名、extraArgs
 /// 脱敏——工具输出会进入主控 agent 的上下文与 transcript（secrets 纪律）。
 pub fn harness_list(ctx: &Ctx) -> Result<Value, Problem> {
@@ -61,10 +73,7 @@ pub fn harness_list(ctx: &Ctx) -> Result<Value, Problem> {
             if let Some(obj) = entry.as_object_mut() {
                 obj.remove("env");
                 obj.insert("envKeys".into(), Value::Array(keys));
-                obj.insert(
-                    "extraArgs".into(),
-                    json!(omt_harness::sanitize::sanitize_args(&args)),
-                );
+                obj.insert("extraArgs".into(), json!(sanitize_args_deep(&args)));
             }
         }
     }
@@ -95,11 +104,13 @@ pub fn policy_show(ctx: &Ctx) -> Result<Value, Problem> {
 /// Q-3：解析目标 home → (homeId, .omt 路径, kind)，一律以 daemon 的映射为准。
 /// MCP 只接受已服务的 `homeId`（`home` 键被忽略，MCP 不能借它声明 home，R7）；
 /// CLI 另认 `home`（路径或 homeId），给出已初始化但未被服务的路径时经
-/// DaemonLink::connect 声明。
+/// DaemonLink::connect 声明。§49 Q-13 先判后声明：声明**之前**先对规范路径
+/// 预判 workspace 范围——被拒的请求不得先在 daemon 里留下已登记的 home。
 fn resolve_home(
     ctx: &Ctx,
     origin: LaunchOrigin,
     args: &Value,
+    user_home: Option<&Path>,
 ) -> Result<(String, PathBuf, String), Problem> {
     let cli_home = match origin {
         LaunchOrigin::Cli => opt_str(args, "home"),
@@ -121,6 +132,12 @@ fn resolve_home(
     }
     if cli_home.is_some() {
         if let Some(path) = canonical.filter(|p| p.join("omt.db").is_file()) {
+            // §49 Q-13 judge-before-declare：全局 home / workspace 根等于
+            // 用户主目录的派发在这里直接拒绝——旧顺序先 home/declare 再由
+            // exec_start 判，被拒请求会在 daemon 里留下已登记的 home。
+            if let Some(denial) = pre_declare_scope_denial(&path, user_home) {
+                return Err(denial.into_problem());
+            }
             let link = crate::daemon_link::DaemonLink::connect(
                 &ctx.runtime_dir,
                 "cli",
@@ -130,13 +147,11 @@ fn resolve_home(
             )
             .map_err(io)?;
             if let Some(id) = link.home_id_for(&path) {
-                let kind =
-                    crate::daemon_link::served_homes(&ctx.runtime_dir, ctx.daemon_bin.as_deref())
-                        .map_err(io)?
-                        .into_iter()
-                        .find(|h| h.home_id == id)
-                        .map(|h| h.kind)
-                        .unwrap_or_else(|| "workspace".into());
+                // kind 取声明后握手自己的 homes[]（缺 kind → "unknown"，
+                // Q-13 fail closed——绝不默认 workspace）
+                let kind = link
+                    .home_kind_for(&path)
+                    .unwrap_or_else(|| "unknown".into());
                 return Ok((id, path, kind));
             }
         }
@@ -146,9 +161,31 @@ fn resolve_home(
     )))
 }
 
+/// 声明前的路径预判（§49 Q-13）：kind 尚无 daemon 映射，按 daemon 的规范
+/// 规则（homes.rs：路径 == 解析出的全局 home → global）从路径推断；workspace
+/// 根等于用户主目录的判定与声明后同一函数，保证先判 / 后判结论一致。
+fn pre_declare_scope_denial(
+    path: &Path,
+    user_home: Option<&Path>,
+) -> Option<crate::policy::PolicyDenial> {
+    let global_home = std::env::var_os("OMT_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".omt")));
+    let is_global = global_home
+        .and_then(|global| std::fs::canonicalize(global).ok())
+        .is_some_and(|global| global == path);
+    workspace_scope_denial(
+        if is_global { "global" } else { "workspace" },
+        path,
+        user_home,
+    )
+}
+
 /// Q-13：`workspaces: homeWorkspaceOnly` 的纯判定。全局 home，或 workspace 根
 /// （与执行器同一规则 `executor::workspace_root_of`：尾段是 `.omt` 才剥掉）等于
 /// 用户主目录，都会让无人值守 harness 以 $HOME 为 cwd 运行。
+/// §49 fail closed：kind 未知（缺字段 / 旧 daemon 的怪值）一律按拒绝——
+/// 「kind 缺失默认 workspace 放行」会把不敢确认的 home 悄悄放开。
 pub fn workspace_scope_denial(
     kind: &str,
     home_path: &Path,
@@ -159,7 +196,7 @@ pub fn workspace_scope_denial(
         std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone())
             == std::fs::canonicalize(h).unwrap_or_else(|_| h.to_path_buf())
     });
-    (kind == "global" || at_user_home).then(|| crate::policy::PolicyDenial {
+    (kind != "workspace" || at_user_home).then(|| crate::policy::PolicyDenial {
         field: "workspaces",
         reason: format!(
             "policy 只允许在 workspace 内的 home 上执行（{} 的工作目录会是用户主目录）",
@@ -178,12 +215,29 @@ pub fn exec_start(ctx: &Ctx, origin: LaunchOrigin, args: &Value) -> Result<Value
     // 先判 policy（不碰 daemon）：被拒的请求不留任何痕迹
     let policy = crate::policy::load(&ctx.runtime_dir)?;
     crate::policy::check_launch(&policy, origin, harness).map_err(|d| d.into_problem())?;
-    let requested = args
-        .get("maxDurationSec")
-        .and_then(Value::as_u64)
-        .map(Duration::from_secs);
-    let (home_id, home_path, home_kind) = resolve_home(ctx, origin, args)?;
+    // §49 maxDurationSec 校验：0 / <60 / 非整数（"600"、30.5、-1）一律
+    // INVALID_INPUT——非整数此前被静默忽略改用 policy 上限；0/30 则会被
+    // watchdog 首个 tick 以 MaxDuration 杀掉、run 无人认领。
+    let requested = match args.get("maxDurationSec") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let secs = value
+                .as_u64()
+                .filter(|n| *n >= crate::policy::MIN_DURATION_SEC);
+            let secs = secs.ok_or_else(|| {
+                invalid(
+                    "maxDurationSec",
+                    format!(
+                        "maxDurationSec 必须为不小于 {} 的整数秒（当前值 {value}）",
+                        crate::policy::MIN_DURATION_SEC
+                    ),
+                )
+            })?;
+            Some(Duration::from_secs(secs))
+        }
+    };
     let user_home = std::env::var_os("HOME").map(PathBuf::from);
+    let (home_id, home_path, home_kind) = resolve_home(ctx, origin, args, user_home.as_deref())?;
     if let Some(denial) = workspace_scope_denial(&home_kind, &home_path, user_home.as_deref()) {
         return Err(denial.into_problem());
     }
@@ -253,7 +307,7 @@ pub fn exec_status(ctx: &Ctx, exec_id: &str) -> Result<Value, Problem> {
         .map_err(io)?
         .ok_or_else(|| not_found(format!("exec {exec_id} 不存在")))?;
     let mut exec = serde_json::to_value(&loc.exec).map_err(|e| io(e.to_string()))?;
-    exec["binaryArgs"] = json!(omt_harness::sanitize::sanitize_args(&loc.exec.binary_args));
+    exec["binaryArgs"] = json!(sanitize_args_deep(&loc.exec.binary_args));
     let active =
         crate::control::exec_active(&ctx.runtime_dir, &loc.home_id, &loc.agent.id, exec_id);
     Ok(json!({
@@ -344,7 +398,14 @@ mod tests {
                 node_id: Some("T-1".into()),
                 run_id: Some("RUN-1".into()),
                 binary_path: None,
-                binary_args: vec!["--api-key".into(), "sk-secret".into()],
+                binary_args: vec![
+                    "--api-key".into(),
+                    "sk-secret".into(),
+                    "--auth".into(),
+                    "sk-leak-789".into(),
+                    "-H".into(),
+                    "Authorization: Bearer abc.def".into(),
+                ],
                 model: None,
                 launched_by: Some(LaunchOrigin::Cli),
                 parent_agent_id: None,
@@ -374,6 +435,12 @@ mod tests {
         assert_eq!(status["agent"]["harness"], "pi");
         let args = status["exec"]["binaryArgs"].to_string();
         assert!(!args.contains("sk-secret"), "argv 输出前必须脱敏：{args}");
+        // §49 sanitize 漏网：不以敏感词结尾的 flag 形态同样不得漏出
+        assert!(!args.contains("sk-leak-789"), "--auth sk-… 漏网：{args}");
+        assert!(
+            !args.contains("abc.def"),
+            "Authorization: Bearer 漏网：{args}"
+        );
     }
 
     #[test]
@@ -448,7 +515,9 @@ mod tests {
         );
     }
 
-    /// 本地工具路径不泄露 harness env 的值（secrets 纪律）。
+    /// 本地工具路径不泄露 harness env 的值（secrets 纪律）。§49 sanitize
+    /// 漏网：`--auth sk-…`、`-H "Authorization: Bearer …"` 不以敏感词结尾的
+    /// flag 形态也必须挡下（sanitize_args 之上再逐词过 sanitize_line）。
     #[test]
     fn harness_list_redacts_env_values_and_extra_args() {
         let tmp = tempfile::tempdir().unwrap();
@@ -459,7 +528,14 @@ mod tests {
             "pi",
             omt_harness::harness::HarnessUserConfig {
                 enabled: true,
-                extra_args: vec!["--api-key".into(), "sk-secret-456".into()],
+                extra_args: vec![
+                    "--api-key".into(),
+                    "sk-secret-456".into(),
+                    "--auth".into(),
+                    "sk-leak-789".into(),
+                    "-H".into(),
+                    "Authorization: Bearer abc.def".into(),
+                ],
                 env,
                 ..Default::default()
             },
@@ -467,11 +543,17 @@ mod tests {
         .unwrap();
         let out = harness_list(&ctx(tmp.path())).unwrap().to_string();
         assert!(!out.contains("sk-secret"), "{out}");
+        assert!(!out.contains("sk-leak-789"), "§49 --auth sk-… 漏网：{out}");
+        assert!(
+            !out.contains("abc.def"),
+            "§49 Authorization: Bearer 漏网：{out}"
+        );
         assert!(out.contains("API_KEY"), "键名保留：{out}");
         assert!(!out.contains("\"env\""), "env 字段整体换成 envKeys：{out}");
     }
 
-    /// Q-13：全局 home、或 workspace 根等于用户主目录 → 拒绝；workspace home 放行。
+    /// Q-13：全局 home、或 workspace 根等于用户主目录 → 拒绝；workspace home
+    /// 放行。§49 fail closed：kind 未知（缺字段 / 旧 daemon 怪值）同样拒绝。
     #[test]
     fn workspace_scope_rejects_global_and_user_home_roots() {
         let user_home = Path::new("/Users/someone");
@@ -489,6 +571,15 @@ mod tests {
             )
             .is_some(),
             "kind 报 workspace 但根目录就是 $HOME 也拒绝"
+        );
+        assert!(
+            workspace_scope_denial(
+                "unknown",
+                Path::new("/Users/someone/dev/proj/.omt"),
+                Some(user_home)
+            )
+            .is_some(),
+            "§49 fail closed：kind 未知不得按 workspace 放行"
         );
         assert!(workspace_scope_denial(
             "workspace",
@@ -517,6 +608,33 @@ mod tests {
                     .code,
                 "INVALID_INPUT",
                 "{args}"
+            );
+        }
+    }
+
+    /// §49 maxDurationSec 校验：0 / <60 / 非整数（"600"、30.5、-1）一律
+    /// INVALID_INPUT（field maxDurationSec），不再静默回落 policy 上限
+    /// （0/30 会被 watchdog 首个 tick 以 MaxDuration 杀掉、run 无人认领）。
+    #[test]
+    fn exec_start_rejects_subminute_and_non_integer_max_duration() {
+        let tmp = tempfile::tempdir().unwrap();
+        for bad in [
+            serde_json::json!(0),
+            serde_json::json!(30),
+            serde_json::json!("600"),
+            serde_json::json!(30.5),
+            serde_json::json!(-1),
+        ] {
+            let args = serde_json::json!({
+                "homeId": "h_t", "harness": "pi", "nodeId": "T-1",
+                "maxDurationSec": bad,
+            });
+            let err = exec_start(&ctx(tmp.path()), LaunchOrigin::Cli, &args).unwrap_err();
+            assert_eq!(err.code, "INVALID_INPUT", "{bad}: {err:?}");
+            assert_eq!(
+                err.details.as_ref().unwrap()["field"],
+                "maxDurationSec",
+                "{bad}: {err:?}"
             );
         }
     }

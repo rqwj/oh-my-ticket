@@ -50,16 +50,29 @@ pub fn shim_alive(exec: &ExecRecord) -> bool {
 /// `shim_alive`（发信号前必须确知身份，未知 = 否）方向相反：
 /// - 无 shim_pid → 否；
 /// - 身份可读：匹配 → 是，不匹配 → 否（确已换人，pid 复用不算假阴性）；
-/// - start-id 缺失或 proc_pidinfo 读不出 → pid 仍存在即按「未知 → 存活」。
+/// - 身份读失败为**权限类**（EPERM/EACCES）→ 否（F-SP2-2：shim 恒以当前
+///   用户运行，pid 已属其他用户的进程 = 不是我们的 shim；否则被复用的 pid
+///   会让租约无限期卡在对账跳过里）；
+/// - start-id 缺失或其余读失败 → pid 仍存在即按「未知 → 存活」。
 pub fn shim_maybe_alive(exec: &ExecRecord) -> bool {
+    shim_maybe_alive_with(exec, crate::executor::process_start_identity_detailed)
+}
+
+/// `shim_maybe_alive` 的内芯（F-SP2-2 的可测缝：身份读取注入——跨用户
+/// pid 的 EPERM 形态在 root/CI 机器上不可构造，见判定表测试）。
+fn shim_maybe_alive_with(
+    exec: &ExecRecord,
+    read_identity: impl FnOnce(u32) -> Result<String, crate::executor::ProcessIdentityError>,
+) -> bool {
     let Some(pid) = exec.shim_pid else {
         return false;
     };
     let pid_alive = || omt_client::pid_live(i64::from(pid));
     match exec.shim_start_id.as_deref() {
         None => pid_alive(),
-        Some(expected) => match crate::executor::process_start_identity(pid) {
+        Some(expected) => match read_identity(pid) {
             Ok(actual) => actual == expected,
+            Err(err) if err.is_permission() => false,
             Err(_) => pid_alive(),
         },
     }
@@ -846,5 +859,80 @@ mod tests {
         let gone_pid = gone.id();
         gone.wait().unwrap();
         assert!(!shim_maybe_alive(&rec(Some(gone_pid), None)));
+    }
+
+    /// F-SP2-2：start-id 在场、身份读失败且失败为权限类 → 判死。macOS 的
+    /// proc_pidinfo(1, PROC_PIDTBSDINFO) 对其他用户进程（launchd）返回
+    /// EPERM，kill(1,0) 同样 EPERM（pid_live 视为存活）——旧代码回落
+    /// pid_live 把被复用的 pid 当「shim 可能存活」，对账永远跳过、租约
+    /// 无限期卡住。shim 恒以当前用户运行：EPERM = pid 已属别人的进程 →
+    /// 不是我们的 shim。前置核实本机形态（root 下 pid 1 可读则跳过）。
+    #[test]
+    fn shim_maybe_alive_treats_eperm_identity_failure_as_dead() {
+        let err = match crate::executor::process_start_identity_detailed(1) {
+            Ok(_) => return, // 本机可读 pid 1（如 root）——形态不可构造
+            Err(err) => err,
+        };
+        assert!(
+            err.is_permission(),
+            "前置：pid 1 的身份读失败应为权限类（EPERM）：{err:?}"
+        );
+        assert!(
+            omt_client::pid_live(1),
+            "前置：kill(1,0) 得 EPERM → pid_live 视为存活"
+        );
+        let rec = ExecRecord {
+            shim_pid: Some(1),
+            shim_start_id: Some("macos:1:1".into()),
+            ..Default::default()
+        };
+        assert!(
+            !shim_maybe_alive(&rec),
+            "EPERM（pid 属其他用户）= 不是我们的 shim → 判死，不得回落 pid_live"
+        );
+    }
+
+    /// F-SP2-2 判定表（缝注入，跨平台确定）：权限类失败 → 死（即便
+    /// pid_live 为真）；其余失败 → 维持「未知按存活」；start-id 缺失 →
+    /// 不受影响。
+    #[test]
+    fn shim_maybe_alive_eperm_is_dead_other_errors_stay_maybe_alive() {
+        use crate::executor::ProcessIdentityError;
+        let me = std::process::id();
+        assert!(omt_client::pid_live(i64::from(me)), "前置：本进程存活");
+        let rec = ExecRecord {
+            shim_pid: Some(me),
+            shim_start_id: Some("macos:0:0".into()),
+            ..Default::default()
+        };
+        let eperm = |_| {
+            Err(ProcessIdentityError {
+                message: "读取 pid 起始身份失败: Operation not permitted".into(),
+                errno: Some(libc::EPERM),
+            })
+        };
+        assert!(
+            !shim_maybe_alive_with(&rec, eperm),
+            "EPERM = pid 已属其他用户 → 判死"
+        );
+        let other = |_| {
+            Err(ProcessIdentityError {
+                message: "读取 pid 起始身份失败: nope".into(),
+                errno: None,
+            })
+        };
+        assert!(
+            shim_maybe_alive_with(&rec, other),
+            "其余失败维持「未知按存活」（§45/§47 保守方向）"
+        );
+        let no_start_id = ExecRecord {
+            shim_pid: Some(me),
+            shim_start_id: None,
+            ..Default::default()
+        };
+        assert!(
+            shim_maybe_alive_with(&no_start_id, eperm),
+            "缺 start-id 的既有语义（接受的成本）不因 EPERM 改变"
+        );
     }
 }

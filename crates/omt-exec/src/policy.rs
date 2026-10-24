@@ -46,7 +46,9 @@ pub enum ApprovalMode {
     Inherit,
 }
 
-const MIN_DURATION_SEC: u64 = 60;
+/// 派发请求 maxDurationSec 的下限（§49：exec_start 对 <60 与非整数报
+/// INVALID_INPUT——0/30 会被 watchdog 首个 tick 以 MaxDuration 杀掉）。
+pub(crate) const MIN_DURATION_SEC: u64 = 60;
 const MAX_CONCURRENT_CAP: u32 = 32;
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]

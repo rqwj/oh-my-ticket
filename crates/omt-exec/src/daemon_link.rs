@@ -220,14 +220,24 @@ impl DaemonLink {
 
     /// handshake 的 `homes[]`（已按凭据范围过滤）里路径与 `home_path` 相同的 homeId。
     pub fn home_id_for(&self, home_path: &Path) -> Option<String> {
+        self.handshake_entry_for(home_path)
+            .and_then(|home| home["homeId"].as_str().map(str::to_string))
+    }
+
+    /// 同一条目的 `kind`。§49 Q-13 fail closed：缺 kind 返回 None（调用方按
+    /// "unknown" 处理 → workspace 范围判定拒绝），绝不默认 "workspace"。
+    pub fn home_kind_for(&self, home_path: &Path) -> Option<String> {
+        self.handshake_entry_for(home_path)
+            .and_then(|home| home["kind"].as_str().map(str::to_string))
+    }
+
+    fn handshake_entry_for(&self, home_path: &Path) -> Option<&serde_json::Value> {
         let want = std::fs::canonicalize(home_path).unwrap_or_else(|_| home_path.to_path_buf());
-        self.handshake["homes"].as_array()?.iter().find_map(|home| {
-            let path = std::fs::canonicalize(home["path"].as_str()?).ok()?;
-            if path == want {
-                home["homeId"].as_str().map(str::to_string)
-            } else {
-                None
-            }
+        self.handshake["homes"].as_array()?.iter().find(|home| {
+            let Some(path) = home["path"].as_str() else {
+                return false;
+            };
+            std::fs::canonicalize(path).ok() == Some(want.clone())
         })
     }
 
@@ -353,7 +363,9 @@ pub fn served_homes(
                     Some(ServedHome {
                         home_id: h["homeId"].as_str()?.to_string(),
                         path: PathBuf::from(h["path"].as_str()?),
-                        kind: h["kind"].as_str().unwrap_or("workspace").to_string(),
+                        // §49 Q-13 fail closed：缺 kind → "unknown"（workspace
+                        // 范围判定按拒绝处理），不默认 "workspace"
+                        kind: h["kind"].as_str().unwrap_or("unknown").to_string(),
                     })
                 })
                 .collect()

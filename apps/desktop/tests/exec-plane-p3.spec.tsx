@@ -405,6 +405,55 @@ describe('B7 stop-all notice and focus (§39)', () => {
   })
 })
 
+describe('§49 5s poll side effects: refreshAgents skips unchanged results', () => {
+  beforeEach(() => {
+    invokeMock.mockReset()
+    invokeMock.mockResolvedValue({})
+  })
+
+  it('silent 轮询结果结构未变时跳过 setState——agents 引用保持稳定，面板 effect 不重跑；变化仍更新', async () => {
+    const failed = agent({ id: 'agent-a', status: 'failed', attachment: 'none' })
+    invokeMock.mockImplementation(async (cmd: string) =>
+      cmd === 'agents_list'
+        ? { agents: [failed], agentSeq: 1, parseFailed: false }
+        : {},
+    )
+    const { useTreeStore } = await import('../src/store')
+    const { renderHook } = await import('@testing-library/react')
+    const { result, unmount } = renderHook(() => useTreeStore())
+    const home = { homeId: 'h1', kind: 'workspace', path: '/tmp/ws/.omt' } as never
+    await act(async () => {
+      await result.current.selectHome(home)
+    })
+    const first = result.current.state.agents
+    expect(first.map(a => a.id)).toEqual(['agent-a'])
+    // 5s 轮询：同样的数据再来两轮——引用必须稳定（AgentsPanel 键在
+    // [agents] 上的 effect——run/list 兜底扫描、exec_transcript_tail 回载、
+    // exec_attach 重试——不会每 5s 重跑）
+    await act(async () => {
+      await result.current.refreshAgents({ silent: true })
+    })
+    expect(result.current.state.agents).toBe(first)
+    await act(async () => {
+      await result.current.refreshAgents({ silent: true })
+    })
+    expect(result.current.state.agents).toBe(first)
+    // 数据变化（agent 状态翻转）仍要落到 state
+    const exited = { ...failed, status: 'exited' as const }
+    invokeMock.mockImplementation(async (cmd: string) =>
+      cmd === 'agents_list'
+        ? { agents: [exited], agentSeq: 1, parseFailed: false }
+        : {},
+    )
+    await act(async () => {
+      await result.current.refreshAgents({ silent: true })
+    })
+    expect(result.current.state.agents).not.toBe(first)
+    expect(result.current.state.agents[0].status).toBe('exited')
+    unmount()
+  })
+})
+
 describe('B7 resume failure re-attach (§39)', () => {
   beforeEach(() => {
     invokeMock.mockReset()

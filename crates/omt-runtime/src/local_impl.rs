@@ -109,14 +109,15 @@ impl LocalTools for LocalImpl {
     }
 }
 
-/// exec list 只读：homeId 原样；路径则按目录名之外的 agents/<homeId> 布局无法反推，
-/// 所以经 daemon 映射（与 exec start 同一来源）。
+/// exec list 只读：home 选择与 exec start 的 resolve_home 同一方式——先按
+/// homeId 匹配已服务 home，再按规范路径匹配（§49：旧实现以「含不含 `/`」
+/// 区分，相对路径如 `.omt` 被当成 homeId 报 invalid home id）。
 fn resolve_home_id(ctx: &Ctx, home: &str) -> Result<String, Problem> {
-    if !home.contains('/') {
-        return Ok(home.to_string());
-    }
     let served = omt_exec::daemon_link::served_homes(&ctx.runtime_dir, ctx.daemon_bin.as_deref())
         .map_err(|e| Problem::new("IO", e))?;
+    if let Some(found) = served.iter().find(|h| h.home_id == home) {
+        return Ok(found.home_id.clone());
+    }
     let want = std::fs::canonicalize(home).ok();
     served
         .into_iter()

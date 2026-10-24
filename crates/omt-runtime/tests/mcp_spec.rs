@@ -556,6 +556,8 @@ fn mcp_restricted_credential_refuses_out_of_scope_actions() {
 }
 
 /// Q-3 / R7：MCP 不能借 `home` 路径让 daemon 声明一个未被服务的 home。
+/// §49 测试加固：只传 `home`（不带 homeId——旧测试两个都传，homeId 优先，
+/// 去掉防护也能通过，守不住 Q-3），断言 INVALID_INPUT 且未声明。
 #[test]
 fn mcp_exec_start_cannot_declare_an_unserved_home() {
     let (ctx, homes) = TestCtx::spawn_with_homes("mcp-local-home", 2);
@@ -580,12 +582,14 @@ fn mcp_exec_start_cannot_declare_an_unserved_home() {
     .unwrap();
     let mut mcp = McpProcess::spawn(&ctx);
     initialize(&mut mcp);
+    // 只传 home 路径（已初始化、未被服务——若防护失效即可被声明的最大威胁
+    // 形态），不带 homeId：MCP 只认 homeId，home 键必须被拒绝为 INVALID_INPUT
     let result = call_tool(
         &mut mcp,
         "exec__start",
         serde_json::json!({
-            "home": homes[1].join(".omt").to_str().unwrap(),
-            "homeId": "h_not_served", "harness": "pi", "nodeId": "TICKET-1"
+            "home": homes[1].to_str().unwrap(),
+            "harness": "pi", "nodeId": "TICKET-1"
         }),
     );
     assert_eq!(result["result"]["isError"], true, "{result}");
@@ -593,8 +597,8 @@ fn mcp_exec_start_cannot_declare_an_unserved_home() {
         result["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
-            .starts_with("NOT_FOUND"),
-        "{result}"
+            .starts_with("INVALID_INPUT"),
+        "MCP 只认 homeId；只给 home 路径必须是 INVALID_INPUT（不是借它查找/声明）: {result}"
     );
     // home-01 仍未被服务（没有被声明）
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_omt"))
