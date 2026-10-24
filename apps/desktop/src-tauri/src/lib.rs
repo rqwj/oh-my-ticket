@@ -385,11 +385,21 @@ pub fn run() {
                         move |choice| {
                             match choice {
                                 // KEEP / STOP 都是退出路径（P3-a）：DIALOG_OPEN
-                                // 保持置位直到进程退出
-                                QuitChoice::Keep => {}
+                                // 保持置位直到进程退出。
+                                // §57 P3：确认+退出由各分支自带（Keep 直接置位
+                                // 退出；Stop 经 quit_stop_branch 的 worker 在 exit
+                                // 前置位）——match 后没有共享尾部，任何分支都
+                                // 不可能「落入」置位+退出（§51 F-SP2-4 的回归
+                                // 形态在结构上不可复现；源文本断言
+                                // run_quit_stop_arms_never_touch_quit_confirmed_in_any_form
+                                // 锁定）。
+                                QuitChoice::Keep => {
+                                    QUIT_CONFIRMED.store(true, Ordering::SeqCst);
+                                    handle.exit(0);
+                                }
                                 // §53 P3-12：分支主体抽为共用的 quit_stop_branch
-                                //（两个 STOP 分支同体）；QUIT_CONFIRMED 的置位
-                                // 时序由 run_quit_stop_worker 承担（§51 F-SP2-4）
+                                //（两个 STOP 分支同体）；确认的置位时序由
+                                // run_quit_stop_worker 承担（§51 F-SP2-4）
                                 QuitChoice::Stop => {
                                     let stopping_handle = handle.clone();
                                     let exit_handle = handle.clone();
@@ -399,17 +409,13 @@ pub fn run() {
                                         move || mark_stopping(&stopping_handle),
                                         move || exit_handle.exit(0),
                                     );
-                                    return;
                                 }
                                 // 取消 / Esc：不退出——只有回到正常运行的分支
                                 // 清 DIALOG_OPEN（P3-a）
                                 QuitChoice::Cancel => {
                                     DIALOG_OPEN.store(false, Ordering::SeqCst);
-                                    return;
                                 }
                             }
-                            QUIT_CONFIRMED.store(true, Ordering::SeqCst);
-                            handle.exit(0);
                         },
                     );
                 }
@@ -672,36 +678,94 @@ mod tests {
         );
     }
 
-    /// §55 P3：源文本断言守 run() 的两个 STOP 分支（与 rpc_bridge 的
-    /// daemon_homes_tests 同法）——helper 级测试（quit_stop_branch /
-    /// run_quit_stop_worker）锁不住调用点：把 `QUIT_CONFIRMED.store(true)`
-    /// 加回任一 `QuitChoice::Stop` 分支（§51 原 bug 位点）本测必须红。
-    ///（needle 运行时拼接，避免本测自己的字面量被扫到。）
+    /// §55 P3 → §57 P3 修订：源文本断言守 run() 的两个 STOP 分支（与
+    /// rpc_bridge 的 daemon_homes_tests 同法）——helper 级测试
+    /// （quit_stop_branch / run_quit_stop_worker）锁不住调用点。
+    /// §57 发现旧断言只扫 `QuitChoice::Stop =>` 到 `quit_stop_branch(`
+    /// 之间：ExitRequested 分支里 helper 调用之后的 `return;` 被删掉
+    /// （落入共享尾部 `QUIT_CONFIRMED.store(true); handle.exit(0);`——
+    /// 即 §51 F-SP2-4 复发）时断言仍绿；`QUIT_CONFIRMED\n.store` /
+    /// `.swap(true` 形态也绕过 needle。修订（配合生产代码重构——共享
+    /// 尾部删除、Keep 分支自带确认+退出）：
+    /// - Stop 分支整段（到下一个 `QuitChoice::` 分支）做**去空白**扫描：
+    ///   不得出现 `QUIT_CONFIRMED` 的任何引用（store / swap / compare_/
+    ///   跨行拼接全部命中），且必须经 quit_stop_branch 收尾；
+    /// - 至少一个 Keep 分支自带 `QUIT_CONFIRMED.store` + `.exit(0)`
+    ///   （把尾部挪回 match 之后会让该分支变空 → 本断言红）。
+    ///
+    ///（needle 运行时拼接，避免本测的字面量被自己扫到。）
     #[test]
-    fn run_quit_stop_arms_never_store_quit_confirmed_before_helper() {
-        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
+    fn run_quit_stop_arms_never_touch_quit_confirmed_in_any_form() {
+        let full = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
             .expect("read lib.rs source");
+        // 只扫 run() 的生产代码：截断到本测试模块之前（测试模块的注释会
+        // 引用 arm 字面量，混进扫描会造出假 arm）
+        let test_module = ["#[cfg(", "test)]"].join("");
+        let src = &full[..full.find(&test_module).expect("lib.rs 应有测试模块")];
         let stop_arm = ["QuitChoice::Stop", "=>"].join(" ");
+        let keep_arm = ["QuitChoice::Keep", "=>"].join(" ");
+        let next_choice = ["QuitChoice", "::"].join("");
         let helper = ["quit_stop_branch", "("].join("");
-        let early_confirm = ["QUIT_CONFIRMED", "store"].join(".");
-        let mut arms = 0usize;
-        let mut rest = src.as_str();
+        // 代码形态 needle：`QUIT_CONFIRMED.<method>`（去空白后）——命中
+        // `QUIT_CONFIRMED.store` / `QUIT_CONFIRMED\n.store` / `.swap(true` /
+        // 任何其它方法调用形态；分支注释里的说明文字（后接中文/空格）不算
+        let confirm_ref = ["QUIT_", "CONFIRMED."].join("");
+        let confirm_store = ["QUIT_", "CONFIRMED.store"].join("");
+        let exit_call = [".exit(", "0"].join("");
+        let collapse =
+            |text: &str| -> String { text.chars().filter(|c| !c.is_whitespace()).collect() };
+        let arm_region = |from: &str| -> String {
+            let end = from[next_choice.len()..]
+                .find(&next_choice)
+                .map(|off| next_choice.len() + off)
+                .unwrap_or(from.len());
+            collapse(&from[..end])
+        };
+        // Stop 分支：整段不得引用 QUIT_CONFIRMED（任何形态），且经 helper 收尾
+        let mut stop_arms = 0usize;
+        let mut rest = src;
         while let Some(idx) = rest.find(&stop_arm) {
-            let arm = &rest[idx..];
-            let helper_at = arm
-                .find(&helper)
-                .expect("每个 Stop 分支都必须经 quit_stop_branch 收尾");
+            let arm = arm_region(&rest[idx..]);
             assert!(
-                !arm[..helper_at].contains(&early_confirm),
-                "run() 的 QuitChoice::Stop 分支不得在 helper 调用前触碰 QUIT_CONFIRMED\
-                 （§51 原 bug 位点；时序契约由 run_quit_stop_worker 承担）"
+                arm.contains(&helper),
+                "每个 Stop 分支都必须经 quit_stop_branch 收尾"
             );
-            arms += 1;
-            rest = &arm[helper_at..];
+            assert!(
+                !arm.contains(&confirm_ref),
+                "run() 的 QuitChoice::Stop 分支不得触碰 QUIT_CONFIRMED（任何方法形态：\
+                 store / swap / 跨行；时序契约由 run_quit_stop_worker 承担）"
+            );
+            stop_arms += 1;
+            let from = &rest[idx..];
+            let end = from[next_choice.len()..]
+                .find(&next_choice)
+                .map(|off| next_choice.len() + off)
+                .unwrap_or(from.len());
+            rest = &from[end..];
         }
         assert!(
-            arms >= 2,
-            "应锁定 CloseRequested / ExitRequested 两个 STOP 分支，实际找到 {arms} 个"
+            stop_arms >= 2,
+            "应锁定 CloseRequested / ExitRequested 两个 STOP 分支，实际找到 {stop_arms} 个"
+        );
+        // Keep 分支自带确认+退出（§57 重构后无共享尾部可落入）
+        let mut rest = src;
+        let mut keep_owns_exit = 0usize;
+        while let Some(idx) = rest.find(&keep_arm) {
+            let arm = arm_region(&rest[idx..]);
+            if arm.contains(&confirm_store) && arm.contains(&exit_call) {
+                keep_owns_exit += 1;
+            }
+            let from = &rest[idx..];
+            let end = from[next_choice.len()..]
+                .find(&next_choice)
+                .map(|off| next_choice.len() + off)
+                .unwrap_or(from.len());
+            rest = &from[end..];
+        }
+        assert!(
+            keep_owns_exit >= 1,
+            "ExitRequested 的 Keep 分支必须自带 QUIT_CONFIRMED.store + exit(0)\
+             （共享尾部已删——把确认+退出挪回 match 之后是 §57 点名的回归位点）"
         );
     }
 }

@@ -46,6 +46,15 @@ const STDERR_TAIL_MAX_CHARS: usize = 2000;
 /// - 空白从「ASCII 空格/tab」回到 `char` 级：NBSP（U+00A0）、U+3000、`\r`
 ///   等都算键值分隔前的合法空白（`trim_start_matches` 的字符闭包保证偏移
 ///   算术仍在字节边界上）。
+///
+/// §57 P3 修订：
+/// - Authorization 的 scheme 词改**已知白名单**（basic / bearer / token /
+///   digest / negotiate / ntlm / dpop / apikey / aws4-hmac-sha256，去引号、
+///   不区分大小写）——首个空白分隔 token 无条件保留会泄漏无 scheme 形态
+///   （`{"Authorization": "SECRETJWT"}`、`Authorization: ghp_SECRET (expired)`、
+///   `Authorization: SECRET, retrying`）。
+/// - 跳过集补 `\`（+ 反引号 / `*`）——转义 JSON（`{\"api_key\": \"S\"}`、
+///   `\"Authorization\":\"Basic S\"`）三版都漏。
 pub fn sanitize_line(line: &str) -> String {
     const KEYWORDS: &[&str] = &["key", "token", "secret", "password", "bearer"];
     // F-U2-8(a)：ascii 小写不改字节长度——lower 的偏移对原串安全（多字节
@@ -64,7 +73,11 @@ pub fn sanitize_line(line: &str) -> String {
     // 空白**和引号**——JSON 键值（`{"apiKey": "abc"}`）、带引号的
     // Authorization 头都算命中。trim_start_matches 按字符跳过，偏移差
     //（字节）仍是字符边界。
-    let skip_sep_ws = |c: char| c.is_whitespace() || c == '"' || c == '\'';
+    // §57 P3：跳过集补 `\`（转义 JSON：Node 错误转储 / 日志里的请求体 /
+    // 单 argv JSON 都是 `\"key\": \"v\"` 形态，三版都漏），顺带并入
+    // 反引号与 `*`（markdown / 强调包裹的同构形态，宁枉勿纵）。
+    let skip_sep_ws =
+        |c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '\\' || c == '`' || c == '*';
     for kw in KEYWORDS {
         // §53：遍历全部命中——词中命中、或词首但非键值（`--key-file`）都
         // 不得挡住同串后面的真键值形态（`--key-file /x --key=SECRET`）。
@@ -131,14 +144,19 @@ pub fn sanitize_line(line: &str) -> String {
         let credentials = &trimmed[1..];
         if let Some(mut value_start) = credentials.find(|c: char| !skip_sep_ws(c)) {
             // 跳过一个 scheme 词（Basic / Bearer / token …）再取值；
-            // scheme 词之后没有更多内容（单段值形态）则从值起点整体替换
+            // §57 P3：scheme 词只有命中已知白名单才保留——首个空白分隔
+            // token 无条件保留会把无 scheme 形态的第一个机密词留下
+            //（`Authorization: ghp_SECRET (expired)`）。
             let scheme_and_rest = &credentials[value_start..];
             let scheme_len = scheme_and_rest
                 .find(|c: char| c.is_whitespace())
                 .unwrap_or(scheme_and_rest.len());
+            let scheme_token = &scheme_and_rest[..scheme_len];
             let after_scheme = &scheme_and_rest[scheme_len..];
             if let Some(follow) = after_scheme.find(|c: char| !skip_sep_ws(c)) {
-                value_start += scheme_len + follow;
+                if is_known_auth_scheme(scheme_token) {
+                    value_start += scheme_len + follow;
+                }
             }
             let colon_off = after_kw.len() - trimmed.len() + 1;
             note(pos + "authorization".len() + colon_off + value_start);
@@ -151,6 +169,29 @@ pub fn sanitize_line(line: &str) -> String {
         }
         _ => line.to_string(),
     }
+}
+
+/// §57 P3：Authorization 的已知 scheme 白名单——冒号后的首个空白分隔
+/// token 只有命中已知 scheme（去引号、不区分大小写）才保留；否则整个值
+/// 从起点替换。此前首个 token **无条件**当 scheme 保留：
+/// `{"Authorization": "SECRETJWT", …}`、`Authorization: ghp_SECRET (expired)`、
+/// `Authorization: SECRET, retrying` 都把第一个机密词留在了输出里。
+fn is_known_auth_scheme(token: &str) -> bool {
+    const SCHEMES: &[&str] = &[
+        "basic",
+        "bearer",
+        "token",
+        "digest",
+        "negotiate",
+        "ntlm",
+        "dpop",
+        "apikey",
+        "aws4-hmac-sha256",
+    ];
+    let bare = token.trim_matches(|c| c == '"' || c == '\'');
+    SCHEMES
+        .iter()
+        .any(|scheme| bare.eq_ignore_ascii_case(scheme))
 }
 
 /// F-BENCH-8（评测设计 B）：语料采集的整段文本脱敏——逐行过 sanitize_line，
@@ -451,6 +492,25 @@ mod tests {
             ("password\u{a0}= S", "S"),
             ("token\u{3000}= S", "S"),
             ("password\r=S", "S"),
+            // §57 P3（Authorization 无 scheme 形态）：首个空白分隔 token
+            // 一律当 scheme 保留——`{"Authorization": "SECRETJWT"}`、
+            // `ghp_SECRET (expired)`、`SECRET, retrying` 把第一个机密词
+            // 留在了输出里；只有命中已知 scheme 白名单才保留该词。
+            (
+                r#"{"Authorization": "SECRETJWT", "Accept": "json"}"#,
+                "SECRETJWT",
+            ),
+            ("Authorization: ghp_SECRET (expired)", "ghp_SECRET"),
+            ("Authorization: SECRET, retrying", "SECRET"),
+            (
+                "headers={'Authorization': 'eyJSECRET', 'X': '1'}",
+                "eyJSECRET",
+            ),
+            // §57 P3（转义 JSON）：skip_sep_ws 未跳 `\`——Node 错误转储 /
+            // 日志里的请求体 / 单 argv JSON 都是 `\"key\": \"v\"` 形态，
+            // 三版都漏
+            (r#"{\"api_key\": \"S\"}"#, "S\""),
+            (r#"\"Authorization\":\"Basic S\""#, "Basic S"),
         ];
         for (input, secret) in LEAKS {
             let out = sanitize_line(input);
@@ -485,6 +545,9 @@ mod tests {
             // §53：Authorization 的冒号必须紧跟关键字（中间只许空白/引号）
             "authorization failed, see https://example.com/help",
             "plain log line",
+            // §57 P3：用量计数字段不得被触碰——`input_tokens`/`max_tokens`
+            // 等复数形式的 `tokens` 后跟 `": N`，不是凭证键值形态
+            r#""usage":{"input_tokens":12,"output_tokens":3,"max_tokens":1024}"#,
         ];
         for input in INTACT {
             assert_eq!(
@@ -504,6 +567,9 @@ mod tests {
         const COLLATERAL: &[(&str, &str)] = &[
             // §55 明示接受：`--monkey=banana → --monkey= ***`
             ("--monkey=banana", "banana"),
+            // §57 P3：以关键字结尾的 JSON 键（引号跳过让 `"key":` 命中键值
+            // 规则）——信息性、可接受（sanitize_line 只用于 Failed stderr 尾）
+            (r#"{"key": "value"}"#, "value"),
         ];
         for (input, value) in COLLATERAL {
             let out = sanitize_line(input);

@@ -5,9 +5,10 @@
  *   error 置位——此前无 TS 覆盖。
  * - enroll-friendly-copy（§55 P3）：重建失败的原始 `enroll: connection
  *   closed: …` 必须映射为友好文案（不得把原始 enroll 报错怼给用户）。
- * - refresh-homes-keeps-timeout-error（§55 P3）：refreshHomes 成功不得
- *   清除「超时类」错误（树并未随 homes 刷新，用户还没确认上次写入是否
- *   生效）；成功的节点拉取（refreshNodes）才清。
+ * - refresh-homes-keeps-timeout-error（§55 P3 → §57 F-SP2-11 修订）：超时
+ *   提示移入独立的粘性 timeoutNotice 字段（只有 refreshNodes 成功才清）；
+ *   重建失败友好文案（读路径、无结果未知语义）照常随 refreshHomes 成功
+ *   清除——§57 点名的「daemon_homes 恢复后仍显示连接重建失败」收口。
  * mock 边界与 exec-plane-p53.spec 相同。
  */
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
@@ -129,9 +130,9 @@ describe('§55 daemon_homes 拒绝 / 超时错误条', () => {
     )
   })
 
-  it('refreshHomes 成功不清除超时类错误（树仍是旧的）；成功的节点拉取才清', async () => {
+  it('超时提示走独立 timeoutNotice（refreshHomes 成功不清）；重建失败文案照常清除；节点拉取成功才清粘性提示', async () => {
     const result = await bootStore()
-    // 先让 refreshHomes 失败一次 → 超时类错误条在场（友好文案含「daemon 无响应」）
+    // ① 重建失败（enroll 超时形态）→ 友好文案进普通 error
     invokeMock.mockImplementation((cmd: string) => {
       if (cmd === 'daemon_homes') return Promise.reject(new Error(RAW_ENROLL_TIMEOUT))
       return Promise.resolve({})
@@ -140,7 +141,9 @@ describe('§55 daemon_homes 拒绝 / 超时错误条', () => {
       await result.current.refreshHomes()
     })
     expect(result.current.state.error).toContain('daemon 无响应')
-    // daemon 恢复：homes 拉取成功——错误条必须保留（节点树并未随之刷新）
+    // ② daemon 恢复：homes 拉取成功——重建失败文案是读路径错误，照常
+    // 清除（§57：不再按「daemon 无响应」子串粘住）；本场景无超时写，
+    // 粘性 timeoutNotice 应为 null
     invokeMock.mockImplementation((cmd: string) => {
       if (cmd === 'daemon_homes') {
         return Promise.resolve({ homes: [homeA, homeB], homeDir: '/Users/test' })
@@ -151,15 +154,48 @@ describe('§55 daemon_homes 拒绝 / 超时错误条', () => {
       await result.current.refreshHomes()
     })
     expect(result.current.state.homes.length).toBe(2, 'homes 照常刷新')
-    expect(
-      result.current.state.error,
-      '§55 P3：refreshHomes 成功不得抹掉超时类错误——用户还没确认上次写入是否生效',
-    ).toContain('daemon 无响应')
-    // 成功的节点拉取清掉它（确认过实际状态后回到正常）
+    expect(result.current.state.error).toBeNull(
+      '§57：重建失败文案随 homes 恢复照常清除（它没有结果未知语义）',
+    )
+    expect(result.current.state.timeoutNotice).toBeNull()
+    // ③ 真正的超时写提示（Rust DAEMON_TIMEOUT_MESSAGE 原文，带机器前缀）
+    // → 独立粘性字段；refreshHomes / 非静默 refreshAgents 的成功路径都不清
+    invokeMock.mockImplementation((cmd: string, args?: { method?: string }) => {
+      if (cmd === 'omt_call' && args?.method === 'node/tree') {
+        return Promise.reject(
+          new Error(
+            '[daemon-timeout] daemon 无响应（30s）：请求结果未知、可能已生效——为避免重复提交未自动重试；请刷新确认结果后再决定是否重试（连接已丢弃，下次调用将重建）',
+          ),
+        )
+      }
+      if (cmd === 'agents_list') return Promise.resolve({ agents: [], parseFailed: false })
+      return Promise.resolve({})
+    })
     await act(async () => {
       await result.current.refreshNodes(result.current.state.activeHome!)
     })
-    expect(result.current.state.error).toBeNull('成功的节点拉取清除超时错误')
+    expect(result.current.state.timeoutNotice).toContain('结果未知')
+    await act(async () => {
+      await result.current.refreshHomes()
+    })
+    expect(
+      result.current.state.timeoutNotice,
+      '§55→§57：refreshHomes 成功不得抹掉超时提示——树并未随之刷新',
+    ).toContain('结果未知')
+    await act(async () => {
+      await result.current.refreshAgents()
+    })
+    expect(
+      result.current.state.timeoutNotice,
+      '§57 F-SP2-11：非静默 refreshAgents（agents_list 只读本地文件）成功不得抹掉超时提示',
+    ).toContain('结果未知')
+    // ④ 成功的节点拉取清掉粘性提示（确认过实际状态后回到正常）
+    invokeMock.mockImplementation(() => Promise.resolve({}))
+    await act(async () => {
+      await result.current.refreshNodes(result.current.state.activeHome!)
+    })
+    expect(result.current.state.timeoutNotice).toBeNull('成功的节点拉取清除超时提示')
+    expect(result.current.state.error).toBeNull()
   })
 
   it('非超时类错误照常被 refreshHomes 成功清除（护栏：不把错误条卡死）', async () => {

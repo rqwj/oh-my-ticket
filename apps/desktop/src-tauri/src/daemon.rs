@@ -182,9 +182,16 @@ pub fn is_read_timeout(problem_message: &str, problem_code: &str) -> bool {
 /// §51 timeout-no-replay：超时路径的统一错误文案（与 daemon 已断的重连+
 /// 重放相区分）。连接在 state.rs 侧被丢弃，下次调用惰性重建。
 /// §53 P3：如实说明**结果未知、可能已生效**——读超时时 daemon 通常仍会
-/// 完成写入，「已放弃且未重试」会诱导用户立即手动重试（正是要避免的
+/// 完成写入，「已放弃且未重试」会诱导用户立即重试（正是要避免的
 /// 重复提交）；引导先刷新确认结果再重试。
-pub const DAEMON_TIMEOUT_MESSAGE: &str = "daemon 无响应（30s）：请求结果未知、可能已生效——\
+/// §57 F-SP2-11：开头带机器可读前缀 `[daemon-timeout]`——前端 store 以它
+/// 把超时类失败分流到**独立的 timeoutNotice 状态**（此前按中文文案子串
+/// 分类，改文案即静默改变前端行为）。前缀在展示层剥掉，友好文案仍以
+/// 本常量为唯一来源（前端不复制文案）；前缀由
+/// `daemon_timeout_message_carries_machine_marker` 跨语言锁定（与前端
+/// store.ts 的 DAEMON_TIMEOUT_MARKER 同值）。
+pub const DAEMON_TIMEOUT_MESSAGE: &str =
+    "[daemon-timeout] daemon 无响应（30s）：请求结果未知、可能已生效——\
      为避免重复提交未自动重试；请刷新确认结果后再决定是否重试（连接已丢弃，下次调用将重建）";
 
 /// Whether an IO-shaped failure means "the daemon is gone — rediscover"
@@ -397,6 +404,18 @@ mod tests {
         assert!(
             !DAEMON_TIMEOUT_MESSAGE.contains("已放弃"),
             "「已放弃」诱导用户立即重试（重复提交）：{DAEMON_TIMEOUT_MESSAGE}"
+        );
+    }
+
+    /// §57 F-SP2-11：超时文案必须带机器可读前缀——前端 store 据此把超时
+    /// 类失败分流到独立的 timeoutNotice 状态（中文文案子串分类是 §57
+    /// 点名的脆弱点：改文案静默改变前端行为）。前缀与文案的绑定在此
+    /// 跨语言锁定（前端 store.ts 的 DAEMON_TIMEOUT_MARKER 与之同值）。
+    #[test]
+    fn daemon_timeout_message_carries_machine_marker() {
+        assert!(
+            DAEMON_TIMEOUT_MESSAGE.starts_with("[daemon-timeout] "),
+            "超时文案必须以 [daemon-timeout] 开头（前端 store.ts 依赖此前缀分流）：{DAEMON_TIMEOUT_MESSAGE}"
         );
     }
 

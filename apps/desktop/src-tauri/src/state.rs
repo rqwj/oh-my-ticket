@@ -65,11 +65,6 @@ impl DaemonSession {
             .expect("enrollment just established"))
     }
 
-    /// 会话服务的 runtime 目录（events_subscribe 的泵线程用）。
-    pub fn runtime_dir(&self) -> &std::path::Path {
-        &self.runtime_dir
-    }
-
     /// handshake 的 homes 投影（daemon_homes 命令用；必要时先惰性重建）。
     /// §53 F-SP2-7：重建失败必须**上抛**——此前 Err 被吞成 `json!([])`，
     /// rpc_bridge 据此返回 `Ok({homes: []})`：home 切换器被清空，且前端

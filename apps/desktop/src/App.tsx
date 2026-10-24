@@ -123,6 +123,10 @@ export function App() {
         </button>
       </nav>
       {state.error && <p className="error-banner">{state.error}</p>}
+      {/* §57 F-SP2-11：超时类提示（结果未知、可能已生效）的粘性横幅——
+          独立于 error（focus 的 agents/homes 刷新不清它），成功的节点拉取
+          （refreshNodes）才清；文案引导先刷新确认结果再决定是否重试。 */}
+      {state.timeoutNotice && <p className="error-banner timeout-notice">{state.timeoutNotice}</p>}
       <LeaseNoticeBanner
         notices={state.leaseNotices}
         onDismiss={store.dismissLeaseNotice}

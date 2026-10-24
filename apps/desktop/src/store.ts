@@ -388,6 +388,14 @@ export interface TreeState {
   transcriptVersion: number
   loading: boolean
   error: string | null
+  /**
+   * §57 F-SP2-11：daemon 超时类失败（结果未知、可能已生效）的**粘性**
+   * 提示——独立于 error：refreshAgents / refreshHomes 的成功路径清 error
+   * 不清它（agents_list 只读本地文件、daemon 卡死时也成功；home 列表拉回
+   * 来了不等于节点树刷新过，用户还没确认上次写入是否生效）。只有
+   * refreshNodes **成功**才清（确认过实际状态后回到正常）。
+   */
+  timeoutNotice: string | null
 }
 
 const INITIAL: TreeState = {
@@ -412,20 +420,57 @@ const INITIAL: TreeState = {
   transcriptVersion: 0,
   loading: true,
   error: null,
+  timeoutNotice: null,
+}
+
+/**
+ * §57 F-SP2-11：Rust 超时文案（daemon.rs `DAEMON_TIMEOUT_MESSAGE`）的机器
+ * 前缀 `DAEMON_TIMEOUT_MARKER`——跨语言锁定（Rust 侧
+ * `daemon_timeout_message_carries_machine_marker` 断言同值）。超时类失败
+ * 据此在**产生友好文案的同一个映射点**分流到独立的 timeoutNotice 状态，
+ * 不再按中文文案子串回判（§57 P3：Rust 改文案会静默改变前端行为）。
+ */
+const DAEMON_TIMEOUT_MARKER = '[daemon-timeout]'
+
+/**
+ * presentError 的结构化伴生（§57 F-SP2-11）：text = 展示文案；
+ * daemonTimeout = 超时类失败（结果未知、可能已生效——Rust 超时原文带
+ * 机器前缀），供错误写入点分流（超时类 → 粘性 timeoutNotice，只有
+ * refreshNodes 成功才清；其余照旧进可被常规刷新清除的 error）。
+ */
+export function presentErrorWithKind(error: unknown): { text: string; daemonTimeout: boolean } {
+  const text = String(error)
+  // §57 F-SP2-11：Rust 超时原文（state.rs 丢弃连接后原样上抛；tauri 命令
+  // 错误以字符串拒绝，但调用方/测试也可能包一层 Error —— `Error: ` 前缀
+  // 容忍）。剥前缀展示（文案仍以 Rust 常量为唯一来源），flag 分流到粘性
+  // 提示
+  const bare = text.replace(/^Error:\s*/, '')
+  if (bare.startsWith(DAEMON_TIMEOUT_MARKER)) {
+    return { text: bare.slice(DAEMON_TIMEOUT_MARKER.length).trim(), daemonTimeout: true }
+  }
+  // §55 P3 + §57 P3：连接重建失败的原始报错（`enroll: connection closed: …`
+  // / `enroll: request write: …`——超时形态与 Rust is_read_timeout 同族，
+  // §57 补上写超时形态）映射为友好文案。重建失败是读路径（homes 握手），
+  // 无重复提交风险 → 不进粘性 timeoutNotice（§57：daemon_homes 恢复后
+  // 这条提示就该随常规 error 一起消失）。
+  if (
+    (text.includes('enroll: connection closed:') || text.includes('enroll: request write:'))
+    && (text.includes('Resource temporarily unavailable') || text.toLowerCase().includes('timed out'))
+  ) {
+    return {
+      text: 'daemon 无响应（30s）：连接重建失败，当前列表可能已过期——请稍后重试或刷新确认。',
+      daemonTimeout: false,
+    }
+  }
+  return { text: presentKnownContractError(text), daemonTimeout: false }
 }
 
 /** QUOTA_EXCEEDED(rule=open-homes) must name the limit and the remedy. */
 export function presentError(error: unknown): string {
-  const text = String(error)
-  // §55 P3：连接重建失败的原始报错（`enroll: connection closed: …`，超时
-  // 形态与 Rust is_read_timeout 同族）映射为友好文案——原始 enroll 报错
-  // 对用户不可读，且会覆盖「结果未知…请刷新确认」的提示。
-  if (
-    text.includes('enroll: connection closed:')
-    && (text.includes('Resource temporarily unavailable') || text.toLowerCase().includes('timed out'))
-  ) {
-    return 'daemon 无响应（30s）：连接重建失败，当前列表可能已过期——请稍后重试或刷新确认。'
-  }
+  return presentErrorWithKind(error).text
+}
+
+function presentKnownContractError(text: string): string {
   if (text.includes('QUOTA_EXCEEDED') && text.includes('open-homes')) {
     return `同时打开的 home 数量已达 daemon 配额上限。解法：调大 daemon.json 的 limits.max_open_homes，或重启 daemon 释放空闲 home。(${text})`
   }
@@ -436,16 +481,6 @@ export function presentError(error: unknown): string {
     return `该 home 被 ts-bridge 占用，需显式 takeover（omt takeover）。(${text})`
   }
   return text
-}
-
-/**
- * §55 P3：超时类提示（Rust `DAEMON_TIMEOUT_MESSAGE` / 重建失败友好文案都
- * 带「结果未知」或「daemon 无响应」标记）。refreshHomes 的**成功**路径不得
- * 清除它——home 列表拉回来了不等于节点树刷新过，用户还没确认上次写入是否
- * 生效；成功的节点拉取（refreshNodes → error: null）才清。
- */
-function isTimeoutNotice(text: string): boolean {
-  return text.includes('结果未知') || text.includes('daemon 无响应')
 }
 
 /**
@@ -504,7 +539,6 @@ function appendTail(
 
 export function useTreeStore() {
   const [state, setState] = useState<TreeState>(INITIAL)
-  const disposers = useRef<Array<() => void>>([])
   // Synchronous mirror of state.filters: saveFilters must compute the
   // merged bag WITHOUT relying on React's async setState updater.
   const filtersRef = useRef<SavedFilters>({})
@@ -556,6 +590,25 @@ export function useTreeStore() {
 
   const bumpTranscriptVersion = useCallback(() => {
     setState(s => ({ ...s, transcriptVersion: s.transcriptVersion + 1 }))
+  }, [])
+
+  /**
+   * §57 F-SP2-11：全局错误写入的统一落点——超时类失败（结果未知、可能已
+   * 生效）只进**粘性** timeoutNotice，不进 error：refreshAgents（非静默）
+   * 与 refreshHomes 的成功路径都写 `error: null`（agents_list 只读本地
+   * 文件、daemon 卡死时也成功；home 列表拉回来了不等于节点树刷新过），
+   * 落在 error 里的超时提示会被照常抹掉——§56 的保留规则恰在它针对的
+   * 触发点上失效。timeoutNotice 只有 refreshNodes **成功**才清（用户
+   * 确认过实际状态后回到正常）。extra 供调用方附带额外 patch（如
+   * refreshHomes 的 `loading: false`）。
+   */
+  const applyError = useCallback((error: unknown, extra?: Partial<TreeState>) => {
+    const { text, daemonTimeout } = presentErrorWithKind(error)
+    setState(s => ({
+      ...s,
+      ...extra,
+      ...(daemonTimeout ? { timeoutNotice: text } : { error: text }),
+    }))
   }, [])
 
   const flushPendingRaw = useCallback(() => {
@@ -651,9 +704,9 @@ export function useTreeStore() {
       await bindingsGc(home.homeId)
       await refreshBindings()
     } catch (error) {
-      setState(s => ({ ...s, error: presentError(error) }))
+      applyError(error)
     }
-  }, [refreshBindings])
+  }, [refreshBindings, applyError])
 
   // §41：「确认并归档」旧版存储——成功后重拉 agents（降级解除）与绑定表
   //（GC 冻结解除后悬空计数才可信），返回移走的文件名供面板显示。失败**抛出**、
@@ -798,7 +851,7 @@ export function useTreeStore() {
         })
         .catch(error => {
         attachedRef.current.delete(execId)
-        setState(s => ({ ...s, error: presentError(error) }))
+        applyError(error)
         // §51 attach-retry：失败重试（有界；间隔一个轮询周期）
         const attempts = (attachRetryCountsRef.current.get(execId) ?? 0) + 1
         if (attempts > ATTACH_RETRY_MAX) return
@@ -814,7 +867,7 @@ export function useTreeStore() {
         attachRetryTimersRef.current.set(execId, timer)
       })
     },
-    [ingestTranscriptEvent],
+    [ingestTranscriptEvent, applyError],
   )
   attachTranscriptRef.current = attachTranscript
 
@@ -969,9 +1022,9 @@ export function useTreeStore() {
     try {
       await execStop(execId)
     } catch (error) {
-      setState(s => ({ ...s, error: presentError(error) }))
+      applyError(error)
     }
-  }, [])
+  }, [applyError])
 
   /** P-10 / review F14 / R2-7 / F-EXEC-12 / §43 P3：停止当前 home 的全部运行中
    * exec。返回 `{ signaled, failed }`（部分失败如实上抛供面板提示「N 个停止
@@ -995,16 +1048,16 @@ export function useTreeStore() {
       scheduleAgentsRepull()
       if (outcome.failed.length > 0 && outcome.signaled === 0) {
         if (activeHomeRef.current?.homeId !== home.homeId) return null
-        setState(s => ({ ...s, error: presentError(outcome.failed.join('；')) }))
+        applyError(outcome.failed.join('；'))
         return null
       }
       return outcome
     } catch (error) {
       if (activeHomeRef.current?.homeId !== home.homeId) return null
-      setState(s => ({ ...s, error: presentError(error) }))
+      applyError(error)
       return null
     }
-  }, [scheduleAgentsRepull])
+  }, [scheduleAgentsRepull, applyError])
 
   const killOrphan = useCallback(
     async (agentId: string, execId: string) => {
@@ -1014,10 +1067,10 @@ export function useTreeStore() {
         await execKillOrphan(home.homeId, agentId, execId)
         scheduleAgentsRepull()
       } catch (error) {
-        setState(s => ({ ...s, error: presentError(error) }))
+        applyError(error)
       }
     },
-    [scheduleAgentsRepull],
+    [scheduleAgentsRepull, applyError],
   )
 
   const refreshHomes = useCallback(async () => {
@@ -1050,14 +1103,16 @@ export function useTreeStore() {
           // adopts the home's persisted filters.
           filters: autoPicking ? {} : s.filters,
           loading: false,
-          // §55 P3：成功路径不清除「超时类」错误——树并未随 homes 刷新，
-          // 用户还没确认上次写入是否生效（原始的 `error: null` 会抹掉刚
-          // 显示的「daemon 无响应（30s）」）；成功的节点拉取才清。
-          error: s.error !== null && isTimeoutNotice(s.error) ? s.error : null,
+          // §57 F-SP2-11：成功路径清普通 error（含「连接重建失败」友好文案
+          // ——homes 拉回来了它就该消失）；**超时类提示**不在这里——它在
+          // 独立的 timeoutNotice 字段（本 setState 不触碰），只有
+          // refreshNodes 成功才清（树未随 homes 刷新，用户还没确认上次
+          // 写入是否生效）。
+          error: null,
         }
       })
     } catch (error) {
-      setState(s => ({ ...s, loading: false, error: presentError(error) }))
+      applyError(error, { loading: false })
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
@@ -1076,11 +1131,13 @@ export function useTreeStore() {
           normalize(child as OmtNode & { nodeId?: string }),
         ),
       })
-      setState(s => ({ ...s, nodes: (result.trees ?? []).map(normalize), error: null }))
+      // §57 F-SP2-11：成功的节点拉取 = 用户确认过实际状态——同时清普通
+      // error 与粘性 timeoutNotice
+      setState(s => ({ ...s, nodes: (result.trees ?? []).map(normalize), error: null, timeoutNotice: null }))
     } catch (error) {
-      setState(s => ({ ...s, error: presentError(error) }))
+      applyError(error)
     }
-  }, [])
+  }, [applyError])
 
   const refreshRuns = useCallback(async (home: HomeInfo) => {
     try {
@@ -1248,7 +1305,11 @@ export function useTreeStore() {
         if (text.includes('NOT_FOUND') || text.includes('method')) {
           return '当前 daemon 版本不支持动态收录 home（缺少 homeDeclare 能力位）— 请升级 daemon 后重试。'
         }
-        return presentError(error)
+        // §57 F-SP2-11：home/declare 超时同样结果未知——返回给切换器就地
+        // 展示，并落粘性 timeoutNotice
+        const presented = presentErrorWithKind(error)
+        if (presented.daemonTimeout) setState(s => ({ ...s, timeoutNotice: presented.text }))
+        return presented.text
       }
     },
     [refreshHomes],
@@ -1263,11 +1324,19 @@ export function useTreeStore() {
   )
 
   // Event-driven refresh (external CLI edits → second-level consistency).
+  // §57 F-SP2-10：订阅失败不再 `.catch(() => {})` 静默——泵停在旧 home 时
+  // 外部 CLI 改动不再刷新树，必须可见（经 applyError 进错误状态）。
+  // §57 P3（监听器泄漏）：effect 在 subscribeEvents 完成前被销毁时，返回的
+  // unlisten 曾被丢弃（旧的 disposers 数组只 push 从不执行/清理——每次切
+  // home 泄漏一个 omt://event 监听器，§56 改 async 把窗口拉宽到 30s）。
+  // 现在：销毁后才 resolve → 立即 unlisten()；销毁前 resolve → 存下来由
+  // cleanup 调用（数组整体退役——不再有只进不出的积累点）。
   useEffect(() => {
     const home = state.activeHome
     if (!home) return
     let disposed = false
     let timer: ReturnType<typeof setTimeout> | undefined
+    let unlisten: (() => void) | undefined
     subscribeEvents(home.homeId, (_envelope: EventEnvelope) => {
       if (disposed) return
       // Debounce bursts (a run claim storms dozens of envelopes).
@@ -1277,15 +1346,25 @@ export function useTreeStore() {
         void refreshRuns(home)
       }, 300)
     })
-      .then(unlisten => {
-        if (!disposed) disposers.current.push(unlisten)
+      .then(fn => {
+        if (disposed) {
+          // effect 已销毁（切 home / 卸载）——立即注销，不得丢 unlisten
+          fn()
+        } else {
+          unlisten = fn
+        }
       })
-      .catch(() => {})
+      .catch(error => {
+        // 已切走/卸载的 home 的订阅失败不再打扰（新 home 的 effect 在跑）
+        if (disposed) return
+        applyError(error)
+      })
     return () => {
       disposed = true
       clearTimeout(timer)
+      unlisten?.()
     }
-  }, [state.activeHome, refreshNodes, refreshRuns])
+  }, [state.activeHome, refreshNodes, refreshRuns, applyError])
 
   // Boot + pull-based home freshness on window focus (v1 contract).
   // U5：agents_list 同享 focus 重拉；U9：bindings_get 同（§四 pull 契约）。
@@ -1377,7 +1456,13 @@ export function useTreeStore() {
         await refreshNodes(home)
         return null
       } catch (error) {
-        return presentError(error)
+        // §57 F-SP2-11：node/update 不带 commandId——超时 = 结果未知、可能
+        // 已生效（重复提交风险最高的路径）。除返回给调用方就地展示外，
+        // 还要落粘性 timeoutNotice（focus 的 refreshAgents 成功清 error
+        // 不得抹掉它）
+        const { text, daemonTimeout } = presentErrorWithKind(error)
+        if (daemonTimeout) setState(s => ({ ...s, timeoutNotice: text }))
+        return text
       }
     },
   }
