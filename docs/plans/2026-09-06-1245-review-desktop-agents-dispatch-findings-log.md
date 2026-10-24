@@ -45,6 +45,8 @@ branch: feat/desktop-agents-dispatch
 | F-SP2-7 | P2 | gated_auto | 桌面 | `state.rs::handshake_homes` / `rpc_bridge.rs::daemon_homes`（§52 惰性重建） | 超时丢弃连接后，重建失败被吞成 `homes: []` → 切换器清空且清掉「daemon 无响应」错误条；同步命令在主线程重建（最长 30s）会转圈 | fixed(2b77285) | — |
 | F-SP2-8 | P2 | gated_auto | 执行面/脱敏 | `sanitize.rs::sanitize_line`（§54 dash 例外 + Authorization 冒号紧跟） | dash 例外不止放过 `--monkey=banana`：`--apiKey=S`、`-Dpassword=S`、`-ePASSWORD=S`、`-PGPASSWORD=S` 旧版脱敏、新版泄漏；「冒号紧跟」规则让 JSON 形态 `"Authorization":"Basic S"` 重新泄漏 | fixed(26df96c) | — |
 | F-SP2-9 | P2 | gated_auto | 桌面 | `rpc_bridge.rs::events_subscribe` / `daemon_ensure`（同步命令持会话锁） | async 的 `daemon_homes`/`omt_call` 持会话锁做 30s 重建时，切 home 触发同步 `events_subscribe` 在主线程等同一把锁 → 仍会转圈（既有，F-SP2-7「不卡主线程」未闭合） | fixed(26df96c) | — |
+| F-SP2-10 | P2 | gated_auto | 桌面 | `rpc_bridge.rs::events_subscribe`（§56 改 async） | 先在会话锁上排队、拿到锁才 `set_target`；`std::sync::Mutex` 非 FIFO，快速切 home A→B 时 A 可能后拿锁 → 事件泵停在 A，B 的树不再随外部改动刷新，前端 `.catch(() => {})` 静默（回归） | open（§57） | — |
+| F-SP2-11 | P2 | gated_auto | 桌面 | `store.ts::refreshAgents`（§56 超时提示保留） | 窗口聚焦与 home 加载都会调非静默 `refreshAgents()`，`agents_list` 只读文件系统、daemon 卡死也成功 → `error: null` 照样清掉「结果未知」提示，§56 的保留规则在它针对的触发点上失效 | open（§57） | — |
 | F-BENCH-18 | P1 | gated_auto | BENCH | `.gitignore:26` / `fixtures/harness/*/raw.log` | **raw.log 语料未入库**：`*.log` 规则把三份 raw.log 全部忽略，只存在于本机。`raw_log_replay_matches_recorded_events` 在干净 clone / CI 上会 panic（「raw.log 应存在」），CI rust 任务必红；F-BENCH-15 在仓库里实际未关闭（§30） | fixed(55a8e55 + 2b8e036)：入库 + 必需文件清单入测（缺一即红）；「时间戳已清洗」「≥12 下限」两项不实声明由 F-BENCH-24 在 2b8e036 兑现 | — |
 | F-BENCH-19 | P1 | gated_auto | BENCH/U12 | `adapters.rs::parse_opencode` step_finish | **opencode 的 usage 也是逐步的值，被误标为累计**：语料 4 个 step_finish 各带不同 messageID，每个 total = 该步 input + output + reasoning + cache.read（如 1518+45+109+23040 = 24712）。按「累计取末值」报 25460，实为 98225（少报约 3.9 倍）；本卷免费档 cost=0 掩盖了问题，付费 provider 会少报费用（§30） | fixed(55a8e55)：opencode 标 message，98225 入测 | — |
 | F-BENCH-20 | P3 | testing-gap | BENCH/U12 | `executor.rs::UsageTotals` | `record` / `final_totals` 无直接单测（混合 scope、全零、历史无 scope 事件）；修复前归档的 ExecRecord 用量仍是旧口径，未重算也未标注 | fixed(55a8e55 + e87a99a)：UsageTotals 四形态单测；口径自描述——ExecRecord.usageCaliber（"message-sum"，旧 JSON 兼容读 None = 末条口径）+ 归档直达测试 + TS 类型；不重算（usageTokens/usageCost 无 UI 消费点，标注路线即关闭，§34） | — |
@@ -2194,3 +2196,43 @@ F-BENCH-13 查证结论：4e960a2 提交说明声称的探针/capture/lib 改动
 **验证**：workspace 517 ×2 连续全绿（513 基线 +4）；前端 207（+4）、tsc 干净；根 vitest 447；clippy/fmt 干净；nm daemon 双零；`pnpm gen` 无差异。台账 F-SP2-8/9 翻 fixed(26df96c)。
 
 **未做（§55 其余 P3，留后续脱敏专项/桌面小项）**：`--bearer-token` 空格分隔形态、`Cookie:`/`set-cookie`/URL 内嵌凭证/`ghp_`/`sk_live_`、全角冒号、`-sH`/`--authorization`/`-u user:pass`/`--cookie` argv 形态；async 命令包 `spawn_blocking`；`events_subscribe` 源码断言之外的路径覆盖；grants symlink 平台别名；p49/p51/p53 spec 第二参数。
+
+### §57. §56 修复复审（2026-10-24，26df96c）
+
+**范围与方法**：26df96c（6 个文件，+558/−77）。2 个并行评审：① sanitize——并排编译 OLD（906f223）、MID2（2b77285）、NEW（HEAD），约 125 条手写行、12 条真实 stream-json、26 组 argv、300 万条随机 `sanitize_line` 输入 + 100 万组随机 argv、14 个 8MB 性能用例、6 个变异体；② 桌面端。xterm 不在范围。
+
+**验证**：fmt、clippy 干净；`cargo test --workspace` 三轮各 517 passed / 0 failed（本轮无 flake）；nm：omt-daemon 中 `omt_exec|omt_harness` = 0；`pnpm gen` 无差异；根 tsc 通过、根 vitest 447 passed；桌面 vitest 207 passed、tsc 干净。
+
+**结论**：
+- **sanitize 已收敛**：§55 全部泄漏样例闭合（含 JSON 键值 `{"apiKey": "abc"}`、`{"access_token": …}` 等三版都漏的形态），历轮完好样例全部保持，`--monkey=banana` 按设计移入可接受误伤；300 万随机输入零 panic，归一化后 NEW 比 MID2 多露的情况只来自下面的 Authorization 无 scheme 形态；OLD 脱敏而 NEW 不脱敏的只剩 §51 有意放开的两类（词中 / 后接字母数字的 `bearer`、词中 `sk-`）；8MB 行 9–22ms（线性）；6 个变异体全部被测试表抓住。用量计数字段（`input_tokens`、`max_tokens`、`token_count` 等）不受影响。
+- **桌面端**：`QUIT_STOPPING` 同步置位、测试锁、STOP 分支断言、`daemon_homes` 拒绝路径测试均成立；主线程上已没有任何同步命令碰会话锁，quit/close 路径也不碰。但改 async 引入 1 条回归、超时提示保留有 1 处漏网，共 2 条 P2。无 P1。
+
+#### F-SP2-10 · P2 · `events_subscribe` 改 async 后，最新订阅不再必然胜出（评审 ②，置信度 70，回归）
+
+- `rpc_bridge.rs:417-424`、`store.ts:1266-1287`：之前同步命令在主线程按到达顺序执行，`set_target(B)` 必在 `set_target(A)` 之后。现在每次调用是独立 tokio 任务，先在 `with_session` 的会话锁上阻塞，拿到锁后才 `SUBSCRIPTIONS.set_target`——代次按拿锁顺序而非请求顺序分配。
+- 场景：A→B 切换会同时触发多个 `omt_call`（node/tree、run/list、filters）持同一把锁（重建时最长 30s）；两次 `events_subscribe` 都在锁上排队，`std::sync::Mutex` 非 FIFO，A 可能后拿锁 → 泵轮询 A；B 的监听器按 `homeId === 'h_b'` 过滤，永不触发，外部 CLI 改动不再刷新树，直到下次切换。前端 `.catch(() => {})`，无任何提示。源码断言测试不覆盖顺序。
+- **建议**：`session.runtime_dir()` 就是 `daemon::runtime_dir()`（`state.rs:39`），`events_subscribe` 直接去掉 `with_session`——泵自己会连接与退避；不持锁后命令很轻，甚至可以改回同步以保住顺序。（同时消除既有问题：订阅失败时 `with_session` 先返回、不 `set_target`，泵继续轮询旧 home 且无重试。）
+
+#### F-SP2-11 · P2 · 聚焦路径上 `refreshAgents()` 仍清掉超时提示（评审 ②，置信度 85）
+
+- `store.ts:614`（`...(opts?.silent ? {} : { error: null })`）、`:1296-1299`：`onFocus` 同时调 `refreshHomes()` 与非静默 `refreshAgents()`；`agents_list` 只读文件系统（`agents.rs:6`），daemon 卡死时也成功 → `error: null`。home 加载的 `Promise.all([refreshNodes(home), …, refreshAgents(), …])`（`:1208`）同理：`refreshNodes` 超时、`refreshAgents` 后完成 → 提示被抹掉。
+- §56「确认前不得清除『结果未知』」的目标恰在它针对的触发点上失效；新测试只覆盖 `refreshHomes`/`refreshNodes`，所以照样通过。
+- **建议**：把超时提示移到独立状态字段（如 `timeoutNotice`），只有 `refreshNodes` 成功才清——同时去掉按中文文案子串分类（见下 P3）。
+
+#### P3
+
+**sanitize**
+- **Authorization 无 scheme 形态仍泄漏**（`sanitize.rs:132-143`，95，三版都漏、非回归）：首个空白前的 token 一律当作 scheme 保留，`{"Authorization": "SECRETJWT", "Accept": "json"}` → `…"SECRETJWT", " ***`、`headers={'Authorization': 'eyJSECRET', 'X': '1'}`、`Authorization: ghp_SECRET (expired)`、`Authorization: SECRET, retrying` 均泄漏。§56 称「引号 JSON 头已闭合」只在带 scheme 词时成立。调用面窄（启动失败 stderr 尾、harness-capture、本地工具 argv）且形态少见，定 P3；修法便宜：首词只有命中已知 scheme（basic / bearer / token / digest / negotiate / ntlm / dpop / apikey / aws4-hmac-sha256 …，去引号后不区分大小写）才保留，否则从值起点整体替换；泄漏列补上述两行。
+- 转义 JSON 三版都漏（`:67` `skip_sep_ws` 未跳 `\`，90）：`{\"api_key\": \"S\"}`、`\"Authorization\":\"Basic S\"`——Node 错误转储、日志里的请求体、作为单个 argv 的 JSON 都是这种形态。`skip_sep_ws` 加 `\`（可选 `` ` ``、`*`）。
+- 引号跳过导致以关键字结尾的 JSON 键被截（95，信息性，可接受）：`{"key": …}`、`"cache_key"`、`"idempotency_key"`、`"next_token"`、opencode `"input":{"key":"src/index.ts"}` → `{"key":" ***`。`sanitize_line` 不用于事件展示，影响小；建议把 `{"key": "value"}` 写进可接受误伤列，并把 `"usage":{"input_tokens":12,"output_tokens":3,"max_tokens":1024}` 加进完好列锁住计数字段。
+- `["--header=", "next"]` 空值会把下一个参数遮掉（仅误伤）；`:7-8` 注释说 `sanitize_line` 只用于 Failed stderr 尾，已过时。
+
+**桌面端**
+- **超时类错误按中文文案子串分类**（`store.ts:420-428/447-449`，75）：`isTimeoutNotice` 依赖「结果未知 / daemon 无响应」，Rust `DAEMON_TIMEOUT_MESSAGE`（`daemon.rs:187`）改文案即静默改变行为，无跨语言测试；重建失败的友好文案也被算作超时提示，之后 `daemon_homes` 成功仍显示「连接重建失败，当前列表可能已过期」；刷新后无活动 home 时 `refreshNodes` 不运行，提示要到重载才消失；`presentError` 只匹配 `enroll: connection closed:`，`enroll: request write: … timed out` 漏网。F-SP2-11 的独立字段方案一并解决。
+- **STOP 分支源码断言漏掉最可能的回归**（`lib.rs:681-706`，85）：只扫 `QuitChoice::Stop =>` 到 `quit_stop_branch(` 之间；ExitRequested 分支里 `quit_stop_branch(...)` 之后的 `return;` 才是防止落入共享尾部 `QUIT_CONFIRMED.store(true); handle.exit(0);` 的关键，删掉它即复现 F-SP2-4 而断言仍绿；`QUIT_CONFIRMED\n.store`、`.swap(true…)` 也能绕过。建议断言 Stop 分支以 `return` 结束，或重构为 Keep 分支自带 `QUIT_CONFIRMED.store`、去掉共享尾部。
+- **`with_session` 源码断言可能假通过**（`rpc_bridge.rs:521-530`，70）：以 `rfind("pub ")` 定函数边界，私有 `fn` / `pub(crate) fn` 同步命令会被算到前面的 `pub async fn`；无最少命中数断言，改变量名即零命中空过；看不到直接的 `shared.0.lock()` / `rpc_of`（目前都在 async 命令里）。建议断言 ≥4 处、以 `#[tauri::command…]` + `fn ` 定边界、纳入 `.0.lock()`。
+- async 命令仍阻塞 tokio worker（60，既有，§55 已记）：建议 `spawn_blocking`。
+- 订阅 effect 的监听器泄漏（`store.ts:1279-1282`，90，既有）：effect 在 `subscribeEvents` 完成前被销毁时返回的 `unlisten` 被丢弃；`disposers.current` 只推不清，每次切 home 泄漏一个 `omt://event` 监听器，async 订阅把窗口拉宽到 30s。建议 `disposed` 时立即 `unlisten()`，cleanup 里调用保存的 unlisten。
+
+**建议**：修 2 条桌面端 P2（F-SP2-10 去掉 `events_subscribe` 的会话锁；F-SP2-11 超时提示改独立字段、只由 `refreshNodes` 成功清除），顺带订阅 effect 的监听器泄漏、STOP 分支 `return` 断言、`with_session` 断言加最少命中数。sanitize 已收敛，Authorization 已知 scheme 白名单与 `\` 跳过两条 P3 改动小，可一并做；其余进后续脱敏专项。
+
