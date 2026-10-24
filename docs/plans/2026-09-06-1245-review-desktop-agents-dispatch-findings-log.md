@@ -2346,3 +2346,13 @@ F-BENCH-13 查证结论：4e960a2 提交说明声称的探针/capture/lib 改动
 - §60 列出的未做项（timeoutNotice 按 home / 序号绑定、泵失败状态事件、`spawn_blocking`、`command_spans` 脆弱性、`runtime_dir` 与 config.md 漂移、`Authorization=Basic S` 等脱敏专项）维持原判，不重复记。
 
 **建议**：本轮可以收口——无 P2。上面两条 P3 改动都很小，可以随下一批桌面专项一起做，不必单独再走一轮修复。
+
+### §62. §61 P3 修复（2026-10-25，9765218）
+
+按 §61「可随下一批一起做」的两条 P3 提前收口：
+
+- **noteTimeout 事件化**：bridge 出口（`presentInvokeError`）整形超时的同时 `emit('omt:daemon-timeout', {text})`；store 挂载期订阅、落 `timeoutNotice`（卸载/重复渲染安全：disposed 守卫 + unlisten 清理）——**全部**经 `omtCall`/`execStart` 的写路径（组件本地直接 await 的 `run/control`、`node/update`、`node/archive` 等）一处覆盖，不再只接 createNode/startDispatch 两条。两个新 vitest（事件置位 + 空 payload/订阅失败不影响主流程）；p55/p57/p59 的事件 mock 补 `emit`。
+- **退出断言 needle 放宽 + Stop 区域闭包内检查**：exit needle `.exit(0` → `exit(`（去空白后），`std::process::exit(0)` / `exit(1)` 不再漏（变异 1 重验：ExitRequested Cancel 加 `std::process::exit(0)` 即红）；Stop 分支改在**剥注释的闭包区**内检查——Stop 为末分支时 arm 延伸到闭包区结束，match 尾部并入 Stop 区域由 confirm 断言兜住（不再从剩余区豁免；变异 2 重验：match 后加 `QUIT_CONFIRMED.store + app.exit(1)` 尾部即红）。Stop 上不做 exit 断言——helper 的 `move || …exit(0)` 闭包实参是合法内容（首次实现误加，桌面 lib 25 测试即红后修正）。
+- 过程记录：变异 2 首测用了作用域外的 `handle.exit(1)`——编译失败被 grep 漏看，误判「存活」；换作用域内的 `app.exit(1)` 重测确认**被抓**。§62 如实记录。
+
+**验证**：workspace 519 全绿、桌面 lib 25 全绿；前端 225（+2）、tsc 干净；clippy/fmt 干净；nm daemon 双零。
