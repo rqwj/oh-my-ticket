@@ -41,8 +41,8 @@ branch: feat/desktop-agents-dispatch
 | F-SP2-3 | P2 | gated_auto | 执行面 | `grants.rs::TempGrant`（§50 引用计数） | 计数归零与撤销之间无互斥：A 归零后、`remove()` 前 B `add` 见授权仍在而不重登记，随后 A 撤销 → B 持守卫却无授权（§49 原症状的窄窗口版） | fixed(17b3a96) | — |
 | F-SP2-4 | P2 | gated_auto | 桌面 | `lib.rs` 退出 STOP 分支（§50 移出主线程） | `QUIT_CONFIRMED` 在 stop 开始前置位，stop 期间再按 ⌘Q 直接放行退出，剩余 agent 收不到停止信号继续运行 | fixed(17b3a96) | — |
 | F-SP2-5 | P2 | gated_auto | CLI/MCP | `local_impl.rs::resolve_home_id`（§50 相对路径修复） | `exec list --home <homeId>` 改为要求 home 当前被服务：idle 关闭的 home 报 NOT_FOUND，只读动词还会拉起 daemon（回归） | fixed(17b3a96) | — |
-| F-SP2-6 | P2 | gated_auto | 执行面/脱敏 | `omt-harness/src/sanitize.rs::sanitize_line`（§52 词首匹配） | 修误伤时削弱了脱敏：`sk-` 只看首次命中（`task-… sk-live-x` 泄漏）、`=`/`:` 前有空格不再算键值（`password = x` 泄漏）、键值形态也要求词首（`apiKey=`、`accessToken=`、`PGPASSWORD=` 泄漏） | open（§53） | — |
-| F-SP2-7 | P2 | gated_auto | 桌面 | `state.rs::handshake_homes` / `rpc_bridge.rs::daemon_homes`（§52 惰性重建） | 超时丢弃连接后，重建失败被吞成 `homes: []` → 切换器清空且清掉「daemon 无响应」错误条；同步命令在主线程重建（最长 30s）会转圈 | open（§53） | — |
+| F-SP2-6 | P2 | gated_auto | 执行面/脱敏 | `omt-harness/src/sanitize.rs::sanitize_line`（§52 词首匹配） | 修误伤时削弱了脱敏：`sk-` 只看首次命中（`task-… sk-live-x` 泄漏）、`=`/`:` 前有空格不再算键值（`password = x` 泄漏）、键值形态也要求词首（`apiKey=`、`accessToken=`、`PGPASSWORD=` 泄漏） | fixed(2b77285) | — |
+| F-SP2-7 | P2 | gated_auto | 桌面 | `state.rs::handshake_homes` / `rpc_bridge.rs::daemon_homes`（§52 惰性重建） | 超时丢弃连接后，重建失败被吞成 `homes: []` → 切换器清空且清掉「daemon 无响应」错误条；同步命令在主线程重建（最长 30s）会转圈 | fixed(2b77285) | — |
 | F-BENCH-18 | P1 | gated_auto | BENCH | `.gitignore:26` / `fixtures/harness/*/raw.log` | **raw.log 语料未入库**：`*.log` 规则把三份 raw.log 全部忽略，只存在于本机。`raw_log_replay_matches_recorded_events` 在干净 clone / CI 上会 panic（「raw.log 应存在」），CI rust 任务必红；F-BENCH-15 在仓库里实际未关闭（§30） | fixed(55a8e55 + 2b8e036)：入库 + 必需文件清单入测（缺一即红）；「时间戳已清洗」「≥12 下限」两项不实声明由 F-BENCH-24 在 2b8e036 兑现 | — |
 | F-BENCH-19 | P1 | gated_auto | BENCH/U12 | `adapters.rs::parse_opencode` step_finish | **opencode 的 usage 也是逐步的值，被误标为累计**：语料 4 个 step_finish 各带不同 messageID，每个 total = 该步 input + output + reasoning + cache.read（如 1518+45+109+23040 = 24712）。按「累计取末值」报 25460，实为 98225（少报约 3.9 倍）；本卷免费档 cost=0 掩盖了问题，付费 provider 会少报费用（§30） | fixed(55a8e55)：opencode 标 message，98225 入测 | — |
 | F-BENCH-20 | P3 | testing-gap | BENCH/U12 | `executor.rs::UsageTotals` | `record` / `final_totals` 无直接单测（混合 scope、全零、历史无 scope 事件）；修复前归档的 ExecRecord 用量仍是旧口径，未重算也未标注 | fixed(55a8e55 + e87a99a)：UsageTotals 四形态单测；口径自描述——ExecRecord.usageCaliber（"message-sum"，旧 JSON 兼容读 None = 末条口径）+ 归档直达测试 + TS 类型；不重算（usageTokens/usageCost 无 UI 消费点，标注路线即关闭，§34） | — |
@@ -2121,3 +2121,13 @@ F-BENCH-13 查证结论：4e960a2 提交说明声称的探针/capture/lib 改动
 
 **建议**：先修 2 条 P2（F-SP2-6 恢复旧版覆盖面同时保留误伤修复，并把本节所有泄漏样例写成测试；F-SP2-7 透传错误 + async 命令），顺带便宜 P3：canonical 键测试、`sanitize_args` 要求前导 `-`、Authorization 遍历命中、关键字循环 `continue`、超时提示文案、store 层切 home 守卫、`QUIT_STOPPING`。脱敏规则已来回两轮，建议这次以表驱动测试（应脱敏 / 不应脱敏两列）锁定行为。
 
+
+### §54. §53 修复（2026-10-24，2b77285）
+
+- **F-SP2-6**：`sanitize_line` 三处回归全部闭合——`sk-` 用 `match_indices` 取第一个**词首**命中；键值判定先 `trim_start`；词首规则只用于无分隔符形态（bearer/sk-），「关键字+可选空白+`=`/`:`」在任意位置命中（dash 前缀的 CLI token 除外——保住 `--monkey=banana` 不误伤）；Authorization 遍历命中且冒号必须紧跟关键字；关键字循环非命中 `continue`。**表驱动两列测试**锁定：泄漏列修复前 13/16 失败（实测取证）、完好列（§51 误伤样例）全过。`sanitize_args` 值 flag 要求前导 `-`（`gh auth login`/`-h foo` 不再误伤）、`-H` 大小写敏感含连写、`--header` 全覆盖。
+- **F-SP2-7**：`handshake_homes` 改返回 Result 经 `with_session` 透传；`daemon_homes`/`daemon_reconnect` 改 `#[tauri::command(async)]`——重建失败不再吞成空列表清掉错误条，也不再卡主线程。
+- **便宜 P3**：canonical 键测试去空洞化（去规范化即红）；超时文案改「结果未知、可能已生效，请刷新确认后再重试」；超时判定限定 `connection closed:`/`request write:` 前缀（daemon 回传的普通 IO 错误不再误判断连）；`store.stopAll` 整体失败路径按发起时的 home 守卫（A 的错误不再写进 B）；`QUIT_STOPPING` 原子量（停止期间两个 handler 直接 prevent，主线程不再跑 `active_exec_count`，读失败按 0 放行的口子同时闭合）；STOP 分支抽共用 `quit_stop_branch` 并测试（原 bug 在调用点复发即红）。
+
+**验证**：workspace 513 ×3 连续全绿（503 基线 +10；首轮 438/4 为高负载早停 flake，复跑三连绿）；前端 203（+3）、tsc 干净；根 vitest 447；clippy/fmt 干净；nm daemon 双零。台账 F-SP2-6/7 翻 fixed(2b77285)。
+
+**未做（§53 其余 P3，留后续）**：MCP exec__list 无分隔符相对路径、通知语义不一致、全局计数锁跨文件锁（信息性）、隐藏窗口「停止中…」+ panic downcast、attach 重试毛边（已结束 exec 重试/定时器漏清/计数不重置）、agentsSigRef 重置无测试、state.rs 层丢连接无覆盖、p49/p51 spec 第二参数。
