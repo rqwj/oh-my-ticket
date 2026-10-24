@@ -43,6 +43,8 @@ branch: feat/desktop-agents-dispatch
 | F-SP2-5 | P2 | gated_auto | CLI/MCP | `local_impl.rs::resolve_home_id`（§50 相对路径修复） | `exec list --home <homeId>` 改为要求 home 当前被服务：idle 关闭的 home 报 NOT_FOUND，只读动词还会拉起 daemon（回归） | fixed(17b3a96) | — |
 | F-SP2-6 | P2 | gated_auto | 执行面/脱敏 | `omt-harness/src/sanitize.rs::sanitize_line`（§52 词首匹配） | 修误伤时削弱了脱敏：`sk-` 只看首次命中（`task-… sk-live-x` 泄漏）、`=`/`:` 前有空格不再算键值（`password = x` 泄漏）、键值形态也要求词首（`apiKey=`、`accessToken=`、`PGPASSWORD=` 泄漏） | fixed(2b77285) | — |
 | F-SP2-7 | P2 | gated_auto | 桌面 | `state.rs::handshake_homes` / `rpc_bridge.rs::daemon_homes`（§52 惰性重建） | 超时丢弃连接后，重建失败被吞成 `homes: []` → 切换器清空且清掉「daemon 无响应」错误条；同步命令在主线程重建（最长 30s）会转圈 | fixed(2b77285) | — |
+| F-SP2-8 | P2 | gated_auto | 执行面/脱敏 | `sanitize.rs::sanitize_line`（§54 dash 例外 + Authorization 冒号紧跟） | dash 例外不止放过 `--monkey=banana`：`--apiKey=S`、`-Dpassword=S`、`-ePASSWORD=S`、`-PGPASSWORD=S` 旧版脱敏、新版泄漏；「冒号紧跟」规则让 JSON 形态 `"Authorization":"Basic S"` 重新泄漏 | open（§55） | — |
+| F-SP2-9 | P2 | gated_auto | 桌面 | `rpc_bridge.rs::events_subscribe` / `daemon_ensure`（同步命令持会话锁） | async 的 `daemon_homes`/`omt_call` 持会话锁做 30s 重建时，切 home 触发同步 `events_subscribe` 在主线程等同一把锁 → 仍会转圈（既有，F-SP2-7「不卡主线程」未闭合） | open（§55） | — |
 | F-BENCH-18 | P1 | gated_auto | BENCH | `.gitignore:26` / `fixtures/harness/*/raw.log` | **raw.log 语料未入库**：`*.log` 规则把三份 raw.log 全部忽略，只存在于本机。`raw_log_replay_matches_recorded_events` 在干净 clone / CI 上会 panic（「raw.log 应存在」），CI rust 任务必红；F-BENCH-15 在仓库里实际未关闭（§30） | fixed(55a8e55 + 2b8e036)：入库 + 必需文件清单入测（缺一即红）；「时间戳已清洗」「≥12 下限」两项不实声明由 F-BENCH-24 在 2b8e036 兑现 | — |
 | F-BENCH-19 | P1 | gated_auto | BENCH/U12 | `adapters.rs::parse_opencode` step_finish | **opencode 的 usage 也是逐步的值，被误标为累计**：语料 4 个 step_finish 各带不同 messageID，每个 total = 该步 input + output + reasoning + cache.read（如 1518+45+109+23040 = 24712）。按「累计取末值」报 25460，实为 98225（少报约 3.9 倍）；本卷免费档 cost=0 掩盖了问题，付费 provider 会少报费用（§30） | fixed(55a8e55)：opencode 标 message，98225 入测 | — |
 | F-BENCH-20 | P3 | testing-gap | BENCH/U12 | `executor.rs::UsageTotals` | `record` / `final_totals` 无直接单测（混合 scope、全零、历史无 scope 事件）；修复前归档的 ExecRecord 用量仍是旧口径，未重算也未标注 | fixed(55a8e55 + e87a99a)：UsageTotals 四形态单测；口径自描述——ExecRecord.usageCaliber（"message-sum"，旧 JSON 兼容读 None = 末条口径）+ 归档直达测试 + TS 类型；不重算（usageTokens/usageCost 无 UI 消费点，标注路线即关闭，§34） | — |
@@ -2131,3 +2133,54 @@ F-BENCH-13 查证结论：4e960a2 提交说明声称的探针/capture/lib 改动
 **验证**：workspace 513 ×3 连续全绿（503 基线 +10；首轮 438/4 为高负载早停 flake，复跑三连绿）；前端 203（+3）、tsc 干净；根 vitest 447；clippy/fmt 干净；nm daemon 双零。台账 F-SP2-6/7 翻 fixed(2b77285)。
 
 **未做（§53 其余 P3，留后续）**：MCP exec__list 无分隔符相对路径、通知语义不一致、全局计数锁跨文件锁（信息性）、隐藏窗口「停止中…」+ panic downcast、attach 重试毛边（已结束 exec 重试/定时器漏清/计数不重置）、agentsSigRef 重置无测试、state.rs 层丢连接无覆盖、p49/p51 spec 第二参数。
+
+### §55. §54 修复复审（2026-10-24，2b77285）
+
+**范围与方法**：2b77285（9 个文件，+812/−100）。2 个并行评审：① sanitize / grants——在 scratch crate 里并排编译 OLD（906f223 / f666a70）、MID（17b3a96）、NEW（HEAD）三版，约 90 条手写行 + 30 组 argv + 300 万条随机差分输入（关键字、`=`、`:`、空白、`-`/`--`、引号、CJK、emoji、NBSP、U+3000）；② 桌面端。xterm 不在范围。
+
+**验证**：fmt、clippy 干净；`cargo test --workspace` 第 1、3 轮 513 passed / 0 failed；nm：omt-daemon 中 `omt_exec|omt_harness` = 0；`pnpm gen` 无差异；根 tsc 通过；桌面 vitest 203 passed、tsc 干净。
+- 第 2 轮 `election_race` 20s 超时、根 vitest `home-lock.spec.ts` 心跳用例失败 1 个，均发生在两个评审并发编译时；低负载下各单独连跑 3 轮全绿。`election_race` 已在最近 6 轮完整测试中两次因负载超时，是既有的负载敏感测试，值得单独加固（非本轮引入）。
+
+**结论**：§53 点名的泄漏全部闭合，§51 误伤修复全部保住；表驱动两列测试回退即红；无 panic（300 万随机输入）、无二次方热路径（8MB 行 10–27ms，旧版 4–18ms）；grants canonical 键测试已非空洞（本机 `$TMPDIR` 非规范路径时生效）。桌面端六项修复均到位。新发现 2 条 P2，无 P1。
+
+#### F-SP2-8 · P2 · `sanitize_line` 仍有两类相对旧版的泄漏（评审 ①，置信度 90–95，三版对照实测）
+
+1. **dash 例外过宽**（`sanitize.rs:52-63` `in_dash_flag`、`:74`）：只要 token 以 `-` 开头且关键字在词中，就跳过——覆盖了 camelCase / 复合 flag、Java `-D`、Gradle `-P`、docker `-e`、unified diff 的删除行：
+
+   | 输入 | OLD | NEW |
+   |---|---|---|
+   | `--apiKey=SECRET`、`--accessToken=S`、`--clientSecret=S`、`--dbPassword=S` | 脱敏 | 泄漏 |
+   | `mvn deploy -Dpassword=SECRET`、`java -DapiKey=S -jar x.jar` | 脱敏 | 泄漏 |
+   | `docker run -ePASSWORD=SECRET img`、`gradle -PsigningKey=S` | 脱敏 | 泄漏 |
+   | `-PGPASSWORD=hunter2`（diff 删除行；`+PGPASSWORD=` 会脱敏） | 脱敏 | 泄漏 |
+
+   MID 同样泄漏，本轮未恢复，表里也没有能抓住它们的行。kebab-case（`--api-key=`、`--token=`、`--client-secret=` 等）仍正常脱敏。
+2. **「冒号必须紧跟 Authorization」破坏了带引号的形态**（`:120-121`）：`{"headers":{"Authorization":"Basic SECRET"}}`、`'authorization': 'Basic SECRET'`——OLD 泄漏、MID 已脱敏、NEW 又泄漏（Bearer 值仍由 bearer 规则兜住，Basic / token 不行）。harness 流输出与调试转储都是 JSON，形态真实。三版共有的同源缺口：`{"apiKey": "abc"}`、`{"token":"abc"}`——关键字与 `:` 之间隔着闭合引号。
+
+- **建议**：脱敏规则已来回三轮，建议取最简单、与「宁枉勿纵」一致的方案——**删除 dash 例外**，接受 `--monkey=banana → --monkey= ***` 的误伤（从完好列移到「可接受误伤」）；键值与 Authorization 的冒号判定都改为跳过空白**和引号**（`trim_start_matches` 加 `"`/`'`，scheme 前也跳开引号），顺带闭合 JSON 键值缺口；把上表与 JSON 形态全部加进泄漏列。
+
+#### F-SP2-9 · P2 · 同步命令仍在主线程持会话锁（评审 ②，置信度 80，既有）
+
+- `rpc_bridge.rs:409` `events_subscribe` 是同步 `#[tauri::command]`（主线程），经 `with_session`（`:416`）锁与 `daemon_homes`/`omt_call` 同一把 `std::sync::Mutex`；后者在惰性重建时整段持锁（握手读超时 30s、sidecar 拉起等待 10s）。
+- 场景：`omt_call` 超时丢连接 → 窗口聚焦，async `daemon_homes` 持锁对卡死 daemon 重建 30s → 用户切 home，`subscribeEvents` 调同步 `events_subscribe` → 主线程在锁上等最长 30s，转圈。
+- 自 U15 起 `omt_call` 持锁即有此模式，本轮把 `daemon_homes` 移出主线程已是改善，但 F-SP2-7「重建不卡主线程」只在没有同步命令碰这把锁时成立。`daemon_ensure`（`:255`）同为同步 + `with_session`（前端目前未调用）。
+- **建议**：`events_subscribe`、`daemon_ensure` 改 `#[tauri::command(async)]`；或 `events_subscribe` 直接用 `daemon::runtime_dir()` 取 runtime 目录、不碰会话锁。
+
+#### P3
+
+**sanitize / grants**
+- 键值空白只跳 ASCII 空格与 tab（`:71`、`:120`，90）：`password\u{a0}= S`、`token\u{3000}= S`、`password\r=S` 旧版脱敏、新版泄漏。改回 `trim_start()`（偏移算术仍在字符边界上）。
+- `--bearer-token SECRET` 旧版 `--bearer ***`、新版泄漏（独立 bearer 规则的副作用；`sanitize_line` 本就不覆盖空格分隔的 `--flag value`）。
+- `sanitize_args` 的 header 前缀匹配吞掉 flag 名：`--header=Authorization: …` → `--header***`（丢 `=`）、`--headers a`/`--header-file /x` → `--header***`（后者值反而可见）、`-HL` → `-H***`。建议只认精确的 `--header`、`--header=…`、`-H…` 并保留 `=`。三版共有缺口：`["-sH", "Authorization: Bearer x"]`、`["--authorization", "Basic x"]`、`["-u", "user:pass"]`、`--user`、`--cookie`；`executor.rs:368/:1443` 只调 `sanitize_args`。
+- grants canonical 键测试在 `$TMPDIR` 已是规范路径的平台（Linux）上静默跳过；CI 只跑 macOS 故当前有效。建议建临时目录的 symlink 别名。
+- 从未覆盖（非回归，记录）：`Cookie: session=…`、`set-cookie`、`https://user:pass@host`、单独的 `ghp_…`/`github_pat_…`、Stripe `sk_live_`（下划线）、全角冒号 `token：S`。
+
+**桌面端**
+- async 命令阻塞 tokio worker（70，既有）：Tauri 2.12 的 async 命令走 `async_runtime::spawn` 而非 `spawn_blocking`，`daemon_homes`/`omt_call` 在 std 锁与阻塞 socket IO 上最长占住 worker 30s；daemon 卡死时排队的会话命令可占满所有 worker，`exec_*`/`agents_*` 等 async 命令一起停摆（UI 本身不卡、无死锁）。建议包 `spawn_blocking`。
+- 超时提示被覆盖或清掉（`store.ts:1004-1043`，65）：重建 30s 后失败会用原始的 `enroll: connection closed: …` 覆盖「结果未知…请刷新确认」；重建成功则下次聚焦 `error: null`，但树并未刷新，用户还没确认写入是否生效提示就消失了。建议重建失败映射为友好文案；`refreshHomes` 不清除已有的超时错误（或清除时同时刷新节点）。
+- `QUIT_STOPPING` 在 worker 线程首行置位而非分支内同步置位（60）：`on_choice` 返回到 worker 起跑之间（微秒级）的 CloseRequested 仍会在主线程跑 `active_exec_count`。建议 `quit_stop_branch` 在 spawn 前先置位。
+- `stop_and_exit_runs_off_the_calling_thread`（`lib.rs` ~459）不拿 `QUIT_TEST_LOCK` 却写 `QUIT_CONFIRMED`/`QUIT_STOPPING`，与轮询静态量的时序测试并行时可能偶发失败（70）。
+- 回归测试的保护面小于名字（85）：`quit_stop_branch_keeps_confirm_false_during_stop` 只锁 helper，在 `run()` 的 `QuitChoice::Stop` 分支里加回 `QUIT_CONFIRMED.store(true)`（原 bug 位置）不会失败——可像 `daemon_homes_tests` 那样加源码文本断言，其「mark」探针推的是写死的 `(false,false)`；F-SP2-7 没有 TS 测试守「`daemon_homes` 被拒时保留 homes/activeHome 并设错误」；Rust 的 `handshake_homes_propagates_reestablishment_failure` 回退即红只因签名不再编译，且因 `deps/` 旁无 `omt-daemon` 而快速失败，没走到「超时丢连接后」路径；p53 spec 的 `toBeNull(msg)`/`toBeTruthy(msg)` 参数被忽略。
+
+**建议**：修 F-SP2-8（删 dash 例外 + 引号容忍的冒号判定 + `trim_start()`，泄漏列补本节全部样例）与 F-SP2-9（两个同步命令改 async）。顺带便宜 P3：`QUIT_STOPPING` 同步置位、测试拿 `QUIT_TEST_LOCK`、源码文本断言守 STOP 分支、超时错误不被 `refreshHomes` 清掉、header 前缀精确匹配。其余 P3 与「从未覆盖」项可留给后续的脱敏专项。
+
