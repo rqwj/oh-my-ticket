@@ -2314,3 +2314,35 @@ F-BENCH-13 查证结论：4e960a2 提交说明声称的探针/capture/lib 改动
 **验证**：workspace 519 ×复跑全绿（新增断言都在既有测试函数内，数量不变）；前端 223（+11）、tsc 干净；根 vitest 447；clippy/fmt 干净；nm daemon 双零。台账 F-SP2-12 翻 fixed(c1bbfdf)。
 
 **未做（§59 其余 P3，按建议留桌面/脱敏专项）**：timeoutNotice 按 home/序号绑定（陈旧读清除、读超时误导、无关闭按钮）、泵失败状态事件（`events_subscribe` 恒 Ok、真实失败静默重试——§58「不再被吞」说法已由本轮收窄）、`spawn_blocking`、`command_spans` 脆弱性、`runtime_dir` 空白/env 漂移、`Authorization=Basic S` CGI 形态等后续脱敏专项清单。
+
+### §61. §60 修复复审（2026-10-24，c1bbfdf）
+
+**范围**：`c1bbfdf`（F-SP2-12 + §59 P3）。改动集中（bridge 出口类型化错误、源码断言、sanitize 值起点集合拆分），本轮由主控直接复审 + 变异实测，未派评审代理。
+
+**验证**：workspace 519 ×3 连续全绿（无 flake）；clippy/fmt 干净；nm daemon 0；`pnpm gen` 无差异；根 tsc 干净、根 vitest 447；桌面 vitest 223（19 个文件）。
+
+**结论**：F-SP2-12 确认关闭；§59 点名的退出断言漏洞、跨语言前缀锁、脱敏幂等与变异存活全部闭合。无新增 P1/P2。
+
+#### 已核实正确
+
+- **覆盖面完整**：`DAEMON_TIMEOUT_MESSAGE` 只由 `DaemonSession::call`（`state.rs:94/112`）产生；`call` 的调用方只有 `omt_call`（`rpc_bridge.rs:228`）与 `rpc_of`（`exec_start`，`executor.rs:143`；另有启动对账在后台使用，不上前端）。这两条命令的前端出口 `omtCall` / `execStart` 都已包装；bridge.ts 之外唯一的直接 `invoke` 是 `daemon_reconnect`（不经 `call`）。`daemon_homes` / `daemon_ensure` 只会返回 `reestablish session: …`，不会是超时常量。`DaemonTimeoutError` 的 `toString()` 与 `message` 都是去前缀文案，`String(err)` 与 `err.message` 两种展示写法都干净；非超时拒绝原样重抛。
+- **跨语言锁是真的**：`tests/daemon-timeout-message.ts` 读 `daemon.rs` 源码抽字面量（处理行续与 `\"`/`\\`/`\n`，遇未知转义直接报错），p59 断言 Rust marker === TS marker、message 以 TS marker 开头，并用抽出的原文驱动 store。
+- **变异实测**（主控，改完即还原，工作区干净；Rust 两条确认是断言失败而非编译错误）：
+
+| 变异 | 结果 |
+|---|---|
+| ExitRequested 的 match 之后加回共享尾部（store + exit） | 抓住（`lib.rs:837`） |
+| CloseRequested 的 Keep 加 store + exit | 抓住（`lib.rs:812`） |
+| sanitize 值起点改回宽集合（含 `*`） | 抓住（幂等断言 `sanitize.rs:554`） |
+| `skip_sep_ws` 去掉 `*` | 抓住（`**password**` 行，`sanitize.rs:539`） |
+| `omtCall` 去掉出口整形 | 抓住（p59 4 条失败） |
+| Rust 侧 marker 与 message 一起改前缀 | 抓住（p59 9 条失败） |
+| ExitRequested 的 Cancel 加 `std::process::exit(0)` | **存活**（见 P3） |
+
+#### P3
+
+- **粘性提示只接了两条写路径**：`noteTimeout` 只在 `createNode`、`startDispatch` 调用。组件里直接 `omtCall` 的写操作——`DetailPanel` 的 `run/create`（同样无 commandId）、`node/archive`，`RunsPanel` / `AgentsPanel` 的 `run/control`、`run/report`、`node/update`——现在显示干净文案，但不落 `timeoutNotice`。错误留在组件本地状态，聚焦刷新不清，实际影响小；§60「createNode/startDispatch **等**写路径」说法偏宽。建议：bridge 出口抛 `DaemonTimeoutError` 时顺带派发一个窗口事件（如 `omt:daemon-timeout`），store 订阅后设 `timeoutNotice`——一处覆盖全部写路径，组件不必逐个改。
+- **退出断言的 exit needle 偏窄**：只认 `.exit(0`，`std::process::exit(0)`、`handle.exit(1)` 都能绕过（上表最后一行）；另外 Stop 区域截止到下一个 `QuitChoice::`，若把 Stop 改成最后一个分支，match 之后的尾部会被并进 Stop 区域而豁免。都属低概率改法；建议 needle 放宽为 `exit(`，Stop 区域截止到 match 结束。
+- §60 列出的未做项（timeoutNotice 按 home / 序号绑定、泵失败状态事件、`spawn_blocking`、`command_spans` 脆弱性、`runtime_dir` 与 config.md 漂移、`Authorization=Basic S` 等脱敏专项）维持原判，不重复记。
+
+**建议**：本轮可以收口——无 P2。上面两条 P3 改动都很小，可以随下一批桌面专项一起做，不必单独再走一轮修复。
