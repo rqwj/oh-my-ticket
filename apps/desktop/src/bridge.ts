@@ -6,7 +6,7 @@
  */
 import { Channel, invoke } from '@tauri-apps/api/core'
 import { getVersion } from '@tauri-apps/api/app'
-import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { emit, listen, type UnlistenFn } from '@tauri-apps/api/event'
 import type { AgentsListResult, BindingsGcResult, BindingsResult, ExecPolicy, ExecPolicyView } from './types'
 
 export interface DaemonStatus {
@@ -65,11 +65,18 @@ export function daemonTimeoutText(error: unknown): string | null {
  * §59 F-SP2-12：bridge 出口的统一错误整形——超时类（机器前缀命中）转
  * {@link DaemonTimeoutError}（剥前缀 + 类型分流），其余原样上抛（既有
  * 文案语义不变）。
+ *
+ * §61 P3：超时整形同时 emit `omt:daemon-timeout`（携带去前缀文案）——
+ * store 订阅后落粘性提示，一处覆盖**全部**经 omtCall / execStart 的写
+ * 路径（组件本地直接 await omtCall 的 run/control、node/update 等不必
+ * 逐个接 noteTimeout）。
  */
 function presentInvokeError(error: unknown): never {
   const raw = String(error).replace(/^Error:\s*/, '')
   if (raw.startsWith(DAEMON_TIMEOUT_MARKER)) {
-    throw new DaemonTimeoutError(raw.slice(DAEMON_TIMEOUT_MARKER.length).trim())
+    const text = raw.slice(DAEMON_TIMEOUT_MARKER.length).trim()
+    void emit('omt:daemon-timeout', { text })
+    throw new DaemonTimeoutError(text)
   }
   throw error
 }

@@ -31,6 +31,7 @@ import {
   sendNotification,
 } from '@tauri-apps/plugin-notification'
 import { Channel, invoke } from '@tauri-apps/api/core'
+import { listen as tauriListen } from '@tauri-apps/api/event'
 import {
   agentsArchiveLegacy,
   agentsList,
@@ -1395,6 +1396,28 @@ export function useTreeStore() {
 
   // Boot + pull-based home freshness on window focus (v1 contract).
   // U5：agents_list 同享 focus 重拉；U9：bindings_get 同（§四 pull 契约）。
+  // §61 P3：bridge 出口 emit 的 `omt:daemon-timeout` 落粘性提示——一处
+  // 覆盖全部经 omtCall / execStart 的写路径（组件本地直接 await 的
+  // run/control、node/update 等也计入），不再依赖各调用点逐个接 noteTimeout。
+  useEffect(() => {
+    let disposed = false
+    let unlisten: (() => void) | undefined
+    void tauriListen<{ text: string }>('omt:daemon-timeout', event => {
+      if (disposed) return
+      const text = event.payload?.text
+      if (typeof text === 'string' && text.length > 0) {
+        setState(s => ({ ...s, timeoutNotice: text }))
+      }
+    }).then(fn => {
+      if (disposed) fn()
+      else unlisten = fn
+    }).catch(() => {/* 事件订阅失败不影响主流程（超时错误仍走类型化路径） */})
+    return () => {
+      disposed = true
+      unlisten?.()
+    }
+  }, [])
+
   useEffect(() => {
     void refreshHomes()
     void loadKnownHomes()

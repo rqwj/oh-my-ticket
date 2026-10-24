@@ -709,7 +709,6 @@ mod tests {
         // 引用 arm 字面量，混进扫描会造出假 arm）
         let test_module = ["#[cfg(", "test)]"].join("");
         let src = &full[..full.find(&test_module).expect("lib.rs 应有测试模块")];
-        let stop_arm = ["QuitChoice::Stop", "=>"].join(" ");
         let next_choice = ["QuitChoice", "::"].join("");
         let helper = ["quit_stop_branch", "("].join("");
         // 代码形态 needle：`QUIT_CONFIRMED.<method>`（去空白后）——命中
@@ -717,43 +716,14 @@ mod tests {
         // 任何其它方法调用形态；分支注释里的说明文字（后接中文/空格）不算
         let confirm_ref = ["QUIT_", "CONFIRMED."].join("");
         let confirm_store = ["QUIT_", "CONFIRMED.store"].join("");
-        let exit_call = [".exit(", "0"].join("");
+        // §61 P3：exit needle 放宽为 `exit(`（去空白后）——`.exit(0` 认不出
+        // `std::process::exit(0)` / `handle.exit(1)`（§61 变异确认存活）。
+        let exit_call = ["exit", "("].join("");
         let collapse =
             |text: &str| -> String { text.chars().filter(|c| !c.is_whitespace()).collect() };
-        let arm_region = |from: &str| -> String {
-            let end = from[next_choice.len()..]
-                .find(&next_choice)
-                .map(|off| next_choice.len() + off)
-                .unwrap_or(from.len());
-            collapse(&from[..end])
-        };
-        // Stop 分支：整段不得引用 QUIT_CONFIRMED（任何形态），且经 helper 收尾
-        let mut stop_arms = 0usize;
-        let mut rest = src;
-        while let Some(idx) = rest.find(&stop_arm) {
-            let arm = arm_region(&rest[idx..]);
-            assert!(
-                arm.contains(&helper),
-                "每个 Stop 分支都必须经 quit_stop_branch 收尾"
-            );
-            assert!(
-                !arm.contains(&confirm_ref),
-                "run() 的 QuitChoice::Stop 分支不得触碰 QUIT_CONFIRMED（任何方法形态：\
-                 store / swap / 跨行；时序契约由 run_quit_stop_worker 承担）"
-            );
-            stop_arms += 1;
-            let from = &rest[idx..];
-            let end = from[next_choice.len()..]
-                .find(&next_choice)
-                .map(|off| next_choice.len() + off)
-                .unwrap_or(from.len());
-            rest = &from[end..];
-        }
-        assert!(
-            stop_arms >= 2,
-            "应锁定 CloseRequested / ExitRequested 两个 STOP 分支，实际找到 {stop_arms} 个"
-        );
-        // ── §59 P3：两个 on_choice 闭包整体（到闭包结束）入扫，区分两处 Keep ──
+        // ── §61 P3：Stop 分支改在闭包区内检查（剥注释），arm 无下一个
+        // QuitChoice:: 时延伸到闭包区结束——Stop 为末分支时 match 之后的
+        // 尾部并入 Stop 区域，由 confirm 断言兜住，不再从剩余区豁免 ──
         // 闭包区结束锚：CloseRequested（on_window_event 内）之后是 `.menu(`
         // builder 调用；ExitRequested（run 事件 arm 内）之后是 Reopen 事件臂
         let choice_head = ["move |choice", "|"].join("");
@@ -772,22 +742,25 @@ mod tests {
                 .join("\n")
         };
         let mut closure_regions: Vec<String> = Vec::new();
-        let mut rest = src;
-        while let Some(idx) = rest.find(&choice_head) {
-            let tail = &rest[idx..];
-            let end = tail
-                .find(".menu(")
-                .or_else(|| tail.find("RunEvent::Reopen"))
-                .expect("§59：on_choice 闭包区应有结束锚（.menu( / RunEvent::Reopen）");
-            closure_regions.push(collapse(&strip_comments(&rest[idx..idx + end])));
-            rest = &rest[idx + end..];
+        {
+            let mut rest = src;
+            while let Some(idx) = rest.find(&choice_head) {
+                let tail = &rest[idx..];
+                let end = tail
+                    .find(".menu(")
+                    .or_else(|| tail.find("RunEvent::Reopen"))
+                    .expect("§59：on_choice 闭包区应有结束锚（.menu( / RunEvent::Reopen）");
+                closure_regions.push(collapse(&strip_comments(&rest[idx..idx + end])));
+                rest = &rest[idx + end..];
+            }
         }
         assert!(
             closure_regions.len() >= 2,
             "应锁定 CloseRequested / ExitRequested 两个 on_choice 闭包，实际 {} 个",
             closure_regions.len()
         );
-        // arm 子区（去空白后的 needle；闭包区内到下一个 QuitChoice::）
+        // arm 子区（去空白后的 needle；闭包区内到下一个 QuitChoice::，没有
+        // 下一个时到闭包区结束——见上方 §61 P3 说明）
         let arm_in = |region: &str, arm: &str| -> String {
             let start = region
                 .find(arm)
@@ -805,7 +778,31 @@ mod tests {
             let stop = arm_in(region, &stop_arm_c);
             region.replacen(&keep, "", 1).replacen(&stop, "", 1)
         };
-        // CloseRequested（关窗）：Keep 只隐藏窗口——无 store 无 exit(0)
+        // Stop 分支：必须经 helper 收尾；不得直接触碰 QUIT_CONFIRMED（任何
+        // 形态）。exit( 不能在 Stop 上断言——helper 的 exit 闭包实参
+        // （`move || …exit(0)`）是合法内容；exit 形态收紧由 Keep/剩余区承担。
+        let mut stop_arms = 0usize;
+        for region in &closure_regions {
+            if region.find(&stop_arm_c).is_some() {
+                let arm = arm_in(region, &stop_arm_c);
+                assert!(
+                    arm.contains(&helper),
+                    "每个 Stop 分支都必须经 quit_stop_branch 收尾"
+                );
+                assert!(
+                    !arm.contains(&confirm_ref),
+                    "run() 的 QuitChoice::Stop 分支（含 Stop 为末分支时并入的 match \
+                     尾部）不得触碰 QUIT_CONFIRMED（任何方法形态：store / swap / 跨行；\
+                     时序契约由 run_quit_stop_worker 承担）"
+                );
+                stop_arms += 1;
+            }
+        }
+        assert!(
+            stop_arms >= 2,
+            "应锁定 CloseRequested / ExitRequested 两个 STOP 分支，实际找到 {stop_arms} 个"
+        );
+        // CloseRequested（关窗）：Keep 只隐藏窗口——无 store 无 exit
         let close_requested = &closure_regions[0];
         let close_keep = arm_in(close_requested, &keep_arm_c);
         assert!(

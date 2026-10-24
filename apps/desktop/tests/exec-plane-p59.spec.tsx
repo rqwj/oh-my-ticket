@@ -43,7 +43,7 @@ afterEach(() => {
 })
 
 const invokeMock = vi.fn()
-const { listenMock } = vi.hoisted(() => ({ listenMock: vi.fn() }))
+const { listenMock, emitMock } = vi.hoisted(() => ({ listenMock: vi.fn(), emitMock: vi.fn() }))
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: (...args: unknown[]) => invokeMock(...args),
   Channel: class {
@@ -55,6 +55,7 @@ vi.mock('@tauri-apps/api/core', () => ({
 }))
 vi.mock('@tauri-apps/api/event', () => ({
   listen: (...args: unknown[]) => listenMock(...args),
+  emit: (...args: unknown[]) => emitMock(...args),
 }))
 vi.mock('@tauri-apps/plugin-notification', () => ({
   isPermissionGranted: vi.fn().mockResolvedValue(true),
@@ -243,6 +244,41 @@ describe('§59 F-SP2-12：写路径超时 → 干净文案 + 粘性 timeoutNotic
     ).toContain('结果未知')
     // 表单仍在（失败不关表单），标题保留
     expect(screen.getByLabelText('节点标题')).toBeTruthy()
+  })
+})
+
+describe('§61 P3：bridge 出口 emit 的 omt:daemon-timeout 事件 → 粘性 timeoutNotice', () => {
+  beforeEach(() => {
+    invokeMock.mockReset()
+    listenMock.mockReset()
+    emitMock.mockReset()
+    window.localStorage.clear()
+    vi.useFakeTimers()
+  })
+
+  it('事件携带去前缀文案 → timeoutNotice 直接置位（组件本地 omtCall 的写路径全覆盖）', async () => {
+    const { result } = await bootStore()
+    // bootStore 的默认 listen mock 会记录全部订阅——从中找 omt:daemon-timeout
+    const call = listenMock.mock.calls.find((c: unknown[]) => c[0] === 'omt:daemon-timeout')
+    expect(call, 'store 应订阅 omt:daemon-timeout').toBeDefined()
+    const handler = call?.[1] as (event: { payload: { text: string } }) => void
+    expect(result.current.state.timeoutNotice).toBeNull()
+    const stripped = RUST_TIMEOUT_MESSAGE.slice(
+      extractDaemonTimeoutMarker().length,
+    ).trim()
+    await act(async () => {
+      handler({ payload: { text: stripped } })
+    })
+    expect(result.current.state.timeoutNotice).toBe(stripped)
+  })
+
+  it('事件空文案 / 订阅失败 → 不置位、不影响主流程', async () => {
+    listenMock.mockImplementation(async (name: string) => {
+      if (name === 'omt:daemon-timeout') throw new Error('ipc down')
+      return () => {}
+    })
+    const { result } = await bootStore()
+    expect(result.current.state.timeoutNotice).toBeNull()
   })
 })
 

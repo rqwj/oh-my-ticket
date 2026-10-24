@@ -32,6 +32,8 @@ vi.mock('@tauri-apps/api/core', () => ({
 }))
 vi.mock('@tauri-apps/api/event', () => ({
   listen: vi.fn().mockResolvedValue(() => {}),
+  // §61：bridge 出口超时整形会 emit('omt:daemon-timeout')——mock 必须提供
+  emit: vi.fn().mockResolvedValue(undefined),
 }))
 vi.mock('@tauri-apps/plugin-notification', () => ({
   isPermissionGranted: vi.fn().mockResolvedValue(true),
