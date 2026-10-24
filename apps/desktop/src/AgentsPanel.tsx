@@ -299,6 +299,14 @@ export function AgentsPanel({
     const timer = setTimeout(() => setStopAllNotice(null), 5000)
     return () => clearTimeout(timer)
   }, [noticeSeq])
+  // §49 notices-leak-across-homes：停止失败警告 / 停止结果 / 归档结果都是
+  // home 作用域的持久提示——切到别的 home 即清空（此前 A home 的失败警告
+  // 在 B home 仍显示）。退出确认的并发计数（Rust 侧宽松计数）不在此列。
+  useEffect(() => {
+    setStopAllAlert(null)
+    setStopAllNotice(null)
+    setArchiveNotice(null)
+  }, [homeId])
   // U14：全面板待裁决项（底部弹窗）——跨所有已拉取的 run 聚合。普通计算
   //（不得用 useMemo——须位于提前 return 之前且避免 hooks 位点抖动；stats 规模小）
   const awaitingItems: Array<{ runId: string; nodeId: string; title?: string }> = []
@@ -436,14 +444,25 @@ export function AgentsPanel({
         onArchive={handleArchive}
       />
     ) : null
-  const archiveStatus = archiveNotice ? (
-    <p className="agents-notice" role="status">
-      {archiveNotice}
-      <button className="chip" onClick={() => setArchiveNotice(null)}>
-        知道了
-      </button>
-    </p>
-  ) : null
+  // §49 archive-notice-live：归档成功文案此前与内容一起挂载（读屏不播报，
+  // B7 给停止结果修过的同一反模式）——改为常驻 status 区域只改文字。停止
+  // 结果与归档结果共用该区域（空串时被 .agents-notice:empty 隐藏）；
+  // 「知道了」按钮在区域外（按钮挂载不进 live region）。
+  const noticeText = [stopAllNotice?.text, archiveNotice]
+    .filter((text): text is string => text !== null && text !== undefined)
+    .join('；')
+  const noticeRegion = (
+    <>
+      <p className="agents-notice" role="status" aria-live="polite">
+        {noticeText}
+      </p>
+      {archiveNotice !== null && (
+        <button className="chip" onClick={() => setArchiveNotice(null)}>
+          知道了
+        </button>
+      )}
+    </>
+  )
 
   // U9：悬空绑定（agentId 不在当前 agents 列表）。降级期间冻结悬空判定
   //（bindingsDegraded / parseFailed——降级空表会把全部绑定误判失效）。
@@ -484,7 +503,7 @@ export function AgentsPanel({
     return (
       <div className="agents-empty">
         {degradedBanner}
-        {archiveStatus}
+        {noticeRegion}
         <p className="empty-hint">尚无 Agent——在 ticket 详情点『运行』派发</p>
         {gatePopup}
         {gcBar}
@@ -633,7 +652,6 @@ export function AgentsPanel({
     <div className="agents-layout">
       <div className="agents-list">
         {degradedBanner}
-        {archiveStatus}
         {gcBar}
         {onStopAll && groups.active.length > 0 && (
           <ConfirmStopAllButton
@@ -643,9 +661,7 @@ export function AgentsPanel({
             onConfirm={() => void handleStopAll()}
           />
         )}
-        <p className="agents-notice" role="status" aria-live="polite">
-          {stopAllNotice?.text ?? ''}
-        </p>
+        {noticeRegion}
         {stopAllAlert && (
           <div className="error-banner" role="alert">
             <p>{stopAllAlert}</p>

@@ -111,24 +111,27 @@ pub fn exec_active(runtime_dir: &Path, home_id: &str, agent_id: &str, exec_id: &
 }
 
 /// review F6：退出确认用——所有 home 中仍在运行的 exec 数（shim 存活，或仍在
-/// 启动宽限期内）。
+/// 启动宽限期内）。§49 保持宽松：读不出的 home 计 0（退出确认宁可少报也不
+/// 拦着用户）；派发容量检查请用 `try_active_exec_count`（错误传播、拒绝派发）。
 pub fn active_exec_count(runtime_dir: &Path) -> usize {
-    layout::home_ids(runtime_dir)
-        .iter()
-        .map(|home_id| {
-            agents::list_agents(runtime_dir, home_id)
-                .map(|(agents, _)| {
-                    agents
-                        .iter()
-                        .filter(|a| is_active(a))
-                        .filter(|a| {
-                            latest_exec(a).is_some_and(|e| shim_alive(e) || within_launch_grace(e))
-                        })
-                        .count()
-                })
-                .unwrap_or(0)
-        })
-        .sum()
+    try_active_exec_count(runtime_dir).unwrap_or(0)
+}
+
+/// §49「并发计数把读不出的 home 当 0」：容量检查路径的严格版——任一 home 的
+/// list_agents 失败（锁超时 / IO 错误）都传播错误（携带 home 身份），由调用方
+/// 拒绝派发；静默计 0 会在并发上限下超额派发。
+pub fn try_active_exec_count(runtime_dir: &Path) -> Result<usize, String> {
+    let mut total = 0;
+    for home_id in layout::home_ids(runtime_dir) {
+        let (agents, _) = agents::list_agents(runtime_dir, &home_id)
+            .map_err(|err| format!("home {home_id}: {err}"))?;
+        total += agents
+            .iter()
+            .filter(|a| is_active(a))
+            .filter(|a| latest_exec(a).is_some_and(|e| shim_alive(e) || within_launch_grace(e)))
+            .count();
+    }
+    Ok(total)
 }
 
 /// MCP 残留清扫用：launcher id（= exec id）对应的 exec 是否仍在运行。
@@ -934,5 +937,30 @@ mod tests {
             shim_maybe_alive_with(&no_start_id, eperm),
             "缺 start-id 的既有语义（接受的成本）不因 EPERM 改变"
         );
+    }
+
+    /// §49「并发计数把读不出的 home 当 0」：退出确认的 active_exec_count 保持
+    /// 宽松（计 0，不拦用户退出）；容量检查的 try_active_exec_count 传播错误
+    /// 并携带 home 身份。构造：agent.json 损坏（触发锁内恢复）+ companion lock
+    /// 不可打开（目录形态）→ list_agents Err。
+    #[test]
+    fn active_exec_count_lenient_but_try_version_propagates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = tmp.path();
+        let id = reg(rt, "exec-cnt-broken");
+        let agent_file = crate::layout::agent_file(rt, "h_t", &id).unwrap();
+        std::fs::write(&agent_file, "{ broken").unwrap();
+        let lock_file = agent_file.with_file_name("agent.json.lock");
+        std::fs::remove_file(&lock_file).ok();
+        std::fs::create_dir_all(&lock_file).unwrap();
+
+        assert_eq!(
+            active_exec_count(rt),
+            0,
+            "退出确认保持宽松：读不出的 home 计 0"
+        );
+        let err = try_active_exec_count(rt).unwrap_err();
+        assert!(err.contains("h_t"), "错误必须携带 home 身份: {err}");
+        assert!(err.contains("lock"), "错误必须点名底层原因: {err}");
     }
 }

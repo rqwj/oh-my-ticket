@@ -63,10 +63,20 @@ describe('ExecPolicySection', () => {
     render(<ExecPolicySection />)
     expect(await screen.findByLabelText('允许经 MCP 派发')).not.toBeChecked()
     expect(screen.getByLabelText('允许经 CLI 派发')).toBeChecked()
-    expect(screen.getByText(/默认值/)).toBeInTheDocument()
+    // §49 策略设置测试守「默认来源」提示：文案已改为「出厂默认」，旧断言
+    // /默认值/ 只匹配到「恢复默认值」按钮——提示被删掉测试也绿。
+    expect(screen.getByText(/出厂默认/)).toBeInTheDocument()
     expect(screen.getByText(/无人值守/)).toBeInTheDocument()
     expect(screen.getByText(/能执行 shell 的 agent/)).toBeInTheDocument()
     expect(screen.getByText(/只影响之后的派发/)).toBeInTheDocument()
+  })
+
+  it('§49 source=file 时不显示「出厂默认」提示', async () => {
+    invokeMock.mockImplementation((cmd: string) =>
+      cmd === 'exec_policy_get' ? Promise.resolve(ok({ source: 'file' })) : cmd ? Promise.reject(new Error(cmd)) : Promise.resolve(undefined))
+    render(<ExecPolicySection />)
+    expect(await screen.findByLabelText('允许经 MCP 派发')).not.toBeChecked()
+    expect(screen.queryByText(/出厂默认/)).toBeNull()
   })
 
   it('saves toggles and numeric limits through exec_policy_set', async () => {

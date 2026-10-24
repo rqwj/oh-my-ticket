@@ -105,6 +105,40 @@ pub fn spawn_sidecar(dir: &Path) -> Result<Descriptor, String> {
         .ok_or_else(|| "sidecar produced no descriptor within 10s".to_string())
 }
 
+/// §49 desktop-dispatch-rpc-bound：desktop 会话 socket 的读写超时。桌面端
+/// 派发链（rpc_of → session.call）在跨进程 exec/launch.lock 内逐条调
+/// daemon——卡死的 daemon（accept 但永不回复）此前让桌面端无限期持锁，
+/// CLI/MCP 每次 60s 后 LAUNCH_FAILED。与 daemon_link 的 DEFAULT_RPC_TIMEOUT
+/// （30s）同值：卡死时最坏「一次调用超时 + state.rs 的单次重连」各 30s，
+/// 仍在锁超时的量级内有界返回，锁最终释放。daemon 各操作都是本地快速
+/// 往返（事件长轮询在 rpc_bridge 自己的连接上，不受影响）。
+const SESSION_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// §49 desktop-dispatch-rpc-bound：enroll 内芯（超时注入的测试缝）——与
+/// daemon_link::DaemonLink::enroll（F-EXEC-10）同法：自行 connect 并先在
+/// socket 上装读写超时（SO_RCVTIMEO/SO_SNDTIMEO），再经 omt_client 公开的
+/// from_stream + enroll 组装——`connect_and_enroll` 不带超时，直接用会被
+/// wedged daemon（accept 但永不回复）挂死，派发锁被无限期传导占用。
+fn enroll_with_timeout(
+    descriptor: &Descriptor,
+    options: &EnrollOptions,
+    timeout: Duration,
+) -> Result<Enrollment, String> {
+    let stream = std::os::unix::net::UnixStream::connect(&descriptor.endpoint)
+        .map_err(|err| format!("endpoint connect: {err}"))?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|err| format!("set read timeout: {err}"))?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|err| format!("set write timeout: {err}"))?;
+    let mut client = Client::from_stream(stream);
+    let handshake = client
+        .enroll(options)
+        .map_err(|problem| format!("enroll: {} ({})", problem.message, problem.code))?;
+    Ok(Enrollment { client, handshake })
+}
+
 /// discover-or-spawn → handshake kind:"desktop". Idempotent: a live
 /// descriptor is reused verbatim (second-instance semantics, R13).
 pub fn discover_or_spawn_and_enroll(dir: &Path) -> Result<(Enrollment, bool), String> {
@@ -122,8 +156,7 @@ pub fn discover_or_spawn_and_enroll(dir: &Path) -> Result<(Enrollment, bool), St
         operations: None,
         credential_path: None,
     };
-    let enrollment = Client::connect_and_enroll(&descriptor, &options)
-        .map_err(|problem| format!("enroll: {} ({})", problem.message, problem.code))?;
+    let enrollment = enroll_with_timeout(&descriptor, &options, SESSION_RPC_TIMEOUT)?;
     Ok((enrollment, spawned))
 }
 
@@ -243,6 +276,51 @@ mod tests {
         assert!(is_daemon_gone("request write: broken pipe", "IO"));
         assert!(!is_daemon_gone("home not in credential scope", "FORBIDDEN"));
         assert!(!is_daemon_gone("unrelated io error", "IO"));
+    }
+
+    /// §49「跨进程派发锁把桌面端卡死的 daemon 传导给 CLI/MCP」：desktop 会话
+    /// 的 daemon RPC 此前无读超时——卡死的 daemon（accept 但永不回复）让桌面
+    /// 端派发在 exec/launch.lock 内无限期挂住。socket 必须带读写超时
+    /// （与 daemon_link 的 F-EXEC-10 同法）：enroll 在界内报错返回。
+    #[test]
+    fn wedged_daemon_session_times_out() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let socket = tmp.path().join("wedged.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+        std::thread::spawn(move || {
+            // accept 并持有连接、永不回复（live 探活连接也吃掉）
+            let mut held = Vec::new();
+            for _ in 0..4 {
+                if let Ok((stream, _)) = listener.accept() {
+                    held.push(stream);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        });
+        let descriptor = Descriptor {
+            schema_version: 1,
+            endpoint: socket.display().to_string(),
+            generation: 1,
+            pid: i64::from(std::process::id()),
+            boot_token: "test".into(),
+        };
+        let options = EnrollOptions {
+            kind: "desktop".into(),
+            name: Some("wedged-test".into()),
+            ..Default::default()
+        };
+        let started = std::time::Instant::now();
+        let err =
+            match enroll_with_timeout(&descriptor, &options, std::time::Duration::from_millis(300))
+            {
+                Ok(_) => panic!("wedged daemon 的 enroll 必须在界内报错"),
+                Err(err) => err,
+            };
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "enroll 应在 300ms 超时界内返回，实际 {:?}（err={err}）",
+            started.elapsed()
+        );
     }
 
     #[test]

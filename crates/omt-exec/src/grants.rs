@@ -5,7 +5,9 @@
 //! 临时登记 `cli:<pid>`，用完即删）。两者经同一把 flock 串行，不会互相覆盖。
 //! 临时条目另记在 `exec/temp-grants.json`，启动时清扫 pid 已死的残留。
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use omt_harness::atomic_json::{
     lock_exclusive, read_json, update_json, write_atomic, LOCK_ACQUIRE_TIMEOUT,
@@ -76,7 +78,44 @@ pub fn remove(runtime_dir: &Path, principal: &str) -> Result<(), String> {
     update_principals(runtime_dir, |ids| ids.retain(|id| id != principal))
 }
 
+/// §49 临时授权的进程内引用计数：同一进程里多个执行方会共用同一
+/// principal（shim 释放租约、desktop 的强制删除 `force_release_agent_leases`
+/// 与后台对账 `reconcile_with_connector` 都用 `cli:<本进程 pid>`）——首个
+/// 结束的一方 Drop 不得撤掉还在用的一方的授权。按 (runtime 目录, principal)
+/// 计数，归零才真正撤销。键用 PathBuf 等值比较（同进程内 runtime 目录来自
+/// 同一解析，拼写一致）。
+static TEMP_GRANT_REFCOUNTS: std::sync::LazyLock<Mutex<HashMap<(PathBuf, String), usize>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn refcount_bump(key: &(PathBuf, String)) {
+    *TEMP_GRANT_REFCOUNTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(key.clone())
+        .or_insert(0) += 1;
+}
+
+/// 计数减一；归零（并摘掉表项）返回 true——只有此时才该撤销授权。
+fn refcount_release(key: &(PathBuf, String)) -> bool {
+    let mut counts = TEMP_GRANT_REFCOUNTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match counts.get_mut(key) {
+        Some(count) if *count > 1 => {
+            *count -= 1;
+            false
+        }
+        Some(_) => {
+            counts.remove(key);
+            true
+        }
+        None => true, // 无计数（防御）：按最后一个持有者处理
+    }
+}
+
 /// 临时授权守卫：创建时登记（grants + 临时登记表），drop 时撤销。
+/// §49：进程内按 principal 引用计数——同 principal 的并发持有者全部 Drop
+/// 后才撤销（文件操作保持幂等，重复 add 不叠加登记）。
 pub struct TempGrant {
     runtime_dir: PathBuf,
     principal: String,
@@ -84,15 +123,21 @@ pub struct TempGrant {
 
 impl TempGrant {
     pub fn add(runtime_dir: &Path, principal: &str) -> Result<Self, String> {
-        update_json(&temp_registry(runtime_dir), |list: &mut Vec<String>| {
+        let key = (runtime_dir.to_path_buf(), principal.to_string());
+        refcount_bump(&key);
+        let registered = update_json(&temp_registry(runtime_dir), |list: &mut Vec<String>| {
             if list.iter().any(|p| p == principal) {
                 return false;
             }
             list.push(principal.to_string());
             true
-        })?;
-        add(runtime_dir, principal)?;
-        Ok(Self {
+        });
+        let granted = registered.and_then(|_| add(runtime_dir, principal));
+        if granted.is_err() {
+            // 登记失败：计数回滚（没有守卫会去撤销，不能留下虚高计数）
+            refcount_release(&key);
+        }
+        granted.map(|_| Self {
             runtime_dir: runtime_dir.to_path_buf(),
             principal: principal.to_string(),
         })
@@ -101,6 +146,12 @@ impl TempGrant {
 
 impl Drop for TempGrant {
     fn drop(&mut self) {
+        // §49 refcount：同进程还有别的持有者（强制删除 / 后台对账 / B7 脱离
+        // 的 worker 共用 `cli:<pid>`）——不是最后一个，授权保留
+        let key = (self.runtime_dir.clone(), self.principal.clone());
+        if !refcount_release(&key) {
+            return;
+        }
         // §39 tempgrant-drop-leak：撤销失败时保留临时登记——启动清扫
         // （sweep_dead_temp_grants）凭它在 pid 死后补删授权。先删登记会让
         // admin 授权永久泄漏（pid 复用即提权窗口）。
@@ -172,6 +223,55 @@ mod tests {
             assert!(principals(tmp.path()).contains(&"cli:4242".to_string()));
         }
         assert!(!principals(tmp.path()).contains(&"cli:4242".to_string()));
+    }
+
+    /// §49「临时管理员授权无引用计数」：同一进程内并发共用同一 principal
+    ///（desktop 的强制删除与后台对账共用 `cli:<pid>`；B7 超时后脱离的 worker
+    /// 还会晚些撤销）——先结束的一方 Drop 不得撤掉还在用的一方的授权。
+    /// 进程内引用计数，最后一个 Drop 才真正撤销（授权 + 登记表）。
+    #[test]
+    fn concurrent_temp_grants_refcount_until_the_last_drop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = TempGrant::add(tmp.path(), "cli:7777").unwrap();
+        {
+            let _second = TempGrant::add(tmp.path(), "cli:7777").unwrap();
+            drop(first); // 先结束的一方：不得撤销共用的授权
+            assert!(
+                principals(tmp.path()).contains(&"cli:7777".to_string()),
+                "还有持有者在用，授权必须保留"
+            );
+            let (registry, _) = read_json::<Vec<String>>(&temp_registry(tmp.path())).unwrap();
+            assert!(registry.contains(&"cli:7777".to_string()), "{registry:?}");
+        }
+        assert!(
+            !principals(tmp.path()).contains(&"cli:7777".to_string()),
+            "最后一个持有者 Drop 后授权撤销"
+        );
+        let (registry, _) = read_json::<Vec<String>>(&temp_registry(tmp.path())).unwrap();
+        assert!(
+            !registry.contains(&"cli:7777".to_string()),
+            "登记表同步清理: {registry:?}"
+        );
+    }
+
+    /// §49 refcount 的回滚臂：登记失败（admin-grants.json 写不进）时计数必须
+    /// 回滚——否则下一个同 principal 的 TempGrant 会在计数虚高下提前保活。
+    #[test]
+    fn failed_temp_grant_add_rolls_the_refcount_back() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = tmp.path().join("rt");
+        std::fs::create_dir_all(rt.join("exec")).unwrap();
+        // exec/ 可写（登记表 OK）、根目录只读（admin-grants.json 写失败）
+        std::fs::set_permissions(&rt, std::fs::Permissions::from_mode(0o555)).unwrap();
+        assert!(TempGrant::add(&rt, "cli:8888").is_err(), "前提：登记失败");
+        std::fs::set_permissions(&rt, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // 回滚后：一次 add + drop 仍应完整撤销（计数没有虚高残留）
+        {
+            let _g = TempGrant::add(&rt, "cli:8888").unwrap();
+            assert!(principals(&rt).contains(&"cli:8888".to_string()));
+        }
+        assert!(!principals(&rt).contains(&"cli:8888".to_string()));
     }
 
     #[test]

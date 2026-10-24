@@ -106,8 +106,12 @@ pub fn start(rpc: DaemonRpc<'_>, req: &LaunchRequest<'_>) -> Result<ExecStartOut
         LAUNCH_LOCK_TIMEOUT,
     )?;
     if let Some(p) = &policy {
-        crate::policy::check_capacity(p, crate::control::active_exec_count(runtime_dir))
-            .map_err(denial_err)?;
+        // §49「并发计数把读不出的 home 当 0」：计数失败（锁超时 / IO 错误）
+        // 必须拒绝派发并点名原因——静默计 0 会在 maxConcurrent 下超额派发。
+        // 退出确认框的宽松计数（active_exec_count）不受影响。
+        let active = crate::control::try_active_exec_count(runtime_dir)
+            .map_err(|err| format!("并发计数失败，拒绝派发（{err}）"))?;
+        crate::policy::check_capacity(p, active).map_err(denial_err)?;
     }
 
     // ①–⑥ daemon 侧派发（executor.rs）：预检 → ensure-run → 注册/续接 →
@@ -675,5 +679,58 @@ mod policy_gate_tests {
         let (code, _, field) = problem_from_launch_error("无未完成可执行成员");
         assert_eq!(code, "LAUNCH_FAILED");
         assert!(field.is_none());
+    }
+
+    /// §49「并发计数把读不出的 home 当 0」：容量检查此前的 active_exec_count
+    /// 对 list_agents 的 Err 计 0（锁超时 / IO 错误）——可超额派发。修复：
+    /// 容量检查传播错误并拒绝本次派发（错误文本点名原因），且不发起任何
+    /// daemon 调用；退出确认框的宽松计数（control::active_exec_count）保留。
+    #[test]
+    fn capacity_check_refuses_launch_when_counting_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = tmp.path();
+        std::fs::create_dir_all(crate::layout::exec_dir(rt)).unwrap();
+        std::fs::write(crate::layout::policy_file(rt), r#"{"allowFromCli": true}"#).unwrap();
+        // 让某个 home 的 list_agents 确定性失败：agent.json 损坏（触发锁内
+        // 恢复路径）+ companion lock 文件不可打开（目录形态）
+        let agent = crate::agents::register_agent(
+            rt,
+            "h_cnt",
+            "pi",
+            crate::agents::NewExec {
+                exec_id: "exec-cnt".into(),
+                node_id: None,
+                run_id: None,
+                binary_path: None,
+                binary_args: vec![],
+                model: None,
+                launched_by: None,
+                parent_agent_id: None,
+            },
+        )
+        .unwrap();
+        let agent_file = crate::layout::agent_file(rt, "h_cnt", &agent.id).unwrap();
+        std::fs::write(&agent_file, "{ broken").unwrap();
+        let lock_file = agent_file.with_file_name("agent.json.lock");
+        std::fs::remove_file(&lock_file).ok(); // register_agent 已创建同伴锁文件
+        std::fs::create_dir_all(&lock_file).unwrap();
+
+        let calls = std::sync::Mutex::new(Vec::<String>::new());
+        let rpc = |m: &str, _p: serde_json::Value| {
+            calls.lock().unwrap().push(m.to_string());
+            Err::<serde_json::Value, String>("unreachable".into())
+        };
+        let bin = rt.join("omt");
+        let err = start(&rpc, &req(rt, rt, &bin, LaunchOrigin::Cli)).unwrap_err();
+        assert!(
+            err.contains("并发计数") && err.contains("拒绝派发"),
+            "容量检查失败必须点名原因并拒绝: {err}"
+        );
+        assert!(err.contains("h_cnt"), "错误必须携带出错 home 的身份: {err}");
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "拒绝派发时不得发起任何 daemon 调用: {:?}",
+            calls.lock().unwrap()
+        );
     }
 }

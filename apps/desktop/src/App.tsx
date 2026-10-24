@@ -75,6 +75,20 @@ export function App() {
     setDispatchWarnings([])
   }, [state.activeHome?.homeId])
 
+  // §49 lease-notice-switch-home：通知跨 home 保留——「前往 Runs」先切到该条
+  // 所属 home 再打开 Runs（homeId 对不上时找不到当前展示的 home 就不动，
+  // 仍只切视图）。
+  const openRunsOfHome = useCallback(
+    (homeId: string) => {
+      if (state.activeHome?.homeId !== homeId) {
+        const target = state.homes.find(h => h.homeId === homeId)
+        if (target) void store.selectHome(target)
+      }
+      setView('runs')
+    },
+    [state.activeHome?.homeId, state.homes, store],
+  )
+
   // Drag-to-resize the tree/center splitter: pointer captured on the
   // divider, width clamped 240–720px, persisted across launches.
   const startDrag = useCallback((down: React.PointerEvent) => {
@@ -112,7 +126,7 @@ export function App() {
       <LeaseNoticeBanner
         notices={state.leaseNotices}
         onDismiss={store.dismissLeaseNotice}
-        onOpenRuns={() => setView('runs')}
+        onOpenRuns={openRunsOfHome}
       />
       <div className="content">
         {/* U8/R-D：树与 splitter 仅 Tickets 视图渲染——Runs/设置自然全宽 */}

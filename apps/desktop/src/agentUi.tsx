@@ -91,6 +91,9 @@ export function ConfirmStopAllButton({
   // §39 fe-a11y-stopall：第二步出现时焦点落在「取消」（安全默认——回车不会
   // 误触确认）；第二步结束（确认、取消、3s 自动复位）后焦点回到「停止全部」
   // （确认时要等「停止中…」结束、按钮重新出现）；Esc 取消。
+  // §49 stopall-reset-focus-steal：复位只把焦点还给「停止全部」当焦点仍落在
+  // 确认区（区域随复位卸载，浏览器把焦点落回 body）或 body——用户已把焦点
+  // 移到别处（其他按钮/输入）时不得抢回。
   const cancelRef = useRef<HTMLButtonElement | null>(null)
   const triggerRef = useRef<HTMLButtonElement | null>(null)
   const restoreFocusRef = useRef(false)
@@ -105,7 +108,10 @@ export function ConfirmStopAllButton({
       cancelRef.current?.focus()
     } else if (!busy && restoreFocusRef.current) {
       restoreFocusRef.current = false
-      triggerRef.current?.focus()
+      const active = document.activeElement
+      if (active === document.body || active === null) {
+        triggerRef.current?.focus()
+      }
     }
   }, [arming, busy])
   if (busy) {
@@ -179,8 +185,10 @@ export function describeFailure(detail: string, canResume = true): string {
 
 /**
  * §47 release-results-hidden：强制删除时被放弃的租约——应用级通知列表（任何
- * 页面都可见，直到逐条关闭）。每条带「前往 Runs」（切到 Runs 页手动取消
- * 对应 run）与「知道了」。
+ * 页面都可见，直到逐条关闭）。每条带「前往 Runs」与「知道了」。
+ * §49 lease-notice-switch-home：通知跨 home 保留，「前往 Runs」带该条的
+ * homeId——App 侧先切到对应 home 再打开 Runs（此前只开当前 home 的 Runs，
+ * 用户在别的 home 上找不到被放弃的 run）。
  */
 export function LeaseNoticeBanner({
   notices,
@@ -189,7 +197,7 @@ export function LeaseNoticeBanner({
 }: {
   notices: LeaseNotice[]
   onDismiss: (agentId: string) => void
-  onOpenRuns: () => void
+  onOpenRuns: (homeId: string) => void
 }) {
   if (notices.length === 0) return null
   return (
@@ -198,7 +206,7 @@ export function LeaseNoticeBanner({
         <div className="lease-notice" key={notice.agentId}>
           <p>{notice.text}</p>
           <div className="chip-row">
-            <button className="chip" onClick={onOpenRuns}>
+            <button className="chip" onClick={() => onOpenRuns(notice.homeId)}>
               前往 Runs
             </button>
             <button className="chip" onClick={() => onDismiss(notice.agentId)}>

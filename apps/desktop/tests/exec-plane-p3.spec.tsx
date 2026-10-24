@@ -306,7 +306,7 @@ describe('B7 force-delete release results (§47)', () => {
       <LeaseNoticeBanner
         notices={[
           { agentId: 'agent-a', homeId: 'h1', runIds: ['RUN-7'], text: '已删除 Agent 1，但 1 个租约释放失败、已被放弃：exec-a（RUN-7）。' },
-          { agentId: 'agent-b', homeId: 'h1', runIds: ['RUN-8'], text: '已删除 Agent 2，但 1 个租约释放失败、已被放弃：exec-b（RUN-8）。' },
+          { agentId: 'agent-b', homeId: 'h2', runIds: ['RUN-8'], text: '已删除 Agent 2，但 1 个租约释放失败、已被放弃：exec-b（RUN-8）。' },
         ]}
         onDismiss={dismiss}
         onOpenRuns={openRuns}
@@ -315,7 +315,12 @@ describe('B7 force-delete release results (§47)', () => {
     expect(screen.getByText(/exec-a（RUN-7）/)).toBeTruthy()
     expect(screen.getByText(/exec-b（RUN-8）/)).toBeTruthy()
     fireEvent.click(screen.getAllByRole('button', { name: '前往 Runs' })[0])
-    expect(openRuns).toHaveBeenCalledTimes(1)
+    // §49 lease-notice-switch-home：「前往 Runs」携带该条通知的 homeId——
+    // App 侧据此先切 home 再打开 Runs（通知跨 home 保留时开当前 home 的
+    // Runs 找不到被放弃的 run）
+    expect(openRuns).toHaveBeenCalledWith('h1')
+    fireEvent.click(screen.getAllByRole('button', { name: '前往 Runs' })[1])
+    expect(openRuns).toHaveBeenCalledWith('h2')
     fireEvent.click(screen.getAllByRole('button', { name: '知道了' })[1])
     expect(dismiss).toHaveBeenCalledWith('agent-b')
   })

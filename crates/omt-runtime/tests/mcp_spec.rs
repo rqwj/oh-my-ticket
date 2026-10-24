@@ -30,6 +30,9 @@ struct McpProcess {
     stdout: BufReader<std::process::ChildStdout>,
     next_id: u64,
     stderr_path: std::path::PathBuf,
+    /// §49 worker-thread 验证：request() 跳过的行（乱序先到的其他响应）
+    /// 记在这里供测试断言本地调用的响应确实另行写出。
+    skipped: Vec<String>,
 }
 
 impl McpProcess {
@@ -66,6 +69,7 @@ impl McpProcess {
             stdout,
             next_id: 0,
             stderr_path,
+            skipped: Vec::new(),
         }
     }
 
@@ -93,7 +97,15 @@ impl McpProcess {
             if value["id"].as_u64() == Some(self.next_id) {
                 return value;
             }
+            self.skipped.push(trimmed.to_string());
         }
+    }
+
+    /// §49 worker-thread 验证：不等应答地发一条请求（id 手工指定），让测试
+    /// 在本地调用阻塞期间继续与 server 交互。
+    fn send_raw(&mut self, body: &str) {
+        writeln!(self.stdin, "{body}").expect("write raw line");
+        self.stdin.flush().expect("flush raw line");
     }
 
     fn notify(&mut self, method: &str) {
@@ -698,6 +710,169 @@ fn exec_start_via_mcp_is_policy_denied_by_default() {
             .unwrap()
             .starts_with("POLICY_DENIED"),
         "{result}"
+    );
+    mcp.shutdown();
+}
+
+/// §49「MCP 的 homeId 也按路径匹配」：把**已服务 home 的路径**塞进 homeId
+/// 不得被解析成功——「MCP 只认 homeId」，路径匹配是 CLI 专属。旧实现按
+/// 规范路径匹配到已服务 home 后继续派发链（最后才因 ticket 不存在报
+/// LAUNCH_FAILED），而不是 INVALID_INPUT。
+#[test]
+fn mcp_exec_start_rejects_a_path_shaped_home_id() {
+    let ctx = TestCtx::spawn_named("mcp-local-homeid-path");
+    let _daemon = common::DaemonProcess::spawn(&ctx, &["--home", ctx.home_str()]);
+    let endpoint = wait_endpoint(&ctx);
+    std::fs::create_dir_all(ctx.runtime_dir.join("exec")).unwrap();
+    std::fs::write(
+        ctx.runtime_dir.join("exec/policy.json"),
+        r#"{"allowFromMcp": true}"#,
+    )
+    .unwrap();
+    let mut mcp = McpProcess::spawn(&ctx);
+    initialize(&mut mcp);
+    let result = call_tool(
+        &mut mcp,
+        "exec__start",
+        serde_json::json!({
+            "homeId": ctx.home_str(),
+            "harness": "pi",
+            "nodeId": "TICKET-1"
+        }),
+    );
+    assert_eq!(result["result"]["isError"], true, "{result}");
+    let text = result["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.starts_with("INVALID_INPUT"),
+        "路径形态的 homeId 必须是 INVALID_INPUT（field homeId），不是按路径解析: {result}"
+    );
+    assert!(text.contains("homeId"), "结构化 field：{text}");
+    // daemon 侧该 home 仍被服务（没有触发任何按路径的副作用）
+    let mut client = common::TestClient::connect(&endpoint).expect("connect");
+    let handshake = client
+        .call(
+            "handshake/request",
+            json!({
+                "protocolVersion": "1.0",
+                "client": { "kind": "cli", "name": "mcp-spec-path-homeid-check" },
+            }),
+        )
+        .expect("helper handshake");
+    assert_eq!(
+        handshake["homes"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .len(),
+        1
+    );
+    mcp.shutdown();
+}
+
+/// §49「MCP stdio 循环单线程阻塞」：本地工具调用（exec__start 阻塞在跨进程
+/// 派发锁上，获取超时 60s）期间 ping 必须保持应答——旧实现里 serve 循环被
+/// 本地调用占死，客户端超时放弃后 shim 已拉起、调用方拿不到 execId。
+/// 手法：测试进程持有 exec/launch 的 flock，先发 exec__start（id 1），再
+/// ping——ping（id 2）必须在界内应答；随后放锁，exec__start 的响应（乱序、
+/// 按 id 配对）另行到达。
+#[test]
+fn mcp_ping_stays_responsive_while_a_local_tool_call_blocks() {
+    let ctx = TestCtx::spawn_named("mcp-local-worker");
+    let _daemon = common::DaemonProcess::spawn(&ctx, &["--home", ctx.home_str()]);
+    let endpoint = wait_endpoint(&ctx);
+    std::fs::create_dir_all(ctx.runtime_dir.join("exec")).unwrap();
+    std::fs::write(
+        ctx.runtime_dir.join("exec/policy.json"),
+        r#"{"allowFromMcp": true}"#,
+    )
+    .unwrap();
+    let mut mcp = McpProcess::spawn(&ctx);
+    initialize(&mut mcp);
+    // 已服务 home 的 homeId（daemon handshake）
+    let mut helper = common::TestClient::connect(&endpoint).expect("connect");
+    let handshake = helper
+        .call(
+            "handshake/request",
+            json!({
+                "protocolVersion": "1.0",
+                "client": { "kind": "cli", "name": "mcp-spec-worker-home" },
+            }),
+        )
+        .expect("helper handshake");
+    let home_id = handshake["homes"][0]["homeId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 持有跨进程派发锁：exec__start 的工作线程阻塞在 lock_exclusive 上
+    let runtime = std::path::PathBuf::from(ctx.runtime_dir_str());
+    let launch_lock = omt_harness::atomic_json::lock_exclusive(
+        &omt_exec::layout::launch_lock_file(&runtime),
+        std::time::Duration::from_secs(30),
+    )
+    .expect("test holds the launch lock");
+
+    // 先发 exec__start（id 1，不等应答），再发 ping——ping 必须在本地调用
+    // 阻塞期间立刻应答（旧实现：ping 要等 exec__start 拿到锁并走完派发链）
+    mcp.send_raw(
+        &json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "exec__start",
+                        "arguments": { "homeId": home_id, "harness": "pi", "nodeId": "TICKET-1" } }
+        })
+        .to_string(),
+    );
+    let (ping_tx, ping_rx) = std::sync::mpsc::channel();
+    let reader = {
+        let mut mcp_for_ping = mcp; // 所有权转进线程，应答后经 join 取回
+        std::thread::spawn(move || {
+            let reply = mcp_for_ping.request("ping", json!({}));
+            let _ = ping_tx.send(reply);
+            mcp_for_ping
+        })
+    };
+    let started = std::time::Instant::now();
+    let ping = ping_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("ping 必须在本地工具调用阻塞期间保持应答（serve 循环不得被本地调用占死）");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "ping 应答耗时 {:?}",
+        started.elapsed()
+    );
+    assert!(
+        ping.get("result").is_some(),
+        "ping 是 result 不是 error: {ping}"
+    );
+
+    // 放锁：exec__start 继续走链（ticket 不存在 → LAUNCH_FAILED），其响应
+    // 乱序到达——被后续 request() 当作「跳过行」读到（id == 1）
+    drop(launch_lock);
+    let mut mcp = reader.join().expect("ping reader thread");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !mcp.skipped.iter().any(|line| {
+        serde_json::from_str::<serde_json::Value>(line)
+            .ok()
+            .and_then(|v| v["id"].as_u64())
+            == Some(1)
+    }) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "exec__start 的响应（id 1）应在放锁后 20s 内到达: {:?}",
+            mcp.skipped
+        );
+        let _ = mcp.request("ping", json!({})); // 泵一行，顺带收集跳过行
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let exec_reply = mcp
+        .skipped
+        .iter()
+        .find_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|v| v["id"].as_u64() == Some(1))
+        .expect("id 1 的响应");
+    assert_eq!(
+        exec_reply["result"]["isError"], true,
+        "ticket 不存在 → exec__start 报错（证明响应确实来自被阻塞的那个调用）: {exec_reply}"
     );
     mcp.shutdown();
 }

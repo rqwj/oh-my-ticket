@@ -106,6 +106,9 @@ pub fn policy_show(ctx: &Ctx) -> Result<Value, Problem> {
 /// CLI 另认 `home`（路径或 homeId），给出已初始化但未被服务的路径时经
 /// DaemonLink::connect 声明。§49 Q-13 先判后声明：声明**之前**先对规范路径
 /// 预判 workspace 范围——被拒的请求不得先在 daemon 里留下已登记的 home。
+/// §49「MCP 的 homeId 也按路径匹配」：路径匹配（及随后的按路径声明）是
+/// CLI 专属——MCP 的 `homeId` 出现路径形态（含路径分隔符）直接 INVALID_INPUT，
+/// 不再尝试按规范路径解析到已服务的 home。
 fn resolve_home(
     ctx: &Ctx,
     origin: LaunchOrigin,
@@ -119,14 +122,21 @@ fn resolve_home(
     let wanted = opt_str(args, "homeId")
         .or(cli_home)
         .ok_or_else(|| invalid("homeId", "需要 homeId（CLI：全局 --home）"))?;
+    if origin != LaunchOrigin::Cli && wanted.contains(std::path::MAIN_SEPARATOR) {
+        return Err(invalid(
+            "homeId",
+            "MCP 只接受 homeId；按路径查找 / 声明 home 是 CLI 专属（--home）",
+        ));
+    }
     let served = crate::daemon_link::served_homes(&ctx.runtime_dir, ctx.daemon_bin.as_deref())
         .map_err(io)?;
     let canonical = std::fs::canonicalize(wanted).ok();
     if let Some(home) = served.iter().find(|h| {
         h.home_id == wanted
-            || canonical
-                .as_ref()
-                .is_some_and(|c| std::fs::canonicalize(&h.path).ok().as_ref() == Some(c))
+            || (origin == LaunchOrigin::Cli
+                && canonical
+                    .as_ref()
+                    .is_some_and(|c| std::fs::canonicalize(&h.path).ok().as_ref() == Some(c)))
     }) {
         return Ok((home.home_id.clone(), home.path.clone(), home.kind.clone()));
     }
@@ -645,5 +655,33 @@ mod tests {
         let shown = policy_show(&ctx(tmp.path())).unwrap();
         assert_eq!(shown["policy"]["allowFromMcp"], false);
         assert_eq!(shown["source"], "default");
+    }
+
+    /// §49「MCP 的 homeId 也按路径匹配」：`{"homeId": "/Users/x/proj/.omt"}`
+    /// 此前能按规范路径解析到已服务的 home，偏离「MCP 只认 homeId」（路径
+    /// 匹配与声明是 CLI 专属）。路径形态（含路径分隔符）在 MCP 侧必须是
+    /// INVALID_INPUT（field homeId），而不是被当作可解析的查找键。
+    #[test]
+    fn mcp_origin_rejects_path_shaped_home_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(crate::layout::exec_dir(tmp.path())).unwrap();
+        // 放行 MCP（否则 POLICY_DENIED 先于 resolve_home，测不到目标分支）
+        std::fs::write(
+            crate::layout::policy_file(tmp.path()),
+            r#"{"allowFromMcp": true}"#,
+        )
+        .unwrap();
+        let err = exec_start(
+            &ctx(tmp.path()),
+            LaunchOrigin::Mcp,
+            &serde_json::json!({
+                "homeId": "/Users/x/proj/.omt",
+                "harness": "pi",
+                "nodeId": "T-1",
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "INVALID_INPUT", "{err:?}");
+        assert_eq!(err.details.as_ref().unwrap()["field"], "homeId", "{err:?}");
     }
 }

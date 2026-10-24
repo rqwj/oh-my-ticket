@@ -1516,6 +1516,10 @@ pub(crate) fn fail_and_compensate(
         if e.failure_detail.is_none() {
             e.failure_detail = Some(err.clone());
         }
+        // §49 failed-plus-killreason：被 SIGTERM 的 shim 可能抢在补偿前写了
+        // Killed(user)——补偿覆盖为 Failed 时一并清掉 kill_reason，否则终态
+        // 自相矛盾（「启动失败」却带「用户停止」）
+        e.kill_reason = None;
     });
     let _ = agents::update_agent_status(
         runtime_dir,
@@ -1536,6 +1540,13 @@ pub(crate) fn fail_and_compensate(
 /// 面的回落测试也经此构造旧布局数据（旧路径知识只在本函数出现一次）。
 fn legacy_transcripts_dir(runtime_dir: &Path, home_id: &str) -> PathBuf {
     runtime_dir.join("transcripts").join(home_id)
+}
+
+/// 候选目录是否带有该 exec 的日志（jsonl 或 raw.log）——tail 与 page 共用
+/// 的候选判定（§39 tail 回落 / §49 page 回落）。
+fn dir_has_exec_log(dir: &Path, exec_id: &str) -> bool {
+    dir.join(format!("{exec_id}.jsonl")).is_file()
+        || dir.join(format!("{exec_id}.raw.log")).is_file()
 }
 
 pub fn transcript_tail_from(
@@ -1561,10 +1572,10 @@ pub fn transcript_tail_from(
         }
     }
     candidates.push(legacy_transcripts_dir(runtime_dir, home_id));
-    let Some(dir) = candidates.into_iter().find(|dir| {
-        dir.join(format!("{exec_id}.jsonl")).is_file()
-            || dir.join(format!("{exec_id}.raw.log")).is_file()
-    }) else {
+    let Some(dir) = candidates
+        .into_iter()
+        .find(|dir| dir_has_exec_log(dir, exec_id))
+    else {
         return Vec::new(); // 无日志（未产出/已清理）→ 空
     };
     let jsonl = dir.join(format!("{exec_id}.jsonl"));
@@ -1647,7 +1658,20 @@ pub fn transcript_page(
     crate::layout::validate_segment("exec_id", exec_id)?;
     let (agent, _) = crate::agents::find_exec_in_home(runtime_dir, home_id, exec_id)?
         .ok_or_else(|| format!("exec {exec_id} 不存在"))?;
-    let dir = crate::layout::agent_dir(runtime_dir, home_id, &agent.id)?;
+    let agent_dir = crate::layout::agent_dir(runtime_dir, home_id, &agent.id)?;
+    // §49 page-legacy-fallback：与 transcript_tail_from 同一候选目录序——
+    // 迁移中断（agent.json 已迁、jsonl 还在旧 transcripts/<home>/）时读旧
+    // 目录，而不是谎报 {events: [], done: true}
+    let dir = if dir_has_exec_log(&agent_dir, exec_id) {
+        agent_dir
+    } else {
+        let legacy = legacy_transcripts_dir(runtime_dir, home_id);
+        if dir_has_exec_log(&legacy, exec_id) {
+            legacy
+        } else {
+            agent_dir
+        }
+    };
     let path = crate::layout::exec_file(&dir, exec_id, crate::layout::ExecFile::Jsonl);
     // 先判活、再读文件：读之前已不活跃 ⇒ 本次读到的内容已包含 shim 写出的全部事件
     // （shim 先写 exit 行再退出）。反过来的顺序会在两步之间漏掉 exit 却报 done。
@@ -3999,6 +4023,68 @@ mod tests {
         assert_eq!(cancels[0]["runId"], "run-new-b");
     }
 
+    /// §49「启动失败可能记成 failed + killReason: user」：launcher 记录身份
+    /// 失败后 SIGTERM shim，shim 的信号处理若先于补偿写了 Killed(user)，
+    /// 补偿覆盖为 Failed 时必须清掉 kill_reason——终态 failed + killReason
+    /// 并存自相矛盾（界面上会显示「启动失败（用户停止）」）。
+    #[test]
+    fn fail_and_compensate_clears_a_preceding_kill_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        let agent = crate::agents::register_agent(
+            &runtime,
+            "h_kr",
+            "pi",
+            NewExec {
+                exec_id: "exec-kr".into(),
+                node_id: None,
+                run_id: Some("RUN-KR".into()),
+                binary_path: None,
+                binary_args: vec![],
+                model: None,
+                launched_by: None,
+                parent_agent_id: None,
+            },
+        )
+        .unwrap();
+        // 模拟 shim 抢先写的终态：Killed + killReason: user
+        crate::agents::update_exec(&runtime, "h_kr", &agent.id, "exec-kr", |e| {
+            e.kill_reason = Some("user".into());
+        })
+        .unwrap();
+        crate::agents::update_agent_status(
+            &runtime,
+            "h_kr",
+            &agent.id,
+            AgentRecordStatus::Killed,
+            AgentAttachment::None,
+        )
+        .unwrap();
+
+        let err = fail_and_compensate(
+            &|_m, _p| Ok(serde_json::json!({})),
+            &runtime,
+            "h_kr",
+            &agent.id,
+            "exec-kr",
+            "RUN-KR",
+            false,
+            "记录 exec-shim 身份失败".to_string(),
+        );
+        assert_eq!(err, "记录 exec-shim 身份失败");
+        let file = crate::agents::snapshot(&runtime, "h_kr");
+        assert_eq!(file.agents[0].status, AgentRecordStatus::Failed);
+        assert_eq!(
+            file.agents[0].execs[0].failure_detail.as_deref(),
+            Some("记录 exec-shim 身份失败")
+        );
+        assert!(
+            file.agents[0].execs[0].kill_reason.is_none(),
+            "补偿为 Failed 时必须清 kill_reason（否则显示「启动失败（用户停止）」）: {:?}",
+            file.agents[0].execs[0].kill_reason
+        );
+    }
+
     #[test]
     fn launch_shim_spawn_failure_marks_agent_failed_and_cancels_new_run() {
         // 补偿表 ⑧（原 dispatch_spawn_failure 测试的移植——spawn 已随执行
@@ -4681,6 +4767,63 @@ mod tests {
         let events = transcript_tail_from(&runtime, "h_m", "exec-mid", None);
         assert_eq!(events.len(), 1, "新目录无文件时必须回落旧目录");
         assert_eq!(events[0]["text"], "OLD");
+    }
+
+    /// §49「transcript_page 没有旧目录回落」：迁移中断（agent.json 已迁、
+    /// jsonl 还在旧 transcripts/<home>/）时分页 tail 不得谎报
+    /// `{events: [], done: true}`——复用 tail 的候选目录查找。
+    #[test]
+    fn transcript_page_falls_back_to_legacy_dir_mid_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        crate::agents::register_agent(
+            &runtime,
+            "h_p",
+            "pi",
+            NewExec {
+                exec_id: "exec-page".into(),
+                node_id: None,
+                run_id: None,
+                binary_path: None,
+                binary_args: vec![],
+                model: None,
+                launched_by: None,
+                parent_agent_id: None,
+            },
+        )
+        .unwrap();
+        let legacy = legacy_transcripts_dir(&runtime, "h_p");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(
+            legacy.join("exec-page.jsonl"),
+            concat!(
+                r#"{"kind":"assistant_text","execId":"exec-page","seq":1,"ts":"1","text":"OLD1"}"#,
+                "\n",
+                r#"{"kind":"assistant_text","execId":"exec-page","seq":2,"ts":"2","text":"OLD2"}"#,
+                "\n",
+                r#"{"kind":"exit","execId":"exec-page","seq":3,"ts":"3","status":"exited"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let page = transcript_page(&runtime, "h_p", "exec-page", None, TAIL_PAGE_DEFAULT).unwrap();
+        let texts: Vec<&str> = page["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["text"].as_str())
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["OLD1", "OLD2"],
+            "必须读到旧目录的 jsonl: {page}"
+        );
+        assert_eq!(page["nextSeq"], 3, "{page}");
+        assert_eq!(page["done"], true, "exit 行在页内: {page}");
+        // since 分页同样经旧目录
+        let rest =
+            transcript_page(&runtime, "h_p", "exec-page", Some(2), TAIL_PAGE_DEFAULT).unwrap();
+        assert_eq!(rest["events"].as_array().unwrap().len(), 1, "{rest}");
     }
 
     /// F-BENCH-20：UsageTotals 累计与合计的直接单测（三形态）。

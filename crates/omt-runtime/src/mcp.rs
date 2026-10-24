@@ -179,76 +179,130 @@ pub fn serve(
 
     log_line("mcp server ready (scoped grant: node/run/events)");
 
-    let stdin = std::io::stdin();
-    let mut reader = BufReader::new(stdin.lock());
-    let stdout = std::io::stdout();
-    let mut writer = stdout.lock();
+    // §49 mcp-stdio-worker：本地工具调用（exec__start 最长 60s 锁等待 + 30s
+    // 就绪握手、harness__list ~14s 探测）放到**单个工作线程**上顺序执行——
+    // serve 循环保持响应（ping / tools/list 立即应答），客户端超时放弃后仍
+    // 可用 exec__list 凭 id 找回 execId。并发上界 = 1（本地工具共享同一把
+    // 跨进程派发锁，并发跑也只会排队；daemon 工具仍在 serve 线程内联执行
+    // ——它们只是 socket 往返）。本地调用的响应由工作线程乱序写出：JSON-RPC
+    // 按 id 配对，乱序合法。`thread::scope` 让工作线程借用非 'static 的
+    // `&dyn LocalTools`，serve 返回前 join（在途调用收尾完才退出，与旧实现
+    // 的内联阻塞等价）。
+    std::thread::scope(|scope| -> Result<i32, Problem> {
+        let local_worker = local.map(|local| {
+            let (tx, rx) = std::sync::mpsc::channel::<LocalCall>();
+            scope.spawn(move || {
+                for call in rx {
+                    let response = call_local_tool(local, call.action, call.arguments, &call.id);
+                    // 写失败（stdout 已关）时继续排空队列后退出
+                    let _ = write_stdout_line(&response.to_string());
+                }
+            });
+            tx
+        });
 
-    while let Some(message) = read_frame(&mut reader)? {
-        let Ok(request) = serde_json::from_str::<serde_json::Value>(&message) else {
-            continue;
-        };
-        let method = request["method"].as_str().unwrap_or_default();
-        let id = request["id"].clone();
+        let stdin = std::io::stdin();
+        let mut reader = BufReader::new(stdin.lock());
 
-        // Notifications (no id) need no response.
-        let is_notification = id.is_null();
+        while let Some(message) = read_frame(&mut reader)? {
+            let Ok(request) = serde_json::from_str::<serde_json::Value>(&message) else {
+                continue;
+            };
+            let method = request["method"].as_str().unwrap_or_default();
+            let id = request["id"].clone();
 
-        let response = match method {
-            "initialize" => Some(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": {
-                    "protocolVersion": PROTOCOL_VERSION,
-                    "capabilities": { "tools": {} },
-                    "serverInfo": {
-                        "name": "omt-mcp",
-                        "version": env!("CARGO_PKG_VERSION"),
+            // Notifications (no id) need no response.
+            let is_notification = id.is_null();
+
+            let response = match method {
+                "initialize" => Some(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "protocolVersion": PROTOCOL_VERSION,
+                        "capabilities": { "tools": {} },
+                        "serverInfo": {
+                            "name": "omt-mcp",
+                            "version": env!("CARGO_PKG_VERSION"),
+                        },
                     },
-                },
-            })),
-            "notifications/initialized" | "notifications/cancelled" => None,
-            "ping" => Some(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {} })),
-            "tools/list" => Some(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": { "tools": all_tool_descriptors(local) },
-            })),
-            "tools/call" => {
-                let name = request["params"]["name"].as_str().unwrap_or_default();
-                let arguments = request["params"]["arguments"].clone();
-                Some(match action_of(name) {
-                    Some(action) => call_tool(&mut enrollment.client, action, arguments, &id),
-                    None => match (local, local_action_of(name)) {
-                        (Some(local), Some(action)) => {
-                            call_local_tool(local, action, arguments, &id)
+                })),
+                "notifications/initialized" | "notifications/cancelled" => None,
+                "ping" => Some(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {} })),
+                "tools/list" => Some(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": { "tools": all_tool_descriptors(local) },
+                })),
+                "tools/call" => {
+                    let name = request["params"]["name"].as_str().unwrap_or_default();
+                    let arguments = request["params"]["arguments"].clone();
+                    match action_of(name) {
+                        Some(action) => {
+                            Some(call_tool(&mut enrollment.client, action, arguments, &id))
                         }
-                        _ => error_reply(&id, -32602, &format!("unknown tool: {name}")),
-                    },
-                })
-            }
-            _ => {
-                if is_notification {
-                    None
-                } else {
-                    Some(error_reply(
-                        &id,
-                        -32601,
-                        &format!("method not found: {method}"),
-                    ))
+                        None => match (&local_worker, local_action_of(name)) {
+                            // §49：派给工作线程——本线程立刻回到读循环（ping
+                            // 不被本地调用阻塞）；响应由工作线程按 id 写出
+                            (Some(tx), Some(action)) => {
+                                match tx.send(LocalCall {
+                                    action,
+                                    arguments,
+                                    id: id.clone(),
+                                }) {
+                                    Ok(()) => None,
+                                    Err(_) => Some(error_reply(
+                                        &id,
+                                        -32603,
+                                        "local tool worker unavailable",
+                                    )),
+                                }
+                            }
+                            _ => Some(error_reply(&id, -32602, &format!("unknown tool: {name}"))),
+                        },
+                    }
+                }
+                _ => {
+                    if is_notification {
+                        None
+                    } else {
+                        Some(error_reply(
+                            &id,
+                            -32601,
+                            &format!("method not found: {method}"),
+                        ))
+                    }
+                }
+            };
+
+            if let Some(response) = response {
+                if !is_notification {
+                    write_stdout_line(&response.to_string())
+                        .map_err(|err| Problem::new("IO", format!("stdout write: {err}")))?;
                 }
             }
-        };
-
-        if let Some(response) = response {
-            if !is_notification {
-                write_frame(&mut writer, &response.to_string())
-                    .map_err(|err| Problem::new("IO", format!("stdout write: {err}")))?;
-            }
         }
-    }
+        Ok(0)
+    })?;
     log_line("mcp server exiting (stdin closed)");
     Ok(0)
+}
+
+/// §49 mcp-stdio-worker：本地工具调用的一次派发（serve 线程 → 工作线程）。
+struct LocalCall {
+    action: &'static str,
+    arguments: serde_json::Value,
+    id: serde_json::Value,
+}
+
+/// 单行写 stdout 并 flush——serve 线程与本地工具工作线程共用（各自的锁在
+/// write 期间互斥；锁随写结束释放，读 stdin 期间不持锁，工作线程不会被
+/// 挡死）。
+fn write_stdout_line(body: &str) -> std::io::Result<()> {
+    let stdout = std::io::stdout();
+    let mut writer = stdout.lock();
+    writeln!(writer, "{body}")?;
+    writer.flush()
 }
 
 /// tools/list descriptors: one MCP tool per exposed action, named with
@@ -479,13 +533,6 @@ fn read_frame(reader: &mut impl BufRead) -> Result<Option<String>, Problem> {
         }
         return Ok(Some(trimmed.to_string()));
     }
-}
-
-fn write_frame(writer: &mut impl Write, body: &str) -> std::io::Result<()> {
-    // Responses are compact single-line JSON (serde_json::to_string) —
-    // writeln supplies the delimiter the client reads on.
-    writeln!(writer, "{body}")?;
-    writer.flush()
 }
 
 /// U3: enrollment 身份——desktop 派发时经 `--actor exec:<execId>` 指定执行者

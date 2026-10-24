@@ -51,6 +51,20 @@ fn stop_all_execs(runtime_dir: &Path) {
     }
 }
 
+/// §49 quit-stop-off-main：Stop 分支的「停止全部 → 退出」序列放到工作线程。
+/// 确认框的 `on_choice` 在 GCD 主队列里跑（quit_dialog.rs），而
+/// stop_all_execs（逐 agent flock + 对账 + 停止信号）可能耗时数秒——在主
+/// 队列里同步跑会阻塞主 run loop（锁竞争下转圈）。退出动作以闭包注入
+/// （生产 = `AppHandle::exit(0)`；测试注入记线程 id 的探针，证明序列不在
+/// 调用线程上执行）。
+fn stop_and_exit_off_main(runtime_dir: &Path, exit: impl FnOnce() + Send + 'static) {
+    let runtime_dir = runtime_dir.to_path_buf();
+    std::thread::spawn(move || {
+        stop_all_execs(&runtime_dir);
+        exit();
+    });
+}
+
 /// F-EXEC-6：主窗口恢复显示。关窗确认选「继续在后台运行」只隐藏不销毁窗口
 /// （CloseRequested 已 prevent），macOS dock 图标点击（RunEvent::Reopen /
 /// applicationShouldHandleReopen）或第二实例启动时由此恢复。
@@ -144,10 +158,14 @@ pub fn run() {
                         DIALOG_OPEN.store(false, Ordering::SeqCst);
                     }
                     QuitChoice::Stop => {
-                        // 退出路径（P3-a）：DIALOG_OPEN 保持置位直到进程退出
-                        stop_all_execs(&runtime_dir);
+                        // 退出路径（P3-a）：DIALOG_OPEN 保持置位直到进程退出。
+                        // §49 quit-stop-off-main：停止+退出序列放到工作线程——
+                        // on_choice 在 GCD 主队列里跑，stop_all_execs（逐 agent
+                        // flock + 对账）不得阻塞主 run loop。QUIT_CONFIRMED 先
+                        // 置位（stop 期间再进 ExitRequested 直接放行，不叠框）。
                         QUIT_CONFIRMED.store(true, Ordering::SeqCst);
-                        handle.exit(0);
+                        let exit_handle = handle.clone();
+                        stop_and_exit_off_main(&runtime_dir, move || exit_handle.exit(0));
                     }
                     // 取消 / Esc：窗口保持原样（close 已被 prevent）——回到正常
                     // 运行，清 DIALOG_OPEN
@@ -284,7 +302,17 @@ pub fn run() {
                                 // KEEP / STOP 都是退出路径（P3-a）：DIALOG_OPEN
                                 // 保持置位直到进程退出
                                 QuitChoice::Keep => {}
-                                QuitChoice::Stop => stop_all_execs(&runtime_dir),
+                                // §49 quit-stop-off-main：停止+退出序列放工作
+                                // 线程（on_choice 在 GCD 主队列里跑，逐 agent
+                                // flock + 对账不得阻塞主 run loop）
+                                QuitChoice::Stop => {
+                                    QUIT_CONFIRMED.store(true, Ordering::SeqCst);
+                                    let exit_handle = handle.clone();
+                                    stop_and_exit_off_main(&runtime_dir, move || {
+                                        exit_handle.exit(0)
+                                    });
+                                    return;
+                                }
                                 // 取消 / Esc：不退出——只有回到正常运行的分支
                                 // 清 DIALOG_OPEN（P3-a）
                                 QuitChoice::Cancel => {
@@ -321,7 +349,7 @@ fn parse_allow_multi_instance(v: Option<&str>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_allow_multi_instance;
+    use super::{parse_allow_multi_instance, stop_and_exit_off_main};
 
     #[test]
     fn allow_multi_instance_env_treats_empty_as_unset() {
@@ -334,5 +362,26 @@ mod tests {
         assert!(parse_allow_multi_instance(Some("1")));
         assert!(parse_allow_multi_instance(Some("true")));
         assert!(parse_allow_multi_instance(Some(" yes ")));
+    }
+
+    /// §49 quit-stop-off-main：Stop 分支的停止+退出序列必须不在调用线程
+    ///（生产 = GCD 主队列）上执行——探针闭包回报自己的线程 id，与调用线程
+    /// 不同即证。旧实现（on_choice 内联 stop_all_execs）在本测的等价形态下
+    /// 线程 id 相同。
+    #[test]
+    fn stop_and_exit_runs_off_the_calling_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let caller_thread = std::thread::current().id();
+        stop_and_exit_off_main(dir.path(), move || {
+            tx.send(std::thread::current().id()).unwrap();
+        });
+        let worker_thread = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("停止+退出序列应完成并回调退出动作");
+        assert_ne!(
+            caller_thread, worker_thread,
+            "序列必须在独立线程上执行，不得阻塞主 run loop"
+        );
     }
 }
