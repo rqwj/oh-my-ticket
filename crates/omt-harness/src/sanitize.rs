@@ -19,18 +19,33 @@ const STDERR_TAIL_MAX_CHARS: usize = 2000;
 ///
 /// §53 F-SP2-6 修订（§51 的词首修复削弱了脱敏，三组回归——行为由表驱动
 /// 测试 `sanitize_line_leak_table_every_entry_is_redacted` /
-/// `sanitize_line_intact_table_is_untouched` 锁定）：
+/// `sanitize_line_intact_table_is_untouched` /
+/// `sanitize_line_acceptable_collateral_column_is_redacted_by_design` 锁定）：
 /// - **键值形态不再要求词首**：「关键字 + 可选空白 + `=`/`:`」任意位置命中
-///   （`apiKey=…`、`PGPASSWORD=…`、`clientSecret: …`）——唯一例外是命中
-///   所在 token 以 `-` 开头（CLI flag 名，如 `--monkey=banana`）时仍按误伤
-///   处理；分隔符前的空白（`password = hunter2`、`token : abc`）重新算键值。
+///   （`apiKey=…`、`PGPASSWORD=…`、`clientSecret: …`）；分隔符前的空白
+///   （`password = hunter2`、`token : abc`）重新算键值。
 /// - `sk-` 用 `match_indices` 取第一个**词首**命中——词中的 `task-`/
 ///   `desk-` 不再挡住后面的真 `sk-` 密钥。
 /// - Authorization 遍历命中（`reauthorization` 的词中命中不挡真头），且
-///   冒号必须**紧跟**关键字（中间只许空白）——`… see https://…` 的 `https:`
-///   冒号不再误伤。
+///   冒号必须紧跟关键字——`… see https://…` 的 `https:` 冒号不再误伤。
 /// - 关键字循环不再在首个词首非键值命中处 break（`--key-file /x
 ///   --key=SECRET` 的后者必须命中）。
+///
+/// §55 F-SP2-8 修订（§54 复审：dash 例外过宽、「冒号必须紧跟」破坏引号
+/// 形态、空白只跳 ASCII 空格/tab——取最简单、宁枉勿纵的方案）：
+/// - **dash 例外删除**：§54 的「命中所在 token 以 `-` 开头即跳过」只为保
+///   `--monkey=banana`，却放过 `--apiKey=SECRET`、`-Dpassword=…`、
+///   `-ePASSWORD=…`、`-PsigningKey=…`、diff 删除行 `-PGPASSWORD=`——键值
+///   形态现在**任意位置**命中即脱敏；`--monkey=banana` 移入「可接受误伤」
+///   列（测试按列区分）。
+/// - 键值与 Authorization 的分隔符判定都跳过**任意 Unicode 空白和引号**
+///   （`"`/`'`）——`{"headers":{"Authorization":"Basic SECRET"}}`、
+///   `'authorization': 'Basic SECRET'`、`{"apiKey": "abc"}`（关键字与 `:`
+///   之间隔着闭合引号的 JSON 形态）闭合；Authorization 的 scheme 值前也
+///   跳过引号。
+/// - 空白从「ASCII 空格/tab」回到 `char` 级：NBSP（U+00A0）、U+3000、`\r`
+///   等都算键值分隔前的合法空白（`trim_start_matches` 的字符闭包保证偏移
+///   算术仍在字节边界上）。
 pub fn sanitize_line(line: &str) -> String {
     const KEYWORDS: &[&str] = &["key", "token", "secret", "password", "bearer"];
     // F-U2-8(a)：ascii 小写不改字节长度——lower 的偏移对原串安全（多字节
@@ -45,43 +60,32 @@ pub fn sanitize_line(line: &str) -> String {
     // 宁枉勿纵）。
     let is_word_start =
         |pos: usize| -> bool { pos == 0 || !lower.as_bytes()[pos - 1].is_ascii_alphanumeric() };
-    // §53：命中所在的 CLI token（往前扫字母数字/`-`/`_`）以 `-` 开头即为
-    // flag 名——flag 名里的词中键值命中（`--monkey=banana`）按 §51 误伤
-    // 处理；裸复合名（`apiKey=`、`PGPASSWORD=`、`clientSecret:`）不是 flag，
-    // 键值形态照脱（宁枉勿纵）。
-    let in_dash_flag = |kw_pos: usize| -> bool {
-        let bytes = lower.as_bytes();
-        let mut start = kw_pos;
-        while start > 0
-            && (bytes[start - 1].is_ascii_alphanumeric()
-                || bytes[start - 1] == b'-'
-                || bytes[start - 1] == b'_')
-        {
-            start -= 1;
-        }
-        bytes[start] == b'-'
-    };
+    // §55：关键字/Authorization 与分隔符（`=`/`:`）之间允许任意 Unicode
+    // 空白**和引号**——JSON 键值（`{"apiKey": "abc"}`）、带引号的
+    // Authorization 头都算命中。trim_start_matches 按字符跳过，偏移差
+    //（字节）仍是字符边界。
+    let skip_sep_ws = |c: char| c.is_whitespace() || c == '"' || c == '\'';
     for kw in KEYWORDS {
         // §53：遍历全部命中——词中命中、或词首但非键值（`--key-file`）都
         // 不得挡住同串后面的真键值形态（`--key-file /x --key=SECRET`）。
+        // §55：dash 例外删除——键值命中不再要求词首，也不再看 flag 名。
         for (pos, _) in lower.match_indices(kw) {
             let after = &lower[pos + kw.len()..];
-            // §53：键值判定先跳过空白——`password = hunter2`、`token : abc`
-            // 都是键值形态（空白皆为 ascii，字节偏移安全）。
-            let ws = after.len() - after.trim_start_matches([' ', '\t']).len();
-            let rest = &after[ws..];
+            let rest = after.trim_start_matches(skip_sep_ws);
+            let ws = after.len() - rest.len();
             let is_kv = rest.starts_with('=') || rest.starts_with(':');
-            if is_kv && (is_word_start(pos) || !in_dash_flag(pos)) {
-                // 值起点：跳过连续的 =/:/空白（皆为 ascii，字节偏移即字符边界）
+            if is_kv {
+                // 值起点：跳过连续的分隔符/空白/引号（§55：引号也跳——
+                // `{"token":"abc"}` 的值从 abc 起截）
                 let value_start = rest
-                    .find(|c: char| c != '=' && c != ':' && c != ' ' && c != '\t')
+                    .find(|c: char| !skip_sep_ws(c) && c != '=' && c != ':')
                     .map(|off| pos + kw.len() + ws + off)
                     .unwrap_or(line.len());
                 note(value_start);
                 break;
             }
             if !is_word_start(pos) {
-                // 词中且非（本规则认定的）键值形态——继续找后面的命中
+                // 词中且非键值形态——继续找后面的命中
                 continue;
             }
             if *kw == "bearer"
@@ -110,21 +114,22 @@ pub fn sanitize_line(line: &str) -> String {
     }
     // §51/§53：Authorization: 后按 scheme 脱敏（任意 scheme）——scheme 词
     // 保留，其后的值整体替换；`Authorization: <单段值>`（无 scheme 形态）
-    // 从冒号后直接整体替换。§53：遍历命中（`reauthorization` 的词中命中
-    // 不挡真头），且冒号必须紧跟关键字（中间只许空白）。
+    // 从冒号后直接整体替换。§53：遍历命中且冒号必须紧跟关键字；§55：
+    // 关键字与冒号之间允许空白**和引号**（`"Authorization":"Basic …"`、
+    // `'authorization': 'Basic …'`），scheme 值前也跳过引号。
     for (pos, _) in lower.match_indices("authorization") {
         if !is_word_start(pos) {
             continue;
         }
         let after_kw = &lower[pos + "authorization".len()..];
-        let trimmed = after_kw.trim_start_matches([' ', '\t']);
+        let trimmed = after_kw.trim_start_matches(skip_sep_ws);
         if !trimmed.starts_with(':') {
             // 不是 Authorization 头（`authorization failed, see https://…`）——
             // 不得拿后面任意位置的冒号（`https:`）误伤
             continue;
         }
         let credentials = &trimmed[1..];
-        if let Some(mut value_start) = credentials.find(|c: char| !c.is_whitespace()) {
+        if let Some(mut value_start) = credentials.find(|c: char| !skip_sep_ws(c)) {
             // 跳过一个 scheme 词（Basic / Bearer / token …）再取值；
             // scheme 词之后没有更多内容（单段值形态）则从值起点整体替换
             let scheme_and_rest = &credentials[value_start..];
@@ -132,7 +137,7 @@ pub fn sanitize_line(line: &str) -> String {
                 .find(|c: char| c.is_whitespace())
                 .unwrap_or(scheme_and_rest.len());
             let after_scheme = &scheme_and_rest[scheme_len..];
-            if let Some(follow) = after_scheme.find(|c: char| !c.is_whitespace()) {
+            if let Some(follow) = after_scheme.find(|c: char| !skip_sep_ws(c)) {
                 value_start += scheme_len + follow;
             }
             let colon_off = after_kw.len() - trimmed.len() + 1;
@@ -188,8 +193,9 @@ pub fn sanitize_stderr_tail(tail: &str) -> String {
 /// §53 F-SP2-6：VALUE_FLAGS（`--auth`）要求**前导 `-`**——裸位置参数
 /// （`gh auth login` 的 `auth`、裸 `h`）不是 flag，不得吞掉下一个 arg；
 /// `-H` **区分大小写**（curl 的 header flag 是大写 `-H`，`-h` 是 help），
-/// 且任何以 `-H` / `--header` 开头的 arg（含 `-HAuthorization: …` 连写）
-/// 都按敏感处理。
+/// 且任何以 `-H` 开头的 arg（含 `-HAuthorization: …` 连写）都按敏感处理。
+/// §55 P3：`--header` 精确匹配（独立 flag 或 `--header=…` 连写、保留 `=`），
+/// 不再误伤 `--headers` / `--header-file`（见 [`header_flag_prefix`]）。
 pub fn sanitize_args(args: &[String]) -> Vec<String> {
     const KEYWORDS: &[&str] = &["key", "token", "secret", "password"];
     const VALUE_FLAGS: &[&str] = &["auth"];
@@ -240,15 +246,25 @@ pub fn sanitize_args(args: &[String]) -> Vec<String> {
 
 /// §53 F-SP2-6：curl 的 header flag——大写 `-H`（大小写敏感：`-h` 是
 /// help）或 `--header`（大小写不敏感）。返回 flag 前缀的字节长度（连写
-/// 值紧跟其后）；任何以二者开头的 arg 都按敏感处理（header 串可能带
-/// `Authorization: Bearer …`，宁枉勿纵）。
+/// 值紧跟其后）。
+/// §55 P3：`--header` 改**精确**匹配——只认独立 flag `--header` 与连写
+/// `--header=…`（前缀含 `=`，输出保留 `=`）；`--headers` / `--header-file`
+/// 不是 header flag（§54 的前缀匹配吞掉 flag 名，且 `--header-file /x`
+/// 的值反而可见）。`-H` 仍按前缀连写（任何 `-H…` arg 都按敏感处理——
+/// header 串可能带 `Authorization: Bearer …`，宁枉勿纵）。
 fn header_flag_prefix(arg: &str) -> Option<usize> {
     let bytes = arg.as_bytes();
     if bytes.len() >= 2 && bytes[0] == b'-' && bytes[1] == b'H' {
         return Some(2);
     }
-    if bytes.len() >= 8 && bytes[..8].eq_ignore_ascii_case(b"--header") {
-        return Some(8);
+    if let Some(head) = arg.get(..8) {
+        if head.eq_ignore_ascii_case("--header") {
+            let rest = &arg[8..];
+            if rest.is_empty() || rest.starts_with('=') {
+                // 独立 flag 返回 8；`--header=…` 返回 9（含 `=`，输出保留）
+                return Some(if rest.is_empty() { 8 } else { 9 });
+            }
+        }
     }
     None
 }
@@ -309,6 +325,8 @@ mod tests {
 
     /// §51「sanitize_line 误伤正常参数且仍有漏网」：`sk-`/关键字只在词首
     /// 匹配、bearer 必须独立词——§51 列的误伤样本必须原样保留。
+    /// §55 F-SP2-8：`--monkey=banana` 移入「可接受误伤」列（dash 例外删除，
+    /// 见 `sanitize_line_acceptable_collateral_column_is_redacted_by_design`）。
     #[test]
     fn sanitize_line_keeps_args_that_only_collide_mid_word() {
         for intact in [
@@ -317,7 +335,6 @@ mod tests {
             "/w/task-list.md",
             "https://desk-api.example.com/v1",
             "--no-bearer-check",
-            "--monkey=banana",
             "plain log line",
         ] {
             assert_eq!(
@@ -373,11 +390,12 @@ mod tests {
         assert_eq!(sanitized[7], "/tmp/out.json");
     }
 
-    /// §53 F-SP2-6 表驱动·泄漏列：§53 列出的**每一个**泄漏样例——§51 词首
-    /// 修复削弱脱敏造成的三组回归（sk- 只看首命中 / 分隔符前有空白 /
-    /// 键值形态要求词首）+ Authorization 首命中与冒号错位 + 关键字循环
-    /// break + §51 原始样本（回归锁定）。脱敏规则已来回两轮（§51→§53），
-    /// 本表锁定行为：输出必须不含机密片段、且带 `***` 标记。
+    /// §53 F-SP2-6 / §55 F-SP2-8 表驱动·泄漏列：§53 与 §55 列出的**每一个**
+    /// 泄漏样例——§51 词首修复削弱脱敏造成的三组回归 + Authorization 首命中
+    /// 与冒号错位 + 关键字循环 break + §51 原始样本（回归锁定）+ §55 的
+    /// dash 例外泄漏（camelCase/-D/-P/-e/diff 删除行）、带引号的
+    /// Authorization/JSON 键值、非 ASCII 空白分隔。脱敏规则已来回三轮
+    /// （§51→§53→§55），本表锁定行为：输出必须不含机密片段、且带 `***`。
     #[test]
     fn sanitize_line_leak_table_every_entry_is_redacted() {
         const LEAKS: &[(&str, &str)] = &[
@@ -406,6 +424,33 @@ mod tests {
             ("Authorization: Bearer xyz-secret-1", "xyz-secret-1"),
             ("Authorization: Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"),
             ("Authorization: token ghp_abc123def", "ghp_abc123def"),
+            // §55 F-SP2-8 回归 1：dash 例外过宽——flag 名（camelCase 复合 /
+            // Java -D / gradle -P / docker -e / unified diff 删除行）内的
+            // 键值形态必须照脱（§54 只为保 --monkey=banana，代价过高）。
+            //（值取 S9/SECRET 等非前缀子串——`clientSecret` 自带大写 S，
+            // 用单字符 S 断言会撞前缀。）
+            ("--apiKey=SECRET", "SECRET"),
+            ("--accessToken=S9", "S9"),
+            ("--clientSecret=S9", "S9"),
+            ("--dbPassword=S9", "S9"),
+            ("mvn deploy -Dpassword=SECRET", "SECRET"),
+            ("java -DapiKey=S -jar x.jar", "S"),
+            ("docker run -ePASSWORD=SECRET img", "SECRET"),
+            ("gradle -PsigningKey=S9", "S9"),
+            // unified diff 的删除行（`+PGPASSWORD=` 本就会脱敏）
+            ("-PGPASSWORD=hunter2", "hunter2"),
+            // §55 F-SP2-8 回归 2：「冒号必须紧跟」破坏了带引号的形态——
+            // 关键字/Authorization 与分隔符之间允许引号（JSON 键值缺口
+            // `{"apiKey": "abc"}` 三版共有，一并闭合）
+            (r#"{"headers":{"Authorization":"Basic SECRET"}}"#, "SECRET"),
+            ("'authorization': 'Basic SECRET'", "SECRET"),
+            (r#"{"apiKey": "abc"}"#, "abc"),
+            (r#"{"token":"abc"}"#, "abc"),
+            // §55 P3：分隔符前的空白只跳 ASCII 空格/tab 的回归——任意
+            // Unicode 空白（NBSP / U+3000 / CR）都算键值
+            ("password\u{a0}= S", "S"),
+            ("token\u{3000}= S", "S"),
+            ("password\r=S", "S"),
         ];
         for (input, secret) in LEAKS {
             let out = sanitize_line(input);
@@ -423,6 +468,10 @@ mod tests {
     /// §53 F-SP2-6 表驱动·保留列：§51 的误伤样本必须原样保留（修复不得
     /// 以回退误伤修复为代价），外加 §53 的 Authorization 冒号紧跟规则
     ///（`https:` 的冒号不再触发）。
+    /// §55 F-SP2-8：`--monkey=banana` 移入「可接受误伤」列（dash 例外删除）。
+    /// 已知未覆盖（§55 记录，非回归，留脱敏专项）：`--bearer-token SECRET`
+    /// 仍泄漏（独立 bearer 规则的副作用；`sanitize_line` 本就不覆盖空格
+    /// 分隔的 `--flag value` 形态）——删除 dash 例外不影响它（非键值形态）。
     #[test]
     fn sanitize_line_intact_table_is_untouched() {
         const INTACT: &[&str] = &[
@@ -431,11 +480,9 @@ mod tests {
             "task-list.md",
             "https://desk-api.example.com/v1",
             "--no-bearer-check",
-            // flag 名（前导 `-`）里的词中键值命中按误伤处理
-            "--monkey=banana",
             // desk- / risk- 词中命中 sk-：无真密钥时不得截断
             "risk-assessment of desk- usage",
-            // §53：Authorization 的冒号必须紧跟关键字（中间只许空白）
+            // §53：Authorization 的冒号必须紧跟关键字（中间只许空白/引号）
             "authorization failed, see https://example.com/help",
             "plain log line",
         ];
@@ -444,6 +491,29 @@ mod tests {
                 sanitize_line(input),
                 *input,
                 "§53 保留列：{input:?} 不得被误伤"
+            );
+        }
+    }
+
+    /// §55 F-SP2-8 表驱动·可接受误伤列：删除 dash 例外（宁枉勿纵）后，
+    /// flag 名里的键值命中**按设计脱敏**——与保留列（必须原样）区分：
+    /// 这里断言的是「确实被脱敏」，是 §55 明示接受的代价（换取上表全部
+    /// dash 形态泄漏闭合）。
+    #[test]
+    fn sanitize_line_acceptable_collateral_column_is_redacted_by_design() {
+        const COLLATERAL: &[(&str, &str)] = &[
+            // §55 明示接受：`--monkey=banana → --monkey= ***`
+            ("--monkey=banana", "banana"),
+        ];
+        for (input, value) in COLLATERAL {
+            let out = sanitize_line(input);
+            assert!(
+                !out.contains(value),
+                "§55 可接受误伤列：{input:?} 的输出 {out:?} 不得泄漏 {value:?}"
+            );
+            assert!(
+                out.contains("***"),
+                "§55 可接受误伤列：{input:?} 按设计脱敏，实际输出 {out:?}"
             );
         }
     }
@@ -482,9 +552,38 @@ mod tests {
         assert_eq!(out[2], "-H***", "-H 连写形态整体脱敏");
         assert_eq!(out[3], "--header");
         assert_eq!(out[4], "***", "--header 的值是 header 串");
-        assert_eq!(out[5], "--header***", "--header= 连写形态整体脱敏");
+        assert_eq!(
+            out[5], "--header=***",
+            "--header= 连写保留 `=`，其余整体脱敏"
+        );
         assert_eq!(out[6], "--auth");
         assert_eq!(out[7], "***", "--auth 的值是凭证");
+    }
+
+    /// §55 P3（sanitize_args）：header flag **精确**匹配——`--headers` /
+    /// `--header-file` 不是 `--header`（§54 的前缀匹配吞掉 flag 名：
+    /// `--header=…` 丢 `=`、`--headers a` / `--header-file /x` 被错误掩码
+    /// 且后者的值反而可见）；`-H` 仍按前缀连写（大小写敏感，含 `-HL`
+    /// 这类 `-H` 前缀族——宁枉勿纵，按设计并入）。
+    #[test]
+    fn sanitize_args_header_flag_matching_is_exact() {
+        let out = sanitize_args(&[
+            "--headers".to_string(),
+            "a".to_string(),
+            "--header-file".to_string(),
+            "/x".to_string(),
+            "--header=Authorization: Bearer abc".to_string(),
+            "-HL".to_string(),
+        ]);
+        assert_eq!(out[0], "--headers", "--headers 不是 --header，不得误伤");
+        assert_eq!(out[1], "a", "--headers 的值照旧可见");
+        assert_eq!(
+            out[2], "--header-file",
+            "--header-file 不是 --header，不得误伤"
+        );
+        assert_eq!(out[3], "/x", "--header-file 的值照旧可见（不是 header 串）");
+        assert_eq!(out[4], "--header=***", "--header= 连写保留 `=`");
+        assert_eq!(out[5], "-H***", "-H 前缀（大小写敏感）仍连写——按设计并入");
     }
 
     /// F-BENCH-8：整段脱敏——含密钥的行被截断，普通行与空行原样，行数与

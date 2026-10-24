@@ -417,6 +417,15 @@ const INITIAL: TreeState = {
 /** QUOTA_EXCEEDED(rule=open-homes) must name the limit and the remedy. */
 export function presentError(error: unknown): string {
   const text = String(error)
+  // §55 P3：连接重建失败的原始报错（`enroll: connection closed: …`，超时
+  // 形态与 Rust is_read_timeout 同族）映射为友好文案——原始 enroll 报错
+  // 对用户不可读，且会覆盖「结果未知…请刷新确认」的提示。
+  if (
+    text.includes('enroll: connection closed:')
+    && (text.includes('Resource temporarily unavailable') || text.toLowerCase().includes('timed out'))
+  ) {
+    return 'daemon 无响应（30s）：连接重建失败，当前列表可能已过期——请稍后重试或刷新确认。'
+  }
   if (text.includes('QUOTA_EXCEEDED') && text.includes('open-homes')) {
     return `同时打开的 home 数量已达 daemon 配额上限。解法：调大 daemon.json 的 limits.max_open_homes，或重启 daemon 释放空闲 home。(${text})`
   }
@@ -427,6 +436,16 @@ export function presentError(error: unknown): string {
     return `该 home 被 ts-bridge 占用，需显式 takeover（omt takeover）。(${text})`
   }
   return text
+}
+
+/**
+ * §55 P3：超时类提示（Rust `DAEMON_TIMEOUT_MESSAGE` / 重建失败友好文案都
+ * 带「结果未知」或「daemon 无响应」标记）。refreshHomes 的**成功**路径不得
+ * 清除它——home 列表拉回来了不等于节点树刷新过，用户还没确认上次写入是否
+ * 生效；成功的节点拉取（refreshNodes → error: null）才清。
+ */
+function isTimeoutNotice(text: string): boolean {
+  return text.includes('结果未知') || text.includes('daemon 无响应')
 }
 
 /**
@@ -1031,7 +1050,10 @@ export function useTreeStore() {
           // adopts the home's persisted filters.
           filters: autoPicking ? {} : s.filters,
           loading: false,
-          error: null,
+          // §55 P3：成功路径不清除「超时类」错误——树并未随 homes 刷新，
+          // 用户还没确认上次写入是否生效（原始的 `error: null` 会抹掉刚
+          // 显示的「daemon 无响应（30s）」）；成功的节点拉取才清。
+          error: s.error !== null && isTimeoutNotice(s.error) ? s.error : null,
         }
       })
     } catch (error) {

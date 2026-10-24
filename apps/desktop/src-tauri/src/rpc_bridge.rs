@@ -252,8 +252,13 @@ pub async fn daemon_homes(shared: State<'_, SharedSession>) -> Result<serde_json
     })
 }
 
-#[tauri::command]
-pub fn daemon_ensure(shared: State<'_, SharedSession>) -> Result<daemon::DaemonStatus, String> {
+/// §55 F-SP2-9：改 async——`daemon_ensure` 经 with_session 惰性建立会话
+///（连接 + 握手最长 30s），同步命令跑在主线程；与 daemon_homes/omt_call
+/// 共享同一把会话 Mutex，后者持锁重建时主线程会在锁上等最长 30s（转圈）。
+#[tauri::command(async)]
+pub async fn daemon_ensure(
+    shared: State<'_, SharedSession>,
+) -> Result<daemon::DaemonStatus, String> {
     with_session(&shared, |_session| Ok(()))?;
     daemon_status()
 }
@@ -406,8 +411,11 @@ fn subscription_pump(
 
 /// U10 seam（U15 重构）：登记/切换某 home 的事件订阅。幂等线程预算——
 /// 全 app 仅一条泵线程（首次调用时启动），此后调用只更新注册表。
-#[tauri::command]
-pub fn events_subscribe(
+/// §55 F-SP2-9：改 async——本命令经 with_session 取 runtime 目录，碰与
+/// daemon_homes/omt_call 同一把会话 Mutex；后者惰性重建（握手读超时
+/// 30s / sidecar 拉起 10s）持锁时，同步命令会在主线程锁上等 30s。
+#[tauri::command(async)]
+pub async fn events_subscribe(
     app: AppHandle,
     shared: State<'_, SharedSession>,
     home_id: String,
@@ -486,5 +494,40 @@ mod daemon_homes_tests {
             src.contains("session.handshake_homes()?"),
             "daemon_homes 必须透传 handshake_homes 的错误（§53 F-SP2-7）"
         );
+    }
+
+    /// §55 F-SP2-9：`events_subscribe` / `daemon_ensure` 同为经 `with_session`
+    /// 碰会话 Mutex 的命令——`daemon_homes` / `omt_call` 惰性重建（握手读
+    /// 超时 30s / sidecar 拉起 10s）整段持锁时，任何**同步**命令都会在主
+    /// 线程的锁上等最长 30s（转圈）。F-SP2-7 的「重建不卡主线程」只有在
+    /// 没有同步命令碰这把锁时成立。tauri 胶水无运行时缝，与 daemon_homes
+    /// 同法按源文本锁定：两个命令必须 async。
+    #[test]
+    fn events_subscribe_and_daemon_ensure_are_async_attributed() {
+        let src =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/rpc_bridge.rs"))
+                .expect("read rpc_bridge.rs source");
+        assert!(
+            src.contains("#[tauri::command(async)]\npub async fn events_subscribe"),
+            "events_subscribe 必须是 #[tauri::command(async)]（会话锁上最长等 30s，不得跑主线程）"
+        );
+        assert!(
+            src.contains("#[tauri::command(async)]\npub async fn daemon_ensure"),
+            "daemon_ensure 必须是 #[tauri::command(async)]（会话锁上最长等 30s，不得跑主线程）"
+        );
+        // 守卫面：with_session 的调用方必须全部在 async 命令里——同步命令
+        //（无 `async fn` 签名）出现即红。（needle 运行时拼接，避免本测的
+        // 字面量被自己扫到。）
+        let needle = ["with_session", "(&shared"].join("");
+        for site in src.match_indices(&needle).map(|(i, _)| i) {
+            let fn_start = src[..site]
+                .rfind("pub ")
+                .expect("with_session 调用点在 pub fn 内");
+            let signature = &src[fn_start..site];
+            assert!(
+                signature.contains("async fn"),
+                "with_session 调用点必须位于 async 命令内（同步命令持会话锁会卡主线程）：{signature:?}"
+            );
+        }
     }
 }
