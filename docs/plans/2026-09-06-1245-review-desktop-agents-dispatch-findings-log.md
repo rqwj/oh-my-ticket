@@ -45,8 +45,9 @@ branch: feat/desktop-agents-dispatch
 | F-SP2-7 | P2 | gated_auto | 桌面 | `state.rs::handshake_homes` / `rpc_bridge.rs::daemon_homes`（§52 惰性重建） | 超时丢弃连接后，重建失败被吞成 `homes: []` → 切换器清空且清掉「daemon 无响应」错误条；同步命令在主线程重建（最长 30s）会转圈 | fixed(2b77285) | — |
 | F-SP2-8 | P2 | gated_auto | 执行面/脱敏 | `sanitize.rs::sanitize_line`（§54 dash 例外 + Authorization 冒号紧跟） | dash 例外不止放过 `--monkey=banana`：`--apiKey=S`、`-Dpassword=S`、`-ePASSWORD=S`、`-PGPASSWORD=S` 旧版脱敏、新版泄漏；「冒号紧跟」规则让 JSON 形态 `"Authorization":"Basic S"` 重新泄漏 | fixed(26df96c) | — |
 | F-SP2-9 | P2 | gated_auto | 桌面 | `rpc_bridge.rs::events_subscribe` / `daemon_ensure`（同步命令持会话锁） | async 的 `daemon_homes`/`omt_call` 持会话锁做 30s 重建时，切 home 触发同步 `events_subscribe` 在主线程等同一把锁 → 仍会转圈（既有，F-SP2-7「不卡主线程」未闭合） | fixed(26df96c) | — |
-| F-SP2-10 | P2 | gated_auto | 桌面 | `rpc_bridge.rs::events_subscribe`（§56 改 async） | 先在会话锁上排队、拿到锁才 `set_target`；`std::sync::Mutex` 非 FIFO，快速切 home A→B 时 A 可能后拿锁 → 事件泵停在 A，B 的树不再随外部改动刷新，前端 `.catch(() => {})` 静默（回归） | fixed(da867c5) | — |
-| F-SP2-11 | P2 | gated_auto | 桌面 | `store.ts::refreshAgents`（§56 超时提示保留） | 窗口聚焦与 home 加载都会调非静默 `refreshAgents()`，`agents_list` 只读文件系统、daemon 卡死也成功 → `error: null` 照样清掉「结果未知」提示，§56 的保留规则在它针对的触发点上失效 | fixed(da867c5) | — |
+| F-SP2-10 | P2 | gated_auto | 桌面 | `rpc_bridge.rs::events_subscribe`（§56 改 async） | 先在会话锁上排队、拿到锁才 `set_target`；`std::sync::Mutex` 非 FIFO，快速切 home A→B 时 A 可能后拿锁 → 事件泵停在 A，B 的树不再随外部改动刷新，前端 `.catch(() => {})` 静默（回归） | fixed(03bcead) | — |
+| F-SP2-11 | P2 | gated_auto | 桌面 | `store.ts::refreshAgents`（§56 超时提示保留） | 窗口聚焦与 home 加载都会调非静默 `refreshAgents()`，`agents_list` 只读文件系统、daemon 卡死也成功 → `error: null` 照样清掉「结果未知」提示，§56 的保留规则在它针对的触发点上失效 | fixed(03bcead) | — |
+| F-SP2-12 | P2 | gated_auto | 桌面 | `store.ts::presentErrorWithKind` 之外的全部错误展示点（§58 `[daemon-timeout]` 机器前缀） | 前缀只在 store 的 `applyError`/`updateNode`/`declareHome` 剥掉；新建节点（`TreePanel` ← `createNode` 原样抛）、派发（`ExecutionDialog` ← `startDispatch` 原样抛）、RunsPanel / DetailPanel / AgentsPanel 的 run/control、run/report、run/create、node/update、node/archive 均 `String(err)` 直显 → 超时时界面出现字面量「[daemon-timeout] daemon 无响应…」，且这些写路径（含无 commandId 的 node/create、run/create）不落 timeoutNotice（回归，显示层） | open | — |
 | F-BENCH-18 | P1 | gated_auto | BENCH | `.gitignore:26` / `fixtures/harness/*/raw.log` | **raw.log 语料未入库**：`*.log` 规则把三份 raw.log 全部忽略，只存在于本机。`raw_log_replay_matches_recorded_events` 在干净 clone / CI 上会 panic（「raw.log 应存在」），CI rust 任务必红；F-BENCH-15 在仓库里实际未关闭（§30） | fixed(55a8e55 + 2b8e036)：入库 + 必需文件清单入测（缺一即红）；「时间戳已清洗」「≥12 下限」两项不实声明由 F-BENCH-24 在 2b8e036 兑现 | — |
 | F-BENCH-19 | P1 | gated_auto | BENCH/U12 | `adapters.rs::parse_opencode` step_finish | **opencode 的 usage 也是逐步的值，被误标为累计**：语料 4 个 step_finish 各带不同 messageID，每个 total = 该步 input + output + reasoning + cache.read（如 1518+45+109+23040 = 24712）。按「累计取末值」报 25460，实为 98225（少报约 3.9 倍）；本卷免费档 cost=0 掩盖了问题，付费 provider 会少报费用（§30） | fixed(55a8e55)：opencode 标 message，98225 入测 | — |
 | F-BENCH-20 | P3 | testing-gap | BENCH/U12 | `executor.rs::UsageTotals` | `record` / `final_totals` 无直接单测（混合 scope、全零、历史无 scope 事件）；修复前归档的 ExecRecord 用量仍是旧口径，未重算也未标注 | fixed(55a8e55 + e87a99a)：UsageTotals 四形态单测；口径自描述——ExecRecord.usageCaliber（"message-sum"，旧 JSON 兼容读 None = 末条口径）+ 归档直达测试 + TS 类型；不重算（usageTokens/usageCost 无 UI 消费点，标注路线即关闭，§34） | — |
@@ -2246,3 +2247,58 @@ F-BENCH-13 查证结论：4e960a2 提交说明声称的探针/capture/lib 改动
 **验证**：workspace 519 ×3 连续全绿（517 基线 +2；首轮一次 401/1 为并发编译负载早停 flake，即刻复跑三连绿）；前端 212（+5）、tsc 干净；根 vitest 447；clippy/fmt 干净；nm daemon 双零。台账 F-SP2-10/11 翻 fixed(03bcead)。
 
 **未做（§57 其余 P3，留后续）**：async 命令包 `spawn_blocking`（既有）、`sanitize.rs` 头注释过时、注释「exit 恒为 jsonl 末行」的 drain 超时例外、`{"key":…}` 类 JSON 键截断的进一步细分（已入可接受误伤列）。
+
+### §59. §58 修复复审（2026-10-24，03bcead）
+
+**范围**：`03bcead`（F-SP2-10/11 + §57 P3）。评审 ①（桌面端：Rust 命令 / store / 退出 / 源码断言，含变异测试）、评审 ②（脱敏：新旧两版对照、探针、模糊、变异），主控抽查 runtime dir 同源、`subscribeEvents` 顺序与各展示点。
+
+**验证**：workspace 519 ×3 连续全绿（无 flake）；clippy/fmt 干净；nm daemon 0；`pnpm gen` 无差异；根 tsc 干净、根 vitest 447；桌面 tsc 干净、vitest 212。评审 ① 另跑桌面 crate `--lib` 25/25；把 store.ts 换回 978bebc 版本，p57 全部 5 条与修订后的 p55 超时用例均变红——新测试是真测试。
+
+**台账更正**：F-SP2-10/11 的 `fixed(da867c5)` 是改写前的哈希（不在本分支上），已改为 `fixed(03bcead)`，与 §58 正文一致。
+
+**结论**：F-SP2-10、F-SP2-11 按处方修复且确认关闭；脱敏无新增泄漏，§57 两条脱敏 P3 均闭合。新增 1 条 P2（本轮引入，显示层）：F-SP2-12。
+
+#### 已核实正确
+
+- **F-SP2-10**：`events_subscribe`（`rpc_bridge.rs:423`）与 `DaemonSession::establish`（`state.rs:39`）调用同一个 `daemon::runtime_dir()`，每次读 env；桌面与链接的 crate 无 `set_var("OMT_RUNTIME_DIR")`，sidecar 以同一目录拉起——不会分叉。Tauri 2.12.4 的同步命令在主线程内联执行，命令不再碰会话锁 → `set_target` 顺序 = 到达顺序。`subscribeEvents`（`bridge.ts:89-98`）先 `invoke` 后 `listen`：invoke 失败不留监听器；dispose 后才 resolve 的 unlisten 立即调用。
+- **F-SP2-11**：聚焦的 `refreshAgents`、`refreshHomes` 成功只写 `error: null`，不再触碰 `timeoutNotice`。Rust 侧 `DAEMON_TIMEOUT_MESSAGE` 只在 `state.rs:94/112` 产生，经 `omt_call`、`rpc_of → launch::start` 原样 `?` 上抛，无二次包裹，前缀始终在开头。
+- **退出**：两处确认框当前行为都正确——CloseRequested 的 Keep 隐藏窗口不退出，ExitRequested 的 Keep 置位后退出，两个 Stop 都经 `quit_stop_branch`，Cancel 清 `DIALOG_OPEN`。
+- **脱敏**：白名单只能保留与 scheme 名完全相等的词，不可能引入泄漏；无 scheme、转义 JSON（含 `\\\"` 双重转义）、`**password**: S`、`` `token`=S ``、Go `map[Authorization:[S]]` 等此前泄漏的形态全部遮住；AWS4 头保留 scheme、`Credential=` 起整体遮掉（含 Signature）。300 万结构化随机行 + 75 万随机字节行无 panic，变化输出均满足「输入前缀 + ` ***`」；8MB 对抗形态 4–23ms，线性。变异：白名单恒真 / 恒假、去掉 `\` 均被抓。
+
+#### F-SP2-12 · P2 · `[daemon-timeout]` 前缀在大部分写路径上原样显示，且这些写路径不落 timeoutNotice（评审 ① + 主控，回归）
+
+- 前缀只在 `presentErrorWithKind` 的调用点剥掉：store 的 `applyError`、`updateNode`、`declareHome`。其余展示点直接 `String(err)`，Tauri 以 Rust 原串拒绝，文本以 `[daemon-timeout]` 开头：
+  - `TreePanel.tsx:356` ← `store.createNode`（`store.ts:1271-1287` 原样抛）→ `node/create`，无 commandId，正是 `state.rs:12-14` 点名的重复提交风险路径；
+  - `ExecutionDialog.tsx:225/314/338` ← `startDispatch`（`store.ts:925-929` 原样抛）→ `exec_start`，以及 `run/add-members`；
+  - `RunsPanel.tsx:27/38/63/80`（run/get、run/control、run/report、node/update）、`DetailPanel.tsx:86/127/138`（node/get、run/create、node/archive）、`AgentsPanel.tsx:347/358/729`（信任门 run/report、node/update、resume）。
+- 场景：新建节点时 daemon 读超时 → 对话框显示「[daemon-timeout] daemon 无响应（30s）：…」。修复前这些位置显示的是干净文案；也与 `daemon.rs:189` 注释「前缀在展示层剥掉」不符。
+- 次要：这些写路径不设 `timeoutNotice`。错误留在组件本地状态里，聚焦刷新不清它，所以缺口比 F-SP2-11 小。
+- **建议**：在 `bridge.ts` 的 `omtCall` / `execStart` 出口统一处理——捕获后抛出带 `{text, daemonTimeout}` 的类型化错误（`toString()` 返回去前缀文案），`applyError` 按类型分流；或导出一个展示 helper 并替换全部 `String(err)` 展示点，写路径调用 store 的 `noteTimeout(error)` 落粘性提示。补一条组件级用例：createNode 超时不出现字面量前缀。
+
+#### P3
+
+**桌面端**
+- **「跨语言锁定」并不存在**（评审 ①）：`daemon.rs:415-420` 断言自己写死的 `"[daemon-timeout] "`，`store.ts:433` 另写一份，p57 / p55 测试手抄整句文案。没有任何测试从一边读另一边的值——Rust 侧把前缀和自己的测试一起改，前端会静默把超时退回 `error`。建议导出 `DAEMON_TIMEOUT_MARKER`，加一条 vitest 读 `../src-tauri/src/daemon.rs` 抽出 `DAEMON_TIMEOUT_MESSAGE` 字面量，断言以该前缀开头，并用抽出的字符串喂 store 测试。
+- **timeoutNotice 的清除不绑定写入与 home**（评审 ①）：
+  - 任何成功的 `refreshNodes` 都清（`store.ts:1136`）：事件去抖（`:1345`）由无关信封触发（run claim 风暴）；切到 home B 的 `loadHome(B)` 会清掉关于 home A 写入的提示。
+  - 非 FIFO 的陈旧读：写入前**发出**的 `node/tree` 可能在写超时后才拿到锁、在重建的连接上执行；daemon 仍在处理写入时返回写前状态 → 成功 → 提示在毫秒内被抹掉。
+  - 读超时（`node/tree`）也落「可能已生效」的粘性提示，对读请求是误导。
+  - 无关闭按钮；无活动 home 时（如零 home 下 `declareHome` 超时）提示永不清除。
+  - 建议：提示记 `{homeId, seq}`，只有同 home、在超时之后发出的 `refreshNodes` 成功才清（序号计数器）；只把写超时路由到提示；加关闭按钮。（相关既有问题：`refreshNodes` 无活动 home 守卫，A 的陈旧结果可覆盖 B 的 `nodes`。）
+- **「订阅失败进错误状态」基本是死代码**（评审 ①）：Rust `events_subscribe` 现在恒返回 `Ok(())`（`rpc_bridge.rs:423-437`）；真实失败在泵里（无活 descriptor、`events/resume` 出错，`:375-405`），泵静默无限重试。`.catch`（`store.ts:1357-1361`）只在 IPC / `listen` 失败时触发，且并发的 `loadHome → refreshNodes` 成功会立刻 `error: null` 抹掉——p57 用例要挂住 `node/tree` 才观察得到。建议泵连续失败 N 次后发 `omt://events-status {homeId, ok, error}`，进独立字段展示。§58「订阅失败不再被吞」的说法偏宽。
+- **退出源码断言仍漏两种回归**（评审 ① 变异确认，测试保持绿）：
+  - 在 ExitRequested 的 `match` 之后加回共享尾部（`QUIT_CONFIRMED.store(true, …); handle.exit(0);`），Keep 分支不动 → Stop 落入尾部（F-SP2-4 原样复现），Cancel 也会退出。原因：Stop 区域截止到下一个 `QuitChoice::`，最后一个分支之后的代码从不扫描。
+  - 给 CloseRequested 的 Keep 分支（`lib.rs:224`，本应隐藏并继续运行）加上 store + `exit(0)`：`keep_owns_exit >= 1` 区分不了两处。
+  - 已正确抓住：给 Stop 分支加 store、删掉 Keep 分支的 exit。§58「结构性不可能」说法过度。建议把两处 `on_choice` 主体抽成返回动作枚举的具名函数并单测；或把扫描延伸到闭包末尾，并分别断言 CloseRequested 的 Keep 无 exit、ExitRequested 的 Keep 有 store+exit。
+- **`command_spans` 断言仍脆**（评审 ① 变异确认）：经命令 span 之外定义的 helper 加锁可通过（同步 `events_subscribe` 调 `session_dir(&shared)`，内部 `.0.lock()`，测试绿）；`with_session` 自身的 `.0.lock(` 函数体落在 `dsh_plugin_install` 的 span 里，只因该命令恰好是 `(async)` 才豁免——改成同步、或在 `with_session` 前新增一个同步命令就会误红。`with_session` 挪进同步命令的变异已被抓住。
+- vitest 新用例把说明文字当第二参数传给匹配器（`toBeNull('…')`、`toContain(x, '…')`、`toHaveLength(1, '…')`），被忽略；应写 `expect(value, msg)`。
+- 既有、非本轮：`daemon::runtime_dir()`（`daemon.rs:58-64`）未把空 / 纯空白的 `OMT_RUNTIME_DIR` 视为未设置（`docs/runtime/config.md:9` 要求），缺 `HOME` 时回退 `/tmp`，而 `paths.rs:37-48` 回退 `.`——与权威文档漂移（会话与订阅彼此一致）。
+
+**脱敏**
+- **加入 `*` 破坏幂等，双重脱敏输出变形**（评审 ②，`sanitize.rs:79-80` + 值起点 `:94`）：值起点查找也跳 `*`，已是掩码的值找不到起点 → 截点落在行尾，再追加一个 ` ***`：`API_KEY= ***` → `API_KEY= *** ***`；`--token=***` → `--token=*** ***`；`Authorization: Bearer ***` → `Authorization: ***`（scheme 丢失）。`sanitize_args_deep`（`omt-exec/src/local.rs:48-53`）对 `sanitize_args` 的输出再跑 `sanitize_line`，harness_list 工具输出从 `--api-key= ***` 变成 `--api-key=*** ***`。仅显示，无泄漏。建议值起点用窄集合（空白、引号、`\`），关键字与分隔符之间的跳过集保留 `` ` `` 和 `*`；LEAKS 各行加幂等断言 `sanitize_line(sanitize_line(x)) == sanitize_line(x)`。
+- **测试缺口**：去掉反引号、去掉 `*`、去掉 `is_known_auth_scheme` 的去引号（`:191`）三个变异都存活——建议 LEAKS 补 `("**password**: S9","S9")`、``("`token`=S9","S9")``。新增两行断言偏弱：`:512` 断言 `S\"` 而非 `S`、`:513` 断言 `Basic S` 而非 `S`（输入里没有其它大写 S，改成 `"S"` 更严）。
+- **注释过时**：`:128-132` 仍写「按 scheme 脱敏（任意 scheme）——scheme 词保留」；`:389-392` 的测试名 `…_any_scheme` 与说明同；`:91` 值起点注释只列「分隔符/空白/引号」。
+- **新增误伤未入可接受列**（可接受，建议入列留档）：``missing field `api_key`: at line 1`` → `` `api_key`: *** ``、``invalid value for `--key`: file not found``、`**Token**: 1024`、`glob key*: matched 3 files`、`{"error":"bad key\": oops"}`。实测：仓库全部 `*.md` 新旧差异仅 5 行（均为脱敏评审笔记），`fixtures/harness/*/help.txt` 与 `models.txt` 不变，jsonl 流 fixture 的变化只有转义 `\"token\"` / `\"leaseToken\"` 值被新遮住——`\` 的实际收益。
+- 仍泄漏、非回归（后续脱敏专项）：`Authorization=Basic S` / `HTTP_AUTHORIZATION=Basic S`（CGI / env 转储，最现实的缺口，规则要求 `:`）、`"` 转义、URL 编码、`&quot;`、驼峰 `proxyAuthorization:`、markdown 表格 `` | `password` | S | ``、`--flag value` 空格分隔形态（已记）。
+
+**建议**：修 F-SP2-12（`bridge.ts` 出口统一类型化错误最省事，一处覆盖全部展示点）；顺带做便宜的三条：真正的跨语言前缀测试、退出断言扫到闭包末尾并区分两处 Keep、`*` 移出值起点集合（恢复幂等）+ 两条反引号 / `*` 泄漏行 + 收紧两条弱断言。timeoutNotice 绑定 home / 序号、泵失败状态事件属于设计改进，可与 `spawn_blocking` 一起进后续桌面专项。
