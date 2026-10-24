@@ -193,6 +193,11 @@ pub fn serve(
             let (tx, rx) = std::sync::mpsc::channel::<LocalCall>();
             scope.spawn(move || {
                 for call in rx {
+                    // §51 P3：通知形式（无 id）的 tools/call 不回包——JSON-RPC
+                    // 通知没有响应；旧实现无条件写出 {"id":null,…} 违反协议。
+                    if call.is_notification {
+                        continue;
+                    }
                     let response = call_local_tool(local, call.action, call.arguments, &call.id);
                     // 写失败（stdout 已关）时继续排空队列后退出
                     let _ = write_stdout_line(&response.to_string());
@@ -243,14 +248,18 @@ pub fn serve(
                         }
                         None => match (&local_worker, local_action_of(name)) {
                             // §49：派给工作线程——本线程立刻回到读循环（ping
-                            // 不被本地调用阻塞）；响应由工作线程按 id 写出
+                            // 不被本地调用阻塞）；响应由工作线程按 id 写出。
+                            // §51 P3：通知（无 id）不回包——is_notification
+                            // 随派发传递，工作线程据此抑制响应写出。
                             (Some(tx), Some(action)) => {
                                 match tx.send(LocalCall {
                                     action,
                                     arguments,
                                     id: id.clone(),
+                                    is_notification,
                                 }) {
                                     Ok(()) => None,
+                                    Err(_) if is_notification => None,
                                     Err(_) => Some(error_reply(
                                         &id,
                                         -32603,
@@ -289,10 +298,13 @@ pub fn serve(
 }
 
 /// §49 mcp-stdio-worker：本地工具调用的一次派发（serve 线程 → 工作线程）。
+/// §51 P3：`is_notification` = 请求无 id——JSON-RPC 通知不得有响应，工作
+/// 线程据此跳过写出（此前无条件回包，输出 `{"id":null,…}`）。
 struct LocalCall {
     action: &'static str,
     arguments: serde_json::Value,
     id: serde_json::Value,
+    is_notification: bool,
 }
 
 /// 单行写 stdout 并 flush——serve 线程与本地工具工作线程共用（各自的锁在

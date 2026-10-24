@@ -769,6 +769,67 @@ fn mcp_exec_start_rejects_a_path_shaped_home_id() {
     mcp.shutdown();
 }
 
+/// §51 P3「MCP 对通知形式的 tools/call 也回包」：无 id 的 `tools/call`（本地
+/// 工具路径，走 §49 工作线程）是 JSON-RPC 通知——不得有任何响应写出（旧实
+/// 现无条件回包，输出 `{"id":null,…}` 违反协议）。手法：先发通知形式的
+/// exec__list，再发一个哨兵 ping 请求；request() 按 id 配对，其余行全部落进
+/// skipped——断言其中没有 id 为 null 的行（即通知没有产生响应）。
+#[test]
+fn mcp_notification_form_tools_call_gets_no_response() {
+    let ctx = TestCtx::spawn_named("mcp-local-notify");
+    let _daemon = common::DaemonProcess::spawn(&ctx, &["--home", ctx.home_str()]);
+    wait_endpoint(&ctx);
+    let mut mcp = McpProcess::spawn(&ctx);
+    initialize(&mut mcp);
+    // 通知形式：无 id 的 tools/call（本地工具 → 工作线程路径）
+    mcp.send_raw(
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": { "name": "exec__list", "arguments": {} }
+        })
+        .to_string(),
+    );
+    // 哨兵请求：等它应答的窗口里，通知的（非法）响应若存在必已到达
+    let sentinel = mcp.request("ping", json!({}));
+    assert!(sentinel.get("result").is_some(), "{sentinel}");
+    // 工作线程的写出与哨兵应答无顺序保证——再泵几轮 ping 收集迟到行
+    for _ in 0..5 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let _ = mcp.request("ping", json!({}));
+    }
+    assert!(
+        mcp.skipped.iter().all(|line| !line.contains("\"id\":null")),
+        "通知形式的 tools/call 不得产生响应（JSON-RPC 通知无响应）: {:?}",
+        mcp.skipped
+    );
+    mcp.shutdown();
+}
+
+/// §51 P3「MCP exec__list 仍接受路径形状 homeId」：§50 的守卫只在 exec_start
+/// ——只读动词同样守卫（MCP 只认 homeId，路径查找是 CLI 专属）。
+#[test]
+fn mcp_exec_list_rejects_a_path_shaped_home_id() {
+    let ctx = TestCtx::spawn_named("mcp-local-list-homeid-path");
+    let _daemon = common::DaemonProcess::spawn(&ctx, &["--home", ctx.home_str()]);
+    wait_endpoint(&ctx);
+    let mut mcp = McpProcess::spawn(&ctx);
+    initialize(&mut mcp);
+    let result = call_tool(
+        &mut mcp,
+        "exec__list",
+        serde_json::json!({ "homeId": ctx.home_str() }),
+    );
+    assert_eq!(result["result"]["isError"], true, "{result}");
+    let text = result["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.starts_with("INVALID_INPUT"),
+        "路径形态的 homeId 必须是 INVALID_INPUT（field homeId），不是按路径解析: {result}"
+    );
+    assert!(text.contains("homeId"), "结构化 field：{text}");
+    mcp.shutdown();
+}
+
 /// §49「MCP stdio 循环单线程阻塞」：本地工具调用（exec__start 阻塞在跨进程
 /// 派发锁上，获取超时 60s）期间 ping 必须保持应答——旧实现里 serve 循环被
 /// 本地调用占死，客户端超时放弃后 shim 已拉起、调用方拿不到 execId。
@@ -812,11 +873,13 @@ fn mcp_ping_stays_responsive_while_a_local_tool_call_blocks() {
     )
     .expect("test holds the launch lock");
 
-    // 先发 exec__start（id 1，不等应答），再发 ping——ping 必须在本地调用
+    // 先发 exec__start（不等应答），再发 ping——ping 必须在本地调用
     // 阻塞期间立刻应答（旧实现：ping 要等 exec__start 拿到锁并走完派发链）
+    // §51 测试卫生：id 用 9001（不与 initialize 的 id 1 复用——复用会与
+    // 乱序配对逻辑相混，响应归属不清）
     mcp.send_raw(
         &json!({
-            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "jsonrpc": "2.0", "id": 9001, "method": "tools/call",
             "params": { "name": "exec__start",
                         "arguments": { "homeId": home_id, "harness": "pi", "nodeId": "TICKET-1" } }
         })
@@ -846,7 +909,7 @@ fn mcp_ping_stays_responsive_while_a_local_tool_call_blocks() {
     );
 
     // 放锁：exec__start 继续走链（ticket 不存在 → LAUNCH_FAILED），其响应
-    // 乱序到达——被后续 request() 当作「跳过行」读到（id == 1）
+    // 乱序到达——被后续 request() 当作「跳过行」读到（id == 9001）
     drop(launch_lock);
     let mut mcp = reader.join().expect("ping reader thread");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
@@ -854,11 +917,11 @@ fn mcp_ping_stays_responsive_while_a_local_tool_call_blocks() {
         serde_json::from_str::<serde_json::Value>(line)
             .ok()
             .and_then(|v| v["id"].as_u64())
-            == Some(1)
+            == Some(9001)
     }) {
         assert!(
             std::time::Instant::now() < deadline,
-            "exec__start 的响应（id 1）应在放锁后 20s 内到达: {:?}",
+            "exec__start 的响应（id 9001）应在放锁后 20s 内到达: {:?}",
             mcp.skipped
         );
         let _ = mcp.request("ping", json!({})); // 泵一行，顺带收集跳过行
@@ -868,8 +931,8 @@ fn mcp_ping_stays_responsive_while_a_local_tool_call_blocks() {
         .skipped
         .iter()
         .find_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .filter(|v| v["id"].as_u64() == Some(1))
-        .expect("id 1 的响应");
+        .filter(|v| v["id"].as_u64() == Some(9001))
+        .expect("id 9001 的响应");
     assert_eq!(
         exec_reply["result"]["isError"], true,
         "ticket 不存在 → exec__start 报错（证明响应确实来自被阻塞的那个调用）: {exec_reply}"

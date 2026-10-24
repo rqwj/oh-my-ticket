@@ -307,6 +307,12 @@ export function AgentsPanel({
     setStopAllNotice(null)
     setArchiveNotice(null)
   }, [homeId])
+  // §51 in-flight-stop-all-archive：homeId 的「最新值」镜像——在途的停止全部
+  // / 归档结果回来时比对发起时的 home，切了 home 就整个丢弃（此前 A home
+  // 的结果会落到切换后的 B home 面板上）。渲染期赋值保证异步回调拿到的
+  // 永远是当前 home。
+  const homeIdRef = useRef(homeId)
+  homeIdRef.current = homeId
   // U14：全面板待裁决项（底部弹窗）——跨所有已拉取的 run 聚合。普通计算
   //（不得用 useMemo——须位于提前 return 之前且避免 hooks 位点抖动；stats 规模小）
   const awaitingItems: Array<{ runId: string; nodeId: string; title?: string }> = []
@@ -432,7 +438,10 @@ export function AgentsPanel({
   // agent 损坏时 parseFailed 也为真，但横幅不依赖这一点
   const handleArchive = onArchiveLegacy
     ? async () => {
+        // §51 in-flight-stop-all-archive：发起时捕获 home；结果回来时已切走就丢弃
+        const homeAtStart = homeId
         const archived = await onArchiveLegacy()
+        if (homeIdRef.current !== homeAtStart) return
         setArchiveNotice(`已归档 ${archived.length} 个文件到 .recovered/：${archived.join('、')}`)
       }
     : undefined
@@ -528,9 +537,12 @@ export function AgentsPanel({
     failed.length <= 2 ? failed.join('；') : `${failed[0]}；${failed[1]}；等 ${failed.length} 个`
   const handleStopAll = async () => {
     if (!onStopAll) return
+    // §51 in-flight-stop-all-archive：发起时捕获 home；结果回来时已切走就丢弃
+    const homeAtStart = homeId
     setStoppingAll(true)
     try {
       const outcome = await onStopAll()
+      if (homeIdRef.current !== homeAtStart) return
       const orphanNote =
         groups.orphan.length > 0 ? `；${groups.orphan.length} 个不受控 agent 需单独强制终止` : ''
       // review R2-7 / F-EXEC-12 / §43 P3：全失败、无事可做、成功、部分失败分开

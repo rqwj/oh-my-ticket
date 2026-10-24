@@ -74,6 +74,12 @@ const EXIT_REPULL_MS = 400 // exit 后 agents_list 防抖重拉（等 Rust 侧�
 // A8 / Q-10：窗口可见时的 agents_list 静默轮询周期（外部 CLI / MCP 发起的
 // 执行由此在桌面端无需切换焦点即可见）
 const AGENTS_POLL_MS = 5_000
+// §51 attach-retry：exec_attach 瞬时失败后的有界重试——§49 让 silent 轮询
+// 结果结构未变时跳过 setState（agents 引用稳定），失败后 AgentsPanel 键在
+// [agents] 上的接回 effect 不再每 5s 重跑，运行中 agent 的实时 transcript
+// 会冻结。失败后按轮询周期重试，上限 3 次（仍在列表且未 attached 才重试）。
+const ATTACH_RETRY_MS = 5_000
+const ATTACH_RETRY_MAX = 3
 
 const EMPTY_TRANSCRIPT: TranscriptEvent[] = []
 
@@ -516,6 +522,11 @@ export function useTreeStore() {
   const agentsSigRef = useRef<string | null>(null)
   // P-10：本会话已接上实时流的 execId（startDispatch 的 Channel 也算）——防重复 attach
   const attachedRef = useRef<Set<string>>(new Set())
+  // §51 attach-retry：失败重试的计数与在途定时器（execId 键控）
+  const attachRetryCountsRef = useRef<Map<string, number>>(new Map())
+  const attachRetryTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
+  // §51 attach-retry：定时器回调里取「最新」的 attachTranscript（闭包不重建）
+  const attachTranscriptRef = useRef<(execId: string, homeId: string) => void>(() => {})
   // review R2-9：派发进行中的计数（含续跑的就绪握手，最长 30s）——进行中不接回
   // 实时流，否则 exec_start 返回后会出现第二个跟随者，事件全部显示两次
   const dispatchingRef = useRef(0)
@@ -647,6 +658,9 @@ export function useTreeStore() {
   // exit 事件的本地联动：更新对应 agent 的 status/attachment（乐观），
   // Failed 计入未查看 badge。
   const applyExitLocal = useCallback((ev: Extract<TranscriptEvent, { kind: 'exit' }>) => {
+    // §51：本地乐观更新后重置轮询签名——序号竞争下下一次 silent 轮询结果
+    // 不得被误判为「与上次相同」而跳过落账
+    agentsSigRef.current = null
     setState(s => {
       let failedAgentId: string | null = null
       const agents = s.agents.map(a => {
@@ -739,7 +753,10 @@ export function useTreeStore() {
     [scheduleFlush, applyExitLocal, scheduleAgentsRepull, bumpTranscriptVersion],
   )
 
-  /** P-10：重启后接回仍在运行的 exec。afterSeq 取本窗口最后一个事件的 seq。 */
+  /** P-10：重启后接回仍在运行的 exec。afterSeq 取本窗口最后一个事件的 seq。
+   * §51 attach-retry：瞬时失败不再永久放弃——按轮询周期有界重试（上限
+   * ATTACH_RETRY_MAX 次；exec 仍在当前 agents 列表且未 attached 才重试），
+   * 否则轮询引用稳定化后无人再触发，运行中的实时 transcript 冻结。 */
   const attachTranscript = useCallback(
     (execId: string, homeId: string) => {
       if (attachedRef.current.has(execId)) return
@@ -755,12 +772,40 @@ export function useTreeStore() {
       const existing = transcriptsRef.current.get(execId)
       const last = existing && existing.length > 0 ? existing[existing.length - 1] : undefined
       const afterSeq = last ? last.seq : null
-      void execAttach({ homeId, execId, afterSeq, channel }).catch(error => {
+      void execAttach({ homeId, execId, afterSeq, channel })
+        .then(() => {
+          // 成功才清重试计数（尝试开始时不清——否则重试链永远从 0 数起）
+          attachRetryCountsRef.current.delete(execId)
+        })
+        .catch(error => {
         attachedRef.current.delete(execId)
         setState(s => ({ ...s, error: presentError(error) }))
+        // §51 attach-retry：失败重试（有界；间隔一个轮询周期）
+        const attempts = (attachRetryCountsRef.current.get(execId) ?? 0) + 1
+        if (attempts > ATTACH_RETRY_MAX) return
+        attachRetryCountsRef.current.set(execId, attempts)
+        const timer = setTimeout(() => {
+          attachRetryTimersRef.current.delete(execId)
+          if (agentsRef.current.some(a => a.execs.some(e => e.execId === execId))) {
+            attachTranscriptRef.current(execId, homeId)
+          } else {
+            attachRetryCountsRef.current.delete(execId)
+          }
+        }, ATTACH_RETRY_MS)
+        attachRetryTimersRef.current.set(execId, timer)
       })
     },
     [ingestTranscriptEvent],
+  )
+  attachTranscriptRef.current = attachTranscript
+
+  // §51 attach-retry：卸载时清掉在途的重试定时器
+  useEffect(
+    () => () => {
+      for (const timer of attachRetryTimersRef.current.values()) clearTimeout(timer)
+      attachRetryTimersRef.current.clear()
+    },
+    [],
   )
 
   /** §39：所有派发结束后补接被推迟的 exec（新 exec 已在 attachedRef 里，自然跳过）。 */
@@ -813,6 +858,7 @@ export function useTreeStore() {
       dispatchingRef.current -= 1
       // P-10：startDispatch 的 Channel 即本会话的实时跟随者——记入防重复 attach
       attachedRef.current.add(outcome.execId)
+      attachRetryCountsRef.current.delete(outcome.execId)
       flushDeferredAttach()
       // pull 契约：派发后拉 agents_list（防抖等 Rust 侧 ⑤ 落盘收敛）；
       // 绑定表重拉由 App 的派发成功回调统一触发（单一落点，避免双拉）
@@ -1126,6 +1172,9 @@ export function useTreeStore() {
       }))
       viewedFailedRef.current.clear()
       filtersRef.current = {}
+      // §51：切 home 重置轮询签名——上一 home 的签名不得让新 home 的首个
+      // silent 轮询结果被误判为「结构未变」而跳过落账（空列表签名尤其常见）
+      agentsSigRef.current = null
       activeHomeRef.current = home
       window.localStorage.setItem(LAST_HOME_KEY, home.homeId)
       // U1b：切 home 装载 per-home 数据时顺带执行 bag v2 迁移（幂等）

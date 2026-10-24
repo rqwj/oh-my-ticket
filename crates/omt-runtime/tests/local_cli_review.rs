@@ -118,6 +118,97 @@ fn exec_list_accepts_relative_home_path_like_exec_start() {
     assert_eq!(value["execs"], serde_json::json!([]));
 }
 
+/// §51 F-SP2-5(a)：磁盘上存在的 homeId，`exec list` 只读 `agents/<homeId>/`
+/// ——无 daemon 时不得为解析 home 拉起 daemon（旧实现所有 homeId 都要求
+/// daemon 的 served 列表，只读动词也会 spawn）。断言：成功列出且 runtime
+/// 目录里没有 descriptor（没有任何 daemon 被拉起）。
+#[test]
+fn exec_list_by_disk_home_id_never_spawns_a_daemon() {
+    let ctx = TestCtx::spawn_named("cli-disk-home");
+    // 磁盘上的 home（曾服务过的形态：agents/h_x/ 存在即可——home_ids 只看目录）
+    std::fs::create_dir_all(ctx.runtime_dir.join("agents").join("h_x")).unwrap();
+    let out = Command::new(omt_path())
+        .arg("--runtime-dir")
+        .arg(ctx.runtime_dir_str())
+        .arg("--home")
+        .arg("h_x")
+        .args(["exec", "list", "--json"])
+        .env("OMT_RUNTIME_DIR", ctx.runtime_dir_str())
+        .output()
+        .expect("run omt exec list");
+    assert!(
+        out.status.success(),
+        "磁盘上的 homeId 应直接解析（不要求被服务）：{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["execs"], serde_json::json!([]));
+    assert!(
+        common::Descriptor::read(&ctx.runtime_dir).is_none(),
+        "只读动词不得为解析 home 拉起 daemon（§51 F-SP2-5）"
+    );
+}
+
+/// §51 F-SP2-5(b)：idle 关闭的 home（磁盘上有 agents/<homeId>/，daemon 只服务
+/// 另一个 home）——`exec list` 应照常列出，而不是 NOT_FOUND（旧实现要求
+/// homeId 出现在 daemon 当前服务的 home 中）。
+#[test]
+fn exec_list_serves_an_idle_closed_home_from_disk() {
+    let (ctx, homes) = TestCtx::spawn_with_homes("cli-idle-closed-home", 2);
+    // home-01 曾被服务（agents 目录留存），现在不被服务（daemon 只开 home-00）
+    std::fs::create_dir_all(ctx.runtime_dir.join("agents").join("home-01")).unwrap();
+    let _daemon = common::DaemonProcess::spawn(&ctx, &["--home", homes[0].to_str().unwrap()]);
+    common::wait_for_descriptor(&ctx.runtime_dir, Duration::from_secs(20)).expect("daemon");
+    let out = Command::new(omt_path())
+        .arg("--runtime-dir")
+        .arg(ctx.runtime_dir_str())
+        .arg("--home")
+        .arg("home-01")
+        .args(["exec", "list", "--json"])
+        .env("OMT_RUNTIME_DIR", ctx.runtime_dir_str())
+        .output()
+        .expect("run omt exec list");
+    assert!(
+        out.status.success(),
+        "idle 关闭的 home 应从磁盘解析（exec list 只读）：{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["execs"], serde_json::json!([]));
+}
+
+/// §51 F-SP2-5(d)：输入不存在的 homeId（want=None）时不得匹配「自身路径
+/// 也无法规范化」的已服务 home（目录已删）——旧实现 None == None 会把拼写
+/// 错误静默解析到那个 home（exit 0 空列表）；必须是 NOT_FOUND（exit 3）。
+#[test]
+fn exec_list_with_unknown_home_id_is_not_found_even_when_a_served_home_dir_is_gone() {
+    let ctx = TestCtx::spawn_named("cli-gone-home");
+    let ws = ctx.dir.path().join("ws-home");
+    std::fs::create_dir_all(&ws).unwrap();
+    let _daemon = common::DaemonProcess::spawn(&ctx, &["--home", ws.to_str().unwrap()]);
+    common::wait_for_descriptor(&ctx.runtime_dir, Duration::from_secs(20)).expect("daemon");
+    // 服务中的 home 目录被删：daemon 的 served 列表仍含它（内存态），但其
+    // 路径已无法 canonicalize——正是与 want=None 误匹配的形状
+    std::fs::remove_dir_all(&ws).expect("remove served home dir");
+    let out = Command::new(omt_path())
+        .arg("--runtime-dir")
+        .arg(ctx.runtime_dir_str())
+        .arg("--home")
+        .arg("h_typo")
+        .args(["exec", "list", "--json"])
+        .env("OMT_RUNTIME_DIR", ctx.runtime_dir_str())
+        .output()
+        .expect("run omt exec list");
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "拼写错误的 homeId 必须 NOT_FOUND：{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let problem: serde_json::Value = serde_json::from_slice(out.stderr.trim_ascii_end()).unwrap();
+    assert_eq!(problem["code"], "NOT_FOUND", "{problem}");
+}
+
 /// §49 Q-13「CLI 声明之后才判」：`omt --home <全局 home> exec start …` 对
 /// 未被服务的已初始化全局 home，必须在 home/declare **之前**按路径拒绝
 /// （POLICY_DENIED / workspaces），且 daemon 的服务清单里不留下该 home。

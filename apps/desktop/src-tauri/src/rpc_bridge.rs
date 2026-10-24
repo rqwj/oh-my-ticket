@@ -241,7 +241,8 @@ pub fn daemon_status() -> Result<daemon::DaemonStatus, String> {
 pub fn daemon_homes(shared: State<'_, SharedSession>) -> Result<serde_json::Value, String> {
     with_session(&shared, |session| {
         Ok(serde_json::json!({
-            "homes": session.enrollment.handshake["homes"].clone(),
+            // §51：经 session 的惰性重建缝（超时丢弃连接后也能恢复）
+            "homes": session.handshake_homes(),
             "homeDir": std::env::var("HOME").unwrap_or_default(),
         }))
     })
@@ -405,7 +406,7 @@ pub fn events_subscribe(
     home_id: String,
     since: u64,
 ) -> Result<(), String> {
-    let runtime_dir = with_session(&shared, |session| Ok(session.runtime_dir.clone()))?;
+    let runtime_dir = with_session(&shared, |session| Ok(session.runtime_dir().to_path_buf()))?;
     SUBSCRIPTIONS.set_target(home_id, since);
     if !SUBSCRIPTIONS
         .started

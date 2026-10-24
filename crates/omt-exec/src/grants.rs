@@ -82,24 +82,38 @@ pub fn remove(runtime_dir: &Path, principal: &str) -> Result<(), String> {
 /// principal（shim 释放租约、desktop 的强制删除 `force_release_agent_leases`
 /// 与后台对账 `reconcile_with_connector` 都用 `cli:<本进程 pid>`）——首个
 /// 结束的一方 Drop 不得撤掉还在用的一方的授权。按 (runtime 目录, principal)
-/// 计数，归零才真正撤销。键用 PathBuf 等值比较（同进程内 runtime 目录来自
-/// 同一解析，拼写一致）。
+/// 计数，归零才真正撤销。键的 runtime 目录先 canonicalize（§51 F-SP2-3 顺带）：
+/// 同一目录的不同拼写（如 macOS 的 /var 与 /private/var）不得拆成两个计数键。
+///
+/// §51 F-SP2-3：`add` 的「计数 +1 + 登记/授权」与 `Drop` 的「计数 −1（归零时
+/// 撤销）」必须在**同一把互斥锁内**完成——此前归零与 `remove()` 之间会插进
+/// 另一方的 `add`（见到授权仍在而不重登记），随后归零方的 `remove()` 把它
+/// 持有的授权一并撤掉。文件操作都是本地短 IO，锁内完成可接受；锁序恒为
+/// 「计数锁 → 文件 flock」，无反向路径。
 static TEMP_GRANT_REFCOUNTS: std::sync::LazyLock<Mutex<HashMap<(PathBuf, String), usize>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn refcount_bump(key: &(PathBuf, String)) {
-    *TEMP_GRANT_REFCOUNTS
+/// 计数键的 runtime 目录规范化：canonicalize（失败回退原拼写——目录尚在
+/// 创建前等场景）。守卫内存的是规范化后的路径，Drop 与 add 的键天然一致。
+fn normalized_runtime_dir(runtime_dir: &Path) -> PathBuf {
+    std::fs::canonicalize(runtime_dir).unwrap_or_else(|_| runtime_dir.to_path_buf())
+}
+
+fn lock_counts() -> std::sync::MutexGuard<'static, HashMap<(PathBuf, String), usize>> {
+    TEMP_GRANT_REFCOUNTS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .entry(key.clone())
-        .or_insert(0) += 1;
+}
+
+fn refcount_bump(counts: &mut HashMap<(PathBuf, String), usize>, key: &(PathBuf, String)) {
+    *counts.entry(key.clone()).or_insert(0) += 1;
 }
 
 /// 计数减一；归零（并摘掉表项）返回 true——只有此时才该撤销授权。
-fn refcount_release(key: &(PathBuf, String)) -> bool {
-    let mut counts = TEMP_GRANT_REFCOUNTS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+fn refcount_release(
+    counts: &mut HashMap<(PathBuf, String), usize>,
+    key: &(PathBuf, String),
+) -> bool {
     match counts.get_mut(key) {
         Some(count) if *count > 1 => {
             *count -= 1;
@@ -113,9 +127,23 @@ fn refcount_release(key: &(PathBuf, String)) -> bool {
     }
 }
 
+/// §51 F-SP2-3 交错测试缝：最后一个持有者进入撤销段前挂起一段时间，
+/// 把「归零 → 撤销」的竞态窗口放大成确定长度。仅测试编译；生产恒为 no-op。
+#[cfg(test)]
+static TEST_REVOKE_DELAY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+fn test_revoke_delay() {
+    let ms = TEST_REVOKE_DELAY_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if ms > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+}
+
 /// 临时授权守卫：创建时登记（grants + 临时登记表），drop 时撤销。
 /// §49：进程内按 principal 引用计数——同 principal 的并发持有者全部 Drop
-/// 后才撤销（文件操作保持幂等，重复 add 不叠加登记）。
+/// 后才撤销（文件操作保持幂等，重复 add 不叠加登记）。§51 F-SP2-3：计数
+/// 与文件操作同锁完成（见 TEMP_GRANT_REFCOUNTS 的说明）。
 pub struct TempGrant {
     runtime_dir: PathBuf,
     principal: String,
@@ -123,22 +151,24 @@ pub struct TempGrant {
 
 impl TempGrant {
     pub fn add(runtime_dir: &Path, principal: &str) -> Result<Self, String> {
-        let key = (runtime_dir.to_path_buf(), principal.to_string());
-        refcount_bump(&key);
-        let registered = update_json(&temp_registry(runtime_dir), |list: &mut Vec<String>| {
+        let runtime_dir = normalized_runtime_dir(runtime_dir);
+        let key = (runtime_dir.clone(), principal.to_string());
+        let mut counts = lock_counts();
+        refcount_bump(&mut counts, &key);
+        let registered = update_json(&temp_registry(&runtime_dir), |list: &mut Vec<String>| {
             if list.iter().any(|p| p == principal) {
                 return false;
             }
             list.push(principal.to_string());
             true
         });
-        let granted = registered.and_then(|_| add(runtime_dir, principal));
+        let granted = registered.and_then(|_| add(&runtime_dir, principal));
         if granted.is_err() {
             // 登记失败：计数回滚（没有守卫会去撤销，不能留下虚高计数）
-            refcount_release(&key);
+            refcount_release(&mut counts, &key);
         }
         granted.map(|_| Self {
-            runtime_dir: runtime_dir.to_path_buf(),
+            runtime_dir,
             principal: principal.to_string(),
         })
     }
@@ -149,9 +179,13 @@ impl Drop for TempGrant {
         // §49 refcount：同进程还有别的持有者（强制删除 / 后台对账 / B7 脱离
         // 的 worker 共用 `cli:<pid>`）——不是最后一个，授权保留
         let key = (self.runtime_dir.clone(), self.principal.clone());
-        if !refcount_release(&key) {
+        let mut counts = lock_counts();
+        if !refcount_release(&mut counts, &key) {
             return;
         }
+        // §51 F-SP2-3 测试缝：在仍持有计数锁的撤销段起点挂起，见上
+        #[cfg(test)]
+        test_revoke_delay();
         // §39 tempgrant-drop-leak：撤销失败时保留临时登记——启动清扫
         // （sweep_dead_temp_grants）凭它在 pid 死后补删授权。先删登记会让
         // admin 授权永久泄漏（pid 复用即提权窗口）。
@@ -252,6 +286,75 @@ mod tests {
             !registry.contains(&"cli:7777".to_string()),
             "登记表同步清理: {registry:?}"
         );
+    }
+
+    /// §51 F-SP2-3「归零 → 撤销」与新 acquire 的交错：A 的 Drop 已把计数
+    /// 归零、正在撤销的窗口里，B 的 add 不得在窗口内「见到授权仍在」就
+    /// no-op——否则 A 随后的 remove() 会把 B 持有的授权一并撤掉。
+    /// 确定性手法：TEST_REVOKE_DELAY_MS 让 A 的撤销段挂起固定时长，期间
+    /// B 完成 add；判定点在 A 的 Drop 结束之后（带界轮询等 B 的登记落盘）。
+    /// 旧实现（计数与文件操作分离）在本测下 A 的 remove 必然落在 B 的
+    /// add 之后——B 持守卫而授权已被撤，红。
+    #[test]
+    fn temp_grant_zero_release_interleaved_with_add_keeps_authorization() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = tmp.path().join("rt");
+        std::fs::create_dir_all(rt.join("exec")).unwrap();
+        let a = TempGrant::add(&rt, "cli:777").unwrap();
+        assert!(principals(&rt).contains(&"cli:777".to_string()));
+        TEST_REVOKE_DELAY_MS.store(50, std::sync::atomic::Ordering::Relaxed);
+        let dropper = std::thread::spawn(move || drop(a));
+        // 让 A 进入撤销段（归零后的延迟窗口内）
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let b = TempGrant::add(&rt, "cli:777").unwrap();
+        dropper.join().unwrap();
+        TEST_REVOKE_DELAY_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !principals(&rt).contains(&"cli:777".to_string()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "B 仍持有守卫，但授权被 A 的撤销带走（§51 F-SP2-3 交错）"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let (registry, _) = read_json::<Vec<String>>(&temp_registry(&rt)).unwrap();
+        assert!(registry.contains(&"cli:777".to_string()), "{registry:?}");
+        drop(b);
+        assert!(!principals(&rt).contains(&"cli:777".to_string()));
+        let (registry, _) = read_json::<Vec<String>>(&temp_registry(&rt)).unwrap();
+        assert!(!registry.contains(&"cli:777".to_string()), "{registry:?}");
+    }
+
+    /// §51 F-SP2-3 顺带：计数键按 canonicalize 后的 runtime 目录——同一
+    /// 目录的两种拼写（macOS 上 /var 与 /private/var）是同一把计数。
+    #[test]
+    fn temp_grant_refcount_key_is_canonicalized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = tmp.path().join("rt");
+        std::fs::create_dir_all(&rt).unwrap();
+        let alias = {
+            // macOS 的 $TMPDIR 形如 /var/folders/...，canonicalize 后是
+            // /private/var/...——构造出同一目录的未规范化拼写
+            let canonical = std::fs::canonicalize(&rt).unwrap();
+            let raw = rt.display().to_string();
+            if canonical.display().to_string() == raw {
+                // 环境给的就是规范形态：跳过（不是本测的目标平台形态）
+                return;
+            }
+            std::path::PathBuf::from(raw)
+        };
+        let a = TempGrant::add(&rt, "cli:7000").unwrap();
+        {
+            // 经别名拼写 add：旧键语义下这是「另一个 runtime 目录」的独立
+            // 计数，drop 时会立即撤销；规范化后应计 2，drop 不撤销
+            let _b = TempGrant::add(&alias, "cli:7000").unwrap();
+            drop(a);
+            assert!(
+                principals(&rt).contains(&"cli:7000".to_string()),
+                "别名拼写的 add 必须并入同一计数——还有持有者在用"
+            );
+        }
+        assert!(!principals(&rt).contains(&"cli:7000".to_string()));
     }
 
     /// §49 refcount 的回滚臂：登记失败（admin-grants.json 写不进）时计数必须

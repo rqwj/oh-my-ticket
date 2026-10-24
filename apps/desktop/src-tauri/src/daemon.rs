@@ -160,10 +160,34 @@ pub fn discover_or_spawn_and_enroll(dir: &Path) -> Result<(Enrollment, bool), St
     Ok((enrollment, spawned))
 }
 
+/// §51 timeout-no-replay：30s 读超时（socket 的 WouldBlock / TimedOut 一族）
+/// **不是**「daemon 已断」——是慢但存活的 daemon。omt_client 把读错误包成
+/// `connection closed: <io err>`，超时形态的文案是
+/// "Resource temporarily unavailable"（macOS 的 WouldBlock）或 "timed out"
+/// 一族，此前恰好命中 is_daemon_gone 的 "connection closed" 子串，触发
+/// 「重连 + 重放一次」：不带 commandId 的写（node/create、run/create、
+/// node/update …）会被重复提交。
+pub fn is_read_timeout(problem_message: &str, problem_code: &str) -> bool {
+    problem_code == "IO"
+        && (problem_message.contains("Resource temporarily unavailable")
+            || problem_message.to_ascii_lowercase().contains("timed out"))
+}
+
+/// §51 timeout-no-replay：超时路径的统一错误文案——如实说明「已放弃且
+/// 未重试」（与 daemon 已断的重连+重放相区分）。连接在 state.rs 侧被
+/// 丢弃，下次调用惰性重建。
+pub const DAEMON_TIMEOUT_MESSAGE: &str =
+    "daemon 无响应（30s）：本次请求已放弃且未重试（避免重复提交），连接已丢弃，下次调用将重建";
+
 /// Whether an IO-shaped failure means "the daemon is gone — rediscover"
 /// (legal idle exit, crash, generation rotation): connection closed /
 /// refused / broken pipe all qualify; protocol problems do not.
+/// §51：读超时形态（[`is_read_timeout`]）不算——那是慢但存活的 daemon，
+/// 重连重放会造成非幂等写重复提交。
 pub fn is_daemon_gone(problem_message: &str, problem_code: &str) -> bool {
+    if is_read_timeout(problem_message, problem_code) {
+        return false;
+    }
     problem_code == "IO"
         && (problem_message.contains("connection closed")
             || problem_message.contains("endpoint connect")
@@ -276,6 +300,41 @@ mod tests {
         assert!(is_daemon_gone("request write: broken pipe", "IO"));
         assert!(!is_daemon_gone("home not in credential scope", "FORBIDDEN"));
         assert!(!is_daemon_gone("unrelated io error", "IO"));
+    }
+
+    /// §51 timeout-no-replay：30s 读超时必须与「daemon 已断」分开分类——
+    /// 超时是慢但存活的 daemon，重连 + 重放会把不带 commandId 的写
+    /// （node/create 等）重复提交。§51 实测的超时文案形态
+    /// （`connection closed: Resource temporarily unavailable`）此前恰好
+    /// 命中 is_daemon_gone。
+    #[test]
+    fn read_timeouts_are_not_daemon_gone_and_never_replayed() {
+        // macOS SO_RCVTIMEO 到期的实测形态
+        assert!(is_read_timeout(
+            "connection closed: Resource temporarily unavailable",
+            "IO"
+        ));
+        // TimedOut 一族（Linux / 其它读路径）
+        assert!(is_read_timeout(
+            "connection closed: Operation timed out",
+            "IO"
+        ));
+        assert!(is_read_timeout("connection closed: read timed out", "IO"));
+        // 超时形态不得再命中 daemon-gone（否则 state.rs 会重连 + 重放）
+        assert!(!is_daemon_gone(
+            "connection closed: Resource temporarily unavailable",
+            "IO"
+        ));
+        assert!(!is_daemon_gone("connection closed: read timed out", "IO"));
+        // 非超时的 IO 形态仍按 daemon-gone 分类（合法退出 / 断连 → 重放）
+        assert!(is_daemon_gone("connection closed: eof", "IO"));
+        assert!(is_daemon_gone("connection closed before response", "IO"));
+        // 非 IO 不属于任何一类
+        assert!(!is_read_timeout("connection closed: eof", "CANCELED"));
+        assert!(!is_read_timeout(
+            "Operation timed out somewhere",
+            "FORBIDDEN"
+        ));
     }
 
     /// §49「跨进程派发锁把桌面端卡死的 daemon 传导给 CLI/MCP」：desktop 会话
