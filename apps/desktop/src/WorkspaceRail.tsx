@@ -29,8 +29,8 @@ interface Props {
   homeDir?: string
   /** 图标错误态（homeId → 原因）：懒声明失败等 */
   errors: Record<string, string>
-  /** 路径已失效的工作区（known-homes 的 missing 探测）——置灰带警告 */
-  missingPaths: Set<string>
+  /** 路径已失效的工作区（known-homes 的 missing 探测，按 path/homeId 双键）——置灰带警告 */
+  isMissingWorkspace: (ws: WorkspaceEntry) => boolean
   settingsOpen: boolean
   /** 添加弹窗由 App 托管（空状态的「添加工作区」按钮共用同一入口） */
   addOpen: boolean
@@ -48,7 +48,7 @@ export function WorkspaceRail({
   activeHomeId,
   homeDir,
   errors,
-  missingPaths,
+  isMissingWorkspace,
   settingsOpen,
   addOpen,
   onSelect,
@@ -95,7 +95,7 @@ export function WorkspaceRail({
       <nav className="workspace-rail" aria-label="工作区">
         <div className="rail-icons">
           {workspaces.map(ws => {
-            const missing = missingPaths.has(ws.path)
+            const missing = isMissingWorkspace(ws)
             const error = errors[ws.homeId]
             const cls = [
               'rail-icon',
@@ -113,7 +113,7 @@ export function WorkspaceRail({
             ].filter(Boolean).join(' — ')
             return (
               <button
-                key={ws.homeId}
+                key={`${ws.homeId}:${ws.path}`}
                 className={cls}
                 style={{ background: workspaceColor(ws.path) }}
                 title={tooltip}

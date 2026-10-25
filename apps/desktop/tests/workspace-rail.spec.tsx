@@ -489,7 +489,7 @@ describe('U1 对齐 effect（F-TERM-7 / P3）', () => {
     expect(railIcons().some(b => b.className.includes('active'))).toBe(false)
   })
 
-  it('点击存量 homeId 已过期的图标（daemon 已按新 id 开着同一目录）：「已打开」分支回写，选中不被弹回首项', async () => {
+  it('点击存量 homeId 已过期的图标（daemon 已按新 id 开着同一目录）：对齐 effect 按 path 回写，选中不被弹回首项', async () => {
     window.localStorage.setItem(STORED_KEY, JSON.stringify([
       { path: '/tmp/ws1/.omt', homeId: 'h_a', name: 'ws1' },
       { path: '/tmp/ws2/.omt', homeId: 'h_b_old', name: 'ws2' },

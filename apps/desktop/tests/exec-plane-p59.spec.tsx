@@ -145,11 +145,13 @@ describe('§59 F-SP2-12：写路径超时 → 干净文案 + 粘性 timeoutNotic
         })
     })
     // 写路径必须落粘性提示（结果未知、可能已生效）——此前 createNode 原样
-    // 上抛、从不进 timeoutNotice（§59 F-SP2-12）
-    expect(result.current.state.timeoutNotice, '写路径超时要落粘性 timeoutNotice').toContain('结果未知')
-    expect(result.current.state.timeoutNotice, '机器前缀是分流契约，不得进展示文案').not.toContain(
+    // 上抛、从不进 timeoutNotice（§59 F-SP2-12）；CF2 起提示是结构化的
+    // {homeId, text, minNodesSeq}（绑定写入的 home）
+    expect(result.current.state.timeoutNotice?.text, '写路径超时要落粘性 timeoutNotice').toContain('结果未知')
+    expect(result.current.state.timeoutNotice?.text, '机器前缀是分流契约，不得进展示文案').not.toContain(
       '[daemon-timeout]',
     )
+    expect(result.current.state.timeoutNotice?.homeId, 'CF2：提示绑定写入的 home').toBe('h_a')
     // 拒绝值本身也要干净（组件层 String(err) 就地展示）
     expect(String(caught), 'String(err) 展示点拿到剥前缀文案').not.toContain('[daemon-timeout]')
     expect(String(caught)).toContain('daemon 无响应')
@@ -172,7 +174,8 @@ describe('§59 F-SP2-12：写路径超时 → 干净文案 + 粘性 timeoutNotic
           caught = error
         })
     })
-    expect(result.current.state.timeoutNotice, '派发写路径超时要落粘性 timeoutNotice').toContain('结果未知')
+    expect(result.current.state.timeoutNotice?.text, '派发写路径超时要落粘性 timeoutNotice').toContain('结果未知')
+    expect(result.current.state.timeoutNotice?.homeId, 'CF2：提示绑定写入的 home').toBe('h_a')
     expect(String(caught), 'ExecutionDialog 的 setError(String(err)) 不得显示机器前缀').not.toContain('[daemon-timeout]')
   })
 
@@ -198,7 +201,7 @@ describe('§59 F-SP2-12：写路径超时 → 干净文案 + 粘性 timeoutNotic
       return (
         <div>
           {store.state.timeoutNotice && (
-            <p className="error-banner timeout-notice">{store.state.timeoutNotice}</p>
+            <p className="error-banner timeout-notice">{store.state.timeoutNotice.text}</p>
           )}
           <TreePanel
             nodes={store.state.nodes}
@@ -216,8 +219,16 @@ describe('§59 F-SP2-12：写路径超时 → 干净文案 + 粘性 timeoutNotic
       )
     }
     render(<Harness />)
-    // 假时钟下推进 boot 链收敛（waitFor 与 fake timers 不兼容，用推进轮询）
-    await advanceUntil(() => screen.queryByRole('button', { name: /新建 Epic/ }) !== null)
+    // 假时钟下推进 boot 链收敛（waitFor 与 fake timers 不兼容，用推进轮询）。
+    // 收敛判据用「per-home 装载已发出 node/tree」——「＋ 新建 Epic」按钮首帧
+    // 就在，等不到 boot；而 boot 未收敛时点创建，装载路径的 refreshNodes
+    // （在超时之后发出）会按 CF2 语义合法地清掉刚落的提示
+    await advanceUntil(() =>
+      invokeMock.mock.calls.some(
+        c => c[0] === 'omt_call' && (c[1] as { method?: string })?.method === 'node/tree',
+      ),
+    )
+    await flush()
     // 打开根级 Epic 表单、填标题、提交 → node/create 超时拒绝
     fireEvent.click(screen.getByRole('button', { name: /新建 Epic/ }))
     fireEvent.change(screen.getByLabelText('节点标题'), { target: { value: '超时票据' } })
@@ -247,7 +258,7 @@ describe('§59 F-SP2-12：写路径超时 → 干净文案 + 粘性 timeoutNotic
   })
 })
 
-describe('§61 P3：bridge 出口 emit 的 omt:daemon-timeout 事件 → 粘性 timeoutNotice', () => {
+describe('§61 P3 / CF2·CF4：bridge 出口派发的 omt:daemon-timeout → 粘性 timeoutNotice', () => {
   beforeEach(() => {
     invokeMock.mockReset()
     listenMock.mockReset()
@@ -256,29 +267,70 @@ describe('§61 P3：bridge 出口 emit 的 omt:daemon-timeout 事件 → 粘性 
     vi.useFakeTimers()
   })
 
-  it('事件携带去前缀文案 → timeoutNotice 直接置位（组件本地 omtCall 的写路径全覆盖）', async () => {
+  it('事件携带去前缀文案与 homeId → timeoutNotice 结构化置位（组件本地 omtCall 的写路径全覆盖）', async () => {
     const { result } = await bootStore()
-    // bootStore 的默认 listen mock 会记录全部订阅——从中找 omt:daemon-timeout
-    const call = listenMock.mock.calls.find((c: unknown[]) => c[0] === 'omt:daemon-timeout')
-    expect(call, 'store 应订阅 omt:daemon-timeout').toBeDefined()
-    const handler = call?.[1] as (event: { payload: { text: string } }) => void
     expect(result.current.state.timeoutNotice).toBeNull()
     const stripped = RUST_TIMEOUT_MESSAGE.slice(
       extractDaemonTimeoutMarker().length,
     ).trim()
+    // §63 P3 / CF4：出口改用同步 DOM CustomEvent——不再经 tauri emit，
+    // 直接派发事件验证接收端
     await act(async () => {
-      handler({ payload: { text: stripped } })
+      window.dispatchEvent(
+        new CustomEvent('omt:daemon-timeout', { detail: { text: stripped, homeId: 'h_a' } }),
+      )
     })
-    expect(result.current.state.timeoutNotice).toBe(stripped)
+    expect(result.current.state.timeoutNotice).toMatchObject({
+      homeId: 'h_a',
+      text: stripped,
+    })
+    expect(Number.isInteger(result.current.state.timeoutNotice?.minNodesSeq)).toBe(true)
   })
 
-  it('事件空文案 / 订阅失败 → 不置位、不影响主流程', async () => {
-    listenMock.mockImplementation(async (name: string) => {
-      if (name === 'omt:daemon-timeout') throw new Error('ipc down')
-      return () => {}
-    })
+  it('事件载荷缺 homeId → 绑定当前活动 home；空文案不置位', async () => {
     const { result } = await bootStore()
-    expect(result.current.state.timeoutNotice).toBeNull()
+    await act(async () => {
+      window.dispatchEvent(
+        new CustomEvent('omt:daemon-timeout', { detail: { text: '写超时：结果未知' } }),
+      )
+    })
+    expect(result.current.state.timeoutNotice?.homeId, '缺 homeId 时回退当前活动 home').toBe('h_a')
+    await act(async () => {
+      window.dispatchEvent(new CustomEvent('omt:daemon-timeout', { detail: {} }))
+    })
+    expect(result.current.state.timeoutNotice, '空文案不覆盖已有提示').not.toBeNull()
+    act(() => {
+      result.current.dismissTimeoutNotice()
+    })
+    expect(result.current.state.timeoutNotice, 'CF2：关闭按钮出口清掉提示').toBeNull()
+    await act(async () => {
+      window.dispatchEvent(new CustomEvent('omt:daemon-timeout', { detail: { text: '' } }))
+    })
+    expect(result.current.state.timeoutNotice, '空文案不置位').toBeNull()
+  })
+
+  it('CF4：omtCall 写方法超时拒会派发事件；读方法超时与非超时拒绝不派发', async () => {
+    const seen: Array<{ text: string; homeId: string | null }> = []
+    const listener = (event: Event) => {
+      seen.push((event as CustomEvent<{ text: string; homeId: string | null }>).detail)
+    }
+    window.addEventListener('omt:daemon-timeout', listener)
+    try {
+      const stripped = RUST_TIMEOUT_MESSAGE.slice(extractDaemonTimeoutMarker().length).trim()
+      invokeMock.mockRejectedValue(RUST_TIMEOUT_MESSAGE)
+      await omtCall('node/create', { homeId: 'h_a', type: 'ticket', title: 'x' }).catch(() => {})
+      expect(seen, '写方法超时必须派发（载荷为去前缀文案 + homeId）').toEqual([
+        { text: stripped, homeId: 'h_a' },
+      ])
+      seen.length = 0
+      await omtCall('node/tree', { homeId: 'h_a' }).catch(() => {})
+      expect(seen, 'CF2：读方法超时不派发（无「可能已生效」语义）').toEqual([])
+      invokeMock.mockRejectedValue(new Error('QUOTA_EXCEEDED(rule=open-homes)'))
+      await omtCall('node/create', { homeId: 'h_a' }).catch(() => {})
+      expect(seen, '非超时拒绝不派发').toEqual([])
+    } finally {
+      window.removeEventListener('omt:daemon-timeout', listener)
+    }
   })
 })
 
@@ -305,9 +357,11 @@ describe('§59 P3-1：跨语言前缀锁定（读 daemon.rs 源码断言）', ()
     ).toBe(true)
   })
 
-  it('抽取的 Rust 原文喂 store：超时分流到粘性 timeoutNotice（非手抄串驱动）', async () => {
+  it('抽取的 Rust 原文喂 store：读超时进普通 error、写超时进结构化粘性提示（非手抄串驱动）', async () => {
     // §59 P3-1：本用例的输入就是从 daemon.rs 抽出的字面量——Rust 侧改
-    // 文案 / 前缀，本用例消费新值（前缀变形时上面的锁定断言红）
+    // 文案 / 前缀，本用例消费新值（前缀变形时上面的锁定断言红）。
+    // CF2：node/tree 是读——超时不再进粘性提示（对读请求「可能已生效」
+    // 是误导），照常进可被常规刷新清除的 error
     const { result } = await bootStore({
       omtCallImpl: method => {
         if (method === 'node/tree') return Promise.reject(new Error(RUST_TIMEOUT_MESSAGE))
@@ -317,8 +371,23 @@ describe('§59 P3-1：跨语言前缀锁定（读 daemon.rs 源码断言）', ()
     await act(async () => {
       await result.current.refreshNodes(result.current.state.activeHome!)
     })
-    expect(result.current.state.timeoutNotice).toContain('结果未知')
-    expect(result.current.state.error).toBeNull()
+    expect(result.current.state.error).toContain('结果未知')
+    expect(result.current.state.timeoutNotice, 'CF2：读超时不进粘性提示').toBeNull()
+    // 写路径（node/update，无 commandId）超时 → 粘性提示（bridge 出口事件）
+    invokeMock.mockImplementation((cmd: string, args?: { method?: string }) => {
+      if (cmd === 'daemon_homes') {
+        return Promise.resolve({ homes: [homeA], homeDir: '/Users/test' })
+      }
+      if (cmd === 'omt_call' && args?.method === 'node/update') {
+        return Promise.reject(new Error(RUST_TIMEOUT_MESSAGE))
+      }
+      return Promise.resolve({})
+    })
+    await act(async () => {
+      await result.current.updateNode('TICKET-0001', { title: 'x' })
+    })
+    expect(result.current.state.timeoutNotice?.text).toContain('结果未知')
+    expect(result.current.state.timeoutNotice?.homeId).toBe('h_a')
   })
 })
 

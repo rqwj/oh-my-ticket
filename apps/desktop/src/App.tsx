@@ -84,18 +84,16 @@ export function App() {
   }, [state.activeHome?.homeId])
 
   // §49 lease-notice-switch-home：通知跨 home 保留——「前往 Runs」先切到该条
-  // 所属 home 再打开 Runs（homeId 对不上时找不到当前展示的 home 就不动，
-  // 仍只切视图）。
+  // 所属 home 再打开 Runs。§64 遗留：home 不在图标栏里时不直接选中（对齐
+  // effect 会把它弹回首项）——store.openRunsOfHome 先把它收进列表；daemon
+  // 未开该 home 时不动 home，仅切视图。
   const openRunsOfHome = useCallback(
     (homeId: string) => {
-      if (state.activeHome?.homeId !== homeId) {
-        const target = state.homes.find(h => h.homeId === homeId)
-        if (target) void store.selectHome(target)
-      }
+      store.openRunsOfHome(homeId)
       setSettingsOpen(false)
       setTicketTab('runs')
     },
-    [state.activeHome?.homeId, state.homes, store],
+    [store],
   )
 
   // R5：ticket 栏顶部的 ⚙ 打开当前工作区的设置标签页（内容在 U2 落地）
@@ -130,10 +128,22 @@ export function App() {
     window.addEventListener('pointerup', onUp)
   }, [treeWidth])
 
-  // KTD14：known-homes 的 missing 探测 → 图标置灰带警告
-  const missingPaths = useMemo(
-    () => new Set(state.knownHomes.filter(k => k.missing).map(k => k.path)),
-    [state.knownHomes],
+  // KTD14：known-homes 的 missing 探测 → 图标置灰带警告。§64 遗留：
+  // known-homes 报规范路径、图标栏条目记原始写法（/tmp 与 /private/tmp）
+  // ——按 path 与 homeId（lastHomeId）双键匹配，路径写法不一致也命中
+  const missingKeys = useMemo(() => {
+    const keys = new Set<string>()
+    for (const k of state.knownHomes) {
+      if (!k.missing) continue
+      keys.add(`path:${k.path}`)
+      if (k.lastHomeId) keys.add(`home:${k.lastHomeId}`)
+    }
+    return keys
+  }, [state.knownHomes])
+  const isMissingWorkspace = useCallback(
+    (ws: { path: string; homeId: string }) =>
+      missingKeys.has(`path:${ws.path}`) || missingKeys.has(`home:${ws.homeId}`),
+    [missingKeys],
   )
   const workspaceErrorText = Object.keys(state.workspaceErrors).length > 0
     ? Object.values(state.workspaceErrors).join('；')
@@ -154,10 +164,14 @@ export function App() {
         activeHomeId={state.activeHome?.homeId ?? null}
         homeDir={state.homeDir}
         errors={state.workspaceErrors}
-        missingPaths={missingPaths}
+        isMissingWorkspace={isMissingWorkspace}
         settingsOpen={settingsOpen}
         addOpen={addOpen}
-        onSelect={ws => void store.selectWorkspace(ws)}
+        onSelect={ws => {
+          // §64 遗留：点击图标时关闭全局设置（回到内容区）
+          setSettingsOpen(false)
+          void store.selectWorkspace(ws)
+        }}
         onAdd={store.addWorkspace}
         onAddOpen={() => setAddOpen(true)}
         onAddClose={() => setAddOpen(false)}
@@ -166,10 +180,23 @@ export function App() {
       <div className="app-main">
         <div className="notice-stack">
           {state.error && <p className="error-banner">{state.error}</p>}
-          {/* §57 F-SP2-11：超时类提示（结果未知、可能已生效）的粘性横幅——
-              独立于 error（focus 的 agents/homes 刷新不清它），成功的节点拉取
-              （refreshNodes）才清；文案引导先刷新确认结果再决定是否重试。 */}
-          {state.timeoutNotice && <p className="error-banner timeout-notice">{state.timeoutNotice}</p>}
+          {/* §57 F-SP2-11 / CF2：**写**超时（结果未知、可能已生效）的粘性
+              横幅——独立于 error（focus 的 agents/homes 刷新不清它），只有
+              同 home、超时后发出的 refreshNodes 成功才清；可手动关闭
+              （CF2：无活动 home 等无法自动清除的场景的出口） */}
+          {state.timeoutNotice && (
+            <div className="error-banner timeout-notice" role="alert">
+              <span className="workspace-error-text">{state.timeoutNotice.text}</span>
+              <button className="banner-close" aria-label="关闭超时提示" onClick={store.dismissTimeoutNotice}>✕</button>
+            </div>
+          )}
+          {/* CF3：事件泵连续失败——外部 CLI 改动不会自动刷新；恢复后消失 */}
+          {state.eventsStatus && (
+            <div className="warn-banner events-status-banner" role="status">
+              外部改动不会自动刷新：事件订阅连接失败
+              {state.eventsStatus.error ? `（${state.eventsStatus.error}）` : ''}，正在自动重试…
+            </div>
+          )}
           {/* U1：工作区图标的错误态（懒声明失败 / 路径失效）逐条列出，可关闭 */}
           {workspaceErrorText && (
             <div className="error-banner workspace-error-banner" role="alert">

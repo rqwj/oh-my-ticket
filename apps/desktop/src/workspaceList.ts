@@ -110,7 +110,10 @@ export function removeWorkspace(
 
 /**
  * 读存量列表：无存储（未迁移过）→ null；内容损坏（非 JSON / 非数组）→
- *  也返回 null 让调用方重新迁移；数组里形状不对的条目被剔除、其余保留
+ *  也返回 null 让调用方重新迁移；数组里形状不对的条目被剔除、其余保留。
+ * §64 遗留：原始数组非空但全部条目无效 → 同样返回 null（按首次运行处
+ * 理，重新迁移）——这种形态不是「用户清空了列表」（用户清空存的是空数组
+ * `[]`），而是历史写入损坏，据为存量会把其他已开 home 的迁移永久跳过。
  */
 export function readStoredWorkspaces(): WorkspaceEntry[] | null {
   const raw = window.localStorage.getItem(WORKSPACES_KEY)
@@ -128,6 +131,7 @@ export function readStoredWorkspaces(): WorkspaceEntry[] | null {
         list.push({ path: item.path, homeId: item.homeId, name: item.name })
       }
     }
+    if (parsed.length > 0 && list.length === 0) return null
     return list
   } catch {
     return null
@@ -162,6 +166,11 @@ export function addCandidates(
 ): AddCandidate[] {
   const out: AddCandidate[] = []
   const seen = new Set<string>()
+  // F-TERM-9：同一 home 只列一次——known-homes 报规范路径、daemon 报首个
+  // 声明者的原始路径（/tmp 与 /private/tmp 指向同一目录），只按 path 去重
+  // 会同 home 出现两行；收录候选时同步登记 homeId，known 条目按
+  // lastHomeId 再拦一道
+  const seenHomeIds = new Set<string>()
   const inRail = (path: string, homeId: string | null | undefined) =>
     workspaces.some(
       w => w.path === path || (homeId != null && homeId !== '' && w.homeId === homeId),
@@ -170,6 +179,7 @@ export function addCandidates(
     const path = home.path ?? ''
     if (path === '' || seen.has(path) || inRail(path, home.homeId)) continue
     seen.add(path)
+    seenHomeIds.add(home.homeId)
     out.push({
       path,
       homeId: home.homeId,
@@ -180,7 +190,9 @@ export function addCandidates(
   }
   for (const known of knownHomes) {
     if (seen.has(known.path) || inRail(known.path, known.lastHomeId)) continue
+    if (known.lastHomeId && seenHomeIds.has(known.lastHomeId)) continue
     seen.add(known.path)
+    if (known.lastHomeId) seenHomeIds.add(known.lastHomeId)
     out.push({
       path: known.path,
       homeId: known.lastHomeId ?? null,

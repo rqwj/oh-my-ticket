@@ -340,17 +340,66 @@ impl SubscriptionManager {
 
 static SUBSCRIPTIONS: SubscriptionManager = SubscriptionManager::new();
 
+/// CF3（§59 P3）：泵健康跟踪——真实失败（无活 descriptor、events/resume
+/// 出错）原本只在泵里静默无限重试，外部 CLI 改动不再刷新树而界面无提示。
+/// 连续失败达到阈值后应发一次 `omt://events-status {ok:false}`（掩盖瞬时
+/// 抖动，又足够快地暴露「外部改动不会自动刷新」）；恢复时发一次
+/// `{ok:true}`，前端提示随之消失。目标切换（换 home）时重置——新目标
+/// 是新订阅，旧 home 的失败不得立刻把新 home 标为失联。
+struct PumpHealth {
+    consecutive_failures: u32,
+    down_reported: bool,
+}
+
+impl PumpHealth {
+    /// 连续失败多少次后发 ok:false（指数退避下约 0.25+0.5+1s 内达成）。
+    const FAILURE_THRESHOLD: u32 = 3;
+
+    fn new() -> Self {
+        Self {
+            consecutive_failures: 0,
+            down_reported: false,
+        }
+    }
+
+    /// 一次失败。跨过阈值且尚未报告过 → true（应发 ok:false）。
+    fn note_failure(&mut self) -> bool {
+        self.consecutive_failures += 1;
+        if self.consecutive_failures >= Self::FAILURE_THRESHOLD && !self.down_reported {
+            self.down_reported = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 一次成功。此前已报告失败 → true（应发 ok:true 恢复）；否则 false。
+    fn note_success(&mut self) -> bool {
+        self.consecutive_failures = 0;
+        std::mem::replace(&mut self.down_reported, false)
+    }
+
+    /// 目标切换（换 home / 游标重置）：健康态归零。
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
+}
+
 /// 泵线程主体：单连接长期轮询 events/resume；代际变化 → 切 home/cursor
 /// （连接复用）；daemon 失联 → 指数退避重连（目标切换立即重试）；
 /// 无目标 → 轻睡眠等待。emit 经闭包注入（测试不打扰 tauri AppHandle）。
+/// CF3：连接/拉取连续失败达 [`PumpHealth::FAILURE_THRESHOLD`] 时经
+/// `emit_status` 上报 ok:false（带错误摘要），恢复时上报 ok:true。
 fn subscription_pump(
     runtime_dir: std::path::PathBuf,
     emit: impl Fn(serde_json::Value) + Send + 'static,
+    emit_status: impl Fn(&str, bool, Option<&str>) + Send + 'static,
 ) {
     let mut client: Option<omt_client::Client> = None;
     let mut active: Option<SubscriptionTarget> = None;
     let mut cursor = 0u64;
     let mut backoff_ms = 250u64;
+    let mut health = PumpHealth::new();
     loop {
         let current = SUBSCRIPTIONS.current();
         // 代际切换：换 home / 游标重置（连接保留——credential 与 home 无关）
@@ -358,6 +407,7 @@ fn subscription_pump(
             active = current;
             cursor = active.as_ref().map(|t| t.since).unwrap_or(0);
             backoff_ms = 250; // 新目标立即全速
+            health.reset(); // 新目标＝新订阅，旧 home 的失败不带入
         }
         let Some(target) = active.clone() else {
             std::thread::sleep(std::time::Duration::from_millis(200));
@@ -371,11 +421,22 @@ fn subscription_pump(
                 operations: None,
                 credential_path: None,
             };
-            match daemon::live_descriptor(&runtime_dir)
-                .and_then(|d| omt_client::Client::connect_and_enroll(&d, &options).ok())
-            {
-                Some(enrollment) => client = Some(enrollment.client),
-                None => {
+            let attempt = daemon::live_descriptor(&runtime_dir)
+                .ok_or_else(|| "无活 descriptor（daemon 未运行）".to_string())
+                .and_then(|descriptor| {
+                    omt_client::Client::connect_and_enroll(&descriptor, &options)
+                        .map_err(|err| err.to_string())
+                });
+            match attempt {
+                Ok(enrollment) => client = Some(enrollment.client),
+                Err(err) => {
+                    if health.note_failure() {
+                        emit_status(
+                            &target.home_id,
+                            false,
+                            Some(&format!("daemon 连接失败：{err}")),
+                        );
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
                     backoff_ms = (backoff_ms * 2).min(5_000);
                     continue;
@@ -389,6 +450,9 @@ fn subscription_pump(
         match page {
             Ok(page) => {
                 backoff_ms = 250;
+                if health.note_success() {
+                    emit_status(&target.home_id, true, None);
+                }
                 let events = page["events"].as_array().cloned().unwrap_or_default();
                 for envelope in &events {
                     emit(envelope.clone());
@@ -399,8 +463,12 @@ fn subscription_pump(
                 }
                 cursor = next;
             }
-            Err(_) => {
-                // daemon 失联/流关闭：弃连接退避重连（前端无需重订阅）
+            Err(problem) => {
+                // daemon 失联/流关闭：弃连接退避重连（前端无需重订阅）；
+                // CF3：连续失败达阈值后上报（外部改动不会自动刷新）
+                if health.note_failure() {
+                    emit_status(&target.home_id, false, Some(&problem.message));
+                }
                 client = None;
                 std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
                 backoff_ms = (backoff_ms * 2).min(5_000);
@@ -428,10 +496,21 @@ pub fn events_subscribe(app: AppHandle, home_id: String, since: u64) -> Result<(
         .started
         .swap(true, std::sync::atomic::Ordering::SeqCst)
     {
+        let status_app = app.clone();
         std::thread::spawn(move || {
-            subscription_pump(runtime_dir, move |envelope| {
-                let _ = app.emit("omt://event", envelope);
-            });
+            subscription_pump(
+                runtime_dir,
+                move |envelope| {
+                    let _ = app.emit("omt://event", envelope);
+                },
+                // CF3：泵健康上报——前端据此提示「外部改动不会自动刷新」
+                move |home_id, ok, error| {
+                    let _ = status_app.emit(
+                        "omt://events-status",
+                        serde_json::json!({ "homeId": home_id, "ok": ok, "error": error }),
+                    );
+                },
+            );
         });
     }
     Ok(())
@@ -470,6 +549,81 @@ mod subscription_tests {
             "set_target 不启动泵线程"
         );
         assert_eq!(mgr.current().unwrap().home_id, "h9", "十次切换后最新者胜");
+    }
+
+    /// CF3：健康跟踪语义——阈值前静默、跨阈值发一次 ok:false（不重复）、
+    /// 恢复发一次 ok:true、未失败时成功不发、目标切换归零。
+    #[test]
+    fn pump_health_reports_down_once_at_threshold_and_up_on_recovery() {
+        let mut health = PumpHealth::new();
+        assert!(!health.note_failure(), "第 1 次失败不报告（掩盖瞬时抖动）");
+        assert!(!health.note_failure(), "第 2 次失败不报告");
+        assert!(
+            health.note_failure(),
+            "第 {} 次连续失败跨过阈值 → 报告 ok:false",
+            PumpHealth::FAILURE_THRESHOLD
+        );
+        assert!(!health.note_failure(), "已报告过不重复报 down");
+        assert!(!health.note_failure(), "继续失败仍不重复报 down");
+        assert!(health.note_success(), "恢复（此前已报 down）→ 报告 ok:true");
+        assert!(!health.note_success(), "未处于 down 态的成功不再报告");
+        assert!(!health.note_failure(), "恢复后计数归零：单次失败不报告");
+    }
+
+    /// CF3：目标切换归零——旧 home 的连续失败不把新 home 立刻标为失联。
+    #[test]
+    fn pump_health_reset_drops_stale_failure_streak() {
+        let mut health = PumpHealth::new();
+        for _ in 0..(PumpHealth::FAILURE_THRESHOLD - 1) {
+            health.note_failure();
+        }
+        health.reset();
+        for _ in 0..(PumpHealth::FAILURE_THRESHOLD - 1) {
+            assert!(!health.note_failure(), "重置后重新计数，未跨阈值不报告");
+        }
+        assert!(health.note_failure(), "重置后达到阈值照常报告");
+    }
+
+    /// CF3：泵线程是无退出条件的无限循环，没有直接的测试缝——用源码锁住
+    /// 健康跟踪的接线（两个失败分支都接 note_failure、成功分支接
+    /// note_success、代际切换接 reset、events_subscribe 经 emit 上报
+    /// omt://events-status）。删掉任一接线，本断言红。
+    #[test]
+    fn subscription_pump_wires_health_reporting() {
+        let full =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/rpc_bridge.rs"))
+                .expect("read rpc_bridge.rs source");
+        let test_module = ["#[cfg(", "test)]"].join("");
+        let src = &full[..full.find(&test_module).expect("rpc_bridge.rs 应有测试模块")];
+        let pump_start = src
+            .find("fn subscription_pump(")
+            .expect("subscription_pump 应在生产代码里");
+        let pump_end = src[pump_start..]
+            .find("\n#[tauri::command]")
+            .expect("subscription_pump 之后是 events_subscribe 命令");
+        let pump = &src[pump_start..pump_start + pump_end];
+        assert_eq!(
+            pump.match_indices("health.note_failure()").count(),
+            2,
+            "连接失败与 events/resume 失败两个分支都要接 note_failure（CF3）"
+        );
+        assert_eq!(
+            pump.match_indices("emit_status(").count(),
+            3,
+            "两个失败分支 + 恢复分支共 3 处 emit_status 调用"
+        );
+        assert!(
+            pump.contains("health.note_success()"),
+            "成功分支接 note_success（恢复上报）"
+        );
+        assert!(
+            pump.contains("health.reset()"),
+            "代际切换接 health.reset（新目标不带旧失败计数）"
+        );
+        assert!(
+            src.contains("omt://events-status"),
+            "events_subscribe 经 app.emit 上报 omt://events-status"
+        );
     }
 }
 

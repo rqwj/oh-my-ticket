@@ -6,7 +6,7 @@
  */
 import { Channel, invoke } from '@tauri-apps/api/core'
 import { getVersion } from '@tauri-apps/api/app'
-import { emit, listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import type { AgentsListResult, BindingsGcResult, BindingsResult, ExecPolicy, ExecPolicyView } from './types'
 
 export interface DaemonStatus {
@@ -37,12 +37,36 @@ export const DAEMON_TIMEOUT_MARKER = '[daemon-timeout]'
  *   DetailPanel / AgentsPanel 的就地错误态（`String(err)`）自动拿到干净
  *   文案，无需逐点替换。
  */
+/**
+ * CF2（§59 P3 / §63 P3）：daemon **写**方法集合——只有这些方法的超时带
+ * 「结果未知、可能已生效」语义（无 commandId 的非幂等写，重试有重复
+ * 提交风险），才值得粘性提示；读方法（node/tree、node/get、run/list…）
+ * 超时没有这层语义，照常进普通 error，不进提示。
+ */
+const DAEMON_WRITE_METHODS = new Set([
+  'node/create',
+  'node/update',
+  'node/archive',
+  'node/move',
+  'run/create',
+  'run/control',
+  'run/report',
+  'run/add-members',
+  'run/interrupt',
+  'run/nudge-record',
+  'home/declare',
+  'ui/filters-set',
+  'ui/recent-set',
+])
+
 export class DaemonTimeoutError extends Error {
   readonly daemonTimeout = true
 
   constructor(
     /** 剥掉机器前缀后的展示文案 */
     readonly text: string,
+    /** CF2：是否**写**方法的超时（决定调用方是否落粘性提示——读超时无「可能已生效」语义） */
+    readonly write: boolean,
   ) {
     super(text)
     this.name = 'DaemonTimeoutError'
@@ -61,31 +85,50 @@ export function daemonTimeoutText(error: unknown): string | null {
   return error instanceof DaemonTimeoutError ? error.text : null
 }
 
+/** CF2：类型化超时是否来自**写**方法（读超时不进粘性提示）。 */
+export function daemonTimeoutIsWrite(error: unknown): boolean {
+  return error instanceof DaemonTimeoutError && error.write
+}
+
+/** bridge 出口派发的超时事件名（同步 DOM CustomEvent，§63 P3：不经 IPC 往返）。 */
+export const DAEMON_TIMEOUT_EVENT = 'omt:daemon-timeout'
+
 /**
  * §59 F-SP2-12：bridge 出口的统一错误整形——超时类（机器前缀命中）转
  * {@link DaemonTimeoutError}（剥前缀 + 类型分流），其余原样上抛（既有
  * 文案语义不变）。
  *
- * §61 P3：超时整形同时 emit `omt:daemon-timeout`（携带去前缀文案）——
- * store 订阅后落粘性提示，一处覆盖**全部**经 omtCall / execStart 的写
- * 路径（组件本地直接 await omtCall 的 run/control、node/update 等不必
- * 逐个接 noteTimeout）。
+ * §61 P3 → CF2/CF4：**写**方法的超时同时派发 `omt:daemon-timeout` 事件
+ * （携带去前缀文案与 homeId）——store 订阅后落粘性提示，一处覆盖全部
+ * 经 omtCall / execStart 的写路径（组件本地直接 await 的 run/control、
+ * node/update 等不必逐个接）。§63 P3 起改用同步 DOM CustomEvent：不经
+ * IPC 往返、不产生被拒绝的 Promise，测试也不必 mock emit。读方法的超时
+ * 不派发（CF2：读超时无「可能已生效」语义，不进粘性提示）。
  */
-function presentInvokeError(error: unknown): never {
+function presentInvokeError(write: boolean, homeId: string | null, error: unknown): never {
   const raw = String(error).replace(/^Error:\s*/, '')
   if (raw.startsWith(DAEMON_TIMEOUT_MARKER)) {
     const text = raw.slice(DAEMON_TIMEOUT_MARKER.length).trim()
-    void emit('omt:daemon-timeout', { text })
-    throw new DaemonTimeoutError(text)
+    if (write) {
+      window.dispatchEvent(
+        new CustomEvent(DAEMON_TIMEOUT_EVENT, { detail: { text, homeId } }),
+      )
+    }
+    throw new DaemonTimeoutError(text, write)
   }
   throw error
+}
+
+/** omtCall 的 params 里携带的 homeId（多数 RPC 以 homeId 限定作用域；无则 null）。 */
+function homeIdOfParams(params: Record<string, unknown>): string | null {
+  return typeof params.homeId === 'string' && params.homeId !== '' ? params.homeId : null
 }
 
 export async function omtCall<T = unknown>(method: string, params: Record<string, unknown> = {}): Promise<T> {
   try {
     return await invoke<T>('omt_call', { method, params })
   } catch (error) {
-    presentInvokeError(error)
+    presentInvokeError(DAEMON_WRITE_METHODS.has(method), homeIdOfParams(params), error)
   }
 }
 
@@ -384,8 +427,8 @@ export async function execStart(options: {
     })
   } catch (error) {
     // §59 F-SP2-12：exec_start 经 rpc_of → launch::start 同样上抛
-    // DAEMON_TIMEOUT_MESSAGE（无 commandId 的写）——出口统一整形
-    presentInvokeError(error)
+    // DAEMON_TIMEOUT_MESSAGE（无 commandId 的写）——出口统一整形（恒为写）
+    presentInvokeError(true, options.homeId, error)
   }
 }
 

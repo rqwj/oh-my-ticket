@@ -5,8 +5,8 @@
  * the credential's operations include the admin family (AE12: no grant →
  * no render).
  *
- * U1b：旧 dsh harness 条目的 per-home 提示（迁移不静默丢弃）保留——当前
- * 工作区命中时在通用段提示。
+ * U1b：旧 dsh harness 条目的 per-home 提示（迁移不静默丢弃）保留。§64
+ * 遗留：按 home 逐条提示（不只看当前 home）——只要该 home 还开着就可见。
  */
 import { useEffect, useState } from 'react'
 import { ask, open as openDialog } from '@tauri-apps/plugin-dialog'
@@ -20,6 +20,7 @@ import {
   type DaemonStatus,
 } from './bridge'
 import type { HomeInfo } from './types'
+import { workspaceNameOf } from './workspaceList'
 import { HarnessManagerTab } from './HarnessManagerTab'
 import { ExecPolicySection } from './ExecPolicySection'
 
@@ -141,12 +142,15 @@ export function SettingsPanel({ homes, legacyDshByHome, activeHome }: Props) {
             </p>
             {installMessage && <p className="info-banner">{installMessage}</p>}
           </section>
-          {activeHome && legacyDshByHome[activeHome.homeId] && (
-            <p className="info-banner">
-              {/* U1b：旧 dsh harness 条目保留在 bag，不静默丢弃（dsh 接入属后续版本） */}
-              dsh harness 后续版本支持，当前配置已保留
-            </p>
-          )}
+          {/* U1b / §64 遗留：旧 dsh harness 条目保留在 bag，不静默丢弃
+              （dsh 接入属后续版本）——按 home 逐条提示，不只看当前 home */}
+          {homes
+            .filter(h => legacyDshByHome[h.homeId])
+            .map(h => (
+              <p key={h.homeId} className="info-banner">
+                「{workspaceNameOf(h.path ?? '')}」：dsh harness 后续版本支持，当前配置已保留
+              </p>
+            ))}
           {isAdmin && (
             <section>
               <h3>Admin</h3>

@@ -151,6 +151,30 @@ describe('添加弹窗候选（F-TERM-5）', () => {
     expect(candidates[0]).toMatchObject({ homeId: 'h_x', missing: false })
     expect(candidates[1]).toMatchObject({ homeId: null })
   })
+
+  it('F-TERM-9：同一 home 按去重——daemon 报原始路径（/tmp）、known-homes 报规范路径（/private/tmp）时只列一行', () => {
+    const candidates = addCandidates(
+      [],
+      [known({ path: '/private/tmp/ws2/.omt', lastHomeId: 'h_b' })],
+      [{ homeId: 'h_b', path: '/tmp/ws2/.omt' }],
+    )
+    // 同一 home（h_b）在 daemon 与 known-homes 各报一种路径写法——只按
+    // path 去重会出现两行；收录 open home 的 homeId 后 known 条目被拦下
+    expect(candidates.map(c => c.path)).toEqual(['/tmp/ws2/.omt'])
+    expect(candidates[0]).toMatchObject({ homeId: 'h_b' })
+  })
+
+  it('F-TERM-9：known 条目之间也按 lastHomeId 去重（不同路径指向同一历史 home）', () => {
+    const candidates = addCandidates(
+      [],
+      [
+        known({ path: '/tmp/ws2/.omt', lastHomeId: 'h_b' }),
+        known({ path: '/private/tmp/ws2/.omt', lastHomeId: 'h_b' }),
+      ],
+      [],
+    )
+    expect(candidates.map(c => c.path)).toEqual(['/tmp/ws2/.omt'])
+  })
 })
 
 describe('localStorage 存取', () => {
@@ -173,5 +197,14 @@ describe('localStorage 存取', () => {
   it('数组里形状不对的条目被剔除，其余条目保留', () => {
     window.localStorage.setItem(WORKSPACES_KEY, JSON.stringify([{ path: '/x/.omt' }, { path: '/y/.omt', homeId: 'h_y', name: 'y' }]))
     expect(readStoredWorkspaces()).toEqual([{ path: '/y/.omt', homeId: 'h_y', name: 'y' }])
+  })
+
+  // §64 遗留：原始数组非空但全部条目无效 → 按首次运行处理（null，重新
+  // 迁移）——这种形态不是「用户清空了列表」（用户清空存的是空数组 []）
+  it('全部条目无效 → null（按首次运行处理）；空数组仍是有效的「用户清空」', () => {
+    window.localStorage.setItem(WORKSPACES_KEY, JSON.stringify([{ path: 42 }, 'oops', null]))
+    expect(readStoredWorkspaces(), '全无效 ≠ 用户清空——不得据为存量跳过迁移').toBeNull()
+    window.localStorage.setItem(WORKSPACES_KEY, '[]')
+    expect(readStoredWorkspaces(), '空数组是用户清空过的有效状态').toEqual([])
   })
 })
