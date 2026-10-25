@@ -34,6 +34,9 @@ struct HandshakeHome {
 struct KnownHomeEntry {
     path: String,
     last_home_id: String,
+    /// workspace / global（F-TERM-20：未在本次握手里的 home 由它判定
+    /// terminalCapable）
+    kind: String,
 }
 
 /// 提取 homeId/path 对（handshake_homes() 返回的已是 homes **数组**：
@@ -66,6 +69,7 @@ fn known_homes_of(homes: &serde_json::Value) -> Vec<KnownHomeEntry> {
                     Some(KnownHomeEntry {
                         path: home["path"].as_str()?.to_string(),
                         last_home_id: home["lastHomeId"].as_str().unwrap_or("").to_string(),
+                        kind: home["kind"].as_str().unwrap_or("").to_string(),
                     })
                 })
                 .collect()
@@ -168,31 +172,67 @@ fn active_count_of_home(runtime_dir: &Path, home_id: &str) -> usize {
         .count()
 }
 
-/// R2/R9/R32：`workspace_session_counts` 的可测内芯——handshake 提供当前
-/// home 的 kind/path（KTD19 判定与 reveal 同源；复用
-/// `workspace_scope_denial`，kind 缺失按拒绝——与 local.rs 的 fail-closed
-/// 口径一致），计数遍历 runtime 的 `agents/` 目录（不依赖 daemon 是否声明
-/// 过该 home）。
+/// R2/R9/R32：`workspace_session_counts` 的可测内芯。
+///
+/// F-TERM-20：home 集合 = runtime 里有 `agents/` 目录的 home ∪ 本次会话握手
+/// 的已开 home ∪ known-homes 记录过的 home（`lastHomeId`）。`agents/<homeId>`
+/// 目录要到首次派发才出现，握手 homes 又只是建会话那一刻的快照——只遍历
+/// 前者会让从未派发过、或不在快照里的工作区（daemon 重启、空闲关闭、其他
+/// 客户端打开）没有条目，前端按「未知」处理：隐藏「在此工作区打开终端」、
+/// 移除总走两段确认。kind/path 先取握手（当前 id，权威）、再取 known-homes；
+/// 没有 agents 目录的计 0。KTD19 仍复用 `workspace_scope_denial`；三处都给不出
+/// kind 的（只剩 agents 目录、daemon 与 known-homes 都不认识）才按拒绝
+/// ——fail-closed，与 local.rs 口径一致。
 fn session_counts_value(
     handshake: &serde_json::Value,
+    known: &serde_json::Value,
     runtime_dir: &Path,
     user_home: Option<&Path>,
 ) -> serde_json::Value {
     let handshake_homes = handshake.as_array().cloned().unwrap_or_default();
+    let known_homes = known_homes_of(known);
     let user_home = user_home.map(PathBuf::from);
+
+    // 稳定顺序：agents 目录 → 握手 → known-homes，各自去重
+    let mut home_ids: Vec<String> = Vec::new();
+    let mut push = |id: &str| {
+        if !id.is_empty() && !home_ids.iter().any(|seen| seen == id) {
+            home_ids.push(id.to_string());
+        }
+    };
+    for id in omt_exec::layout::home_ids(runtime_dir) {
+        push(&id);
+    }
+    for home in &handshake_homes {
+        if let Some(id) = home["homeId"].as_str() {
+            push(id);
+        }
+    }
+    for entry in &known_homes {
+        push(&entry.last_home_id);
+    }
+
     let mut homes = Vec::new();
-    for home_id in omt_exec::layout::home_ids(runtime_dir) {
-        let entry = handshake_homes
+    for home_id in home_ids {
+        let kind_and_path = handshake_homes
             .iter()
-            .find(|h| h["homeId"].as_str() == Some(home_id.as_str()));
-        // KTD19：复用 workspace_scope_denial；kind 缺失（未在 daemon 声明
-        // 过 / 旧 daemon 怪值）按拒绝——fail-closed，与 local.rs 口径一致
-        let terminal_capable = entry
-            .and_then(|h| Some((h["kind"].as_str()?, h["path"].as_str().unwrap_or_default())))
-            .is_some_and(|(kind, path)| {
-                omt_exec::local::workspace_scope_denial(kind, Path::new(path), user_home.as_deref())
-                    .is_none()
+            .find(|h| h["homeId"].as_str() == Some(home_id.as_str()))
+            .and_then(|h| {
+                Some((
+                    h["kind"].as_str()?.to_string(),
+                    h["path"].as_str().unwrap_or_default().to_string(),
+                ))
+            })
+            .or_else(|| {
+                known_homes
+                    .iter()
+                    .find(|k| k.last_home_id == home_id && !k.kind.is_empty())
+                    .map(|k| (k.kind.clone(), k.path.clone()))
             });
+        let terminal_capable = kind_and_path.is_some_and(|(kind, path)| {
+            omt_exec::local::workspace_scope_denial(&kind, Path::new(&path), user_home.as_deref())
+                .is_none()
+        });
         let others = active_count_of_home(runtime_dir, &home_id);
         homes.push(serde_json::json!({
             "homeId": home_id,
@@ -215,8 +255,13 @@ pub async fn workspace_session_counts(
     shared
         .in_blocking_scope(move |scope| {
             let handshake = scope.with_session(|session| session.handshake_homes())?;
+            // F-TERM-20：known-homes 补齐未在握手快照里的 home；拉取失败按空
+            // 处理（计数照常，这些 home 的能力判定 fail-closed）
+            let known = scope.rpc()("home/list-known", serde_json::Value::Null)
+                .unwrap_or_else(|_| serde_json::json!({ "homes": [] }));
             Ok(session_counts_value(
                 &handshake,
+                &known,
                 &daemon::runtime_dir(),
                 std::env::var_os("HOME").map(PathBuf::from).as_deref(),
             ))
@@ -361,6 +406,7 @@ mod tests {
                 ("h_x", "workspace", "/tmp/ws1/.omt"),
                 ("h_g", "global", "/Users/tester/.omt"),
             ]),
+            &known(&[]),
             runtime.path(),
             Some(Path::new("/Users/tester")),
         );
@@ -380,10 +426,69 @@ mod tests {
         );
 
         // 只含 agents 目录、未在 daemon 声明过的 home：计数照常、能力 fail-closed
-        let undeclared = session_counts_value(&handshake(&[]), runtime.path(), None);
+        let undeclared = session_counts_value(&handshake(&[]), &known(&[]), runtime.path(), None);
         let list = undeclared["homes"].as_array().expect("homes 数组");
         let h_x = list.iter().find(|h| h["homeId"] == "h_x").expect("h_x");
         assert_eq!(h_x["others"], 1, "未声明的 home 也能计数：{undeclared}");
         assert_eq!(h_x["terminalCapable"], false, "无法判定 kind → fail-closed");
+    }
+
+    /// F-TERM-20：从未派发过（没有 agents 目录）的工作区也要有条目——只在
+    /// 握手里的、只在 known-homes 里的都计 0 且按 kind 判定能力；known-homes
+    /// 的全局 home 不可开终端；三处都给不出 kind 的（只剩 agents 目录）才
+    /// fail-closed。修复前只遍历 agents 目录，前两类工作区没有条目，前端
+    /// 隐藏「在此工作区打开终端」、移除总走两段确认。
+    #[test]
+    fn session_counts_cover_homes_without_agents_dir() {
+        let runtime = tempfile::tempdir().expect("tempdir");
+        // 只有 agents 目录、daemon 与 known-homes 都不认识
+        std::fs::create_dir_all(runtime.path().join("agents/h_orphan")).expect("create home dir");
+
+        let known_homes = serde_json::json!({ "homes": [
+            { "path": "/tmp/ws2/.omt", "lastHomeId": "h_known", "kind": "workspace",
+              "name": ".omt", "open": false, "missing": false },
+            { "path": "/Users/tester/.omt", "lastHomeId": "h_global", "kind": "global",
+              "name": ".omt", "open": false, "missing": false },
+        ]});
+        let value = session_counts_value(
+            &handshake(&[("h_open", "workspace", "/tmp/ws1/.omt")]),
+            &known_homes,
+            runtime.path(),
+            Some(Path::new("/Users/tester")),
+        );
+        let homes = value["homes"].as_array().expect("homes 数组");
+        let get = |id: &str| {
+            homes
+                .iter()
+                .find(|h| h["homeId"] == id)
+                .unwrap_or_else(|| panic!("{id} 必须有条目：{value}"))
+                .clone()
+        };
+
+        let open = get("h_open");
+        assert_eq!(open["others"], 0, "没有 agents 目录计 0");
+        assert_eq!(
+            open["terminalCapable"], true,
+            "握手里的普通 workspace 可开终端"
+        );
+
+        let known_only = get("h_known");
+        assert_eq!(known_only["others"], 0);
+        assert_eq!(
+            known_only["terminalCapable"], true,
+            "不在握手快照里、但 known-homes 记得的 workspace 可开终端"
+        );
+
+        assert_eq!(
+            get("h_global")["terminalCapable"],
+            false,
+            "KTD19：全局 home"
+        );
+        assert_eq!(
+            get("h_orphan")["terminalCapable"],
+            false,
+            "三处都给不出 kind → fail-closed"
+        );
+        assert_eq!(homes.len(), 4, "{value}");
     }
 }

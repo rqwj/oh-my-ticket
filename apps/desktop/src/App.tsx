@@ -104,27 +104,25 @@ export function App() {
   }, [])
 
   // U2/R4：右键菜单入口——非当前工作区也无需先切换（菜单回调里按需切换）。
-  // 「在此工作区打开终端」U8 之前的行为：切到该工作区并跳 Agents 页
-  const openWorkspaceSettingsOf = useCallback(
-    (ws: WorkspaceEntry) => {
+  // 「在此工作区打开终端」U8 之前的行为：切到该工作区并跳 Agents 页。
+  // F-TERM-21：标签只在切换**落定**后才切——切换失败（目录失效、声明失败、
+  // 被后来的选择取代）或仍在进行时切标签，展示与操作的是当前工作区（对它
+  // 「停止会话并移除」会停掉错误工作区的 agent）；失败原因由图标错误态提示。
+  const switchThenOpenTab = useCallback(
+    async (ws: WorkspaceEntry, tab: TicketTab) => {
       setSettingsOpen(false)
-      if (state.activeHome?.homeId !== ws.homeId && state.activeHome?.path !== ws.path) {
-        void store.selectWorkspace(ws)
-      }
-      setTicketTab('workspace')
+      const isCurrent = state.activeHome?.homeId === ws.homeId || state.activeHome?.path === ws.path
+      if (isCurrent || (await store.selectWorkspace(ws))) setTicketTab(tab)
     },
     [state.activeHome?.homeId, state.activeHome?.path, store],
   )
-
+  const openWorkspaceSettingsOf = useCallback(
+    (ws: WorkspaceEntry) => void switchThenOpenTab(ws, 'workspace'),
+    [switchThenOpenTab],
+  )
   const openTerminalOf = useCallback(
-    (ws: WorkspaceEntry) => {
-      setSettingsOpen(false)
-      if (state.activeHome?.homeId !== ws.homeId && state.activeHome?.path !== ws.path) {
-        void store.selectWorkspace(ws)
-      }
-      setTicketTab('agents')
-    },
-    [state.activeHome?.homeId, state.activeHome?.path, store],
+    (ws: WorkspaceEntry) => void switchThenOpenTab(ws, 'agents'),
+    [switchThenOpenTab],
   )
 
   const toggleGlobalSettings = useCallback(() => setSettingsOpen(open => !open), [])

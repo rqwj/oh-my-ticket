@@ -139,6 +139,30 @@ describe('U2 右键菜单（R4）', () => {
     expect(within(document.querySelector('.workspace-settings-page') as HTMLElement).getByText('工作区设置')).toBeTruthy()
   })
 
+  it('F-TERM-21：切换失败（目录已失效）时「工作区设置」不打开设置标签——否则展示与操作的是当前工作区', async () => {
+    window.localStorage.setItem(STORED_KEY, JSON.stringify([
+      { path: '/tmp/ws1/.omt', homeId: 'h_a', name: 'ws1' },
+      { path: '/tmp/ws2/.omt', homeId: 'h_b', name: 'ws2' },
+    ]))
+    sessionCounts = [
+      { homeId: 'h_a', terminals: 1, others: 0, terminalCapable: true },
+      { homeId: 'h_b', terminals: 0, others: 0, terminalCapable: true },
+    ]
+    // B 不在 daemon 里、known-homes 标记目录已失效（计划要求这类图标仍可移除）
+    mockDaemon([homeA], [{ path: '/tmp/ws2/.omt', name: '.omt', kind: 'workspace', open: false, missing: true, lastHomeId: 'h_b' }])
+    const { App } = await import('../src/App')
+    render(<App />)
+    await waitFor(() => expect(railIcons().length).toBe(2))
+    expect(document.querySelector('.workspace-name')?.textContent).toBe('ws1')
+
+    const menu = await contextMenuOf(railIcons()[1])
+    fireEvent.click(within(menu).getByRole('menuitem', { name: '工作区设置' }))
+    await waitFor(() => expect(screen.getByText(/目录已不存在/)).toBeTruthy())
+    // 仍在 A，且没有打开（A 的）设置标签——不会在 A 上提供「从列表移除」
+    expect(document.querySelector('.workspace-name')?.textContent).toBe('ws1')
+    expect(document.querySelector('.workspace-settings-page')).toBeNull()
+  })
+
   it('「在此工作区打开终端」（U8 之前）：切换到该工作区并跳 Agents 页', async () => {
     window.localStorage.setItem(STORED_KEY, JSON.stringify([
       { path: '/tmp/ws1/.omt', homeId: 'h_a', name: 'ws1' },

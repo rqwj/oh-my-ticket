@@ -1553,9 +1553,12 @@ export function useTreeStore() {
    * 时回写列表）。声明失败（配额/路径缺失/home 锁/超时）→ 图标错误态 +
    * 全局提示。F-TERM-6：选择序号守卫——慢声明完成后若用户已改选别的
    * 图标（先点慢的 B 再点快的 C），过期结果直接丢弃，最终停在 C。
+   * F-TERM-21：返回选择是否落定（失效 / 声明失败 / 被后来的选择取代 →
+   * false）——依赖「已切到该工作区」的后续动作（如打开它的设置标签）据此
+   * 决定是否继续，不得在切换失败时作用到当前工作区上。
    */
   const selectWorkspace = useCallback(
-    async (ws: WorkspaceEntry) => {
+    async (ws: WorkspaceEntry): Promise<boolean> => {
       const seq = ++workspaceSelectSeqRef.current
       // daemon 已持有该 home（homeId 命中，或路径命中）→ 直接选中——
       // open 是权威状态，优先于 known-homes 可能过期的 missing 标记。
@@ -1568,19 +1571,19 @@ export function useTreeStore() {
         setWorkspaceError(ws.homeId, null)
         setWorkspaceError(open.homeId, null)
         void selectHome(open)
-        return
+        return true
       }
       // F-TERM-12：路径精确匹配优先、homeId 仅作写法不一致时的回退——
       // 移动过的项目（homeId 不变、旧路径条目永久 missing）不得误判失效
       if (isWorkspaceMissing(ws, knownHomesRef.current)) {
         setWorkspaceError(ws.homeId, '目录已不存在（被移动/删除），无法切换到该工作区。')
-        return
+        return false
       }
       const declared = await declareHome(ws.path)
-      if (seq !== workspaceSelectSeqRef.current) return // 过期的慢声明：用户已改选
+      if (seq !== workspaceSelectSeqRef.current) return false // 过期的慢声明：用户已改选
       if (declared.error !== null) {
         setWorkspaceError(ws.homeId, declared.error)
-        return
+        return false
       }
       // F-TERM-4：优先按声明返回的 homeId 找回（路径写法不一致时兜底旧值/路径）
       const fresh =
@@ -1589,7 +1592,7 @@ export function useTreeStore() {
         ?? homesRef.current.find(h => h.path === ws.path)
       if (!fresh) {
         setWorkspaceError(ws.homeId, '工作区已声明，但 home 列表中没有找到它——请重试。')
-        return
+        return false
       }
       setWorkspaceError(ws.homeId, null)
       setWorkspaceError(fresh.homeId, null)
@@ -1599,6 +1602,7 @@ export function useTreeStore() {
         updateWorkspaces(list => list.map(w => (w.path === ws.path ? { ...w, homeId: fresh.homeId } : w)))
       }
       void selectHome(fresh)
+      return true
     },
     [declareHome, selectHome, setWorkspaceError, updateWorkspaces],
   )
