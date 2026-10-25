@@ -40,20 +40,47 @@ export function parentDirOf(path: string, homeDir?: string): string | null {
 }
 
 /**
- * 路径哈希色相（0–359）：同缩写的工作区靠颜色区分（KTD14）。字符串 31 进
- * 哈希，稳定且与展示顺序无关。
+ * 图标调色板：12 个人眼可分的底色（白字对比度足够）。不在 360° 色相上连续
+ * 取值——相差 20° 以内的两个色相肉眼几乎分不出，同缩写的工作区就失去了
+ * 用颜色区分的意义（KTD14）。
  */
-export function hueOf(path: string): number {
-  let hash = 0
+export const WORKSPACE_PALETTE: readonly string[] = [
+  'hsl(0, 55%, 46%)', // 红
+  'hsl(24, 70%, 42%)', // 橙
+  'hsl(45, 65%, 36%)', // 芥黄
+  'hsl(90, 40%, 36%)', // 橄榄绿
+  'hsl(150, 50%, 33%)', // 绿
+  'hsl(182, 55%, 32%)', // 青
+  'hsl(205, 60%, 44%)', // 蓝
+  'hsl(232, 45%, 54%)', // 靛
+  'hsl(268, 42%, 52%)', // 紫
+  'hsl(300, 38%, 44%)', // 品红
+  'hsl(335, 52%, 47%)', // 粉
+  'hsl(210, 14%, 44%)', // 石板灰
+]
+
+/**
+ * 路径 → 调色板下标：FNV-1a 再做一次 fmix32 末端混合，只差末尾一两个字符
+ * 的路径（ws/ws2/ws3）也能散开。稳定、与展示顺序无关；工作区多于调色板时
+ * 仍可能撞色。
+ */
+export function colorIndexOf(path: string): number {
+  let h = 0x811c9dc5
   for (let i = 0; i < path.length; i++) {
-    hash = (hash * 31 + path.charCodeAt(i)) >>> 0
+    h ^= path.charCodeAt(i)
+    h = Math.imul(h, 0x01000193)
   }
-  return hash % 360
+  h ^= h >>> 16
+  h = Math.imul(h, 0x85ebca6b)
+  h ^= h >>> 13
+  h = Math.imul(h, 0xc2b2ae35)
+  h ^= h >>> 16
+  return (h >>> 0) % WORKSPACE_PALETTE.length
 }
 
-/** 图标底色：哈希色相 → 固定饱和度/亮度的 hsl（逗号参数形式，jsdom 可解析）。 */
+/** 图标底色（hsl 逗号参数形式，jsdom 可解析）。 */
 export function workspaceColor(path: string): string {
-  return `hsl(${hueOf(path)}, 45%, 42%)`
+  return WORKSPACE_PALETTE[colorIndexOf(path)]
 }
 
 /**

@@ -9,13 +9,14 @@ import {
   addCandidates,
   abbreviationOf,
   appendWorkspace,
-  hueOf,
+  colorIndexOf,
   isWorkspaceMissing,
   migrateWorkspaces,
   parentDirOf,
   readStoredWorkspaces,
   removeWorkspace,
   saveStoredWorkspaces,
+  WORKSPACE_PALETTE,
   workspaceColor,
   workspaceNameOf,
 } from '../src/workspaceList'
@@ -41,10 +42,18 @@ describe('显示名 / 缩写 / 颜色 / 上级目录', () => {
     expect(abbreviationOf('🚀项目')).toBe('🚀项')
   })
 
-  it('hueOf/workspaceColor：同路径稳定、不同路径（选取样例）不同色相', () => {
-    expect(hueOf('/tmp/one/app/.omt')).toBe(hueOf('/tmp/one/app/.omt'))
-    expect(hueOf('/tmp/one/app/.omt')).not.toBe(hueOf('/tmp/two/app/.omt'))
-    expect(workspaceColor('/tmp/one/app/.omt')).not.toBe(workspaceColor('/tmp/two/app/.omt'))
+  it('colorIndexOf/workspaceColor：同路径稳定；只差末尾字符的同名工作区也落在不同调色板色', () => {
+    expect(colorIndexOf('/tmp/one/app/.omt')).toBe(colorIndexOf('/tmp/one/app/.omt'))
+    expect(workspaceColor('/tmp/one/app/.omt')).toBe(WORKSPACE_PALETTE[colorIndexOf('/tmp/one/app/.omt')])
+    // U2 验收现场：旧的 31 进制哈希把 ws/ws3/全局 home 都落在 294–311°，
+    // 肉眼只剩两种颜色
+    const paths = ['/tmp/ws/.omt', '/tmp/ws2/.omt', '/tmp/ws3/.omt', '/tmp/one/app/.omt', '/tmp/two/app/.omt']
+    expect(new Set(paths.map(workspaceColor)).size).toBe(paths.length)
+  })
+
+  it('WORKSPACE_PALETTE：12 色互不重复', () => {
+    expect(WORKSPACE_PALETTE).toHaveLength(12)
+    expect(new Set(WORKSPACE_PALETTE).size).toBe(12)
   })
 
   it('parentDirOf：根路径去最后一段；homeDir 前缀压缩后再取；没有上级（全局 home 的 ~）→ null', () => {
