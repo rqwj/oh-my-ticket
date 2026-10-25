@@ -89,23 +89,33 @@ export function appendWorkspace(list: WorkspaceEntry[], entry: WorkspaceEntry): 
 }
 
 /**
- * 从列表移除（KTD14 选中规则）：移除项不是当前 → 选中不变；是当前 →
+ * 从列表移除（KTD14 选中规则）：条目按 path **或** homeId 命中（homeId 为
+ * 空串的未开条目靠 path 找到）。移除项不是当前 → 选中不变；是当前 →
  * 上一个，没有上一个就下一个，都没有 → null（调用方显示带「添加工作区」
- * 的空状态）。
+ * 的空状态）。返回**条目本身**（不是 homeId）——空串 homeId 的条目无法
+ * 按 id 唯一找回。
  */
 export function removeWorkspace(
   list: WorkspaceEntry[],
-  homeId: string,
-  currentHomeId: string | null,
-): { list: WorkspaceEntry[]; selectHomeId: string | null } {
-  const idx = list.findIndex(w => w.homeId === homeId)
-  if (idx === -1) return { list, selectHomeId: currentHomeId }
+  ws: { homeId: string; path: string },
+  current: { homeId: string | null; path?: string | null } | null,
+): { list: WorkspaceEntry[]; removedCurrent: boolean; next: WorkspaceEntry | null } {
+  const idx = list.findIndex(
+    w => (ws.homeId !== '' && w.homeId === ws.homeId) || w.path === ws.path,
+  )
+  if (idx === -1) return { list, removedCurrent: false, next: null }
   const next = list.filter((_, i) => i !== idx)
-  const selectHomeId =
-    homeId === currentHomeId
-      ? next[idx - 1]?.homeId ?? next[idx]?.homeId ?? null
-      : currentHomeId
-  return { list: next, selectHomeId }
+  // 当前选中按 homeId **或** path 命中（homeId 轮换回写未必及时）
+  const currentHomeId = current?.homeId ?? null
+  const currentPath = current?.path ?? null
+  const removedCurrent =
+    list[idx].homeId === currentHomeId
+    || (currentPath != null && currentPath !== '' && list[idx].path === currentPath)
+  return {
+    list: next,
+    removedCurrent,
+    next: removedCurrent ? next[idx - 1] ?? next[idx] ?? null : null,
+  }
 }
 
 /**

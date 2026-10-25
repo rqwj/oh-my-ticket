@@ -371,7 +371,9 @@ describe('§59 P3-1：跨语言前缀锁定（读 daemon.rs 源码断言）', ()
     await act(async () => {
       await result.current.refreshNodes(result.current.state.activeHome!)
     })
-    expect(result.current.state.error).toContain('结果未知')
+    // F-TERM-14：读超时用读路径自己的文案（可安全重试，无「可能已生效」）
+    expect(result.current.state.error).toContain('可安全重试')
+    expect(result.current.state.error).not.toContain('可能已生效')
     expect(result.current.state.timeoutNotice, 'CF2：读超时不进粘性提示').toBeNull()
     // 写路径（node/update，无 commandId）超时 → 粘性提示（bridge 出口事件）
     invokeMock.mockImplementation((cmd: string, args?: { method?: string }) => {

@@ -33,9 +33,11 @@ interface Props {
   /** U1b：旧 dsh harness 条目的 home 集合（迁移不静默丢弃，提示条） */
   legacyDshByHome: Record<string, boolean>
   activeHome: HomeInfo | null
+  /** §67 nit：legacy dsh 提示的显示名要压缩 homeDir 前缀（全局 home → ~） */
+  homeDir?: string
 }
 
-export function SettingsPanel({ homes, legacyDshByHome, activeHome }: Props) {
+export function SettingsPanel({ homes, legacyDshByHome, activeHome, homeDir }: Props) {
   const [status, setStatus] = useState<DaemonStatus | null>(null)
   const [isAdmin, setIsAdmin] = useState(false)
   const [installing, setInstalling] = useState(false)
@@ -148,7 +150,7 @@ export function SettingsPanel({ homes, legacyDshByHome, activeHome }: Props) {
             .filter(h => legacyDshByHome[h.homeId])
             .map(h => (
               <p key={h.homeId} className="info-banner">
-                「{workspaceNameOf(h.path ?? '')}」：dsh harness 后续版本支持，当前配置已保留
+                「{workspaceNameOf(h.path ?? '', homeDir)}」：dsh harness 后续版本支持，当前配置已保留
               </p>
             ))}
           {isAdmin && (

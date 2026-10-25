@@ -101,15 +101,40 @@ describe('收录与移除', () => {
 
   it('removeWorkspace：移除当前 → 选上一个；没有上一个选下一个；都没有 → null（空态）', () => {
     const list = [ws1, ws2, ws3]
-    expect(removeWorkspace(list, 'h_b', 'h_b')).toEqual({ list: [ws1, ws3], selectHomeId: 'h_a' })
-    expect(removeWorkspace(list, 'h_a', 'h_a')).toEqual({ list: [ws2, ws3], selectHomeId: 'h_b' })
-    expect(removeWorkspace([ws1], 'h_a', 'h_a')).toEqual({ list: [], selectHomeId: null })
+    expect(removeWorkspace(list, ws2, { homeId: 'h_b' })).toEqual({
+      list: [ws1, ws3],
+      removedCurrent: true,
+      next: ws1,
+    })
+    expect(removeWorkspace(list, ws1, { homeId: 'h_a' })).toEqual({
+      list: [ws2, ws3],
+      removedCurrent: true,
+      next: ws2,
+    })
+    expect(removeWorkspace([ws1], ws1, { homeId: 'h_a' })).toEqual({
+      list: [],
+      removedCurrent: true,
+      next: null,
+    })
+    // 当前选中按 path 命中（homeId 轮换回写未及时）：条目 id 陈旧也认得出是当前
+    expect(removeWorkspace(list, ws1, { homeId: 'h_other', path: '/tmp/ws1/.omt' }).removedCurrent).toBe(true)
   })
 
-  it('removeWorkspace：移除的不是当前 → 选中不变；未知 homeId → 原样', () => {
+  it('removeWorkspace：移除的不是当前 → 选中不变；未知条目 → 原样；空串 homeId 的条目按 path 命中', () => {
     const list = [ws1, ws2]
-    expect(removeWorkspace(list, 'h_a', 'h_b')).toEqual({ list: [ws2], selectHomeId: 'h_b' })
-    expect(removeWorkspace(list, 'h_x', 'h_a')).toEqual({ list, selectHomeId: 'h_a' })
+    expect(removeWorkspace(list, ws1, { homeId: 'h_b' })).toEqual({
+      list: [ws2],
+      removedCurrent: false,
+      next: null,
+    })
+    expect(removeWorkspace(list, { homeId: 'h_x', path: '/tmp/none/.omt' }, { homeId: 'h_a' })).toEqual({
+      list,
+      removedCurrent: false,
+      next: null,
+    })
+    // homeId 为空串的未开条目：按 path 命中（不误伤其它空串条目）
+    const neverOpened = { path: '/tmp/ws9/.omt', homeId: '', name: 'ws9' }
+    expect(removeWorkspace([neverOpened, ws1], neverOpened, { homeId: 'h_a' }).list).toEqual([ws1])
   })
 })
 

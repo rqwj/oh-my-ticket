@@ -227,7 +227,9 @@ describe('§57 超时提示独立字段（F-SP2-11）', () => {
     await act(async () => {
       await result.current.refreshNodes(result.current.state.activeHome!)
     })
-    expect(result.current.state.error).toContain('结果未知')
+    // F-TERM-14：读超时用读路径自己的文案（可安全重试，无「可能已生效」）
+    expect(result.current.state.error).toContain('可安全重试')
+    expect(result.current.state.error, '读文案不得带写路径的「可能已生效」').not.toContain('可能已生效')
     expect(result.current.state.error, '机器前缀是分流契约，不得展示给用户').not.toContain(
       '[daemon-timeout]',
     )
@@ -246,7 +248,7 @@ describe('§57 超时提示独立字段（F-SP2-11）', () => {
     expect(result.current.state.timeoutNotice?.text, '机器前缀是分流契约，不得展示给用户').not.toContain(
       '[daemon-timeout]',
     )
-    expect(result.current.state.error, 'error 与粘性提示互不干扰').toContain('结果未知')
+    expect(result.current.state.error, 'error 与粘性提示互不干扰').toContain('可安全重试')
     await act(async () => {
       await result.current.refreshAgents()
     })

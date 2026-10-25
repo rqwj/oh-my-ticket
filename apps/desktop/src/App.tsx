@@ -11,8 +11,9 @@
  */
 import { useCallback, useEffect, useState } from 'react'
 import { WorkspaceRail } from './WorkspaceRail'
+import { WorkspaceSettingsTab } from './WorkspaceSettingsTab'
 import { workspaceRootOf } from './homePath'
-import { isWorkspaceMissing, workspaceNameOf } from './workspaceList'
+import { isWorkspaceMissing, workspaceNameOf, type WorkspaceEntry } from './workspaceList'
 import { useTreeStore } from './store'
 import { TreePanel } from './TreePanel'
 import { DetailPanel } from './DetailPanel'
@@ -96,11 +97,35 @@ export function App() {
     [store],
   )
 
-  // R5：ticket 栏顶部的 ⚙ 打开当前工作区的设置标签页（内容在 U2 落地）
+  // R5：ticket 栏顶部的 ⚙ 打开当前工作区的设置标签页（U2：设置页实体落地）
   const openWorkspaceSettings = useCallback(() => {
     setSettingsOpen(false)
     setTicketTab('workspace')
   }, [])
+
+  // U2/R4：右键菜单入口——非当前工作区也无需先切换（菜单回调里按需切换）。
+  // 「在此工作区打开终端」U8 之前的行为：切到该工作区并跳 Agents 页
+  const openWorkspaceSettingsOf = useCallback(
+    (ws: WorkspaceEntry) => {
+      setSettingsOpen(false)
+      if (state.activeHome?.homeId !== ws.homeId && state.activeHome?.path !== ws.path) {
+        void store.selectWorkspace(ws)
+      }
+      setTicketTab('workspace')
+    },
+    [state.activeHome?.homeId, state.activeHome?.path, store],
+  )
+
+  const openTerminalOf = useCallback(
+    (ws: WorkspaceEntry) => {
+      setSettingsOpen(false)
+      if (state.activeHome?.homeId !== ws.homeId && state.activeHome?.path !== ws.path) {
+        void store.selectWorkspace(ws)
+      }
+      setTicketTab('agents')
+    },
+    [state.activeHome?.homeId, state.activeHome?.path, store],
+  )
 
   const toggleGlobalSettings = useCallback(() => setSettingsOpen(open => !open), [])
 
@@ -141,6 +166,11 @@ export function App() {
   const activeWorkspaceRoot = state.activeHome
     ? workspaceRootOf(state.activeHome.path, state.homeDir, state.activeHome.name ?? state.activeHome.homeId)
     : null
+  // U2/R6：当前工作区在图标栏里的条目（homeId 或 path 命中；不在列表里时
+  // 设置页降级为提示——例如 boot 自动选中的 home 尚未收录）
+  const activeWorkspaceEntry = state.activeHome
+    ? state.workspaces.find(w => w.homeId === state.activeHome!.homeId || w.path === state.activeHome!.path) ?? null
+    : null
 
   if (state.loading) return <main className="app-shell"><p className="empty-hint">连接 daemon…</p></main>
 
@@ -165,6 +195,9 @@ export function App() {
         onAddOpen={() => setAddOpen(true)}
         onAddClose={() => setAddOpen(false)}
         onToggleSettings={toggleGlobalSettings}
+        onOpenSettings={openWorkspaceSettingsOf}
+        onOpenTerminal={openTerminalOf}
+        onRemove={store.removeWorkspace}
       />
       <div className="app-main">
         <div className="notice-stack">
@@ -203,7 +236,7 @@ export function App() {
           // U1/R8：全局设置占满整个内容区（Daemon、DSH 集成、Harnesses、派发策略）
           <div className="content">
             <section className="center-pane">
-              <SettingsPanel homes={state.homes} legacyDshByHome={state.legacyDshByHome} activeHome={state.activeHome} />
+              <SettingsPanel homes={state.homes} legacyDshByHome={state.legacyDshByHome} activeHome={state.activeHome} homeDir={state.homeDir} />
             </section>
           </div>
         ) : (
@@ -337,16 +370,21 @@ export function App() {
                 />
               )}
               {ticketTab === 'workspace' && (
-                // R6：工作区设置标签页与详情/Agents/Runs 并列；内容（路径、
-                // 重建索引、Finder 显示、移除）在 U2 落地
-                <div className="workspace-settings-page">
-                  <h2>工作区设置</h2>
-                  {state.activeHome ? (
-                    <p className="empty-hint">路径、重建索引、在 Finder 中显示与从列表移除等设置项将在后续版本提供。</p>
-                  ) : (
+                // R6：工作区设置标签页与详情/Agents/Runs 并列——路径、重建索引
+                //（admin 探测，无权限不显示）、在 Finder 中显示、从列表移除
+                activeWorkspaceEntry && state.activeHome ? (
+                  <WorkspaceSettingsTab
+                    workspace={activeWorkspaceEntry}
+                    home={state.activeHome}
+                    homeDir={state.homeDir}
+                    onRemove={store.removeWorkspace}
+                  />
+                ) : (
+                  <div className="workspace-settings-page">
+                    <h2>工作区设置</h2>
                     <p className="empty-hint">当前没有打开的工作区。</p>
-                  )}
-                </div>
+                  </div>
+                )
               )}
             </section>
           </div>

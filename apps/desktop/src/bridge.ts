@@ -26,24 +26,16 @@ export interface DaemonStatus {
 export const DAEMON_TIMEOUT_MARKER = '[daemon-timeout]'
 
 /**
- * §59 F-SP2-12：daemon 写路径超时的类型化错误——bridge 出口（omtCall /
- * execStart）把 Rust `DAEMON_TIMEOUT_MESSAGE`（`[daemon-timeout] ` 机器前缀）
- * 转成本类后上抛：
- * - `text` 为剥前缀后的展示文案（Rust 常量仍是文案唯一来源），
- *   `daemonTimeout = true` 供 store 按类型分流到粘性 timeoutNotice
- *   （不再靠字符串回判——此前前缀只在 presentErrorWithKind 的调用点剥掉，
- *   组件层 `String(err)` 的展示面全在覆盖之外）；
- * - `toString()` 返回剥前缀文案——TreePanel / ExecutionDialog / RunsPanel /
- *   DetailPanel / AgentsPanel 的就地错误态（`String(err)`）自动拿到干净
- *   文案，无需逐点替换。
- */
-/**
  * CF2（§59 P3 / §63 P3）：daemon **写**方法集合——只有这些方法的超时带
  * 「结果未知、可能已生效」语义（无 commandId 的非幂等写，重试有重复
  * 提交风险），才值得粘性提示；读方法（node/tree、node/get、run/list…）
  * 超时没有这层语义，照常进普通 error，不进提示。
+ * F-TERM-14（§67）：`ui/filters-set` / `ui/recent-set` **移出**写集合——
+ * 它们是幂等的后台写（整个 bag 替换、重发无重复提交风险），超时挂上
+ * 「可能已生效、避免重复提交」的粘性提示只会误导（且可能绑到非活动
+ * home、只能手动关）；超时照常进普通 error（可安全重试文案）。
  */
-const DAEMON_WRITE_METHODS = new Set([
+export const DAEMON_WRITE_METHODS: ReadonlySet<string> = new Set([
   'node/create',
   'node/update',
   'node/archive',
@@ -55,10 +47,20 @@ const DAEMON_WRITE_METHODS = new Set([
   'run/interrupt',
   'run/nudge-record',
   'home/declare',
-  'ui/filters-set',
-  'ui/recent-set',
 ])
 
+/**
+ * §59 F-SP2-12：daemon 写路径超时的类型化错误——bridge 出口（omtCall /
+ * execStart）把 Rust `DAEMON_TIMEOUT_MESSAGE`（`[daemon-timeout] ` 机器前缀）
+ * 转成本类后上抛：
+ * - `text` 为剥前缀后的展示文案（Rust 常量仍是文案唯一来源），
+ *   `daemonTimeout = true` 供 store 按类型分流到粘性 timeoutNotice
+ *   （不再靠字符串回判——此前前缀只在 presentErrorWithKind 的调用点剥掉，
+ *   组件层 `String(err)` 的展示面全在覆盖之外）；
+ * - `toString()` 返回剥前缀文案——TreePanel / ExecutionDialog / RunsPanel /
+ *   DetailPanel / AgentsPanel 的就地错误态（`String(err)`）自动拿到干净
+ *   文案，无需逐点替换。
+ */
 export class DaemonTimeoutError extends Error {
   readonly daemonTimeout = true
 
@@ -130,6 +132,30 @@ export async function omtCall<T = unknown>(method: string, params: Record<string
   } catch (error) {
     presentInvokeError(DAEMON_WRITE_METHODS.has(method), homeIdOfParams(params), error)
   }
+}
+
+// ── U2：工作区命令（R4/R6/R9；KTD17/KTD19）──────────────────────────
+
+/** U2：workspace_session_counts 的单条投影（Rust workspace.rs 的 camelCase 键）。 */
+export interface WorkspaceSessionCount {
+  homeId: string
+  /** 交互式终端会话数（U4 落地前恒为 0） */
+  terminals: number
+  /** 其他运行中的 exec 数（桌面派发 / CLI / MCP） */
+  others: number
+  /** KTD19：是否有项目目录（workspace_scope_denial 判定）——「在此工作区打开终端」入口以此为准 */
+  terminalCapable: boolean
+}
+
+/** R2/R9/R32：全部 home 的运行中会话计数（含未在 daemon 声明过的 home）。 */
+export async function workspaceSessionCounts(): Promise<WorkspaceSessionCount[]> {
+  const result = await invoke<{ homes?: WorkspaceSessionCount[] }>('workspace_session_counts')
+  return result.homes ?? []
+}
+
+/** KTD17：「在 Finder 中显示」——服务端由 homeId 解析路径并 `open -R`，前端不传路径。 */
+export async function workspaceReveal(homeId: string): Promise<void> {
+  await invoke<void>('workspace_reveal', { homeId })
 }
 
 export async function daemonStatus(): Promise<DaemonStatus> {

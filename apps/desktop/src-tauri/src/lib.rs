@@ -13,6 +13,8 @@ mod rpc_bridge;
 /// U2-1（CF6）：pub 仅为 doctest 的 compile_fail 证明可用（会话锁在库外
 /// 拿不到、令牌不可构造）；命令面不变。
 pub mod state;
+/// U2（嵌入式终端计划）：工作区命令（reveal / 会话计数）。
+mod workspace;
 
 use quit_dialog::{QuitChoice, DIALOG_KEEP};
 use state::SharedSession;
@@ -335,6 +337,8 @@ pub fn run() {
             executor::exec_attach,
             executor::exec_policy_get,
             executor::exec_policy_set,
+            workspace::workspace_reveal,
+            workspace::workspace_session_counts,
         ])
         .build(tauri::generate_context!())
         .expect("error while building oh-my-ticket desktop")

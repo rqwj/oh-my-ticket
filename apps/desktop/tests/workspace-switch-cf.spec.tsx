@@ -676,3 +676,313 @@ describe('§64 遗留：openRunsOfHome / missing 双键 / 全无效存量 / 设�
     await waitFor(() => expect(screen.getByText(/「ws2」：dsh harness 后续版本支持/)).toBeTruthy())
   })
 })
+
+// ── F-TERM-13（§67）：events-status 按 homeId 过滤 + 只在 homeId 变化时清 ──
+
+describe('F-TERM-13：events-status 监听按 payload.homeId 过滤', () => {
+  async function eventsStatusListener(): Promise<(payload: unknown) => void> {
+    const call = listenMock.mock.calls.find((c: unknown[]) => c[0] === 'omt://events-status')
+    if (!call) throw new Error('store 应订阅 omt://events-status')
+    return call[1] as (event: { payload: unknown }) => void
+  }
+
+  it('store：切到 B 前一刻 A 的「失败」不挂到 B；重选当前图标不清横幅', async () => {
+    const { result } = await bootStore([homeA, homeB])
+    const handler = await eventsStatusListener()
+    expect(result.current.state.eventsStatus).toBeNull()
+
+    // A 上的失败（A 是当前 home）：照常挂上
+    await act(async () => {
+      handler({ payload: { homeId: 'h_a', ok: false, error: 'connection closed' } })
+    })
+    expect(result.current.state.eventsStatus?.homeId).toBe('h_a')
+
+    // 切到 B：横幅随切换清掉（homeId 变化）
+    await act(async () => {
+      await result.current.selectHome(homeB)
+    })
+    expect(result.current.state.eventsStatus).toBeNull()
+
+    // A 的旧失败事件此刻才到（泵停在 A 的尾声 / 事件竞争）：不得挂到 B
+    await act(async () => {
+      handler({ payload: { homeId: 'h_a', ok: false, error: 'stale' } })
+    })
+    expect(result.current.state.eventsStatus, 'A 的旧事件不得挂到 B（否则 B 的恢复事件永不到来，横幅卡死）').toBeNull()
+
+    // B 自己的失败照常可见
+    await act(async () => {
+      handler({ payload: { homeId: 'h_b', ok: false, error: 'b down' } })
+    })
+    expect(result.current.state.eventsStatus?.homeId).toBe('h_b')
+
+    // 重选当前图标（selectHome 同 home）：不清横幅——泵的 down 已锁存不会
+    // 重报，清了就永远回不来
+    await act(async () => {
+      await result.current.selectHome(homeB)
+    })
+    expect(result.current.state.eventsStatus?.homeId, '重点当前图标不清横幅').toBe('h_b')
+
+    // ok:true（同 home）照常恢复
+    await act(async () => {
+      handler({ payload: { homeId: 'h_b', ok: true, error: null } })
+    })
+    expect(result.current.state.eventsStatus).toBeNull()
+  })
+
+  it('App：A 的失败事件在切到 B 后到达 → 不显示横幅；重选 B 不清 B 的横幅', async () => {
+    mockDaemon([homeA, homeB])
+    const { App } = await import('../src/App')
+    render(<App />)
+    await waitFor(() => expect(railIcons().length).toBe(2))
+    const handler = await eventsStatusListener()
+
+    // 切到 B 后，A 的旧失败事件到达——横幅不得出现
+    fireEvent.click(screen.getByTitle('ws2（/tmp）'))
+    await waitFor(() => expect(document.querySelector('.workspace-name')?.textContent).toBe('ws2'))
+    await act(async () => {
+      handler({ payload: { homeId: 'h_a', ok: false, error: 'stale' } })
+    })
+    expect(document.querySelector('.events-status-banner')).toBeNull()
+
+    // B 自己失败 → 横幅出现；重点当前图标 → 横幅保持（事件仍坏）
+    await act(async () => {
+      handler({ payload: { homeId: 'h_b', ok: false, error: 'b down' } })
+    })
+    await waitFor(() => expect(document.querySelector('.events-status-banner')).toBeTruthy())
+    fireEvent.click(screen.getByTitle('ws2（/tmp）'))
+    await act(async () => {})
+    expect(document.querySelector('.events-status-banner'), '重选当前图标不得清掉仍坏的横幅').toBeTruthy()
+  })
+})
+
+// ── F-TERM-14（§67）：幂等后台写移出写集合；读超时自有文案；失败守卫 ──────
+
+describe('F-TERM-14：写方法集合与超时分流', () => {
+  it('组件写方法（run/control 等）在写集合里；ui/filters-set / ui/recent-set / node/tree 不在', async () => {
+    const { DAEMON_WRITE_METHODS } = await import('../src/bridge')
+    // 组件直连的写路径必须在集合里（超时 = 结果未知、可能已生效 → 粘性提示）
+    for (const method of [
+      'node/create', 'node/update', 'node/archive', 'node/move',
+      'run/create', 'run/control', 'run/report', 'run/add-members', 'run/interrupt', 'run/nudge-record',
+      'home/declare',
+    ]) {
+      expect(DAEMON_WRITE_METHODS.has(method), `${method} 必须在写集合里`).toBe(true)
+    }
+    // 幂等后台写（整个 bag 替换、重发无风险）与读方法不得在集合里
+    expect(DAEMON_WRITE_METHODS.has('ui/filters-set'), '幂等后台写不挂粘性提示').toBe(false)
+    expect(DAEMON_WRITE_METHODS.has('ui/recent-set'), '幂等后台写不挂粘性提示').toBe(false)
+    expect(DAEMON_WRITE_METHODS.has('node/tree')).toBe(false)
+    expect(DAEMON_WRITE_METHODS.has('run/list')).toBe(false)
+  })
+
+  it('bridge：ui/filters-set 超时不派发 omt:daemon-timeout（无粘性提示）、DaemonTimeoutError.write=false', async () => {
+    const { omtCall, DAEMON_TIMEOUT_EVENT } = await import('../src/bridge')
+    const dispatchSpy = vi.spyOn(window, 'dispatchEvent')
+    invokeMock.mockReset()
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === 'omt_call') return Promise.reject(new Error('[daemon-timeout] daemon 无响应（30s）：结果未知、可能已生效'))
+      return Promise.resolve({})
+    })
+    let caught: unknown = null
+    await omtCall('ui/filters-set', { homeId: 'h_a', key: 'tauri:harness', filters: {} }).catch(error => {
+      caught = error
+    })
+    expect(String(caught)).toContain('daemon 无响应')
+    const typed = caught as { daemonTimeout?: boolean; write?: boolean }
+    expect(typed.daemonTimeout, '仍是类型化超时错误（调用方可读文案）').toBe(true)
+    expect(typed.write, '幂等后台写不算写（不落粘性提示）').toBe(false)
+    expect(
+      dispatchSpy.mock.calls.some(([event]) => (event as Event).type === DAEMON_TIMEOUT_EVENT),
+      '不得派发粘性提示事件',
+    ).toBe(false)
+    dispatchSpy.mockRestore()
+  })
+
+  it('refreshNodes 失败分支的活动 home 守卫：A 迟到的失败横幅不显示在 B', async () => {
+    let rejectTreeA: ((reason: Error) => void) | undefined
+    const rendered = await bootStore([homeA, homeB], () => {
+      invokeMock.mockReset()
+      invokeMock.mockImplementation((cmd: string, args?: { method?: string; params?: { homeId?: string } }) => {
+        if (cmd === 'daemon_homes') return Promise.resolve({ homes: [homeA, homeB], homeDir: '/Users/test' })
+        if (cmd === 'omt_call' && args?.method === 'home/list-known') return Promise.resolve({ homes: [] })
+        if (cmd === 'omt_call' && args?.method === 'node/tree') {
+          if (args.params?.homeId === 'h_a') {
+            return new Promise((_resolve, reject) => {
+              rejectTreeA = reject
+            })
+          }
+          return Promise.resolve({ trees: [] })
+        }
+        return Promise.resolve({})
+      })
+    })
+    const { result } = rendered
+    await waitFor(() => expect(result.current.state.activeHome?.homeId).toBe('h_a'))
+
+    await act(async () => {
+      await result.current.selectHome(homeB)
+    })
+    expect(result.current.state.error).toBeNull()
+    // A 的 node/tree 现在才失败（迟到）——不得把错误横幅挂到 B
+    await act(async () => {
+      rejectTreeA?.(new Error('A 的读失败'))
+      await Promise.resolve()
+    })
+    await act(async () => {})
+    expect(result.current.state.error, 'A 迟到的失败不得显示在 B（F-TERM-14）').toBeNull()
+    // B 自己的失败照常可见（守卫没有误伤）
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === 'daemon_homes') return Promise.resolve({ homes: [homeA, homeB], homeDir: '/Users/test' })
+      return Promise.reject(new Error('B 的读失败'))
+    })
+    await act(async () => {
+      await result.current.refreshNodes(homeB)
+    })
+    expect(result.current.state.error).toContain('B 的读失败')
+  })
+})
+
+// ── F-TERM-15（§67）：通知绑定写操作自己的 homeId；App 的 openRunsOfHome 接线 ──
+
+describe('F-TERM-15：变异兜底测试', () => {
+  it('写超时的粘性提示绑定**写操作自己的 homeId**（写超时发生在用户切走之后）', async () => {
+    const { result } = await bootStore([homeA, homeB])
+    // 用户切到 B 之后，针对 A 的写（node/update）才超时——提示必须记 A，
+    // 不是当前的 B（CF2 的核心场景：B 的刷新不得清掉关于 A 的写提示）
+    await act(async () => {
+      await result.current.selectHome(homeB)
+    })
+    expect(result.current.state.activeHome?.homeId).toBe('h_b')
+    await act(async () => {
+      window.dispatchEvent(
+        new CustomEvent('omt:daemon-timeout', {
+          detail: { text: 'daemon 无响应（30s）：结果未知、可能已生效', homeId: 'h_a' },
+        }),
+      )
+    })
+    expect(result.current.state.timeoutNotice?.homeId, '提示绑定写操作的 homeId（h_a），不是活动 home（h_b）').toBe('h_a')
+    // B 的刷新成功不得清它（同 home 门槛）
+    await act(async () => {
+      await result.current.refreshNodes(homeB)
+    })
+    expect(result.current.state.timeoutNotice?.homeId).toBe('h_a')
+  })
+
+  it('bridge 出口：omtCall 的写超时事件带 params.homeId（不是 bridge 层活动 home 猜测）', async () => {
+    const { omtCall, DAEMON_TIMEOUT_EVENT } = await import('../src/bridge')
+    const dispatchSpy = vi.spyOn(window, 'dispatchEvent')
+    invokeMock.mockReset()
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === 'omt_call') return Promise.reject(new Error('[daemon-timeout] daemon 无响应（30s）'))
+      return Promise.resolve({})
+    })
+    await omtCall('run/control', { homeId: 'h_target', runId: 'RUN-0001', action: 'pause' }).catch(() => {})
+    const fired = dispatchSpy.mock.calls
+      .map(([event]) => event as CustomEvent<{ homeId?: string; text?: string }>)
+      .find(event => event.type === DAEMON_TIMEOUT_EVENT)
+    expect(fired, '写超时必须派发 omt:daemon-timeout（组件直连的 run/control 由它统一覆盖）').toBeTruthy()
+    expect(fired!.detail.homeId, '事件携带写操作自己的 homeId').toBe('h_target')
+    dispatchSpy.mockRestore()
+  })
+
+  it('App 的 openRunsOfHome 接线：租约通知「前往 Runs」切到 Runs 视图（并关掉全局设置）', async () => {
+    window.localStorage.setItem(STORED_KEY, JSON.stringify([
+      { path: '/tmp/ws1/.omt', homeId: 'h_a', name: 'ws1' },
+    ]))
+    invokeMock.mockReset()
+    invokeMock.mockImplementation((cmd: string, args?: { method?: string; homeId?: string }) => {
+      if (cmd === 'daemon_homes') return Promise.resolve({ homes: [homeA], homeDir: '/Users/test' })
+      if (cmd === 'omt_call' && args?.method === 'home/list-known') return Promise.resolve({ homes: [] })
+      if (cmd === 'agents_list') {
+        return Promise.resolve({
+          agents: [{
+            id: 'agent-a',
+            displayName: 'Agent 1',
+            title: '冒烟任务',
+            harness: 'omp',
+            status: 'exited',
+            attachment: 'none',
+            lastExecId: 'exec-a',
+            lastSessionId: null,
+            execs: [{
+              execId: 'exec-a',
+              nodeId: 'T-1',
+              runId: 'RUN-0001',
+              startedAt: '1000',
+              exitCode: 0,
+              killReason: null,
+              failureDetail: null,
+              harnessSessionId: null,
+              transcriptFile: null,
+              binaryPath: null,
+              binaryArgs: [],
+              pid: null,
+              processStartId: null,
+            }],
+          }],
+          agentSeq: 1,
+          parseFailed: false,
+        })
+      }
+      if (cmd === 'agents_delete') {
+        return Promise.resolve({
+          deleted: 'agent-a',
+          leasesReleased: 0,
+          leaseReleaseFailures: ['exec exec-a: daemon 不可达'],
+        })
+      }
+      return Promise.resolve({})
+    })
+    const { App } = await import('../src/App')
+    render(<App />)
+    await waitFor(() => expect(railIcons().length).toBe(1))
+    // 打开全局设置再进 Agents 删 agent——「前往 Runs」必须同时关掉它
+    fireEvent.click(screen.getByTitle('全局设置'))
+    await waitFor(() => expect(document.querySelector('.settings-panel')).toBeTruthy())
+    fireEvent.click(screen.getByTitle('ws1（/tmp）'))
+    await waitFor(() => expect(document.querySelector('.settings-panel')).toBeNull())
+    fireEvent.click(screen.getByRole('button', { name: /Agents/ }))
+    // 删除 agent（确认弹窗 → 确认删除）
+    fireEvent.click(await screen.findByRole('button', { name: '删除 冒烟任务' }))
+    fireEvent.click(await screen.findByRole('button', { name: '确认删除' }))
+    // §47 通知条出现 → 「前往 Runs」
+    const banner = await waitFor(() => {
+      const el = document.querySelector('.lease-notices') as HTMLElement | null
+      expect(el, '强删通知应出现（§47）').toBeTruthy()
+      return el!
+    })
+    expect(within(banner).getByText(/已删除/)).toBeTruthy()
+    fireEvent.click(within(banner).getByRole('button', { name: '前往 Runs' }))
+    await waitFor(() => expect(document.querySelector('.runs-panel'), '切到 Runs 视图').toBeTruthy())
+    expect(document.querySelector('.settings-panel'), '全局设置保持关闭').toBeNull()
+  })
+})
+
+// ── §67 nit：legacy dsh 提示传 homeDir（全局 home 显示 ~）─────────────────
+
+describe('§67 nit：legacy dsh 提示的显示名压缩 homeDir 前缀', () => {
+  it('全局 home 的 dsh 提示显示「~」，不是目录名', async () => {
+    window.localStorage.setItem(STORED_KEY, JSON.stringify([
+      { path: '/Users/test/.omt', homeId: 'h_g', name: '~' },
+    ]))
+    invokeMock.mockReset()
+    invokeMock.mockImplementation((cmd: string, args?: { method?: string; params?: { homeId?: string } }) => {
+      if (cmd === 'daemon_homes') {
+        return Promise.resolve({
+          homes: [{ homeId: 'h_g', kind: 'global', path: '/Users/test/.omt' }],
+          homeDir: '/Users/test',
+        })
+      }
+      if (cmd === 'omt_call' && args?.method === 'home/list-known') return Promise.resolve({ homes: [] })
+      if (cmd === 'omt_call' && args?.method === 'ui/filters-get') {
+        return Promise.resolve({ filters: { harness: { type: 'dsh' } } })
+      }
+      return Promise.resolve({})
+    })
+    const { App } = await import('../src/App')
+    render(<App />)
+    await waitFor(() => expect(railIcons().length).toBe(1))
+    fireEvent.click(screen.getByTitle('全局设置'))
+    await waitFor(() => expect(screen.getByText(/「~」：dsh harness 后续版本支持/)).toBeTruthy())
+  })
+})

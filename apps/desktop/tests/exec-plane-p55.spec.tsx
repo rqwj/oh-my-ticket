@@ -171,7 +171,10 @@ describe('§55 daemon_homes 拒绝 / 超时错误条', () => {
     await act(async () => {
       await result.current.refreshNodes(result.current.state.activeHome!)
     })
-    expect(result.current.state.error, '读超时照常进普通 error').toContain('结果未知')
+    // F-TERM-14：读超时用读路径自己的文案（可安全重试），不再复用写路径的
+    // 「结果未知、可能已生效、避免重复提交」——对读是误导
+    expect(result.current.state.error, '读超时照常进普通 error').toContain('可安全重试')
+    expect(result.current.state.error, '读文案不得带写路径的「可能已生效」').not.toContain('可能已生效')
     expect(result.current.state.timeoutNotice, 'CF2：读超时不进粘性提示').toBeNull()
     // 写超时（bridge 出口事件）→ 结构化粘性提示
     await act(async () => {

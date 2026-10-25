@@ -73,6 +73,11 @@ body {
 .notice-stack { display: flex; flex-direction: column; gap: 8px; padding: 8px 12px 0; }
 .workspace-error-banner { display: flex; align-items: center; gap: 8px; }
 .workspace-error-banner .workspace-error-text { flex: 1; }
+/* §67 nit：`.timeout-notice` 的关闭按钮此前没有 flex 布局（规则只写在
+   .workspace-error-banner 上），长文案时 ✕ 换行 / 不对齐——同一形态的横幅
+   共用同一套行内布局 */
+.timeout-notice { display: flex; align-items: center; gap: 8px; }
+.timeout-notice .workspace-error-text { flex: 1; }
 .banner-close {
   border: none; background: transparent; color: inherit; cursor: pointer;
   font-size: 12px; padding: 2px 6px; border-radius: 4px; flex-shrink: 0;
@@ -235,6 +240,26 @@ body {
   align-items: center; justify-content: center;
 }
 .workspace-settings-page h2 { margin: 0 0 12px; font-size: 18px; }
+.workspace-settings-page { padding: 16px; overflow-y: auto; }
+.ws-settings-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 16px; }
+
+/* ── U2：工作区右键菜单（R4）与移除确认（R32）───────────────── */
+.context-overlay { position: fixed; inset: 0; z-index: 90; }
+.ws-context-menu {
+  position: fixed; z-index: 91; min-width: 200px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+  padding: 4px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+}
+.ws-menu-item {
+  display: block; width: 100%; text-align: left;
+  border: none; background: transparent; color: var(--text);
+  padding: 6px 10px; border-radius: 6px; cursor: pointer; font-size: 13px;
+}
+.ws-menu-item:hover { background: var(--panel-raised); }
+.ws-menu-sep { height: 1px; background: var(--border); margin: 4px 2px; }
+.ws-menu-danger { color: var(--danger); }
+.ws-remove-confirm { padding: 8px 10px; max-width: 300px; }
+.ws-remove-text { margin: 0 0 10px; font-size: 13px; line-height: 1.5; }
 
 /* 添加工作区弹窗（图标栏「＋」）沿用 modal 形态 */
 .modal-overlay {

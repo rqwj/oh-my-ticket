@@ -5,6 +5,8 @@
  * 点击切换（懒声明与错误态由 store 的 selectWorkspace 处理）。底部「＋」
  * 添加工作区（沿用目录选择 + 已知未开流程，R3）、「⚙」全局设置（R8）。
  * 运行中终端的角标（R2）数据源在 U2/U8 接入。
+ * U2（R4）：右键弹工作区菜单——会话计数在打开菜单前经
+ * workspace_session_counts 拉取（失败 → running=null，移除走两段确认）。
  */
 import { useState } from 'react'
 import { open as openDialog } from '@tauri-apps/plugin-dialog'
@@ -19,6 +21,8 @@ import {
   workspaceColor,
   type WorkspaceEntry,
 } from './workspaceList'
+import { workspaceSessionCounts, workspaceReveal } from './bridge'
+import { WorkspaceContextMenu, type WorkspaceMenuInfo } from './WorkspaceContextMenu'
 
 interface Props {
   workspaces: WorkspaceEntry[]
@@ -39,6 +43,10 @@ interface Props {
   onAddOpen: () => void
   onAddClose: () => void
   onToggleSettings: () => void
+  /** U2/R4：右键菜单的入口（非当前工作区也可操作，无需先切换） */
+  onOpenSettings: (ws: WorkspaceEntry) => void
+  onOpenTerminal: (ws: WorkspaceEntry) => void
+  onRemove: (ws: WorkspaceEntry, opts?: { stopSessions?: boolean }) => Promise<void>
 }
 
 export function WorkspaceRail({
@@ -56,9 +64,19 @@ export function WorkspaceRail({
   onAddOpen,
   onAddClose,
   onToggleSettings,
+  onOpenSettings,
+  onOpenTerminal,
+  onRemove,
 }: Props) {
   const [addMessage, setAddMessage] = useState<string | null>(null)
   const [picking, setPicking] = useState(false)
+  // U2/R4：右键菜单（打开前先拉会话计数，拉到才弹——terminalCapable 与
+  // running 一次拿齐；失败也弹，running=null 走保守两段确认）
+  const [menu, setMenu] = useState<{
+    ws: WorkspaceEntry
+    position: { x: number; y: number }
+    info: WorkspaceMenuInfo
+  } | null>(null)
 
   const add = async (homePath: string) => {
     const error = await onAdd(homePath)
@@ -83,6 +101,30 @@ export function WorkspaceRail({
     } finally {
       setPicking(false)
     }
+  }
+
+  const openContextMenu = (ws: WorkspaceEntry, x: number, y: number) => {
+    void workspaceSessionCounts()
+      .then(homes => {
+        const entry = homes.find(h => h.homeId === ws.homeId)
+        setMenu({
+          ws,
+          position: { x, y },
+          info: {
+            terminalCapable: entry?.terminalCapable ?? false,
+            // 找不到条目（homeId 轮换 / home 无 agents 目录）按未知处理——
+            // 移除走两段确认，绝不因“没找到”而当作 0 直接移除
+            running: entry ? entry.terminals + entry.others : null,
+          },
+        })
+      })
+      .catch(() => {
+        setMenu({
+          ws,
+          position: { x, y },
+          info: { terminalCapable: false, running: null },
+        })
+      })
   }
 
   // F-TERM-5：候选 = known-homes 条目 + daemon 已打开的 home，排除已在
@@ -120,6 +162,10 @@ export function WorkspaceRail({
                 aria-label={ws.name}
                 aria-current={ws.homeId === activeHomeId ? 'true' : undefined}
                 onClick={() => onSelect(ws)}
+                onContextMenu={event => {
+                  event.preventDefault()
+                  openContextMenu(ws, event.clientX, event.clientY)
+                }}
               >
                 <span className="rail-abbr">{abbreviationOf(ws.name)}</span>
                 {(missing || error) && <span className="rail-warn" aria-hidden>⚠</span>}
@@ -139,6 +185,20 @@ export function WorkspaceRail({
           </button>
         </div>
       </nav>
+      {menu && (
+        <WorkspaceContextMenu
+          ws={menu.ws}
+          info={menu.info}
+          position={menu.position}
+          onClose={() => setMenu(null)}
+          onOpenSettings={onOpenSettings}
+          onOpenTerminal={onOpenTerminal}
+          onReveal={ws => {
+            void workspaceReveal(ws.homeId).catch(() => {/* 错误在 Rust 侧已拒、菜单关闭 */ })
+          }}
+          onRemove={onRemove}
+        />
+      )}
       {addOpen && (
         <div className="modal-overlay" onClick={onAddClose}>
           <div className="modal-panel" onClick={e => e.stopPropagation()}>
