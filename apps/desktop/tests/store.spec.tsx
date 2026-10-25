@@ -526,11 +526,8 @@ describe('bag v2 迁移（U1b：旧 tauri:harness 条目，home 加载路径顺�
     render(
       <SettingsPanel
         homes={[home]}
-        knownHomes={[]}
         legacyDshByHome={{ h1: true }}
         activeHome={home}
-        onSelectHome={() => {}}
-        onDeclare={() => Promise.resolve(null)}
       />,
     )
     await waitFor(() => expect(screen.queryByText(/dsh harness 后续版本支持/)).toBeTruthy())

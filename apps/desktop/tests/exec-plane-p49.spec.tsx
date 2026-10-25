@@ -250,17 +250,17 @@ describe('§49 lease-notice-switch-home：「前往 Runs」先切 home（App 级
     fireEvent.click(await screen.findByRole('button', { name: '删除 Agent 1' }))
     fireEvent.click(screen.getByRole('button', { name: '确认删除' }))
     await waitFor(() => expect(screen.getByText(/租约释放失败/)).toBeTruthy())
-    // 切到 home B：通知仍显示（§47 跨 home 保留），顶栏显示 ws2
-    fireEvent.click(screen.getByTitle('切换 workspace'))
-    fireEvent.click(await screen.findByText('/tmp/omt-ws2'))
+    // 切到 home B：通知仍显示（§47 跨 home 保留），ticket 栏顶部显示 ws2
+    // （U1：右上角切换弹窗已由图标栏取代）
+    fireEvent.click(screen.getByTitle('omt-ws2（/tmp）'))
     await waitFor(() =>
-      expect(screen.getByTitle('切换 workspace').textContent).toContain('omt-ws2'),
+      expect(document.querySelector('.workspace-name')?.textContent).toContain('omt-ws2'),
     )
     expect(screen.getByText(/租约释放失败/)).toBeTruthy()
-    // 「前往 Runs」：先切回 h_a 再打开 Runs——顶栏回到 ws1，Runs 视图渲染
+    // 「前往 Runs」：先切回 h_a 再打开 Runs——标题回到 ws1，Runs 视图渲染
     fireEvent.click(screen.getByRole('button', { name: '前往 Runs' }))
     await waitFor(() =>
-      expect(screen.getByTitle('切换 workspace').textContent).toContain('omt-ws1'),
+      expect(document.querySelector('.workspace-name')?.textContent).toContain('omt-ws1'),
     )
     await waitFor(() => expect(screen.getByText('当前 home 无 run')).toBeTruthy())
   })

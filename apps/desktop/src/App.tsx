@@ -1,17 +1,18 @@
 /**
- * U10 app shell: tree (left) + detail/runs (center) + settings (toggle).
- * KD4 — fresh visual design; only domain concepts and status-color
- * semantics align with the DSH surface.
+ * U1（嵌入式终端计划）app shell：最左侧工作区图标栏 + 内容列。ticket 树
+ * 常驻内容列左侧，顶部显示当前工作区的显示名、路径与「⚙ 工作区设置」
+ * （R1、R5）；中间区域标签为「详情 | Agents | Runs | 工作区」（R6、R8）。
+ * 顶栏与右上角的切换弹窗已移除——全局设置从图标栏底部的 ⚙ 进入，占满整
+ * 个内容区（R8）。KD4：仅领域概念与状态色语义与 DSH 表面对齐。
  *
- * U5：Tickets 视图的 center-pane 内层 tab「详情 | Agents」（R-E）——选中
- * 树节点自动切详情；Agents 标签带未查看 Failed 计数 badge。
- * U9：树 badge 的绑定数据（bindingsByHome/agents）与 Agents 面一键清理
- * 接线；派发成功后 refreshBindings（R-C）。
- * U8/R-D：树与 splitter 仅 Tickets 视图渲染（Runs/设置全宽）。
+ * U5：中间区域标签的 Agents 带（R-E）未查看 Failed 计数 badge——选中树节
+ * 点自动切详情。U9：树 badge 的绑定数据（bindingsByHome/agents）与 Agents
+ * 面一键清理接线；派发成功后 refreshBindings（R-C）。
  */
-import { useCallback, useEffect, useState } from 'react'
-import { WorkspaceSwitcher } from './WorkspaceSwitcher'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import { WorkspaceRail } from './WorkspaceRail'
 import { workspaceRootOf } from './homePath'
+import { workspaceNameOf } from './workspaceList'
 import { useTreeStore } from './store'
 import { TreePanel } from './TreePanel'
 import { DetailPanel } from './DetailPanel'
@@ -23,8 +24,7 @@ import { ExecutionDialog } from './ExecutionDialog'
 import type { ExecStartOutcome } from './bridge'
 import './styles.css'
 
-type CenterView = 'detail' | 'runs' | 'settings'
-type TicketTab = 'detail' | 'agents'
+type TicketTab = 'detail' | 'agents' | 'runs' | 'workspace'
 
 const TREE_WIDTH_KEY = 'omt-desktop-tree-width'
 // 无绑定的稳定空表：每渲染新建 `{}` 会击穿下游 views memo（U7 评审修复）
@@ -39,10 +39,12 @@ function initialTreeWidth(): number {
 export function App() {
   const store = useTreeStore()
   const { state } = store
-  const [view, setView] = useState<CenterView>('detail')
   const [ticketTab, setTicketTab] = useState<TicketTab>('detail')
+  // U1/R8：全局设置由图标栏底部 ⚙ 进入，占满内容区（关闭回到原标签）
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  // 添加弹窗由 App 托管：图标栏「＋」与空状态的「添加工作区」共用入口
+  const [addOpen, setAddOpen] = useState(false)
   const [treeWidth, setTreeWidth] = useState(initialTreeWidth)
-  const [switcherOpen, setSwitcherOpen] = useState(false)
   // U6：执行弹窗全局门控（R-B）——DetailPanel 的运行按钮只开弹窗；outcome
   // warnings 作为 Agents 面持久警告条（下次派发或换 workspace 前不清除）。
   const [dispatchTarget, setDispatchTarget] = useState<{ nodeId: string; title: string } | null>(null)
@@ -56,7 +58,7 @@ export function App() {
 
   const switchToAgent = useCallback((agentId: string) => {
     setDispatchTarget(null)
-    setView('detail')
+    setSettingsOpen(false)
     setTicketTab('agents')
     store.selectAgent(agentId)
     void store.refreshAgents()
@@ -84,10 +86,19 @@ export function App() {
         const target = state.homes.find(h => h.homeId === homeId)
         if (target) void store.selectHome(target)
       }
-      setView('runs')
+      setSettingsOpen(false)
+      setTicketTab('runs')
     },
     [state.activeHome?.homeId, state.homes, store],
   )
+
+  // R5：ticket 栏顶部的 ⚙ 打开当前工作区的设置标签页（内容在 U2 落地）
+  const openWorkspaceSettings = useCallback(() => {
+    setSettingsOpen(false)
+    setTicketTab('workspace')
+  }, [])
+
+  const toggleGlobalSettings = useCallback(() => setSettingsOpen(open => !open), [])
 
   // Drag-to-resize the tree/center splitter: pointer captured on the
   // divider, width clamped 240–720px, persisted across launches.
@@ -108,52 +119,100 @@ export function App() {
     window.addEventListener('pointerup', onUp)
   }, [treeWidth])
 
+  // KTD14：known-homes 的 missing 探测 → 图标置灰带警告
+  const missingPaths = useMemo(
+    () => new Set(state.knownHomes.filter(k => k.missing).map(k => k.path)),
+    [state.knownHomes],
+  )
+  const workspaceErrorText = Object.keys(state.workspaceErrors).length > 0
+    ? Object.values(state.workspaceErrors).join('；')
+    : null
+  const activeWorkspaceName = state.activeHome ? workspaceNameOf(state.activeHome.path ?? '', state.homeDir) : null
+  const activeWorkspaceRoot = state.activeHome
+    ? workspaceRootOf(state.activeHome.path, state.homeDir, state.activeHome.name ?? state.activeHome.homeId)
+    : null
+
   if (state.loading) return <main className="app-shell"><p className="empty-hint">连接 daemon…</p></main>
 
   return (
     <main className="app-shell">
-      <nav className="top-bar">
-        <div className="tab-strip">
-          <button className={`tab${view === 'detail' ? ' active' : ''}`} onClick={() => setView('detail')}>Tickets</button>
-          <button className={`tab${view === 'runs' ? ' active' : ''}`} onClick={() => setView('runs')}>Runs</button>
-          <button className={`tab${view === 'settings' ? ' active' : ''}`} onClick={() => setView('settings')}>设置</button>
-        </div>
-        <button className="home-name home-switch-btn" title="切换 workspace" onClick={() => setSwitcherOpen(true)}>
-          {state.activeHome ? workspaceRootOf(state.activeHome.path, state.homeDir, state.activeHome.name ?? '') : '选择 workspace'}
-        </button>
-      </nav>
-      {state.error && <p className="error-banner">{state.error}</p>}
-      {/* §57 F-SP2-11：超时类提示（结果未知、可能已生效）的粘性横幅——
-          独立于 error（focus 的 agents/homes 刷新不清它），成功的节点拉取
-          （refreshNodes）才清；文案引导先刷新确认结果再决定是否重试。 */}
-      {state.timeoutNotice && <p className="error-banner timeout-notice">{state.timeoutNotice}</p>}
-      <LeaseNoticeBanner
-        notices={state.leaseNotices}
-        onDismiss={store.dismissLeaseNotice}
-        onOpenRuns={openRunsOfHome}
+      <WorkspaceRail
+        workspaces={state.workspaces}
+        knownHomes={state.knownHomes}
+        activeHomeId={state.activeHome?.homeId ?? null}
+        homeDir={state.homeDir}
+        errors={state.workspaceErrors}
+        missingPaths={missingPaths}
+        settingsOpen={settingsOpen}
+        addOpen={addOpen}
+        onSelect={ws => void store.selectWorkspace(ws)}
+        onAdd={store.addWorkspace}
+        onAddOpen={() => setAddOpen(true)}
+        onAddClose={() => setAddOpen(false)}
+        onToggleSettings={toggleGlobalSettings}
       />
-      <div className="content">
-        {/* U8/R-D：树与 splitter 仅 Tickets 视图渲染——Runs/设置自然全宽 */}
-        {view === 'detail' && state.activeHome && (
-          <div className="tree-wrap" style={{ width: treeWidth }}>
-          <TreePanel
-            nodes={state.nodes}
-            filters={state.filters}
-            recentIds={state.recentIds}
-            selectedId={state.selectedId}
-            bindings={state.bindingsByHome[state.activeHome.homeId] ?? EMPTY_BINDINGS}
-            agents={state.agents}
-            bindingsDegraded={state.bindingsParseFailed}
-            onSelect={id => { store.selectNode(id); setView('detail'); setTicketTab('detail') }}
-            onFilters={patch => state.activeHome && void store.saveFilters(state.activeHome, patch)}
-            onCreateNode={store.createNode}
-          />
+      <div className="app-main">
+        <div className="notice-stack">
+          {state.error && <p className="error-banner">{state.error}</p>}
+          {/* §57 F-SP2-11：超时类提示（结果未知、可能已生效）的粘性横幅——
+              独立于 error（focus 的 agents/homes 刷新不清它），成功的节点拉取
+              （refreshNodes）才清；文案引导先刷新确认结果再决定是否重试。 */}
+          {state.timeoutNotice && <p className="error-banner timeout-notice">{state.timeoutNotice}</p>}
+          {/* U1：工作区图标的错误态（懒声明失败 / 路径失效）逐条列出，可关闭 */}
+          {workspaceErrorText && (
+            <div className="error-banner workspace-error-banner" role="alert">
+              <span className="workspace-error-text">{workspaceErrorText}</span>
+              <button className="banner-close" aria-label="关闭工作区提示" onClick={store.clearWorkspaceErrors}>✕</button>
+            </div>
+          )}
+        </div>
+        <LeaseNoticeBanner
+          notices={state.leaseNotices}
+          onDismiss={store.dismissLeaseNotice}
+          onOpenRuns={openRunsOfHome}
+        />
+        {settingsOpen ? (
+          // U1/R8：全局设置占满整个内容区（Daemon、DSH 集成、Harnesses、派发策略）
+          <div className="content">
+            <section className="center-pane">
+              <SettingsPanel homes={state.homes} legacyDshByHome={state.legacyDshByHome} activeHome={state.activeHome} />
+            </section>
           </div>
-        )}
-        {view === 'detail' && <div className="splitter" onPointerDown={startDrag} role="separator" aria-orientation="vertical" />}
-        <section className={`center-pane${view === 'detail' && ticketTab === 'agents' ? ' agents-pane' : ''}`}>
-          {view === 'detail' && (
-            <>
+        ) : (
+          <div className="content">
+            <div className="tree-wrap" style={{ width: treeWidth }}>
+              {state.activeHome ? (
+                <>
+                  {/* R5：ticket 栏顶部——当前工作区的显示名、路径与设置入口 */}
+                  <header className="workspace-header">
+                    <div className="workspace-title">
+                      <span className="workspace-name">{activeWorkspaceName}</span>
+                      <span className="mono workspace-path">{activeWorkspaceRoot}</span>
+                    </div>
+                    <button className="icon-btn" title="工作区设置" onClick={openWorkspaceSettings}>⚙</button>
+                  </header>
+                  <TreePanel
+                    nodes={state.nodes}
+                    filters={state.filters}
+                    recentIds={state.recentIds}
+                    selectedId={state.selectedId}
+                    bindings={state.bindingsByHome[state.activeHome.homeId] ?? EMPTY_BINDINGS}
+                    agents={state.agents}
+                    bindingsDegraded={state.bindingsParseFailed}
+                    onSelect={id => { store.selectNode(id); setTicketTab('detail') }}
+                    onFilters={patch => state.activeHome && void store.saveFilters(state.activeHome, patch)}
+                    onCreateNode={store.createNode}
+                  />
+                </>
+              ) : (
+                <div className="workspace-empty">
+                  <p className="empty-hint">还没有打开的工作区</p>
+                  <button className="chip active" onClick={() => setAddOpen(true)}>＋ 添加工作区</button>
+                </div>
+              )}
+            </div>
+            <div className="splitter" onPointerDown={startDrag} role="separator" aria-orientation="vertical" />
+            <section className={`center-pane${ticketTab === 'agents' ? ' agents-pane' : ''}`}>
               <div className="inner-tabs">
                 <button
                   className={`inner-tab${ticketTab === 'detail' ? ' active' : ''}`}
@@ -169,6 +228,18 @@ export function App() {
                   {state.unviewedFailedIds.length > 0 && (
                     <span className="tab-badge">{state.unviewedFailedIds.length}</span>
                   )}
+                </button>
+                <button
+                  className={`inner-tab${ticketTab === 'runs' ? ' active' : ''}`}
+                  onClick={() => setTicketTab('runs')}
+                >
+                  Runs
+                </button>
+                <button
+                  className={`inner-tab${ticketTab === 'workspace' ? ' active' : ''}`}
+                  onClick={openWorkspaceSettings}
+                >
+                  工作区
                 </button>
               </div>
               {ticketTab === 'detail' && (
@@ -217,44 +288,34 @@ export function App() {
                     onDeleteAgent={async (agent, force) => { await store.deleteAgent(agent.id, force) }}
                     onKillOrphan={(agentId, execId) => void store.killOrphan(agentId, execId)}
                     onGcBindings={() => void store.gcBindings()}
-                    onOpenHarnessSettings={() => setView('settings')}
+                    onOpenHarnessSettings={() => setSettingsOpen(true)}
                   />
                 </>
               )}
-            </>
-          )}
-          {view === 'runs' && state.activeHome && (
-            <RunsPanel
-              home={state.activeHome}
-              runs={state.runs}
-              fetchRun={store.fetchRun}
-              onChanged={() => state.activeHome && void store.refreshNodes(state.activeHome)}
-            />
-          )}
-          {view === 'settings' && (
-            <SettingsPanel
-              homes={state.homes}
-              knownHomes={state.knownHomes}
-              homeDir={state.homeDir}
-              legacyDshByHome={state.legacyDshByHome}
-              activeHome={state.activeHome}
-              onSelectHome={home => { void store.selectHome(home); setView('detail') }}
-              onDeclare={store.declareHome}
-            />
-          )}
-        </section>
+              {ticketTab === 'runs' && state.activeHome && (
+                <RunsPanel
+                  home={state.activeHome}
+                  runs={state.runs}
+                  fetchRun={store.fetchRun}
+                  onChanged={() => state.activeHome && void store.refreshNodes(state.activeHome)}
+                />
+              )}
+              {ticketTab === 'workspace' && (
+                // R6：工作区设置标签页与详情/Agents/Runs 并列；内容（路径、
+                // 重建索引、Finder 显示、移除）在 U2 落地
+                <div className="workspace-settings-page">
+                  <h2>工作区设置</h2>
+                  {state.activeHome ? (
+                    <p className="empty-hint">路径、重建索引、在 Finder 中显示与从列表移除等设置项将在后续版本提供。</p>
+                  ) : (
+                    <p className="empty-hint">当前没有打开的工作区。</p>
+                  )}
+                </div>
+              )}
+            </section>
+          </div>
+        )}
       </div>
-      {switcherOpen && (
-        <WorkspaceSwitcher
-          homes={state.homes}
-          knownHomes={state.knownHomes}
-          activeHome={state.activeHome}
-          homeDir={state.homeDir}
-          onSelect={home => void store.selectHome(home)}
-          onDeclare={store.declareHome}
-          onClose={() => setSwitcherOpen(false)}
-        />
-      )}
       {dispatchTarget && state.activeHome && (
         <ExecutionDialog
           home={state.activeHome}
@@ -266,7 +327,7 @@ export function App() {
           onClose={() => setDispatchTarget(null)}
           onDispatched={handleDispatched}
           onSelectExistingAgent={switchToAgent}
-          onOpenHarnessSettings={() => setView('settings')}
+          onOpenHarnessSettings={() => setSettingsOpen(true)}
         />
       )}
     </main>

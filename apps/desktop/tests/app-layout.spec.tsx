@@ -1,7 +1,8 @@
 /**
- * U8/R-D layout tests: the ticket tree and splitter render only in the
- * Tickets view — Runs/设置 go full width. Bridge layer is mocked at the
- * tauri invoke boundary (same factory shape as store.spec).
+ * U1（嵌入式终端计划）布局测试：左侧工作区图标栏取代顶栏与切换弹窗
+ * （R1/R8）——ticket 树在中间区域各标签下常驻，全局设置从图标栏底部 ⚙
+ * 进入并占满内容区。Bridge 层 mock 在 tauri invoke 边界（同 store.spec 的
+ * 工厂形态）。
  */
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
@@ -29,41 +30,59 @@ vi.mock('@tauri-apps/api/event', () => ({
   listen: vi.fn().mockResolvedValue(() => {}),
 }))
 
-describe('U8/R-D：树仅 Tickets tab 渲染', () => {
-  beforeEach(() => {
-    invokeMock.mockReset()
-    invokeMock.mockImplementation((cmd: string, args?: { method?: string }) => {
-      if (cmd === 'daemon_homes') {
-        return Promise.resolve({ homes: [{ homeId: 'h1', kind: 'workspace', path: '/tmp/ws/.omt' }] })
-      }
-      if (cmd === 'omt_call' && args?.method === 'home/list-known') return Promise.resolve({ homes: [] })
-      return Promise.resolve({})
-    })
+beforeEach(() => {
+  invokeMock.mockReset()
+  window.localStorage.clear()
+  invokeMock.mockImplementation((cmd: string, args?: { method?: string }) => {
+    if (cmd === 'daemon_homes') {
+      return Promise.resolve({ homes: [{ homeId: 'h1', kind: 'workspace', path: '/tmp/ws/.omt' }] })
+    }
+    if (cmd === 'omt_call' && args?.method === 'home/list-known') return Promise.resolve({ homes: [] })
+    return Promise.resolve({})
   })
+})
 
-  it('三 tab 切换：Tickets 有树与 splitter，Runs/设置全宽隐藏，切回恢复', async () => {
+describe('U1：图标栏布局与全局设置', () => {
+  it('树与 splitter 在详情/Agents/Runs/工作区各标签下常驻；⚙ 全局设置占满内容区，关闭恢复', async () => {
     const { App } = await import('../src/App')
     render(<App />)
 
-    // boot 完成、home 自动选中后，Tickets 视图有树与 splitter
-    await waitFor(() => expect(screen.getByText('Tickets')).toBeTruthy())
+    // boot 完成、home 自动选中后：图标栏 + 树 + splitter
+    await waitFor(() => expect(document.querySelector('.workspace-rail')).toBeTruthy())
     await waitFor(() => expect(document.querySelector('.tree-wrap')).toBeTruthy())
     expect(document.querySelector('.splitter')).toBeTruthy()
 
-    // Runs：树与 splitter 摘除（全宽）
-    fireEvent.click(screen.getByText('Runs'))
-    await waitFor(() => expect(screen.queryByText('连接 daemon…')).toBeNull())
-    expect(document.querySelector('.tree-wrap')).toBeNull()
-    expect(document.querySelector('.splitter')).toBeNull()
+    // 中间区域四个标签（R6/R8），逐个切换树都常驻
+    for (const tab of ['Agents', 'Runs', '工作区', '详情']) {
+      fireEvent.click(screen.getByText(tab))
+      await waitFor(() => expect(document.querySelector('.tree-wrap')).toBeTruthy())
+      expect(document.querySelector('.splitter')).toBeTruthy()
+    }
 
-    // 设置：同样隐藏
-    fireEvent.click(screen.getByText('设置'))
+    // 图标栏底部 ⚙：全局设置占满内容区——树与 splitter 摘除（R8）
+    fireEvent.click(screen.getByTitle('全局设置'))
     await waitFor(() => expect(document.querySelector('.tree-wrap')).toBeNull())
     expect(document.querySelector('.splitter')).toBeNull()
+    expect(screen.getByText('Daemon')).toBeTruthy()
+    expect(screen.getByText('DSH 集成')).toBeTruthy()
+    expect(screen.getByText('Harnesses')).toBeTruthy()
+    expect(screen.getByText('派发策略')).toBeTruthy()
 
-    // 切回 Tickets：树恢复
-    fireEvent.click(screen.getByText('Tickets'))
+    // 再点一次 ⚙ 收起：树恢复
+    fireEvent.click(screen.getByTitle('全局设置'))
     await waitFor(() => expect(document.querySelector('.tree-wrap')).toBeTruthy())
-    expect(document.querySelector('.splitter')).toBeTruthy()
+    expect(screen.queryByText('DSH 集成')).toBeNull()
+  })
+
+  it('顶栏不再渲染：没有「切换 workspace」按钮，也没有 Tickets/设置顶栏标签', async () => {
+    const { App } = await import('../src/App')
+    render(<App />)
+    await waitFor(() => expect(document.querySelector('.workspace-rail')).toBeTruthy())
+    expect(screen.queryByTitle('切换 workspace')).toBeNull()
+    expect(document.querySelector('.top-bar')).toBeNull()
+    expect(screen.queryByText('Tickets')).toBeNull()
+    expect(screen.queryByText('设置')).toBeNull()
+    // 中间区域的标签包含 Runs（R8：Runs 从顶栏移入中间区域标签）
+    expect(screen.getByText('Runs')).toBeTruthy()
   })
 })

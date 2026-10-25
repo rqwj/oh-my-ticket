@@ -22,26 +22,62 @@ body {
   font-size: 14px;
 }
 
-.app-shell { display: flex; flex-direction: column; height: 100vh; }
+.app-shell { display: flex; flex-direction: row; height: 100vh; }
+.app-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 
-/* 顶部标签条（Tickets | Runs 形态） */
-.top-bar {
-  display: flex; align-items: center; gap: 16px;
-  padding: 0 16px; border-bottom: 1px solid var(--border);
-  background: var(--bg);
+/* ── U1：工作区图标栏（KTD14）─────────────────────────────────── */
+.workspace-rail {
+  width: 56px; flex-shrink: 0; display: flex; flex-direction: column;
+  border-right: 1px solid var(--border); background: var(--panel);
 }
-.tab-strip { display: flex; gap: 18px; }
-.tab {
-  padding: 12px 2px 10px; border: none; background: transparent;
-  color: var(--muted); font-size: 14px; font-weight: 600; cursor: pointer;
-  border-bottom: 2px solid transparent;
+.rail-icons {
+  flex: 1; min-height: 0; overflow-y: auto; /* 溢出滚动（KTD14） */
+  display: flex; flex-direction: column; gap: 8px; align-items: center;
+  padding: 12px 0;
 }
-.tab.active { color: var(--text); border-bottom-color: var(--text); }
-.home-name { margin-left: auto; color: var(--muted); font-size: 12px; }
+.rail-icon {
+  position: relative; width: 36px; height: 36px; border-radius: 9px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  color: #fff; font-size: 13px; font-weight: 700; cursor: pointer;
+  display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+}
+/* 当前工作区左侧的指示条（KTD14） */
+.rail-icon.active::before {
+  content: ''; position: absolute; left: -11px; top: 6px; bottom: 6px;
+  width: 3px; border-radius: 2px; background: var(--accent);
+}
+.rail-abbr { pointer-events: none; }
+/* 路径失效：置灰带警告，仍可点击（KTD14） */
+.rail-icon.missing { opacity: 0.45; }
+.rail-icon.error { border-color: var(--danger); }
+.rail-warn {
+  position: absolute; right: -4px; top: -4px; font-size: 11px;
+  color: #d29922;
+}
+.rail-footer {
+  display: flex; flex-direction: column; align-items: center; gap: 4px;
+  padding: 8px 0 12px; border-top: 1px solid var(--border);
+}
+.rail-action {
+  width: 32px; height: 32px; border-radius: 8px; border: none;
+  background: transparent; color: var(--muted); font-size: 15px; cursor: pointer;
+}
+.rail-action:hover { background: var(--panel-raised); color: var(--text); }
+.rail-action.active { background: var(--panel-raised); color: var(--text); }
+
+/* 通知堆叠区（U1：顶栏移除后错误/提示条收入内容列顶部） */
+.notice-stack { display: flex; flex-direction: column; gap: 8px; padding: 8px 12px 0; }
+.workspace-error-banner { display: flex; align-items: center; gap: 8px; }
+.workspace-error-banner .workspace-error-text { flex: 1; }
+.banner-close {
+  border: none; background: transparent; color: inherit; cursor: pointer;
+  font-size: 12px; padding: 2px 6px; border-radius: 4px; flex-shrink: 0;
+}
+.banner-close:hover { background: rgba(248, 81, 73, 0.2); }
 
 .content { display: flex; flex: 1; min-height: 0; }
 
-.tree-wrap { flex-shrink: 0; min-width: 0; display: flex; }
+.tree-wrap { flex-shrink: 0; min-width: 0; display: flex; flex-direction: column; }
 .tree-panel {
   width: 100%;
   display: flex; flex-direction: column; background: var(--bg);
@@ -156,7 +192,6 @@ body {
 .status-grid { display: grid; grid-template-columns: 90px 1fr; gap: 6px 12px; }
 .status-grid dt { color: var(--muted); }
 .mono { font-family: ui-monospace, monospace; font-size: 12px; }
-.home-list { display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; }
 .home-row {
   display: flex; flex-direction: column; gap: 6px; align-items: stretch;
   padding: 8px 12px;
@@ -175,13 +210,32 @@ body {
 .known-section .home-row { margin-bottom: 4px; }
 .declare-form { display: flex; gap: 8px; }
 
-/* Workspace 切换弹窗 */
-.home-switch-btn {
-  border: none; background: transparent; color: var(--muted);
-  font-size: 12px; cursor: pointer; padding: 4px 8px; border-radius: 6px;
-  font-family: ui-monospace, monospace;
+/* ── U1：ticket 栏顶部的工作区标题（R5）────────────────────────── */
+.workspace-header {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 10px; border-bottom: 1px solid var(--border); flex-shrink: 0;
 }
-.home-switch-btn:hover { background: var(--panel-raised); color: var(--text); }
+.workspace-title { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.workspace-name {
+  font-weight: 600; font-size: 13px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.workspace-path {
+  color: var(--muted); font-size: 11px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.icon-btn {
+  border: none; background: transparent; color: var(--muted); cursor: pointer;
+  font-size: 14px; padding: 4px 6px; border-radius: 6px; flex-shrink: 0;
+}
+.icon-btn:hover { background: var(--panel-raised); color: var(--text); }
+.workspace-empty {
+  flex: 1; display: flex; flex-direction: column; gap: 12px;
+  align-items: center; justify-content: center;
+}
+.workspace-settings-page h2 { margin: 0 0 12px; font-size: 18px; }
+
+/* 添加工作区弹窗（图标栏「＋」）沿用 modal 形态 */
 .modal-overlay {
   position: fixed; inset: 0; background: rgba(0, 0, 0, 0.5);
   display: flex; align-items: flex-start; justify-content: center;
@@ -272,9 +326,8 @@ body {
 }
 .md-link { color: var(--accent); cursor: default; }
 
-/* U1b：旧 dsh harness 条目的迁移提示（设置页 home 行；旧选择器已退役） */
+/* row-spacer：行内把尾郡操作推到右侧（AgentsPanel / TranscriptView） */
 .row-spacer { flex: 1; }
-.harness-notice { color: var(--muted); font-size: 11px; }
 
 /* ── U7：设置页 Harnesses 管理面（R-A：左类型列表右详情）──────────────── */
 .harness-manager { margin-bottom: 24px; }
