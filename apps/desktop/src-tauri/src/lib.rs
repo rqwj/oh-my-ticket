@@ -10,7 +10,9 @@ mod executor;
 mod harness;
 mod quit_dialog;
 mod rpc_bridge;
-mod state;
+/// U2-1（CF6）：pub 仅为 doctest 的 compile_fail 证明可用（会话锁在库外
+/// 拿不到、令牌不可构造）；命令面不变。
+pub mod state;
 
 use quit_dialog::{QuitChoice, DIALOG_KEEP};
 use state::SharedSession;

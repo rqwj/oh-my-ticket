@@ -106,7 +106,8 @@ pub fn spawn_sidecar(dir: &Path) -> Result<Descriptor, String> {
 }
 
 /// §49 desktop-dispatch-rpc-bound：desktop 会话 socket 的读写超时。桌面端
-/// 派发链（rpc_of → session.call）在跨进程 exec/launch.lock 内逐条调
+/// 派发链（state::BlockingScope::rpc → session.call，旧 rpc_of）在跨进程
+/// exec/launch.lock 内逐条调
 /// daemon——卡死的 daemon（accept 但永不回复）此前让桌面端无限期持锁，
 /// CLI/MCP 每次 60s 后 LAUNCH_FAILED。与 daemon_link 的 DEFAULT_RPC_TIMEOUT
 /// （30s）同值：卡死时最坏「一次调用超时 + state.rs 的单次重连」各 30s，

@@ -1,28 +1,17 @@
 //! exec_* tauri command 包装。执行面内核在 omt_exec（设计 §3.1）；这里
-//! 负责把 SharedSession 适配成 RpcFn、把 Tauri Channel 适配成 EventSink。
+//! 负责把 Tauri Channel 适配成 EventSink，并把阻塞的派发链交给
+//! state 模块的阻塞作用域（U2-1 CF5/CF6：SharedSession → RpcFn 的适配
+//! 在 state::BlockingScope::rpc，锁不再公开可达）。
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use omt_exec::executor::{EventSink, ExecStartOutcome, RpcFn};
+use omt_exec::executor::{EventSink, ExecStartOutcome};
 use omt_exec::layout::{self, ExecFile};
 
 use crate::daemon;
 use crate::state::SharedSession;
-
-/// SharedSession → RpcFn（clone 共享同一个内部 mutex，等待线程据此释放租约）。
-pub fn rpc_of(shared: &SharedSession) -> RpcFn {
-    let shared = shared.clone();
-    Arc::new(move |method: &str, params: serde_json::Value| {
-        let mut guard = shared
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let session = guard.as_mut().ok_or("daemon session not established")?;
-        session.call(method, params)
-    })
-}
 
 /// review R2-4：对账目标的租约走 shim 路径释放（声明 home + 临时授权），
 /// 不依赖 desktop 会话此刻是否已打开该 workspace home。后台执行；启动对账与
@@ -126,9 +115,12 @@ fn channel_sink(channel: tauri::ipc::Channel<serde_json::Value>) -> EventSink {
 
 /// U6 (R-B)：exec_start。派发链 ①–⑥ 在本进程，执行在分离的 exec-shim 里；
 /// 前端 Channel 由 jsonl 尾随喂入（事件形状不变）。
+/// U2-1（CF5）：整个 `launch::start`（多次 RPC + 进程启动，阻塞）连同
+/// 会话锁访问经 in_blocking_scope 跑在阻塞线程池，不占 tokio worker；
+/// CF6：RpcFn 经阻塞令牌（state::BlockingScope::rpc）取得。
 #[allow(clippy::too_many_arguments)]
 #[tauri::command(async)]
-pub fn exec_start(
+pub async fn exec_start(
     shared: tauri::State<'_, SharedSession>,
     home_id: String,
     home_path: String,
@@ -140,35 +132,40 @@ pub fn exec_start(
     agent_id: Option<String>,
     channel: tauri::ipc::Channel<serde_json::Value>,
 ) -> Result<ExecStartOutcome, String> {
-    let rpc = rpc_of(&shared);
-    let omt_bin = daemon::omt_sidecar_path()?;
-    let runtime_dir = daemon::runtime_dir();
-    let outcome = omt_exec::launch::start(
-        &|method: &str, params: serde_json::Value| rpc(method, params),
-        &omt_exec::launch::LaunchRequest {
-            runtime_dir: &runtime_dir,
-            omt_bin: &omt_bin,
-            home_id: &home_id,
-            home_path: Path::new(&home_path),
-            target: omt_exec::executor::LaunchTarget::Node(&node_id),
-            origin: omt_exec::policy::LaunchOrigin::Desktop,
-            harness: &harness,
-            unattended,
-            model: model.as_deref(),
-            resume_session: resume_session.as_deref(),
-            target_agent_id: agent_id.as_deref(),
-            parent_agent_id: None,
-            max_duration: omt_exec::executor::DEFAULT_MAX_DURATION,
-        },
-    )?;
-    follow(
-        &home_id,
-        &outcome.agent_id,
-        &outcome.exec_id,
-        None,
-        channel_sink(channel),
-    )?;
-    Ok(outcome)
+    let shared = shared.inner().clone();
+    shared
+        .in_blocking_scope(move |scope| {
+            let rpc = scope.rpc();
+            let omt_bin = daemon::omt_sidecar_path()?;
+            let runtime_dir = daemon::runtime_dir();
+            let outcome = omt_exec::launch::start(
+                &|method: &str, params: serde_json::Value| rpc(method, params),
+                &omt_exec::launch::LaunchRequest {
+                    runtime_dir: &runtime_dir,
+                    omt_bin: &omt_bin,
+                    home_id: &home_id,
+                    home_path: Path::new(&home_path),
+                    target: omt_exec::executor::LaunchTarget::Node(&node_id),
+                    origin: omt_exec::policy::LaunchOrigin::Desktop,
+                    harness: &harness,
+                    unattended,
+                    model: model.as_deref(),
+                    resume_session: resume_session.as_deref(),
+                    target_agent_id: agent_id.as_deref(),
+                    parent_agent_id: None,
+                    max_duration: omt_exec::executor::DEFAULT_MAX_DURATION,
+                },
+            )?;
+            follow(
+                &home_id,
+                &outcome.agent_id,
+                &outcome.exec_id,
+                None,
+                channel_sink(channel),
+            )?;
+            Ok(outcome)
+        })
+        .await
 }
 
 /// 幂等终止：SIGTERM 发给该 exec 的 shim（身份校验后）。
