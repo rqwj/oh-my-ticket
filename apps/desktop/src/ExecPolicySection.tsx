@@ -92,7 +92,7 @@ export function ExecPolicySection() {
         {view.source === 'default' && '（当前为出厂默认，尚未保存过）'}
       </p>
       <p className="warning">
-        经 CLI / MCP 派发的 harness 一律无人值守运行（pi <code>--auto</code>、omp <code>--approval-mode=yolo</code> 等），没有桌面端派发弹窗那一步确认。
+        经 CLI / MCP 派发的 harness 一律无人值守运行（opencode <code>--auto</code>、omp <code>--approval-mode=yolo</code>；pi 本身没有审批层），没有桌面端派发弹窗那一步确认。
       </p>
       {view.error && (
         <p className="error" role="alert">
