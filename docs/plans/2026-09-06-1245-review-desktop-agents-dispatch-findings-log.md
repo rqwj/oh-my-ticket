@@ -55,10 +55,15 @@ branch: feat/desktop-agents-dispatch
 | F-TERM-5 | P2 | gated_auto | 桌面/U1 | `WorkspaceRail.tsx:83` | 添加弹窗只列 `knownHomes` 中未打开的条目：首次迁移之后由 DSH/CLI 打开的 home 既不在图标栏也不在「已知未开」里（旧切换器可一键选中）；已在列表中但已关闭的 home 却被列为「已知未开」 | fixed(6c3cbb2) | — |
 | F-TERM-6 | P2 | gated_auto | 桌面/U1 | `store.ts:1455-1487` `selectWorkspace` | 无序号守卫：先点未打开的 B（声明 + 重连 + 刷新较慢），再点已打开的 C，B 的声明完成后 `selectHome(B)` 覆盖用户最后一次选择 | fixed(6c3cbb2) | — |
 | F-TERM-7 | P2 | testing-gap | 桌面/U1 | `store.ts:1624-1631` 对齐 effect、`addWorkspace` | 删掉对齐 effect、让 `addWorkspace` 不追加，244 个测试仍全绿：R3 的添加流程（目录选择 / 已知未开）与对齐 effect 无任何测试 | fixed(6c3cbb2) | — |
-| F-TERM-8 | P3 | gated_auto | 桌面/U1 | `store.ts:1533-1550` `addWorkspace`、`App.tsx:93` `openRunsOfHome` | 选择序号守卫只在 `selectWorkspace` 里：先点未打开的 B（声明慢），再从添加弹窗加 D，B 的声明完成后 `selectHome(B)` 覆盖 D（已复现） | open | — |
-| F-TERM-9 | P3 | gated_auto | 桌面/U1 | `workspaceList.ts:171-183` `addCandidates` | 只按路径去重：known-homes 报规范路径、daemon 报首个声明者的原始路径，`/tmp` 与 `/private/tmp` 同一 home 出现两行（仅显示问题，添加后两行都消失） | open | — |
-| F-TERM-10 | P3 | gated_auto | 桌面/U1 | `store.ts:1422-1434`、`1533-1550` | F-TERM-3 残留：启动时 `daemon_homes` 失败后、首次成功刷新前用户先「＋ 添加工作区」，`updateWorkspaces` 在未初始化时存下 `[picked]`，其他已打开 home 的迁移永久不再执行（可经添加弹窗手动补回） | open | — |
-| F-TERM-11 | P3 | testing-gap | 桌面/U1 | `store.ts` 多处（6c3cbb2） | 变异存活：`selectHome` 写入保护、focus 路径的成功门、`selectWorkspace` 按声明 homeId 查找、对齐 effect 吸附到 `list[0]`、「已打开」分支 homeId 回写（被对齐 effect 的回写掩盖）。行为按代码阅读正确，只是缺覆盖；agent「每条修复都有修复前会失败的测试」的说法因此不完全成立 | open | — |
+| F-TERM-8 | P3 | gated_auto | 桌面/U1 | `store.ts:1533-1550` `addWorkspace`、`App.tsx:93` `openRunsOfHome` | 选择序号守卫只在 `selectWorkspace` 里：先点未打开的 B（声明慢），再从添加弹窗加 D，B 的声明完成后 `selectHome(B)` 覆盖 D（已复现） | fixed(97614e3) | — |
+| F-TERM-9 | P3 | gated_auto | 桌面/U1 | `workspaceList.ts:171-183` `addCandidates` | 只按路径去重：known-homes 报规范路径、daemon 报首个声明者的原始路径，`/tmp` 与 `/private/tmp` 同一 home 出现两行（仅显示问题，添加后两行都消失） | fixed(97614e3) | — |
+| F-TERM-10 | P3 | gated_auto | 桌面/U1 | `store.ts:1422-1434`、`1533-1550` | F-TERM-3 残留：启动时 `daemon_homes` 失败后、首次成功刷新前用户先「＋ 添加工作区」，`updateWorkspaces` 在未初始化时存下 `[picked]`，其他已打开 home 的迁移永久不再执行（可经添加弹窗手动补回） | fixed(97614e3) | — |
+| F-TERM-11 | P3 | testing-gap | 桌面/U1 | `store.ts` 多处（6c3cbb2） | 变异存活：`selectHome` 写入保护、focus 路径的成功门、`selectWorkspace` 按声明 homeId 查找、对齐 effect 吸附到 `list[0]`、「已打开」分支 homeId 回写（被对齐 effect 的回写掩盖）。行为按代码阅读正确，只是缺覆盖；agent「每条修复都有修复前会失败的测试」的说法因此不完全成立 | fixed(97614e3) | — |
+| F-TERM-12 | P2 | gated_auto | 桌面/U1 | `App.tsx:130-146` `isMissingWorkspace`、`store.ts:1561-1563`（97614e3） | 失效探测改成 path 或 homeId 双键后，项目目录被移动 / 改名会被误判失效：homeId 存在 home 自己的库里、移动后不变，known-homes 的旧路径条目永久 missing 且按首次出现排在前面——新路径的图标即使已打开也被置灰；daemon 不再持有该 home 后点击报「目录已不存在」、从不声明有效路径（临时测试复现；改动前只按路径匹配无此问题）。修法：路径精确匹配优先，无同路径条目时才回退 homeId，且只有该 homeId 的所有条目都 missing 才算失效 | open | — |
+| F-TERM-13 | P3 | gated_auto | 桌面/CF3 | `store.ts` ~1733-1748、`store.ts:1390` | events-status 监听不看 `payload.homeId`：切到 B 前一刻 A 的「失败」事件会把横幅挂到 B，之后恢复时 B 不会再发事件（latch 已重置），横幅卡住；`selectHome` 重点当前图标会清掉横幅而订阅 effect 不重跑，事件仍坏时横幅再也不回来。修法：按 homeId 过滤，只在 homeId 变化时清 | open | — |
+| F-TERM-14 | P3 | advisory | 桌面/CF2 | `bridge.ts:46-60` `DAEMON_WRITE_METHODS`；`store.ts:1263` | 幂等的后台写 `ui/filters-set` / `ui/recent-set` 在写集合里，超时会挂上「可能已生效、避免重复提交」的粘性提示（可能绑定到非活动 home、只能手动关）；读超时进 `error` 后文案仍是「结果未知、可能已生效」；`refreshNodes` 失败分支无活动 home 守卫，A 迟到的失败横幅显示在 B | open | — |
+| F-TERM-15 | P3 | testing-gap | 桌面/CF2·CF3 | 测试（97614e3） | 变异存活：组件写方法（如 run/control）退出写集合、通知绑定到写操作自己的 homeId（而非活动 home，CF2 的核心场景）、App 的 `openRunsOfHome` 接线；Rust 事件泵只有统计子串的源码扫描测试，「每次成功都发 ok」「事件名改错」「恢复时 homeId 为空」「只在非空页计成功」四个变异存活——与计划 CF6/CF8「源码扫描改结构性测试」的方向相反，建议给 `subscription_pump` 注入连接 / descriptor 闭包后直接测 | open | — |
+| F-SELF-3 | P3 | advisory | 执行面/注入 | `mcp_injection.rs`（pi 项目注入释放） | 注入释放删除了 `.pi/mcp.json` 但留下空的 `.pi/` 目录（该目录由注入创建）；git 不显示空目录，但会残留在用户项目里 | open | — |
 | F-SELF-1 | P2 | gated_auto | 执行面/run | `dispatch.rs:1537-1539` `LEASE_TTL_MS`、`runs.rs:174` | 认领租约固定 15 分钟且**从未接上续期**（注释称随 U5b janitor 落地，未实现）；CLI/MCP 默认时长上限 30 分钟、桌面端 120 分钟——任何超过 15 分钟的派发都必然 `run__report` 被拒（`lease-stale: the claiming lease has expired`），工作已完成但 run 状态无法记录，exec 退出后 item 回到 pending、可能被重复派发。自托管试点 U1 首次真实单元即触发（29.6 分钟） | fixed(9cfa834，PR #11) | — |
 | F-SELF-2 | P3 | advisory | 执行面/注入 | `mcp_injection.rs`（pi 项目注入） | omt 为 pi 写入工作区的 `.pi/mcp.json` 在 exec 期间是未跟踪、未忽略的文件；被派发的 agent 若用 `git add -A` 提交会把指向本次启动器的临时注入带进仓库。本次 agent 未提交、退出后注入已清理 | open | — |
 | F-BENCH-18 | P1 | gated_auto | BENCH | `.gitignore:26` / `fixtures/harness/*/raw.log` | **raw.log 语料未入库**：`*.log` 规则把三份 raw.log 全部忽略，只存在于本机。`raw_log_replay_matches_recorded_events` 在干净 clone / CI 上会 panic（「raw.log 应存在」），CI rust 任务必红；F-BENCH-15 在仓库里实际未关闭（§30） | fixed(55a8e55 + 2b8e036)：入库 + 必需文件清单入测（缺一即红）；「时间戳已清洗」「≥12 下限」两项不实声明由 F-BENCH-24 在 2b8e036 兑现 | — |
@@ -2466,3 +2471,21 @@ F-BENCH-13 查证结论：4e960a2 提交说明声称的探针/capture/lib 改动
 - **测试**：新增 `expired_grant_still_authorizes_its_holder_but_stays_fenced`——早已过期的 grant 仍授权持有者，attempt 不符与伪造 token 仍被拒；把过期检查加回去该测试失败。
 - **验证**：workspace 520 ×3（+1）、clippy / fmt 干净、nm daemon 0、`pnpm gen` 与提交一致、根 vitest 447、桌面 vitest 225；PR CI 两个任务全绿。新 worktree 首跑出现的 desktop 构建脚本失败与根 vitest 181 失败，是 worktree 缺 sidecar 二进制与 `target/debug/omt-daemon` 的环境问题，补齐后全绿。
 - **部署**：稳定版用合并后的 `main`（5832749）release 重建，替换 `~/.omt-stable/bin`（核对新 daemon 二进制已不含被删除的报错文案）；终端分支合入 `main`。
+
+
+### §67. 自托管试点 · TICKET-0138 复审（2026-10-25，97614e3）
+
+**运行**：TICKET-0138（CF1–CF4、F-TERM-8..11、§64 遗留五条，共 9 项）派给 pi + `zai/glm-5.3`，`exec-81248-1` 运行 54.7 分钟、exit 0；156 轮模型调用、各轮 token 合计约 2653 万、费用 $7.70。一次提交 `97614e3`（只动 `apps/desktop/`，含 Rust `rpc_bridge.rs` +174 行）。**`run__report` 成功、RUN-0007 completed——F-SELF-1 修复（PR #11）在真实长任务上得到验证**：修复前超过 15 分钟必然被拒，这次 54.7 分钟无需人工收口。
+
+**验证**：主控复跑桌面 vitest 22 文件 279 通过（257 → 279）、tsc 干净、`pnpm build` 通过、desktop crate lib 28 通过、clippy `-D warnings` 与 fmt 干净。
+
+**结论：基本可以接受，F-TERM-12（P2）需在关闭 CF / §64 之前修掉。** 9 项均已实现：CF1、CF2（序号规则正确：超时前发出的读不会清、A 的写超时切到 B 再切回 A 刷新成功才清、读超时进 `error`、可关闭；bridge 改同步 DOM CustomEvent、按写方法集合判定写操作）、CF3（Rust 事件泵阈值 3、失败只发一次并锁存、恢复发一次、切 home 重置、不刷屏）、CF4、F-TERM-8（序号递增移到 `selectHome` 入口，未发现误伤正常选择）、F-TERM-9、F-TERM-10、F-TERM-11（上一轮存活的五个变异这次都能抓住）；§64 遗留中 `openRunsOfHome` 先收进列表、全部条目无效按首次运行、点图标关闭全局设置、legacy dsh 提示按 home 显示均正确，失效探测的双键改动引入了 F-TERM-12。台账：F-TERM-8..11 翻 fixed(97614e3)；新增 F-TERM-12（P2）、F-TERM-13..15（P3）、F-SELF-3（P3）。
+
+**变异（评审代理）**：39 项，32 被抓、7 存活（见 F-TERM-15）；存活项都不在 agent 声称验证过的集合里——**这一轮 agent「逐一回退验证」的声明属实**，与上一轮不同。
+
+**其它**：注入释放留下空 `.pi/` 目录（F-SELF-3），主控已删除（目录为空才能删）。
+
+**试点小结（三轮）**：
+- 三轮共约 109 分钟、$13.87；ticket 粒度越大，单轮成本越高（本轮 54.7 分钟、$7.70），但一次交付了 9 项、只留 1 条 P2。
+- agent 的自测质量在提升：本轮按要求做了回退验证，声明属实；遗漏集中在「跨 home 的边界」（移动的项目、切换瞬间的事件归属）与 Rust 侧只有源码扫描测试。
+- F-SELF-1 修好后，长任务不再需要人工收口，流程上已可持续串行推进。
