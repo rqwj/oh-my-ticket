@@ -1,7 +1,8 @@
 //! exec_* tauri command 包装。执行面内核在 omt_exec（设计 §3.1）；这里
 //! 负责把 Tauri Channel 适配成 EventSink，并把阻塞的派发链交给
-//! state 模块的阻塞作用域（U2-1 CF5/CF6：SharedSession → RpcFn 的适配
-//! 在 state::BlockingScope::rpc，锁不再公开可达）。
+//! state 模块的阻塞作用域（U2-1 CF5/CF6：SharedSession → 借用式 rpc 的
+//! 适配在 state::BlockingScope::rpc，锁不再公开可达、拿锁能力带不出
+//! 阻塞作用域——F-TERM-16）。
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -117,7 +118,9 @@ fn channel_sink(channel: tauri::ipc::Channel<serde_json::Value>) -> EventSink {
 /// 前端 Channel 由 jsonl 尾随喂入（事件形状不变）。
 /// U2-1（CF5）：整个 `launch::start`（多次 RPC + 进程启动，阻塞）连同
 /// 会话锁访问经 in_blocking_scope 跑在阻塞线程池，不占 tokio worker；
-/// CF6：RpcFn 经阻塞令牌（state::BlockingScope::rpc）取得。
+/// CF6/F-TERM-16：rpc 经阻塞令牌（state::BlockingScope::rpc）取得且
+/// **借用 scope**——launch::start 本就接受借用的 DaemonRpc<'_>，拿锁
+/// 能力带不出阻塞作用域。
 #[allow(clippy::too_many_arguments)]
 #[tauri::command(async)]
 pub async fn exec_start(
@@ -139,7 +142,7 @@ pub async fn exec_start(
             let omt_bin = daemon::omt_sidecar_path()?;
             let runtime_dir = daemon::runtime_dir();
             let outcome = omt_exec::launch::start(
-                &|method: &str, params: serde_json::Value| rpc(method, params),
+                &rpc,
                 &omt_exec::launch::LaunchRequest {
                     runtime_dir: &runtime_dir,
                     omt_bin: &omt_bin,

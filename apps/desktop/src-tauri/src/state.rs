@@ -27,12 +27,20 @@
 //!   模块外不可构造——同步代码（含同步 tauri 命令，以及 U2 起新文件里
 //!   的命令）在类型上就拿不到会话锁（CF6），取代 rpc_bridge.rs 的源码
 //!   扫描守卫（`session_lock_shapes_live_only_in_async_commands` 等）。
+//!
+//! F-TERM-16/18（§69）：**本模块是会话锁的信任边界。** CF6 的结构性保
+//! 证在本模块内成立（字段私有、令牌不可构造、[`BlockingScope::rpc`] 借
+//! 用 scope、不能带出阻塞作用域）；但 crate 外的 compile_fail doctest
+//! 看不到 `pub(crate)` 内的形态（字段改 `pub(crate)`、加 pub 构造器/同步
+//! 访问器等变异 doctest 抓不住），边界最终靠本模块的评审纪律守住：**新
+//! 增任何 `pub` / `pub(crate)` 的锁访问（字段、构造器、访问器）都必须保
+//! 持「只经 async 入口或 BlockingScope 令牌」，不得引入同步可调的锁入
+//! 口，也不得让拿锁能力以 `'static` 形态外流。**
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use omt_client::Enrollment;
-use omt_exec::executor::RpcFn;
 
 use crate::daemon;
 
@@ -174,10 +182,11 @@ impl SharedSession {
     }
 
     /// CF5/CF6：阻塞作用域入口——`f` 在阻塞线程池上执行，经参数拿到
-    /// [`BlockingScope`] 令牌（会话访问 / 长持有 RpcFn）。需要在同一份
+    /// [`BlockingScope`] 令牌（会话访问 / 借用式 rpc）。需要在同一份
     /// 阻塞预算里做更多阻塞工作的命令（如 exec_start 的整个
     /// `launch::start`：多次 RPC + 进程启动）走这里。令牌在模块外不可
-    /// 构造，同步代码无法进入本入口的闭包——结构性保证由此成立。
+    /// 构造，同步代码无法进入本入口的闭包——结构性保证由此成立；
+    /// F-TERM-16：`R: 'static` 保证借用 scope 的 rpc 闭包带不出作用域。
     pub async fn in_blocking_scope<R>(
         &self,
         f: impl FnOnce(&BlockingScope) -> Result<R, String> + Send + 'static,
@@ -227,20 +236,26 @@ impl BlockingScope {
         f(guard.as_mut().expect("session just established"))
     }
 
-    /// 旧 `executor::rpc_of` 的内芯：可长期持有的 RpcFn（exec/launch 链
-    /// 在跨进程锁内逐条调 daemon，等待线程据此释放租约）。会话未建立时
-    /// 报错（**不**惰性建立）——与旧实现语义一致；锁的中毒处理沿用旧
-    /// rpc_of 的宽容策略（into_inner，锁还在就继续用）。
-    pub fn rpc(&self) -> RpcFn {
-        let shared = self.shared.clone();
-        Arc::new(move |method: &str, params: serde_json::Value| {
-            let mut guard = shared
+    /// 旧 `executor::rpc_of` 的内芯，F-TERM-16 改为**借用式**：返回的闭包
+    /// 借用 `self`（scope 令牌），不能被带出阻塞作用域（
+    /// `in_blocking_scope` 要求 `R: Send + 'static`，类型上拒绝——见下方
+    /// compile_fail doctest）；调用方要么在作用域闭包内直接使用（
+    /// `omt_exec::launch::start` 本就接受借用的 `DaemonRpc<'_>`），要么把
+    /// scope 整体移进专用后台线程（`spawn_reconcile_once`）再借用。会话
+    /// 未建立时报错（**不**惰性建立）——与旧实现语义一致；锁的中毒处理
+    /// 沿用旧 rpc_of 的宽容策略（into_inner，锁还在就继续用）。
+    pub fn rpc(
+        &self,
+    ) -> impl Fn(&str, serde_json::Value) -> Result<serde_json::Value, String> + '_ {
+        move |method: &str, params: serde_json::Value| {
+            let mut guard = self
+                .shared
                 .0
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let session = guard.as_mut().ok_or("daemon session not established")?;
             session.call(method, params)
-        })
+        }
     }
 
     /// 丢弃缓存会话（daemon_reconnect；旧实现的 `*guard = None`）。
@@ -253,8 +268,10 @@ impl BlockingScope {
 
 /// U10：首个会话建立（所有 RPC 的咽喉点）→ 一次性后台对账（幂等 swap
 /// 守卫）。从 rpc_bridge::with_session 原样迁入：对账线程是专用后台
-/// std::thread（阻塞上下文），在模块内直接构造令牌取得 RpcFn——模块
-/// 外没有等价的同步入口。
+/// std::thread（阻塞上下文），在模块内直接构造令牌——模块外没有等价
+/// 的同步入口。F-TERM-16：scope 整体移进线程、线程内借用式 rpc
+///（reconcile_interrupted_execs_with 接受 `&dyn Fn`）——拿锁能力不再
+/// 以 'static RpcFn 形态外流，也不依赖（已删除的）跨线程 RpcFn。
 fn spawn_reconcile_once(shared: &SharedSession) {
     static RECONCILED_ONCE: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
@@ -263,7 +280,12 @@ fn spawn_reconcile_once(shared: &SharedSession) {
             shared: shared.clone(),
         };
         std::thread::spawn(move || {
-            omt_exec::executor::reconcile_interrupted_execs(&scope.rpc(), &daemon::runtime_dir());
+            let rpc = scope.rpc();
+            let handled =
+                omt_exec::executor::reconcile_interrupted_execs_with(&rpc, &daemon::runtime_dir());
+            if handled > 0 {
+                eprintln!("U10 对账：释放了 {handled} 个中断 exec 的 daemon 租约");
+            }
         });
     }
 }
@@ -285,12 +307,31 @@ const _: () = ();
 /// ```compile_fail
 /// use oh_my_ticket_desktop_lib::state::{BlockingScope, SharedSession};
 /// let shared = SharedSession::new();
-/// // E0603：字段私有——令牌构造不出来
+/// // E0451：字段私有——令牌构造不出来
 /// let _scope = BlockingScope { shared };
 /// ```
 const _: () = ();
 
+/// F-TERM-16 的编译期证明：借用式 rpc 不能带出阻塞作用域。
+/// `rpc()` 返回借用 scope 的闭包，`in_blocking_scope` 要求 `R: Send +
+/// 'static`——把 rpc 闭包作为结果返回时隐藏类型捕获了 `&BlockingScope`
+/// 的生命周期，不满足 `'static`，必须编译失败（拿锁能力出不了作用域）。
+/// 回退验证缝：`rpc()` 改回返回 `'static` 的 `RpcFn`（Arc 闭包）时本
+/// doctest 变绿、compile_fail 失败，测试即红。
+///
+/// ```compile_fail
+/// use oh_my_ticket_desktop_lib::state::SharedSession;
+/// let shared = SharedSession::new();
+/// // 隐藏类型捕获闭包参数的生命周期，不满足 R: 'static
+/// let escaped = shared.in_blocking_scope(|scope| Ok(scope.rpc()));
+/// ```
+const _: () = ();
+
+// F-TERM-17：测试线程用 block_on 驱动 async 入口是合理用途——被驱动的
+// 是 `spawn_blocking` 承载的阻塞工作（不占 tokio worker，探针任务照常
+// 调度），不存在饿死风险；生产代码禁止 block_on（见根 clippy.toml）。
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 
@@ -345,45 +386,68 @@ mod tests {
         );
     }
 
-    /// CF5：会话锁被长占用时，另一个 async 调用不被饿死——持锁 500ms
-    /// 的会话调用进行期间，并发的 `in_blocking_scope`（正是 async 命令
-    /// 阻塞部分的承载路径）在远小于持锁时长内完成。旧实现里这些阻塞
-    /// 都在 tokio worker 上，worker 排队即停摆；现在各跑各的阻塞线程。
+    /// CF5（F-TERM-19）：真正测饿死。持锁方长占会话锁；在锁上排队**多于
+    /// tokio worker 数**（`available_parallelism() + 1`，经
+    /// `tauri::async_runtime::spawn` 发起）的 `with_session_async` 调用，
+    /// 再断言一个**无关**的 `tauri::async_runtime::spawn` 任务能很快完成。
+    /// 回退验证缝：`in_blocking_scope` 里的 `spawn_blocking` 若被换成
+    /// `async_runtime::spawn`（阻塞工作回到 tokio worker），等锁任务占满
+    /// 全部 worker，无关任务饿死 → 本测试红。
     #[test]
     fn async_entry_points_do_not_starve_while_session_lock_is_held() {
         let dir = tempfile::tempdir().expect("tempdir");
         let holder = shared_with_placeholder_session(dir.path());
-        let probe = holder.clone();
+        let queued = holder.clone();
 
+        // 持锁方：锁内睡 2s（阻塞线程池上，形状同慢 daemon 调用）。
         let holder_thread = std::thread::spawn(move || {
             tauri::async_runtime::block_on(holder.with_session_async(|_session| {
-                std::thread::sleep(std::time::Duration::from_millis(500));
+                std::thread::sleep(std::time::Duration::from_millis(2000));
                 Ok::<_, String>(())
             }))
         });
-        // 让持锁方先拿到锁（其闭包在锁内 sleep）
-        std::thread::sleep(std::time::Duration::from_millis(80));
+        // 让持锁方先拿到锁（其闭包在锁内 sleep）。
+        std::thread::sleep(std::time::Duration::from_millis(120));
 
-        let started = std::time::Instant::now();
-        let worker = tauri::async_runtime::block_on(
-            probe.in_blocking_scope(|_scope| Ok::<_, String>(std::thread::current().id())),
-        )
-        .expect("锁被占用时并发 async 调用仍应完成（CF5 不饿死）");
-        assert!(
-            started.elapsed() < std::time::Duration::from_millis(400),
-            "会话锁被占用 {}ms 期间并发调用应在 400ms 内完成，实际 {:?}（CF5）",
-            500,
-            started.elapsed()
-        );
-        assert_ne!(
-            std::thread::current().id(),
-            worker,
-            "并发调用同样跑在阻塞线程池"
-        );
+        // 在被占住的锁上排队多于 worker 数的 with_session_async——
+        // 它们的阻塞部分各自排队等 std 锁。
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let handles: Vec<_> = (0..workers + 1)
+            .map(|_| {
+                let queued = queued.clone();
+                tauri::async_runtime::spawn(async move {
+                    queued
+                        .with_session_async(|_session| Ok::<_, String>(()))
+                        .await
+                })
+            })
+            .collect();
+        // 等它们全部真正排在锁上。
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        // 无关探针：不碰会话锁的 spawn 任务必须很快完成（tokio worker
+        // 未被等锁的阻塞工作占用）。锁被长占（2s）期间探针若 400ms 内
+        // 完不成，就是饿死。
+        let (probe_tx, probe_rx) = std::sync::mpsc::channel::<()>();
+        tauri::async_runtime::spawn(async move {
+            let _ = probe_tx.send(());
+        });
+        probe_rx
+            .recv_timeout(std::time::Duration::from_millis(400))
+            .expect("会话锁被占 2s 期间无关 spawn 任务应在 400ms 内完成（CF5 饿死回归）");
+
+        // 收尾：持锁方结束、排队任务全部成功。
         holder_thread
             .join()
             .expect("holder 无 panic")
             .expect("holder 成功");
+        for handle in handles {
+            tauri::async_runtime::block_on(handle)
+                .expect("排队任务 join 成功")
+                .expect("排队任务成功");
+        }
     }
 
     /// CF6 行为面：`rpc()` 在会话未建立时报错且**不**惰性建立（旧
@@ -395,8 +459,8 @@ mod tests {
         let scope = BlockingScope {
             shared: empty.clone(),
         };
-        let err =
-            scope.rpc()("node/list", serde_json::Value::Null).expect_err("未建立的会话必须报错");
+        let rpc = scope.rpc();
+        let err = rpc("node/list", serde_json::Value::Null).expect_err("未建立的会话必须报错");
         assert!(err.contains("not established"), "实际：{err}");
         assert!(
             empty.guard().expect("锁可用").is_none(),
