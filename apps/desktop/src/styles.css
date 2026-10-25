@@ -31,10 +31,18 @@ body {
   border-right: 1px solid var(--border); background: var(--panel);
 }
 .rail-icons {
-  flex: 1; min-height: 0; overflow-y: auto; /* 溢出滚动（KTD14） */
+  /* 溢出滚动（KTD14）。滚动条位置常驻（overflow-y: scroll + 透明轨道）：
+     溢出出现 / 消失时图标不再左右跳动；左侧补同宽内边距保持图标居中 */
+  flex: 1; min-height: 0; overflow-y: scroll;
   display: flex; flex-direction: column; gap: 8px; align-items: center;
-  padding: 12px 0;
+  padding: 12px 0 12px 4px;
 }
+.rail-icons::-webkit-scrollbar { width: 4px; }
+.rail-icons::-webkit-scrollbar-track { background: transparent; }
+.rail-icons::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.16); border-radius: 2px;
+}
+.rail-icons::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.32); }
 .rail-icon {
   position: relative; width: 36px; height: 36px; border-radius: 9px;
   border: 1px solid rgba(255, 255, 255, 0.12);
