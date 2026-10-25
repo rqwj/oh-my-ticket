@@ -48,6 +48,19 @@ branch: feat/desktop-agents-dispatch
 | F-SP2-10 | P2 | gated_auto | 桌面 | `rpc_bridge.rs::events_subscribe`（§56 改 async） | 先在会话锁上排队、拿到锁才 `set_target`；`std::sync::Mutex` 非 FIFO，快速切 home A→B 时 A 可能后拿锁 → 事件泵停在 A，B 的树不再随外部改动刷新，前端 `.catch(() => {})` 静默（回归） | fixed(03bcead) | — |
 | F-SP2-11 | P2 | gated_auto | 桌面 | `store.ts::refreshAgents`（§56 超时提示保留） | 窗口聚焦与 home 加载都会调非静默 `refreshAgents()`，`agents_list` 只读文件系统、daemon 卡死也成功 → `error: null` 照样清掉「结果未知」提示，§56 的保留规则在它针对的触发点上失效 | fixed(03bcead) | — |
 | F-SP2-12 | P2 | gated_auto | 桌面 | `store.ts::presentErrorWithKind` 之外的全部错误展示点（§58 `[daemon-timeout]` 机器前缀） | 前缀只在 store 的 `applyError`/`updateNode`/`declareHome` 剥掉；新建节点（`TreePanel` ← `createNode` 原样抛）、派发（`ExecutionDialog` ← `startDispatch` 原样抛）、RunsPanel / DetailPanel / AgentsPanel 的 run/control、run/report、run/create、node/update、node/archive 均 `String(err)` 直显 → 超时时界面出现字面量「[daemon-timeout] daemon 无响应…」，且这些写路径（含无 commandId 的 node/create、run/create）不落 timeoutNotice（回归，显示层） | fixed(c1bbfdf) | — |
+| F-TERM-1 | P1 | gated_auto | 桌面/U1 | `styles.css:80-84` `.tree-panel`（c85d9e5） | `.tree-wrap` 改为纵向 flex 后 `.tree-panel` 缺 `flex: 1; min-height: 0`，`.tree-scroll` 拿不到有界高度：节点多于一屏时树不在面板内滚动，整页滚动、过滤器与工作区标题随之滚走（headless Chrome 复现：400px 外壳内面板 3050px） | fixed(6c3cbb2) | — |
+| F-TERM-2 | P2 | gated_auto | 桌面/U1 | `workspace-rail.spec.tsx:234` + `App.tsx:35` / `store.ts:1146,1320` | localStorage 降级测试 spy 在 `window.localStorage` 实例上，jsdom 下不生效——把降级改成 `[]` 测试照绿；真实「所有 key 都抛错」时既有的三处未加保护的读取直接让应用崩溃，计划场景「页面照常渲染」不成立 | fixed(6c3cbb2) | — |
+| F-TERM-3 | P2 | gated_auto | 桌面/U1 | `store.ts:1590-1594`、`1424-1437` | 启动时 `refreshHomes` 失败（错误被吞、homes 为空）仍执行首次迁移并持久化 `[]`；之后每次启动都把 `[]` 当成「用户清空了列表」——升级后首启 daemon 不可达或较慢，图标栏永久为空 | fixed(6c3cbb2) | — |
+| F-TERM-4 | P2 | gated_auto | 桌面/U1 | `store.ts:1500` `addWorkspace` | 声明后按路径字符串精确匹配找新 home；daemon 回报的是首个声明者的原始路径（`homes.rs:600`），符号链接或已由 DSH/CLI 以另一种写法打开时，每次都报「工作区已声明，但 home 列表中没有找到它」。`home/declare` 已返回 homeId，应按 homeId 查找 | fixed(6c3cbb2) | — |
+| F-TERM-5 | P2 | gated_auto | 桌面/U1 | `WorkspaceRail.tsx:83` | 添加弹窗只列 `knownHomes` 中未打开的条目：首次迁移之后由 DSH/CLI 打开的 home 既不在图标栏也不在「已知未开」里（旧切换器可一键选中）；已在列表中但已关闭的 home 却被列为「已知未开」 | fixed(6c3cbb2) | — |
+| F-TERM-6 | P2 | gated_auto | 桌面/U1 | `store.ts:1455-1487` `selectWorkspace` | 无序号守卫：先点未打开的 B（声明 + 重连 + 刷新较慢），再点已打开的 C，B 的声明完成后 `selectHome(B)` 覆盖用户最后一次选择 | fixed(6c3cbb2) | — |
+| F-TERM-7 | P2 | testing-gap | 桌面/U1 | `store.ts:1624-1631` 对齐 effect、`addWorkspace` | 删掉对齐 effect、让 `addWorkspace` 不追加，244 个测试仍全绿：R3 的添加流程（目录选择 / 已知未开）与对齐 effect 无任何测试 | fixed(6c3cbb2) | — |
+| F-TERM-8 | P3 | gated_auto | 桌面/U1 | `store.ts:1533-1550` `addWorkspace`、`App.tsx:93` `openRunsOfHome` | 选择序号守卫只在 `selectWorkspace` 里：先点未打开的 B（声明慢），再从添加弹窗加 D，B 的声明完成后 `selectHome(B)` 覆盖 D（已复现） | open | — |
+| F-TERM-9 | P3 | gated_auto | 桌面/U1 | `workspaceList.ts:171-183` `addCandidates` | 只按路径去重：known-homes 报规范路径、daemon 报首个声明者的原始路径，`/tmp` 与 `/private/tmp` 同一 home 出现两行（仅显示问题，添加后两行都消失） | open | — |
+| F-TERM-10 | P3 | gated_auto | 桌面/U1 | `store.ts:1422-1434`、`1533-1550` | F-TERM-3 残留：启动时 `daemon_homes` 失败后、首次成功刷新前用户先「＋ 添加工作区」，`updateWorkspaces` 在未初始化时存下 `[picked]`，其他已打开 home 的迁移永久不再执行（可经添加弹窗手动补回） | open | — |
+| F-TERM-11 | P3 | testing-gap | 桌面/U1 | `store.ts` 多处（6c3cbb2） | 变异存活：`selectHome` 写入保护、focus 路径的成功门、`selectWorkspace` 按声明 homeId 查找、对齐 effect 吸附到 `list[0]`、「已打开」分支 homeId 回写（被对齐 effect 的回写掩盖）。行为按代码阅读正确，只是缺覆盖；agent「每条修复都有修复前会失败的测试」的说法因此不完全成立 | open | — |
+| F-SELF-1 | P2 | gated_auto | 执行面/run | `dispatch.rs:1537-1539` `LEASE_TTL_MS`、`runs.rs:174` | 认领租约固定 15 分钟且**从未接上续期**（注释称随 U5b janitor 落地，未实现）；CLI/MCP 默认时长上限 30 分钟、桌面端 120 分钟——任何超过 15 分钟的派发都必然 `run__report` 被拒（`lease-stale: the claiming lease has expired`），工作已完成但 run 状态无法记录，exec 退出后 item 回到 pending、可能被重复派发。自托管试点 U1 首次真实单元即触发（29.6 分钟） | fixed(9cfa834，PR #11) | — |
+| F-SELF-2 | P3 | advisory | 执行面/注入 | `mcp_injection.rs`（pi 项目注入） | omt 为 pi 写入工作区的 `.pi/mcp.json` 在 exec 期间是未跟踪、未忽略的文件；被派发的 agent 若用 `git add -A` 提交会把指向本次启动器的临时注入带进仓库。本次 agent 未提交、退出后注入已清理 | open | — |
 | F-BENCH-18 | P1 | gated_auto | BENCH | `.gitignore:26` / `fixtures/harness/*/raw.log` | **raw.log 语料未入库**：`*.log` 规则把三份 raw.log 全部忽略，只存在于本机。`raw_log_replay_matches_recorded_events` 在干净 clone / CI 上会 panic（「raw.log 应存在」），CI rust 任务必红；F-BENCH-15 在仓库里实际未关闭（§30） | fixed(55a8e55 + 2b8e036)：入库 + 必需文件清单入测（缺一即红）；「时间戳已清洗」「≥12 下限」两项不实声明由 F-BENCH-24 在 2b8e036 兑现 | — |
 | F-BENCH-19 | P1 | gated_auto | BENCH/U12 | `adapters.rs::parse_opencode` step_finish | **opencode 的 usage 也是逐步的值，被误标为累计**：语料 4 个 step_finish 各带不同 messageID，每个 total = 该步 input + output + reasoning + cache.read（如 1518+45+109+23040 = 24712）。按「累计取末值」报 25460，实为 98225（少报约 3.9 倍）；本卷免费档 cost=0 掩盖了问题，付费 provider 会少报费用（§30） | fixed(55a8e55)：opencode 标 message，98225 入测 | — |
 | F-BENCH-20 | P3 | testing-gap | BENCH/U12 | `executor.rs::UsageTotals` | `record` / `final_totals` 无直接单测（混合 scope、全零、历史无 scope 事件）；修复前归档的 ExecRecord 用量仍是旧口径，未重算也未标注 | fixed(55a8e55 + e87a99a)：UsageTotals 四形态单测；口径自描述——ExecRecord.usageCaliber（"message-sum"，旧 JSON 兼容读 None = 末条口径）+ 归档直达测试 + TS 类型；不重算（usageTokens/usageCost 无 UI 消费点，标注路线即关闭，§34） | — |
@@ -2392,3 +2405,64 @@ F-BENCH-13 查证结论：4e960a2 提交说明声称的探针/capture/lib 改动
 **建议**：可以收口。发出端测试是一行断言，随下次触及这些文件时补上即可。
 
 **去向（2026-10-25）**：§57–§63 遗留的桌面端 P3 已转入 `docs/plans/2026-10-25-0113-feat-desktop-embedded-terminal-plan.md` 的「遗留评审发现」（CF1–CF8），随 U1 / U2 / U3 / U6 / U10 关闭：CF1 `refreshNodes` 活动 home 守卫、CF2 timeoutNotice 绑定 home / 序号与读写区分、CF3 事件泵失败状态、CF4 超时事件发出端测试、CF5 async 命令 `spawn_blocking`、CF6 会话锁结构性保证（替代 `command_spans` 源码扫描）、CF7 `runtime_dir` 与 config.md 对齐、CF8 退出确认框动作函数化（替代源码文本断言）。脱敏剩余泄漏形态不转入，留给单独的脱敏专项。
+
+
+### §64. 自托管试点 · U1 复审（2026-10-25，c85d9e5）
+
+**试点设置**：稳定版 omt（`main` f90b436 的 release 构建，装在 `~/.omt-stable/bin`，独立 runtime / 全局 home，见 `~/.omt-stable/env.sh`）编排，被编辑的是仓库开发版（分支 `feat/desktop-embedded-terminal`）。仓库 `.omt` 中建 EPIC-0010 › STORY-0039 › TICKET-0137（U1，范围为计划 U1 Approach 第 1–5 步及非 CF 测试场景）与 TICKET-0138（CF1–CF4，待派）。主控用 CLI `omt exec start --harness pi --model zai/glm-5.3` 派发；policy 只允许 CLI、只允许 pi、并发 1、时长上限 5400 秒。
+
+**运行结果**：`exec-98124-1` 运行 29.6 分钟、exit 0；103 轮模型调用、107 次工具调用、各轮 token 合计约 1277 万、费用 $3.84。agent 一次提交 `c85d9e5`（提交说明逐条对应计划），未 push、未切分支、未碰 Rust、未提交注入文件；自报验证 244 测试通过、tsc 与 vite build 通过——主控复跑一致（桌面 vitest 21 文件 244 通过、tsc 干净、`pnpm build` 通过）。**`run__report` 因租约过期被拒**（F-SELF-1），agent 按派发规则停止并如实汇报；exec 退出后 item 回到 pending、run 仍为 running，待主控评审后以管理员身份收口。
+
+**结论：U1 不能按现状接受。** 结构与计划一致——Approach 第 1–5 步齐全、没有越界到 U2、KTD14 各条规则到位、既有测试只删除了已不存在的 props——但有 1 条 P1 与 6 条 P2 需要修（F-TERM-1..7，见台账），修法都不大。另记执行面两条：F-SELF-1（租约无续期，P2）、F-SELF-2（注入文件未受保护，P3）。
+
+**评审（评审代理 + 主控抽查）**：
+- 主控在代码中核对了 F-TERM-1（`.tree-panel` 缺 `flex: 1; min-height: 0`）、F-TERM-2（spy 落在实例上）、F-TERM-3（启动不判 `refreshHomes` 成败即迁移）、F-TERM-4（按路径字符串查找），均成立。
+- 变异：移除选中规则改顺序、颜色改常量、homeId 轮换回写删除——被抓；localStorage 降级改 `[]`、删除对齐 effect、`addWorkspace` 不追加——**存活**（F-TERM-2、F-TERM-7）。
+- 已核实正确：横向布局与标签扩展、`onOpenHarnessSettings` / `openRunsOfHome` / `switchToAgent` 重新接线、KTD14 存储键与条目形状、迁移顺序与去重、懒声明走既有 `declareHome`、缩写与路径哈希色、悬停提示、当前指示条、路径失效置灰且点击不声明、QUOTA 错误态、显示名取工作区根目录 basename、R5 标题、R8 全局设置不含 Workspaces 列表、注释风格贴合周边。
+
+**P3（随修复顺带）**：homeId 轮换后「已打开」分支不回写导致图标被对齐 effect 弹回首项；`openRunsOfHome` 仍可选中列表外的 home；对齐 effect 在启动时会懒声明 `list[0]`（与注释「boot 不主动开 home」矛盾）；`missingPaths` 用规范路径比对原始路径；空态文案在有图标时也显示；图标缺 `aria-label` / `aria-current` 与 `:focus-visible`；`abbreviationOf` 按 UTF-16 码元切片会切开 emoji；全局 home 悬停提示为「~（~）」；全部条目无效时被当成「用户清空」；测试标题「条目形状不对 → null」与行为不符；legacy dsh 提示只对当前 home 显示；死 CSS（`.home-row-main` 等）、`ExecutionDialog.tsx:2` 引用已删除的 WorkspaceSwitcher、`styles.css:329` 错字「尾郡」；点图标时全局设置不关闭。
+
+**试点观察**：
+- 质量：pi + glm-5.3 对一个约 1100 行的纯前端单元，结构与计划的贴合度高、提交纪律良好、汇报诚实；缺陷集中在 CSS 布局、异步时序、失败路径（daemon 不可达、路径写法不一）与「看起来覆盖、实际空跑」的测试——正是本日志历轮评审反复抓到的类型，独立评审仍不可省。
+- 流程：CLI 编排可行；租约问题（F-SELF-1）是继续自托管前必须先修的阻塞项，否则每个超过 15 分钟的 ticket 都要人工收口。
+- 安全：pi 没有审批层，被派发时以用户身份拥有完整 shell / 文件权限，仅靠 ticket 纪律与事后评审约束。
+
+**建议**：
+1. 先修 F-SELF-1（推荐：shim 在 harness 存活期间周期性续租——shim 已持有 lease 与 daemon link；或在同一 attempt 未被新认领取代时允许过期租约汇报，attempt 围栏已足以防止陈旧覆盖）。它不在终端计划范围内，应作为独立修复先行。
+2. U1 打回：把 F-TERM-1..7 与上列 P3 写成修复 ticket，再派给同一 harness 一次，观察「按评审意见返工」的能力；或改由 ce-work 修。
+3. TICKET-0137 的 run 状态由主控在 U1 通过后以管理员身份 `run-report … --outcome done` 收口。
+
+
+### §65. 自托管试点 · U1 返工复审（2026-10-25，6c3cbb2）
+
+**运行**：TICKET-0139（§64 的 F-TERM-1..7 与 P3 清单）派给同一组合 pi + `zai/glm-5.3`，`exec-44450-1` 运行 24.8 分钟、exit 0；82 轮模型调用、95 次工具调用、各轮 token 合计约 724 万、费用 $2.33。一次提交 `6c3cbb2`（9 个文件，+581/−79，其中测试约 +380 行）。纪律：只暂存自己改的文件，主控未提交的本日志与 `.pi/` 均未被暂存或提交；注入在退出后清理。**`run__report` 再次因租约过期被拒**（F-SELF-1），agent 如实汇报并停止。
+
+**验证**：主控复跑桌面 vitest 21 文件 257 通过（244 → 257）、tsc 干净、`pnpm build` 通过。
+
+**结论：U1（c85d9e5 + 6c3cbb2）通过，可以接受。** F-TERM-1..7 全部修复（台账翻 fixed(6c3cbb2)），返工未引入 P1/P2；新增 4 条 P3（F-TERM-8..11）。
+
+**评审（评审代理，含变异与 headless Chrome）**：
+- F-TERM-1：headless Chrome 用真实 `styles.css`、200 行、视口高 313：修复后文档高 313、`.tree-scroll` 220px 内含 5212px 内容可滚；去掉修复后文档高 5305（整页滚动）。
+- F-TERM-2：四处 localStorage 读写加保护；测试改为 spy `Storage.prototype`，两处读保护的回退都被抓；所有 key 读写均抛错时应用正常渲染、切换可用、无未处理拒绝。
+- F-TERM-3 / 4 / 5 / 6：按 §64 场景修复；序号守卫与对齐 effect 配合正确（effect 自身的选择也递增序号）。F-TERM-7：添加流程不追加被 3 条测试抓住，删除对齐 effect 被抓。
+- 变异 20 项：15 项被抓，5 项存活（见 F-TERM-11）。agent 汇报称每条修复都有修复前会失败的测试，实测有 3 条 F-TERM 修复可回退而全绿——**agent 的自我验证声明需要独立复核**。
+- ticket 列出的 P3 全部完成；未列入 ticket 的 §64 遗留仍在：`openRunsOfHome` 选列表外 home 会被吸回首个工作区、`missingPaths` 与 `selectWorkspace` 的已知/失效查找用规范路径比对原始路径、全部条目无效被当成「用户清空」、点图标不关闭全局设置、legacy dsh 提示只对当前 home 显示。
+
+**收口**：TICKET-0137 / TICKET-0139 的 item 在 exec 退出后已回到 pending，`run/report` 只接受进行中的 item（`report-state-gate`），无法补报。改为主控 `omt update <ticket> --status done`：节点状态联动把 item 置 done、RUN-0005 / RUN-0006 均 completed。这是 F-SELF-1 修好之前的人工收口路径。
+
+**试点小结（两轮）**：
+- 首轮交付结构贴合计划、纪律好，但有 1 条 P1 + 6 条 P2；按评审意见返工一轮即全部修复，返工质量明显好于首轮（逐条对应、补了针对性测试、诚实列出未做项）。
+- 两轮共约 54 分钟、$6.17。每个超过 15 分钟的 ticket 都撞上 F-SELF-1，需要人工收口。
+- 「独立评审 + 变异检验」在两轮里都抓到了 agent 自测没覆盖到的问题，不能省。
+
+**建议**：
+1. F-TERM-8..11 与上列 §64 遗留可并入 TICKET-0138（CF1–CF4，同属切换 home 路径）一起派发。
+2. 继续自托管前优先修 F-SELF-1，免去每个 ticket 的人工收口。
+
+
+### §66. F-SELF-1 修复（2026-10-25，9cfa834，PR #11）
+
+- **修法（用户选定）**：`run/report` 不再按 `expires_at` 拒绝——租约在 item 被汇报、重试、移除或中断之前一直有效，防陈旧执行者仍靠 attempt + token 围栏。改在 daemon 共用的 `omt_domain::runs::authorize_report`（去掉过期检查与 `now_ms` 参数），DSH / MCP / CLI 三条派发路径一起修好。`expiresAt` 留在接口上作参考字段（schema 形状不变，描述改为如实说明）；DSH `disposed-hook` 的注释与警告文案原称「等 daemon 租约过期处理」，实际过期从不降级 item（只有启动 janitor 会），一并改正。
+- **测试**：新增 `expired_grant_still_authorizes_its_holder_but_stays_fenced`——早已过期的 grant 仍授权持有者，attempt 不符与伪造 token 仍被拒；把过期检查加回去该测试失败。
+- **验证**：workspace 520 ×3（+1）、clippy / fmt 干净、nm daemon 0、`pnpm gen` 与提交一致、根 vitest 447、桌面 vitest 225；PR CI 两个任务全绿。新 worktree 首跑出现的 desktop 构建脚本失败与根 vitest 181 失败，是 worktree 缺 sidecar 二进制与 `target/debug/omt-daemon` 的环境问题，补齐后全绿。
+- **部署**：稳定版用合并后的 `main`（5832749）release 重建，替换 `~/.omt-stable/bin`（核对新 daemon 二进制已不含被删除的报错文案）；终端分支合入 `main`。
