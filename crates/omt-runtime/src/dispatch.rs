@@ -1534,8 +1534,11 @@ fn leases() -> &'static Mutex<BTreeMap<(String, String), omt_domain::ports::Leas
     LEASES.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
-/// Lease TTL for claims (heartbeat renewal wiring lands with the janitor
-/// in U5b; claims stay attempt-fenced regardless).
+/// Advisory lease horizon reported as `lease.expiresAt` on claims.
+/// F-SELF-1：not enforced — report authorization ignores it (see
+/// `omt_domain::runs::authorize_report`), since nothing renews or reclaims
+/// leases and a dispatch longer than this would otherwise be unable to
+/// record finished work. Claims stay attempt- and token-fenced.
 pub const LEASE_TTL_MS: i64 = 15 * 60 * 1000;
 
 fn run_view_full(ctx: &mut Ctx, home_id: &str, run_id: &str) -> Result<Value> {
@@ -2306,7 +2309,6 @@ fn run_report(ctx: &mut Ctx, params: &Value) -> Result<Value> {
         item.attempts,
         stored_grant.as_ref(),
         &authority,
-        ctx.now_ms(),
         stored_grant.as_ref().map(|grant| grant.token.as_str()),
     )?;
     let _ = verdict;

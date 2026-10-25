@@ -544,7 +544,7 @@ export interface ClaimRunResult {
   [k: string]: unknown;
 }
 /**
- * Fenced execution lease returned by a successful claim (R10). Reports must echo the token; expiry demotes the claim.
+ * Fenced execution lease returned by a successful claim (R10). Reports must echo the token; the grant stays valid until the item is reported, retried, removed or interrupted. expiresAt is advisory and not enforced (attempt + token fencing keeps stale executors out).
  */
 
 /**

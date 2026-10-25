@@ -6,9 +6,10 @@
  *
  * U7a rewrites (documented deviation): the pre-daemon janitor sweep demoted
  * dead sessions' running items to interrupted IN-PROCESS. This daemon build
- * owns lease expiry and exposes no mid-flight demotion RPC, so the adapter's
- * sweep is notify-only: outstanding items stay `running` until the
- * daemon-side lease path or a human retry settles them, and the hook emits a
+ * demotes in-flight items only in its startup janitor (lease expiry is
+ * advisory, F-SELF-1) and exposes no mid-flight demotion RPC, so the adapter's
+ * sweep is notify-only: outstanding items stay `running` until a daemon
+ * restart or a human retry settles them, and the hook emits a
  * once-per-process degradation warning instead. The old "demoted to
  * interrupted" assertions below are rewritten to pin the AS-BUILT behavior.
  */

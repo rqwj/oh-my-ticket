@@ -300,11 +300,9 @@ fn grant(attempt: i64, expires_at: i64) -> LeaseGrant {
 
 #[test]
 fn stale_or_mismatched_leases_are_denied_with_distinct_rules() {
-    let now = 10_000;
     let cases: Vec<(&str, Option<LeaseGrant>, i64)> = vec![
-        ("lease-stale", Some(grant(1, 9_000)), 1), // expired at now
         ("lease-attempt", Some(grant(1, 20_000)), 2), // attempt mismatch
-        ("lease-stale", None, 1),                  // nothing issued
+        ("lease-stale", None, 1),                     // nothing issued
     ];
     for (rule, lease_entry, attempt) in cases {
         let presented = lease_entry.clone();
@@ -316,7 +314,6 @@ fn stale_or_mismatched_leases_are_denied_with_distinct_rules() {
                 token: "lease-session-a-1".into(),
                 actor: "session-a".into(),
             },
-            now,
             Some("lease-session-a-1"),
         )
         .expect_err(&format!("{rule} must deny"));
@@ -342,7 +339,6 @@ fn stale_or_mismatched_leases_are_denied_with_distinct_rules() {
             token: "forged-token".into(),
             actor: "session-a".into(),
         },
-        now,
         Some("lease-session-a-1"),
     )
     .expect_err("forged token must be denied");
@@ -365,7 +361,6 @@ fn stale_or_mismatched_leases_are_denied_with_distinct_rules() {
             token: "lease-session-a-1".into(),
             actor: "session-a".into(),
         },
-        now,
         Some("lease-session-a-1"),
     ) {
         Ok(authorized) => assert!(matches!(authorized, ReportVerdict::ExecutorAuthorized)),
@@ -381,7 +376,6 @@ fn stale_or_mismatched_leases_are_denied_with_distinct_rules() {
             &ReportAuthority::Administrator {
                 reason: "human decision".into(),
             },
-            now,
             None,
         ) {
             Ok(authorized) => {
@@ -401,7 +395,6 @@ fn stale_or_mismatched_leases_are_denied_with_distinct_rules() {
             token: "lease-session-a-1".into(),
             actor: "session-z".into(),
         },
-        now,
         Some("lease-session-a-1"),
     )
     .expect_err("foreign actor must be denied");
@@ -424,7 +417,6 @@ fn stale_or_mismatched_leases_are_denied_with_distinct_rules() {
             token: "lease-session-a-1".into(),
             actor: "session-a".into(),
         },
-        now,
         Some("lease-session-a-1"),
     )
     .expect_err("pending item must not accept reports");
@@ -436,6 +428,62 @@ fn stale_or_mismatched_leases_are_denied_with_distinct_rules() {
             .and_then(|r| r.as_str()),
         Some("report-state-gate")
     );
+}
+
+/// F-SELF-1：租约的 `expires_at` 不是拒绝条件——没有任何机制续租或回收
+/// 过期租约，过期检查只会拒绝合法持有者（自托管试点里 30 分钟的派发做完
+/// 工作后 run__report 被拒，item 回到 pending）。过期很久的 grant 只要仍是
+/// 该 item 当前登记的那份（attempt + token 吻合），持有者照常可以汇报；
+/// 防陈旧执行者的仍是 attempt / token 围栏。
+#[test]
+fn expired_grant_still_authorizes_its_holder_but_stays_fenced() {
+    let rule_of = |problem: &omt_domain::error::Problem| {
+        problem
+            .details
+            .as_ref()
+            .and_then(|d| d.get("rule"))
+            .and_then(|r| r.as_str())
+            .map(str::to_string)
+    };
+    let holder = ReportAuthority::ExecutorLease {
+        token: "lease-session-a-1".into(),
+        actor: "session-a".into(),
+    };
+    // expires_at = 1：早已过期
+    let expired = Some(grant(1, 1));
+    match authorize_report(
+        RunItemState::Running,
+        1,
+        expired.as_ref(),
+        &holder,
+        Some("lease-session-a-1"),
+    ) {
+        Ok(verdict) => assert!(matches!(verdict, ReportVerdict::ExecutorAuthorized)),
+        Err(problem) => panic!("expired-but-current lease must still authorize: {problem}"),
+    }
+    // 同一份过期 grant，item 已被重试到 attempt 2：仍被 attempt 围栏挡住
+    let problem = authorize_report(
+        RunItemState::Running,
+        2,
+        expired.as_ref(),
+        &holder,
+        Some("lease-session-a-1"),
+    )
+    .expect_err("stale attempt must stay fenced");
+    assert_eq!(rule_of(&problem).as_deref(), Some("lease-attempt"));
+    // 伪造 token：仍被 token 围栏挡住
+    let problem = authorize_report(
+        RunItemState::Running,
+        1,
+        expired.as_ref(),
+        &ReportAuthority::ExecutorLease {
+            token: "forged-token".into(),
+            actor: "session-a".into(),
+        },
+        Some("lease-session-a-1"),
+    )
+    .expect_err("forged token must stay fenced");
+    assert_eq!(rule_of(&problem).as_deref(), Some("lease-token"));
 }
 
 /// P3-ACC-2：非管理员未带 leaseToken（dispatch 传入空串）单列规则
@@ -463,7 +511,6 @@ fn missing_token_is_denied_with_its_own_rule() {
         1,
         stored.as_ref(),
         &no_token,
-        10_000,
         Some("lease-session-a-1"),
     )
     .expect_err("missing token must be denied");
@@ -475,7 +522,7 @@ fn missing_token_is_denied_with_its_own_rule() {
         problem.message
     );
     // 无租约：缺 token 仍报缺 token（比 lease-stale 更可行动）
-    let problem = authorize_report(RunItemState::Running, 1, None, &no_token, 10_000, None)
+    let problem = authorize_report(RunItemState::Running, 1, None, &no_token, None)
         .expect_err("missing token without grant must be denied");
     assert_eq!(rule_of(&problem).as_deref(), Some("lease-token-missing"));
     // 不在途：state gate 仍然优先
@@ -484,7 +531,6 @@ fn missing_token_is_denied_with_its_own_rule() {
         1,
         stored.as_ref(),
         &no_token,
-        10_000,
         Some("lease-session-a-1"),
     )
     .expect_err("pending item must be denied by the state gate");
@@ -498,7 +544,6 @@ fn missing_token_is_denied_with_its_own_rule() {
             &ReportAuthority::Administrator {
                 reason: "admin-grant".into()
             },
-            10_000,
             None,
         )
         .unwrap(),
