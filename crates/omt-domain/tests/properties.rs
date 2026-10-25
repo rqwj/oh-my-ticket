@@ -438,6 +438,74 @@ fn stale_or_mismatched_leases_are_denied_with_distinct_rules() {
     );
 }
 
+/// P3-ACC-2：非管理员未带 leaseToken（dispatch 传入空串）单列规则
+/// `lease-token-missing`，消息点名缺少的参数与来源——此前按空串与存储
+/// token 比对，报 `lease-token`「presented token does not fence this item」，
+/// 模型无从得知是漏传了参数（omp 首次 report 即撞上）。
+#[test]
+fn missing_token_is_denied_with_its_own_rule() {
+    let rule_of = |problem: &omt_domain::error::Problem| {
+        problem
+            .details
+            .as_ref()
+            .and_then(|d| d.get("rule"))
+            .and_then(|r| r.as_str())
+            .map(str::to_string)
+    };
+    let no_token = ReportAuthority::ExecutorLease {
+        token: String::new(),
+        actor: "session-a".into(),
+    };
+    // 有活租约：缺 token 不再被当成「token 不匹配」
+    let stored = Some(grant(1, 20_000));
+    let problem = authorize_report(
+        RunItemState::Running,
+        1,
+        stored.as_ref(),
+        &no_token,
+        10_000,
+        Some("lease-session-a-1"),
+    )
+    .expect_err("missing token must be denied");
+    assert_eq!(problem.code, "CONFLICT");
+    assert_eq!(rule_of(&problem).as_deref(), Some("lease-token-missing"));
+    assert!(
+        problem.message.contains("leaseToken") && problem.message.contains("run/claim"),
+        "消息必须点名参数与来源：{}",
+        problem.message
+    );
+    // 无租约：缺 token 仍报缺 token（比 lease-stale 更可行动）
+    let problem = authorize_report(RunItemState::Running, 1, None, &no_token, 10_000, None)
+        .expect_err("missing token without grant must be denied");
+    assert_eq!(rule_of(&problem).as_deref(), Some("lease-token-missing"));
+    // 不在途：state gate 仍然优先
+    let problem = authorize_report(
+        RunItemState::Pending,
+        1,
+        stored.as_ref(),
+        &no_token,
+        10_000,
+        Some("lease-session-a-1"),
+    )
+    .expect_err("pending item must be denied by the state gate");
+    assert_eq!(rule_of(&problem).as_deref(), Some("report-state-gate"));
+    // 管理员路径不受影响
+    assert_eq!(
+        authorize_report(
+            RunItemState::Running,
+            1,
+            None,
+            &ReportAuthority::Administrator {
+                reason: "admin-grant".into()
+            },
+            10_000,
+            None,
+        )
+        .unwrap(),
+        ReportVerdict::AdminAuthorized
+    );
+}
+
 // ── 6. sweep equivalence against the membership oracle (decision 1/2) ───
 
 const STATUSES: [RunStatus; 3] = [

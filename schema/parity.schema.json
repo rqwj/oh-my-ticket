@@ -71,6 +71,35 @@
           { "action": "home/list-known", "classification": "adapter_only", "summary": "Runtime-dir known-homes catalog for surface pickers (persisted across generations; open/missing annotated). Discovery aid, not an agent action.", "since": "v1" }
         ]
       }
+    },
+    "LocalToolEntry": {
+      "type": "object",
+      "description": "子项目 2 本地工具（不经 daemon，KD-E4）。local_read 只读；local_exec 有副作用，受 exec/policy.json 约束。",
+      "additionalProperties": false,
+      "required": ["tool", "classification", "summary", "since"],
+      "properties": {
+        "tool": { "type": "string", "pattern": "^(harness|exec)/[a-z]+$" },
+        "classification": { "enum": ["local_read", "local_exec"] },
+        "summary": { "type": "string" },
+        "since": { "type": "string", "pattern": "^v[0-9]+$" }
+      }
+    },
+    "LocalToolMatrix": {
+      "type": "object",
+      "required": ["entries"],
+      "properties": { "entries": { "type": "array", "items": { "$ref": "#/$defs/LocalToolEntry" } } },
+      "default": {
+        "entries": [
+          { "tool": "harness/list", "classification": "local_read", "summary": "列出 harness 与安装/启用状态", "since": "v1" },
+          { "tool": "harness/models", "classification": "local_read", "summary": "列出 harness 可用模型", "since": "v1" },
+          { "tool": "exec/start", "classification": "local_exec", "summary": "拉起执行（policy 约束）", "since": "v1" },
+          { "tool": "exec/stop", "classification": "local_exec", "summary": "停止执行（不受 policy 约束；被派发 agent 不可用）", "since": "v1" },
+          { "tool": "exec/status", "classification": "local_read", "summary": "执行状态", "since": "v1" },
+          { "tool": "exec/list", "classification": "local_read", "summary": "执行列表", "since": "v1" },
+          { "tool": "exec/tail", "classification": "local_read", "summary": "按 seq 分页读取事件", "since": "v1" },
+          { "tool": "exec/policy", "classification": "local_read", "summary": "查看生效的派发策略", "since": "v1" }
+        ]
+      }
     }
   }
 }

@@ -126,11 +126,23 @@ export interface ExecRecord {
   /** F-U12-4：终态归档的会话累计用量（无 usage 事件为 null） */
   usageTokens?: number | null
   usageCost?: number | null
+  /** F-BENCH-20：usage 归档口径。'message-sum' = 按消息/步求和、
+   * 'cumulative-last' = 会话累计取末值（e87a99a 起）；null/缺省 = 旧口径
+   * （只含末条消息，少报）——历史记录未重算，消费方据此区分。 */
+  usageCaliber?: 'message-sum' | 'cumulative-last' | null
   /** 本次派发选用的模型（F-VIEW3：弹窗空闲 Agent 列表展示；未指定为 null） */
   model?: string | null
   /** Rust-captured process identity; never accepted from the renderer for kill authorization. */
   pid: number | null
   processStartId: string | null
+  /** exec-shim 进程身份（Rust 侧写入，仅展示/诊断；停止授权不信任 renderer） */
+  shimPid?: number | null
+  shimStartId?: string | null
+  /** shim 收尾时租约释放失败、待对账重试 */
+  leaseReleasePending?: boolean
+  /** A8 / Q-7：本次派发的发起方（desktop 派发 / CLI / MCP 主控）；旧记录为
+   *  null/缺省。Agents 面板据此显示发起方标签（只标 cli / mcp）。 */
+  launchedBy?: 'desktop' | 'cli' | 'mcp' | null
 }
 
 export interface AgentRecord {
@@ -144,12 +156,36 @@ export interface AgentRecord {
   lastExecId: string | null
   lastSessionId: string | null
   execs: ExecRecord[]
+  /** A8 / Q-7：新建该 agent 的显式派发参数写入的父 agent id；旧记录缺省。 */
+  parentAgentId?: string | null
+}
+
+/** §41：未能迁移的旧版 home 级 agents.json（损坏 / 尚未迁移 / 只剩 .corrupt-* 留证）。 */
+export interface LegacyUnmigrated {
+  path: string
+  /** 旧文件仍在原位 */
+  present: boolean
+  /** 可按旧格式解析（启动迁移会处理；不提供归档） */
+  parseable: boolean
+  /** 同目录的 `.corrupt-*` 留证文件名 */
+  corruptEvidence: string[]
+}
+
+/** §41：agent.json 已损坏的 agent——目录与留证文件名（解冻：删留证或改名回 agent.json）。 */
+export interface CorruptAgent {
+  agentId: string
+  dir: string
+  evidence: string[]
 }
 
 export interface AgentsListResult {
   agents: AgentRecord[]
   agentSeq: number
   parseFailed: boolean
+  /** §41：旧 fixture / 旧后端缺省按 null 处理 */
+  legacyUnmigrated?: LegacyUnmigrated | null
+  /** §41：缺省按空处理 */
+  corruptAgents?: CorruptAgent[]
 }
 
 // ── U9 Bindings（R-C；wire 契约 = bindings_get / bindings_gc 的 json! 投影）──
@@ -165,4 +201,36 @@ export interface BindingsResult {
 export interface BindingsGcResult {
   removed: number
   bindings: Record<string, string>
+}
+
+// ── A8 派发策略（设置页「派发策略」；wire = exec_policy_get/set 投影）─────
+
+/** A8：exec/policy.json（设计 §3.6）。只约束 CLI / MCP 发起的派发。 */
+export interface ExecPolicy {
+  allowFromCli: boolean
+  allowFromMcp: boolean
+  harnesses: string[]
+  workspaces: 'homeWorkspaceOnly'
+  maxConcurrent: number
+  maxDurationSec: number
+  approvalMode: 'inherit'
+}
+
+export interface ExecPolicyView {
+  policy?: ExecPolicy
+  /** ExecPolicy::default()（Rust 侧唯一来源） */
+  defaults: ExecPolicy
+  source?: 'file' | 'default'
+  path: string
+  error?: string
+}
+
+/** §47 release-results-hidden：强制删除时释放失败（被放弃）的租约——全局
+ * 通知列表的一条，按被删 agent 键控，直到用户关闭。 */
+export interface LeaseNotice {
+  agentId: string
+  homeId: string
+  /** 被放弃租约所属的 run（文案里也写明，便于在 Runs 页定位） */
+  runIds: string[]
+  text: string
 }

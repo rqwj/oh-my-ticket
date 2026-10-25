@@ -14,6 +14,8 @@ path = "src/main.rs"
 
 [dependencies]
 omt-client = { path = "../../../crates/omt-client" }
+omt-exec = { path = "../../../crates/omt-exec" }
+omt-harness = { path = "../../../crates/omt-harness" }
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tauri-plugin-notification = "2"
@@ -22,13 +24,25 @@ tauri-plugin-single-instance = "2"
 libc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-# F-U3-5: stable content hashing for the omp MCP injection's persisted
-# workspace/content digests — DefaultHasher's algorithm is not guaranteed
-# stable across Rust versions.
-sha2 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+# P3-ACC-6：退出 / 关窗确认框直调 NSAlert（「取消」绑定 Esc）。版本与 tauri /
+# rfd 已拉进 Cargo.lock 的一致，不引入新版本。
+[target.'cfg(target_os = "macos")'.dependencies]
+dispatch2 = "0.3.1"
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "NSAlert",
+    "NSApplication",
+    "NSButton",
+    "NSControl",
+    "NSResponder",
+    "NSView",
+] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString"] }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

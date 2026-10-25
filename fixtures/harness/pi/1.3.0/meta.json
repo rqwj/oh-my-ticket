@@ -1,0 +1,10 @@
+{
+ "capturedAt": "2026-10-20",
+ "harnessVersion": "1.3.0",
+ "provider": "pi",
+ "source": "acceptance env real dispatch (post F-PROMPT/F-EXPOSE, 3-tool-call round)",
+ "model": "kimi-coding/k3",
+ "task": "smoke-hello-dispatch",
+ "normalization": "paths/sessionId/execId/pid/timestamps -> fixed placeholders (object-level; string bodies: ISO -> __TS__, mcp:<pid> -> mcp:__PID__)",
+ "omtVersion": "0.6.6"
+}

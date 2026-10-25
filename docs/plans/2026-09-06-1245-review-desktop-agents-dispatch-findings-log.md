@@ -25,6 +25,69 @@ branch: feat/desktop-agents-dispatch
 
 | ID | 级别 | 类型 | 单元 | 位置 | 摘要 | 状态 | 负责人 |
 |---|---|---|---|---|---|---|---|
+| P3-ACC-1 | P3 | gated_auto | 执行面/验收 | `executor.rs` DISPATCH_PROMPT 第 4 条 | 派发 prompt 未要求 leaseToken，omp 首次 `run__report` 被拒 | fixed(fe84f27) | — |
+| P3-ACC-2 | P3 | gated_auto | daemon/验收 | `omt-domain runs.rs::authorize_report` | 缺 token 的非管理员 report 报「token 不匹配」而非「缺少 leaseToken」 | fixed(0c1c29f)：规则 `lease-token-missing`，消息指向 run/claim 的 lease.token | — |
+| P3-ACC-3 | P3 | gated_auto | 执行面/验收 | DISPATCH_PROMPT 第 7 条 | run completed 后模型多认领一次 | fixed(fe84f27) | — |
+| P3-ACC-4 | P3 | gated_auto | 执行面/验收 | `executor.rs::dispatch_daemon_side` ① | 已完成 ticket 续跑报「无未完成可执行成员」，不说明原因 | fixed(ed500ff) | — |
+| P3-ACC-5 | P3 | gated_auto | 执行面/验收 | `executor.rs::spawn_inner` / `agents.rs::mark_exec_spawned` | agent 状态从不进入 running | fixed(ed500ff) | — |
+| P3-ACC-6 | P3 | gated_auto | 桌面/验收 | `lib.rs` 退出 / 关窗确认框 | Esc 无效（rfd 无父窗口走 CFUserNotification，不绑 Esc） | fixed(a4f51e0)：macOS 直调 NSAlert、「取消」绑 Esc；Esc 手工验收见第 13 项 | — |
+| P3-ACC-7 | P3 | gated_auto | 工具链/验收 | `apps/desktop/scripts/copy-sidecar.mjs` | `copyFileSync` 带 provenance，tauri-build EPERM | fixed(b7a514e)：字节流复制 + 临时名 rename | — |
+| P3-ACC-8 | P3 | gated_auto | 执行面/验收 | `executor.rs::release_items_for_exec` | 对已取消 run 释放 → retry CONFLICT，日志误报失败 | fixed(e3d770b) | — |
+| F-ACC-12 | P2 | gated_auto | 执行面/验收 | `executor.rs::dispatch_daemon_side` ② | 停止后重新派发同一 ticket，item 被桌面端身份激活后卡死 | fixed(5ce2750) | — |
+| F-EXEC-17 | P2 | gated_auto | 执行面/桌面 | `follow.rs` / `control.rs::settle_lost_exec` | app 运行期间 shim 崩溃不可见，租约持有到下次启动 | fixed(b2f8aca) | — |
+| F-DAEMON-1 | P1 | gated_auto | daemon | `server.rs` / `events.rs` | events/resume 每次调用新增一个永不撤销的订阅与转发线程 | fixed(4e8c92e) | — |
+| F-SP2-1 | P2 | gated_auto | 执行面 | `executor.rs::transcript_page`（按 seq 分页）+ stdout/stderr 读线程的取号与追加 | 取 seq 与追加 jsonl 不是原子的，文件顺序 ≠ seq 顺序，`exec tail` 按 `since` 分页会永久漏掉或重复事件 | fixed(df5049c) | — |
+| F-SP2-2 | P2 | gated_auto | 执行面 | `control.rs::shim_maybe_alive` / `executor.rs::target_shim_alive` | 身份读取失败一律视为「可能存活」，EPERM（pid 被其他用户进程复用）也被算作存活，对账永远跳过，租约无限期卡住 | fixed(df5049c) | — |
+| F-SP2-3 | P2 | gated_auto | 执行面 | `grants.rs::TempGrant`（§50 引用计数） | 计数归零与撤销之间无互斥：A 归零后、`remove()` 前 B `add` 见授权仍在而不重登记，随后 A 撤销 → B 持守卫却无授权（§49 原症状的窄窗口版） | fixed(17b3a96) | — |
+| F-SP2-4 | P2 | gated_auto | 桌面 | `lib.rs` 退出 STOP 分支（§50 移出主线程） | `QUIT_CONFIRMED` 在 stop 开始前置位，stop 期间再按 ⌘Q 直接放行退出，剩余 agent 收不到停止信号继续运行 | fixed(17b3a96) | — |
+| F-SP2-5 | P2 | gated_auto | CLI/MCP | `local_impl.rs::resolve_home_id`（§50 相对路径修复） | `exec list --home <homeId>` 改为要求 home 当前被服务：idle 关闭的 home 报 NOT_FOUND，只读动词还会拉起 daemon（回归） | fixed(17b3a96) | — |
+| F-SP2-6 | P2 | gated_auto | 执行面/脱敏 | `omt-harness/src/sanitize.rs::sanitize_line`（§52 词首匹配） | 修误伤时削弱了脱敏：`sk-` 只看首次命中（`task-… sk-live-x` 泄漏）、`=`/`:` 前有空格不再算键值（`password = x` 泄漏）、键值形态也要求词首（`apiKey=`、`accessToken=`、`PGPASSWORD=` 泄漏） | fixed(2b77285) | — |
+| F-SP2-7 | P2 | gated_auto | 桌面 | `state.rs::handshake_homes` / `rpc_bridge.rs::daemon_homes`（§52 惰性重建） | 超时丢弃连接后，重建失败被吞成 `homes: []` → 切换器清空且清掉「daemon 无响应」错误条；同步命令在主线程重建（最长 30s）会转圈 | fixed(2b77285) | — |
+| F-SP2-8 | P2 | gated_auto | 执行面/脱敏 | `sanitize.rs::sanitize_line`（§54 dash 例外 + Authorization 冒号紧跟） | dash 例外不止放过 `--monkey=banana`：`--apiKey=S`、`-Dpassword=S`、`-ePASSWORD=S`、`-PGPASSWORD=S` 旧版脱敏、新版泄漏；「冒号紧跟」规则让 JSON 形态 `"Authorization":"Basic S"` 重新泄漏 | fixed(26df96c) | — |
+| F-SP2-9 | P2 | gated_auto | 桌面 | `rpc_bridge.rs::events_subscribe` / `daemon_ensure`（同步命令持会话锁） | async 的 `daemon_homes`/`omt_call` 持会话锁做 30s 重建时，切 home 触发同步 `events_subscribe` 在主线程等同一把锁 → 仍会转圈（既有，F-SP2-7「不卡主线程」未闭合） | fixed(26df96c) | — |
+| F-SP2-10 | P2 | gated_auto | 桌面 | `rpc_bridge.rs::events_subscribe`（§56 改 async） | 先在会话锁上排队、拿到锁才 `set_target`；`std::sync::Mutex` 非 FIFO，快速切 home A→B 时 A 可能后拿锁 → 事件泵停在 A，B 的树不再随外部改动刷新，前端 `.catch(() => {})` 静默（回归） | fixed(03bcead) | — |
+| F-SP2-11 | P2 | gated_auto | 桌面 | `store.ts::refreshAgents`（§56 超时提示保留） | 窗口聚焦与 home 加载都会调非静默 `refreshAgents()`，`agents_list` 只读文件系统、daemon 卡死也成功 → `error: null` 照样清掉「结果未知」提示，§56 的保留规则在它针对的触发点上失效 | fixed(03bcead) | — |
+| F-SP2-12 | P2 | gated_auto | 桌面 | `store.ts::presentErrorWithKind` 之外的全部错误展示点（§58 `[daemon-timeout]` 机器前缀） | 前缀只在 store 的 `applyError`/`updateNode`/`declareHome` 剥掉；新建节点（`TreePanel` ← `createNode` 原样抛）、派发（`ExecutionDialog` ← `startDispatch` 原样抛）、RunsPanel / DetailPanel / AgentsPanel 的 run/control、run/report、run/create、node/update、node/archive 均 `String(err)` 直显 → 超时时界面出现字面量「[daemon-timeout] daemon 无响应…」，且这些写路径（含无 commandId 的 node/create、run/create）不落 timeoutNotice（回归，显示层） | fixed(c1bbfdf) | — |
+| F-BENCH-18 | P1 | gated_auto | BENCH | `.gitignore:26` / `fixtures/harness/*/raw.log` | **raw.log 语料未入库**：`*.log` 规则把三份 raw.log 全部忽略，只存在于本机。`raw_log_replay_matches_recorded_events` 在干净 clone / CI 上会 panic（「raw.log 应存在」），CI rust 任务必红；F-BENCH-15 在仓库里实际未关闭（§30） | fixed(55a8e55 + 2b8e036)：入库 + 必需文件清单入测（缺一即红）；「时间戳已清洗」「≥12 下限」两项不实声明由 F-BENCH-24 在 2b8e036 兑现 | — |
+| F-BENCH-19 | P1 | gated_auto | BENCH/U12 | `adapters.rs::parse_opencode` step_finish | **opencode 的 usage 也是逐步的值，被误标为累计**：语料 4 个 step_finish 各带不同 messageID，每个 total = 该步 input + output + reasoning + cache.read（如 1518+45+109+23040 = 24712）。按「累计取末值」报 25460，实为 98225（少报约 3.9 倍）；本卷免费档 cost=0 掩盖了问题，付费 provider 会少报费用（§30） | fixed(55a8e55)：opencode 标 message，98225 入测 | — |
+| F-BENCH-20 | P3 | testing-gap | BENCH/U12 | `executor.rs::UsageTotals` | `record` / `final_totals` 无直接单测（混合 scope、全零、历史无 scope 事件）；修复前归档的 ExecRecord 用量仍是旧口径，未重算也未标注 | fixed(55a8e55 + e87a99a)：UsageTotals 四形态单测；口径自描述——ExecRecord.usageCaliber（"message-sum"，旧 JSON 兼容读 None = 末条口径）+ 归档直达测试 + TS 类型；不重算（usageTokens/usageCost 无 UI 消费点，标注路线即关闭，§34） | — |
+| F-BENCH-21 | P3 | gated_auto | BENCH | `harness_probe.rs::run_with_timeout` / `harness-capture.rs::capture` | 进程退出后才读 stdout：输出超过管道缓冲（约 64KB）时子进程阻塞在写，30s 后被误判超时；`PROVIDERS` 是手写列表，REGISTRY 新增 provider 不会被探测 | fixed(2b8e036)：capture 双读线程前置、all_providers 真遍历 REGISTRY、探针 flag 面用 d.probe_args（§32） | — |
+| F-BENCH-22 | P2 | gated_auto | 测试稳定性 | `harness.rs` / `executor.rs` 计时类测试 | 全量 `cargo test -p oh-my-ticket-desktop --lib` 3 次中 2 次失败，失败的测试每次不同（`probe_version_times_out_hanging_binary`、`harness_entry_projects_state_from_binary_source`、`kill_all_timeout_branch_settles_unwaited_session`），单独运行均通过。这些代码路径本轮未改，应是既有 flake；§29「重跑即绿」的做法会让 CI 偶发红，需要单独定位 | fixed(2b8e036)：真因是 macOS 首次 exec 现写文件的系统评估停顿（插桩三轮定案，ETXTBSY 被证伪），探针梯子 2/6/6s + 测试预算 20s + READY 屏障 + 线程上限移仓库根；4T×5 + 16T×2 + worktree 全绿（§32） | — |
+| F-BENCH-23 | P2 | gated_auto | BENCH | `bench.rs::analyze_jsonl` raw.log 回落 | **语料目录的 raw.log 被同目录所有 jsonl 共用**：找不到 `<execId>.raw.log` 时回落到 `raw.log`。omp 18.12.2 目录有两卷（smoke-hello 与 synthetic-lines），分析 synthetic-lines 时会用 smoke 那次运行的 raw.log 覆盖用量，报出另一条流的 42430 tokens。修法：语料按 executor 的命名存成 `<stem>.raw.log`，删掉回落分支（§31） | fixed(2b8e036)：改名成对 + 回退删除 + gitignore `*.raw.log` + 必需文件清单（§32） | — |
+| F-BENCH-24 | P3 | gated_auto | BENCH | `fixtures/harness/*/raw.log` / `bench.rs::fixtures_are_normalized` | 55a8e55 提交说明称「时间戳已清洗」「覆盖下限 ≥12」，实际 raw.log 仍有 170 处内嵌 ISO 时间戳（omp 100 / opencode 10 / pi 60，与 §30 计数相同），测试下限仍是 `checked >= 9`，归一化测试也不检查时间戳；另含 `mcp:93364` 这类真实 pid（§31） | fixed(2b8e036)：288 处 ISO + 87 处 pid 清洗（行级解析一致性保持）、防回退断言 + 下限 13、capture normalize() 生成侧补齐、meta.json 说明如实化（§32） | — |
+| F-BENCH-25 | P3→P2 | gated_auto | 设置页 / 探针 | `harness.rs::probe_descriptor` / `harness_list` | 探针梯子 2/6/6s 后，挂起型 binary（flag 写错起 TUI）每家最长 14s（原 6s）；`harness_list` 按 REGISTRY 串行探测，三家都挂时设置页约 42s 才出结果。注释「首试保 TUI 快否决」不成立——首试超时后仍会再等 12s。可改为各 provider 并行探测，或在 UI 先返回 pending 再回填版本（§33） | fixed(e87a99a)：probe_all 并行探测（保序，墙钟 = 最慢一家）+ 并行性测试；不实注释已改写（挂起判定 6→14s 如实记录，由并行补偿）；根配置线程上限注释改为「冗余保险」定位（§34） | — |
+| F-BENCH-26 | P2 | gated_auto | U2/U12 | `executor.rs::finish_terminal` / 等待线程 `:640-670` | **终态先于落账发布**：(a) `finish_terminal` 第一步就写 `terminal`，之后才算 usage、写 agents.json、写 session id、追加 exit 行——轮询 `terminal()` 的一方会读到半成品；(b) reader 线程在 `finish_terminal` **之后**才 join，等待线程只等「首事件」≤300ms——最后几行 stdout（通常正是最后一条 `message_end`）可能还没被解析，usage 少记最后一条、session id 丢失、exit 之后还有 raw 行。16 线程下 6 次有 3 次失败（三个不同测试，均秒级失败，不是 30s 窗口超时）；慢 sink 确定性复现 3/3：归档 100 而非 250、jsonl 末行不是 exit；4 线程上限把它掩盖了（§35） | fixed(9e6331e)：waiter 清孤儿后先 drain_readers（有界 10s）再落账；幂等 guard 改 finishing 原子标记、terminal 最后发布；评审复现改编为回归测试（不 sleep，(a)(b) 同钉）；16T ×10 验证门全绿后线程上限已删除（§36） | — |
+| F-EXEC-1 | P1 | gated_auto | 存储/U9 | `crates/omt-exec/src/agents.rs::bindings_gc_value` / `list_agents` | **旧 store 损坏或未迁移的 home 失去 GC 冻结**。旧 `agents.json` 损坏时迁移跳过它，原地保留，冻结只靠 `seq.json` 缺失维持；用户在该 home 派发一次后 `seq.json` 被创建，冻结就解除，「清理绑定」会删掉指向旧 agent 的绑定。升级前已有的 `agents.json.corrupt-*` 留证也被忽略。已复现（§39） | fixed(e292202)；P3 降级永久 / 无恢复入口 / 横幅文案 → fixed(e540e5c) | — |
+| F-EXEC-2 | P2 | gated_auto | 执行面 | `launch.rs` 写 shim 身份 / `control.rs` | **shim 身份只由 launcher 尽力写入**。写入失败，或 launcher 在 spawn 与写入之间退出时，健康的 exec 会在 60s 宽限后被判为 SHIM_LOST，对账随即释放它正持有的租约（同一 ticket 可被再次派发），停止操作也被静默丢弃。修法：shim 启动时先自己写入身份（§39） | fixed(bbdc194)；P3 残口 fixed(501d898)；launcher SIGTERM 补偿分支补测试 fixed(ed500ff) | — |
+| F-EXEC-3 | P2 | gated_auto | 执行面 | `control.rs::stop_all` / 桌面退出路径 | **`stop_all` 遇到第一个错误就中断**，退出路径还吞掉了错误。shim 恰好在身份校验与 kill 之间退出（ESRCH）就会触发，用户选了「全部停止后退出」，其余 agent 却仍在运行（§39） | 部分 fixed(58f14d9+8ca92b6)：Rust 侧逐个续错已修；桌面侧把错误吞成成功，见 F-EXEC-12（§41） | — |
+| F-EXEC-4 | P2 | gated_auto | 执行面 | `launch.rs::wait_ready` | **「shim 意外退出」分支只取消 run，不把 agent 标为 Failed**。agent 停在 Starting/Live，既不能续跑也不能删除，要等手动停止或下次重启才恢复（§39） | fixed(58f14d9) | — |
+| F-EXEC-5 | P2 | gated_auto | 执行面/前端 | `agents.rs::append_exec` / 派发守卫 / AgentsPanel | **orphan 可以续跑**。续跑把 `attachment=Orphan` 覆盖成 Live：旧 harness 仍在跑同一会话，却再也无法强制终止。失败说明「可续跑」还在鼓励用户这样做（§39） | 部分 fixed(58f14d9)：后端已修；ExecutionDialog 仍列出 orphan，orphan 行仍显示「可续跑」（P3，§41） | — |
+| F-EXEC-6 | P2 | gated_auto | 桌面 | `lib.rs` ExitRequested | **关主窗口（红按钮或 ⌘W）也会弹退出确认**，选「取消」后应用没有窗口，dock 点击（Reopen）没人处理，single-instance 又挡住重新启动（§39） | 部分 fixed(bbdc194)：关窗确认、隐藏与恢复、⌘Q 已核实；关窗确认框可重入（P3，§41） | — |
+| F-EXEC-7 | P2 | gated_auto | 执行面 | `executor.rs::dispatch_daemon_side` ③–⑤ | **新建 run 之后有几条失败路径不补偿**（run/get、run/control start、resolve_launch、目标 agent 校验），新 run 卡在 running。改造前已存在（§39） | fixed(bbdc194) | — |
+| F-EXEC-8 | P2 | gated_auto | 存储 | `migrate.rs` | **一个坏 home 让所有 home 的迁移中止，而且每次启动都中止**。非 UTF-8 的旧文件在 `read_to_string` 处直接返回错误，走不到 skipped_corrupt 分支。已复现（§39） | fixed(3d692bf) | — |
+| F-EXEC-9 | P2 | gated_auto | 存储 | `agents.rs::delete_agent` | **删除的检查与删除不在同一把锁内**（相对旧实现是退化）。并发续跑会被 `remove_dir_all` 删掉 spec 和记录，租约无法再释放（§39） | 部分 fixed(3d692bf)：与 append_exec 互斥已修；删除丢失对账标记见 F-EXEC-13（§41） | — |
+| F-EXEC-10 | P2 | gated_auto | 执行面 | `executor.rs::finish_terminal` / `daemon_link` | **daemon 无响应时 shim 永不退出**。租约释放的 RPC 没有超时，terminal 不会发布，跟随线程不会结束；状态已是终态，停止操作是 no-op，退出确认也不计入这个 exec（§39） | fixed(cd332d1)；P3 副作用：临时授权残留 fixed(501d898)，item 卡 failed fixed(e3d770b) | — |
+| F-EXEC-11 | P2 | gated_auto | 执行面/测试 | `executor.rs::finish_terminal` / `exec_survives_launcher.rs:98` | **终态状态和 exit_code 分两次写入**，读方可能看到 Exited 但 exit_code 为空。单独跑 `exec_completes_after_launcher_is_killed` 6 次失败 1 次，CI 会偶发变红；UI 也会短暂显示不一致的状态（§39） | fixed(cd332d1)；kill_orphan 两步写 fixed(23d1c7c) | — |
+| F-EXEC-12 | P2 | gated_auto | 桌面/前端 | `apps/desktop/src-tauri/src/executor.rs::exec_stop_all` | **「停止全部」的失败被报成成功**（F-EXEC-3 修复引入的回归）。错误只打到 stderr，命令仍返回 `Ok(signaled_count)`：全部失败时界面显示「当前没有运行中的 agent」，部分失败时显示「已向 N 个 agent 发出停止信号」，与 R2-7「失败、无事可做、成功三种结果分开提示」相违（§41） | fixed(501d898)；§43 P3 fixed(c72830c) | — |
+| F-EXEC-13 | P2 | gated_auto | 执行面/存储 | `executor.rs::finish_terminal` / `agents.rs::delete_agent` | **租约释放的待对账标记会丢**。<br>(a) finalize 先写终态（pending=false），再去释放租约；这段窗口里 shim 被杀或机器关机，记录处于终态，却既无 SHIM_LOST 标记也无 pending 标记，对账永远找不到它。<br>(b) 删除守卫只看 status 和 attachment：在释放窗口里，或对一个仍带未对账标记的 Failed agent 执行删除，记录随目录一起消失，租约永不释放。<br>这是 F-EXEC-9 原本要防的结果（§41） | fixed(501d898 + c72830c) | — |
+| F-EXEC-14 | P2 | gated_auto | 执行面/存储 | `agents.rs::delete_agent` 守卫 ① / `executor.rs::finish_terminal` / `reconcile_with_connector` | **agent 可能永久删不掉，同一租约可能被双重释放**。<br>· 守卫 ① 只看 `lease_release_pending`，没有和 `list_reconcile_targets` 一样加 `run_id.is_some() && !reconciled`。<br>· shim 的租约释放窗口会跨过 desktop 重启，而 desktop 每次启动都会跑 shim 路径对账，两边可能同时释放同一租约：desktop 先 `mark_reconciled`，shim 的重复释放失败后又把 pending 写回 true，于是出现 `pending=true && reconciled=true`，这条记录不是对账目标，却被守卫永久挡住删除。<br>· 释放永远无法成功（run 或 home 已被删、home id 不一致）的 exec 也同样删不掉，而且没有逃生口。<br>· 双重释放中，用陈旧的 run/get 快照发出的 admin report，可能把另一个 exec 刚认领的 item 判为失败（置信度 50）（§43） | fixed(c72830c)：守卫同谓词、reconciled 不回写 pending、对账跳过存活 shim（变异验证）；强制删除的出口描述失实 → F-EXEC-16（§45） | — |
+| F-EXEC-15 | P2 | gated_auto | 执行面 | `shim.rs::lease_releaser` / `daemon_link::admin_rpc_with_grant` | **租约释放的 30s 上限被打破**（501d898 的回归）。为了让超时也能撤销授权，`connect` 被挪到 `run_bounded` 外面：连接（最长 10s）加上 enroll、declare、re-enroll（各 30s 读超时）都发生在计时开始之前，`finish_terminal` 最坏要阻塞约 130s，`OMT_SHIM_LEASE_TIMEOUT_MS` 不再能限制整个过程。这推翻了 §41 已核实的 F-EXEC-10 性质。wedged-daemon 测试的 Leaser 都是立即返回，没覆盖到（§43） | fixed(c72830c)：connect 已回到计时段内；实际最坏约 30s，锁竞争时约 70s（变异验证） | — |
+| F-EXEC-16 | P2 | gated_auto | 执行面/前端 | `AgentsPanel.tsx` 强制删除第二步 / `omt-exec agents.rs::delete_agent(force)` | **强制删除会让租约永久泄漏，文案却说「交由 daemon 对账收尾」**。<br>· daemon 没有租约回收：janitor 未接线（dispatch.rs 注释「heartbeat renewal wiring lands with the janitor in U5b」），`LEASE_TTL_MS` 只在 report 授权时检查。<br>· 强制删除抹掉的是唯一的对账依据，run item 会永远停在 running，ticket 一直是 in_progress，只能手动 interrupt 或 cancel 整个 run。<br>· 一次瞬时的守卫拒绝（启动对账还没跑、daemon 短暂离线）就会立即提供第二步，用户可能放弃一个本来能释放的租约。<br>（前端、后端评审独立指出）（§45） | fixed(c8abc6a)；§47 P3（释放结果展示、总时限）fixed(a4f51e0) | — |
+| F-BENCH-13 | P1 | manual | BENCH | `4e960a2` 提交说明 / §27（修复节） | 提交说明与日志称 F-BENCH-5/6/7/10 及 8/12 部分已修，但 `harness_probe.rs`、`harness-capture.rs`、`lib.rs` 自 f6eeaed 后**未改动**（无 worktree / stash / 其他分支留存）——改动疑似未提交即丢失（§28） | fixed(3192d60)（改动已重做并核实存在） | — |
+| F-BENCH-14 | P1 | manual | BENCH/U12 | `executor.rs` usage 归档 / `bench.rs` / `adapters.rs` | **usage 是每条消息的值，不是会话累计**：pi 1.3.0 与 omp 18.12.2 语料中 cost 逐消息非单调（0.0349→0.0095→0.0078→0.0092）。F-U12-3「累计快照取末值」的口径错误——ExecRecord 的 usage 与分析器的 tokens/cost 只记最后一条消息：pi 卷报 $0.0092 实为 $0.0615（少报 6.7 倍），omp 卷报 $0.0096 实为 $0.0431（§28） | fixed(da9c376 + 55a8e55)：三家均按消息/步求和 | — |
+| F-BENCH-15 | P1 | manual | BENCH | `bench.rs::raw_lines_reparse_through_current_adapter` | 重放测不到解析漂移：语料的 raw 行只是采集时**未产出事件**的行，产出 tool_call / thinking / text 的源行没有保留，无从重放；该测试能通过只因 4e960a2 新增的 turn_end usage 提取（改动前 pi 的 raw 行重放结构化数为 0）（§28） | fixed(55a8e55)：raw.log 已入库，重放对账测试在干净树上可跑 | — |
+| F-BENCH-16 | P3 | gated_auto | BENCH | `bench.rs::analyze_jsonl` is_omt | `path.contains("omt_")` 过宽：写普通文件（如 `docs/omt_notes.md`）也会被算作 omt 调用；应收紧为 `path.starts_with("xd://mcp__omt")` 并补反例测试 | fixed(da9c376) | — |
+| F-BENCH-17 | P3 | testing-gap | BENCH | `adapters.rs` end 族 usage 分支 | 新分支无 adapters 单测，只经分析器的 fixture 测试间接覆盖 | fixed(da9c376) | — |
+| F-BENCH-3 | P1 | gated_auto | BENCH | `bench.rs::analyze_jsonl` | omp 经 `write xd://mcp__omt_*` 调 MCP，`is_omt` 只看名字 → omp 的 discovery_overhead 恒等于全部调用，硬门永久红（§27） | fixed(4e960a2)（P3 余项见 F-BENCH-16） | — |
+| F-BENCH-4 | P1 | manual | BENCH | fixture 回放测试 | 语料未对 `parse_line` / `parse_models_output` 回放；事件词汇测试 grep 冻结的 adapter 产物，测不出漂移（§27） | 随 F-BENCH-15（重放测试已改为全量对账，但 raw.log 未入库——见 F-BENCH-18） | — |
+| F-BENCH-5 | P1 | manual | BENCH | `harness_probe.rs` / `harness-capture.rs` | 探针硬编码 binary 路径与 model_list_args，测的是自己的 registry 副本（违反 R-1，F-PI-2 类漂移测不出）（§27） | fixed(3192d60) | — |
+| F-BENCH-6 | P2 | gated_auto | BENCH | `harness-capture.rs` | omp `--version` 为 `omp/18.12.2` → 落到 `omp/omp/18.12.2/` | fixed(3192d60) | — |
+| F-BENCH-7 | P2 | gated_auto | BENCH | `harness-capture.rs` | 重跑 capture 覆盖手写 meta.json 出处 | fixed(3192d60)（三家 meta 出处已补回） | — |
+| F-BENCH-8 | P2 | gated_auto | BENCH | `fixtures_are_normalized` / `normalize` | 归一测试不含 omp 卷与 help/models；raw 内嵌时间戳未归一；未过 sanitize_line | fixed(2b8e036 + b7a514e)：capture 先 sanitize_text 再归一 | — |
+| F-BENCH-9 | P2 | gated_auto | BENCH | `bench.rs` opencode 测试 | 注释过时（实为 3 次）且未断言 tool_calls==3 | fixed(4e960a2) | — |
+| F-BENCH-10 | P3 | gated_auto | BENCH | 探针 / capture | 裸 `.output()` 无超时（F1 教训） | fixed(3192d60)（余项见 F-BENCH-21） | — |
+| F-BENCH-11 | P3 | advisory | BENCH | omp 卷 | 无 usage 事件 → omp tokens/cost 恒 None | superseded(F-BENCH-14)（end 族提取已补，但取末值的口径本身是错的） | — |
+| F-BENCH-12 | P3 | advisory | BENCH | 注释 / §26 | 「MCP 握手」未实现、adapter-lines 文件名不符、「上两级」应为三级 | fixed：bench.rs「上两级」在 Task 1 搬迁后已与 ../../fixtures 一致；probe 模块注释已不提 MCP 握手（b7a514e 核实） | — |
 | F-U3-15 | P1 | manual | U3 | `mcp_injection.rs::prepare_omp_with` :279→:283 | **merge 先于 state.json 写入**：二者之间崩溃 → 首个 exec 无 `workspace` 记录，sweep 跳过该目录且删光 launcher → 用户文件留悬空 `omt`；下次 prepare 把污染后的文件当"原件"备份，永远恢复不干净（556c1d2 引入，§8 漏检） | fixed(d53b191) | — |
 | F-U3-16 | P1 | manual | U3 | `mcp_injection.rs` :281/:304 | **writtenSha 每次 prepare 都重置基线**：两 exec 重叠期间用户改了文件 → 第二次 prepare 把改动吸进 S2 → 最后 release 比对 S2 相等 → 整体恢复到第一次 prepare 时的 backup，用户改动静默丢失（556c1d2 引入，§8 漏检） | fixed(d53b191) | — |
 | F-U3-11 | P2 | gated_auto | U3 | `mcp_injection.rs::finalize_release` :310/:323 | **b3500cb 回归**：user_modified 分支打印「备份保留于 …」后无条件 `remove_dir_all(state_dir)` 删掉 backup；外科手术 no-op（command 不匹配/文件不可解析）时用户文件仍被污染且唯一原件已毁 | fixed(d53b191) | — |
@@ -46,26 +109,26 @@ branch: feat/desktop-agents-dispatch
 | F-U2-17 | P2 | manual（设计） | U2 | `executor.rs:747` | 测试模块未拆分（1344 行，约 600 行测试） | open（设计项，人工排期） | — |
 | F-U2-18 | P3 | gated_auto | 本日志 :92 | F-U3-9 kill_all 半已随 12e4d91 完成，行与检查清单仍 open | fixed（F-U3-9 行翻转 fixed(12e4d91)，检查清单勾选） | — |
 | F-U2-6 | P3 | advisory | U2 | `executor.rs` 事件 | envelope 不统一：`session_start`/`exit` 无 `seq`/`ts`，与 design §5.3 `{seq, ts, execId, kind, payload}` 不符；U5 消费前统一 | open（U5 前） | — |
-| F-U2-7 | P3 | advisory | U2/U12 | 计划 §3.2 / design §5.6 | transcript `.jsonl`（header + 事件）写入未落地，仅 raw.log；U10 reconcile 依赖 header | open（归属已定：U4，见计划 U4 Approach；U10 前必须存在） | — |
+| F-U2-7 | P3 | advisory | U2/U12 | 计划 §3.2 / design §5.6 | transcript `.jsonl`（header + 事件）写入未落地，仅 raw.log；U10 reconcile 依赖 header | fixed：spawn_inner 写 session_header + 事件 jsonl（F-U12-4 / KD-E3），b7a514e 核实 | — |
 | F-U2-8 | P3 | gated_auto | U2 | `executor.rs::sanitize_line` / `session_start.args` | `to_lowercase()` 索引原串，非 ASCII 行偏移错位可能欠脱敏（改 `to_ascii_lowercase`）；`args` 事件/日志未脱敏（extra_args 可含 `--api-key`） | fixed(12e4d91)（sanitize_line 改 ascii lowercase；新增 sanitize_args 并用于 session_start 事件与会话记录） | — |
 | F-U2-9 | P3 | advisory | U2 | `agents::demote_live_agents` × dev 多实例 | `OMT_ALLOW_MULTI_INSTANCE` 下第二实例启动 demote 会把首实例的 Live agent 标 Failed；dev-notes 需补「同时隔离 `OMT_RUNTIME_DIR`」 | fixed(af28ca2)（dev-notes §1.4 已补 OMT_RUNTIME_DIR 隔离说明） | — |
 | F-U2-10 | P3 | gated_auto | U2 | `executor.rs::spawn` raw_log 路径 | `home_id` 未经 `validate_home_id` 即拼路径 | fixed(12e4d91)（spawn 入口复用 agents::validate_home_id（提为 pub(crate)）） | — |
-| F-U2-11 | P3 | advisory | U2 | `harness.rs::probe_descriptor` | 探针失败重试一次把 `harness_list` 最坏延迟翻倍（8s）；注释归因「fork→exec 卡死」需复现记录 | open | — |
-| F-U4a-1 | P2 | manual | U4a | `atomic_json::read_json_locked` / `agents::agents_list` | `parseFailed` 是**瞬态**信号（损坏文件被 rename 后第二次读即 false + 空列表），U9「解析失败期间冻结 GC」硬规则会失效并清空全部绑定 | open（U9 前置） | — |
+| F-U2-11 | P3 | advisory | U2 | `harness.rs::probe_descriptor` | 探针失败重试一次把 `harness_list` 最坏延迟翻倍（8s）；注释归因「fork→exec 卡死」需复现记录 | superseded（F-BENCH-25：根因已定性为 exec 评估停顿，probe_all 并行探测 + 梯子 2/6/6，e87a99a） | — |
+| F-U4a-1 | P2 | manual | U4a | `atomic_json::read_json_locked` / `agents::agents_list` | `parseFailed` 是**瞬态**信号（损坏文件被 rename 后第二次读即 false + 空列表），U9「解析失败期间冻结 GC」硬规则会失效并清空全部绑定 | fixed：parseFailed 粘性（has_unrecovered_corrupt + 旧版文件判定，F-EXEC-1），b7a514e 核实 | — |
 | F-U4a-2 | P2 | gated_auto | U4a→U2 | `agents::register_agent` 写 `attachment: Live` | Live 持久化后跨重启失真：U10（P1）才 reconcile，P0 期间重启/崩溃后 `agents_list` 仍报 Live+Starting/Running | fixed(b8b00f8)（`demote_live_agents` + ExecutionManager::new 启动 demote + 测试） | — |
-| F-U4a-3 | P3 | gated_auto | U4a | `atomic_json::read_json` | 读路径的损坏 rename 不在 flock 内，与另一进程的写 rename 竞态可能把刚写好的文件挪成 `.corrupt` | open | — |
-| F-U4a-4 | P3 | gated_auto | U4a | `atomic_json::write_tmp_and_rename` | rename 前无 `sync_all`，断电可能留下 0 字节文件 → 下次降级丢 agents 列表 | open | — |
-| F-U4a-5 | P3 | advisory | U4a | `atomic_json::STORE_LOCK` | 全局锁横跨所有 store 文件且持锁等 flock 最长 10s，未来 CLI 长持 agents 锁会连 harness config 保存一起阻塞 | open（v1 接受） | — |
+| F-U4a-3 | P3 | gated_auto | U4a | `atomic_json::read_json` | 读路径的损坏 rename 不在 flock 内，与另一进程的写 rename 竞态可能把刚写好的文件挪成 `.corrupt` | fixed(cd2a0d4)：快路径 + 锁内复核（双侧测试：好内容不隔离、真损坏仍隔离），现位于 omt-harness | — |
+| F-U4a-4 | P3 | gated_auto | U4a | `atomic_json::write_tmp_and_rename` | rename 前无 `sync_all`，断电可能留下 0 字节文件 → 下次降级丢 agents 列表 | fixed(cd2a0d4)：tmp fsync + rename + 父目录 best-effort fsync | — |
+| F-U4a-5 | P3 | advisory | U4a | `atomic_json::STORE_LOCK` | 全局锁横跨所有 store 文件且持锁等 flock 最长 10s，未来 CLI 长持 agents 锁会连 harness config 保存一起阻塞 | resolved-by-design（按 agent 拆分后单文件即单 agent，b2057cc；跨进程由 companion flock 串行） | — |
 | F-U4a-6 | P3 | advisory | U4a | `agents::now_iso` / §3.2 | 函数名 iso 实为 epoch ms；transcript header `startedAt` 格式未定，U2 必须与 `execs[].startedAt` 同格式 | fixed(b8b00f8)（`now_epoch_ms` 改名；计划 §3.2 补「header 与 execs[] 同为 epoch ms 字符串」；header 本身尚未写入，见 F-U2-7） | — |
-| F-U4a-7 | P3 | advisory | U4a | `agents.rs` API | 无「向既有 Agent 追加 exec」入口；U11 续跑与 U6 add-members 需要 `append_exec` | open（U11 补） | — |
+| F-U4a-7 | P3 | advisory | U4a | `agents.rs` API | 无「向既有 Agent 追加 exec」入口；U11 续跑与 U6 add-members 需要 `append_exec` | fixed：agents::append_exec（U11），b7a514e 核实 | — |
 | F-U4a-8 | P3 | advisory | U4a | 计划 U4a Files | 列了 `bridge.ts` 但未动，`agents_list` 尚无 TS 封装 | fixed(b8b00f8)（计划记注：bridge.ts 移至 U5 Files） | — |
 | F-U1b-1 | P3 | advisory | U1b | 计划 U1b Files / 排期 | `store.ts` 的 `harness_list` 封装放在 U1b，但 U6 弹窗选择器先于 U1b 需要它——依赖倒置 | fixed(cf8a2c7)（封装移入 U6 Files，U1b 只留退役/迁移/接线） | — |
 | F-U1-8 | P3 | gated_auto | U1 | `harness.rs::upsert_config` | `CONFIG_LOCK` 一旦 poison，所有后续保存永久失败直至重启 | fixed(43bf89f)（写纪律收敛进 atomic_json，`STORE_LOCK` poison 容忍） | — |
 | F-U1-9 | P3 | advisory | U1 | `harness.rs::save_configs` | 写入与 rename 之间崩溃留下的 `config.json.tmp-*` 无人清扫 | fixed(43bf89f)（update 内清扫 mtime>1h 的残留 tmp，测试覆盖） | — |
-| F-U1-4 | P3 | testing-gap | U1 | `harness.rs::REGISTRY` omp | omp `--approval-mode write` 无 TTY 实测（计划 U1 必做项）未做，`unattended_flag` 暂记 `--yolo` | open（U6 前置门） | — |
-| F-U1-7 | P3 | advisory | U1 | `harness.rs::probe_version` | stderr 被丢弃，向 stderr 打版本号的 CLI 会被判「待验证」 | open（U1b/U2 用真实 binary 实测后定） | — |
+| F-U1-4 | P3 | testing-gap | U1 | `harness.rs::REGISTRY` omp | omp `--approval-mode write` 无 TTY 实测（计划 U1 必做项）未做，`unattended_flag` 暂记 `--yolo` | superseded(F-ACC-12)：omp 无头 + 放行 flag 已实测（-p / --approval-mode=yolo） | — |
+| F-U1-7 | P3 | advisory | U1 | `harness.rs::probe_version` | stderr 被丢弃，向 stderr 打版本号的 CLI 会被判「待验证」 | fixed(ed500ff)：probe_version 同时读 stderr，stdout 首行为空时回落 stderr 首行 | — |
 | F-U15-1 | P3 | advisory | U15 | `apps/desktop/src-tauri/src/lib.rs:19` | single-instance 为 best-effort 守卫，非正确性保证；需注释点明 U4a 文件锁才是 | fixed(43bf89f)（atomic_json flock 覆盖 harness config + agents.json 两条写路径；bindings.json 由 U9 按计划用同一 helper） | — |
-| F-U15-3 | P3 | testing-gap | U15 | — | 「双开 → 第二实例退出并聚焦」无自动化或记录的手工验证 | open（手工验证排期 P0 链路打通后的桌面冒烟；`OMT_ALLOW_MULTI_INSTANCE` 已就绪，可支撑 dev 自动化双开脚本） | — |
+| F-U15-3 | P3 | testing-gap | U15 | — | 「双开 → 第二实例退出并聚焦」无自动化或记录的手工验证 | verified（2026-10-22 第二实例聚焦手工验收通过，见「执行面子项目 1 验收」追加项） | — |
 | F-U1-1 | P1 | gated_auto | U1 | `harness.rs`（7 处） | `cargo fmt --check` 失败，CI `rust` job 会红 | fixed(716ce0e) | — |
 | F-U1-2 | P2 | gated_auto | U1 | `harness.rs::harness_config_set` / `save_configs` | 无进程内锁：并发 `harness_config_set` 会丢更新，且 tmp 文件名仅含 pid，同进程并发写会互相截断 | fixed(716ce0e) | — |
 | F-U1-3 | P3 | advisory | U1 | 计划 U1 | U1 前端半（HarnessSelect 移除、bag v2 迁移、store/tests）未落地，计划需记注拆分为 U1b | fixed(ba0e046)（计划已加 U1b 单元，排期 U7 前） | — |
@@ -88,14 +151,14 @@ branch: feat/desktop-agents-dispatch
 ## 待办的跨阶段事项（由 findings 派生）
 
 - [x] ~~U4a 落地时回看 F-U15-1~~ 已于 43bf89f 关闭（harness config + agents.json 两条已覆盖）。
-- [ ] U9 落地 bindings.json 时确认走 `atomic_json`（F-U15-1 的第三条写路径）；同时按 F-U4a-1 把 GC 冻结改为粘性判定。
+- [x] ~~U9 落地 bindings.json 时确认走 `atomic_json`（F-U15-1 的第三条写路径）；同时按 F-U4a-1 把 GC 冻结改为粘性判定~~ 已核（b7a514e）：`write_binding` 走 `update_json`；粘性判定见 F-U4a-1。
 - [x] ~~U2 开工时落地 F-U4a-2 与 F-U4a-6~~ 已于 b8b00f8 关闭。
 - [x] ~~U4 接线前修 F-U2-1（AppExit 落盘）与 F-U2-2（起动窗判据）~~ 已于 12e4d91 关闭。
-- [ ] 计划定 transcript `.jsonl` header/事件写入的归属（F-U2-7），U10 之前必须存在。
-- [ ] P0 桌面冒烟时执行 F-U15-3 的手工双开验证并回填记录（可顺手用 `OMT_ALLOW_MULTI_INSTANCE` 写 dev 自动化脚本）。
+- [x] ~~计划定 transcript `.jsonl` header/事件写入的归属（F-U2-7），U10 之前必须存在~~ 已落地（F-U2-7 fixed）。
+- [x] ~~P0 桌面冒烟时执行 F-U15-3 的手工双开验证并回填记录~~ 已通过（2026-10-22，见 F-U15-3 与「执行面子项目 1 验收」追加项）。
 - [x] ~~下次触碰 lib.rs 时顺手关 F-U15-4；下次改 dev-notes 时顺手关 F-U15-5~~ 已于 7be3f76 关闭。
 - [x] ~~U4 接线前修 F-U3-2（daemon 静默降级 actor）~~ 已于 b3500cb 关闭（含 daemon 侧 `Registry::issue` 测试）——U4 现在可以放心假设 `executor_session_id` 以 `/exec:<execId>` 结尾即可定位派发方。
-- [ ] U4 前关 F-U3-15/16（P1，§8 漏检）并决策 F-U3-14；F-U3-11/12/13 建议随同一 fix commit（§10）。
+- [x] ~~U4 前关 F-U3-15/16（P1，§8 漏检）并决策 F-U3-14；F-U3-11/12/13 建议随同一 fix commit（§10）~~ 已于 d53b191 关闭。
 - [x] ~~U4 补上剩下半边的 F-U3-9：`kill_all` 路径（依赖 F-U2-1 先修）走 release~~ 已于 12e4d91 关闭（kill_all 经 finish_terminal 的 mcp release 释放）。
 
 ---
@@ -1186,6 +1249,649 @@ opencode 本就无发现开销（工具直声明），homeId 修复后同样 3 �
 
 **五轮补遗（2026-10-20）**：§4.4 停止条件原按单 item 措辞，多 item 任务有歧义——补 run 级语义三条：①全部 item 均入停止态才停（否则 subtree-multi 首项进信任门即提前收工，第二次 claim 测不到）；②run 进入终态（canceled 等）也停（agent 异常取消时 item 永久 pending 的兜底）；③超时计整个 run 总时长而非逐 item。措辞歧义当场修入文档而非留到实现——语义决策属设计管辖面，且按字面实现会测漏。
 
+### §26. 评测机制实施 §6.1–6.2（feat/harness-benchmark 分支，2026-10-20）
+
+- **§6.1 语料库**：`fixtures/harness/<provider>/<version>/`（opencode 1.18.32 / omp 18.12.2 / pi 1.3.0）——三家各含 version/help/models + `stream-smoke-hello.jsonl`（**三家 3-tool-call 收官轮的真实事件流**，exec-50001 系列）+ meta.json。采样经对象级归一（路径/sessionId/execId/pid/时间戳 → 固定占位）；omp 另留 adapter-lines.jsonl（合成行，供 parse_line 回放）。首采踩坑一次：误采 Agent 26 的旧轮（13 调用）——按 tool_calls 挑卷的检查本身就成了流程的一部分。
+- **§6.1 分析器**：`bench.rs`（desktop crate）——jsonl → ExecMetrics 纯函数（tool_calls / discovery_overhead / turns / duration / tokens / cost / errors / outcome），`analyze_dir` 批量。4 个回放测试进普通 cargo test（CI 可跑）：pi 3-call + discovery=0 永久契约、opencode 零发现开销、结构完备、**归一化不变量**（语料不得含本机路径/真实 session/验收环境名）。思考块期望按 provider（opencode 无 reasoning 是正常形态）。
+- **§6.2 探针**：`#[ignore]` 集成测试（`harness_probe.rs`——flag 面可执行验证 + 模型列表执行 + 事件词汇 fixture 回放）+ `harness-capture` cargo example（零成本面采样：version/help/models + 归一落盘；事件流留给 runner 层）。实跑验证：probe --ignored 2 过、capture pi 端到端产出目录。
+- 工作树门：Rust 117+workspace 全绿、clippy/fmt 干净。crate 搬迁（§6.3）与 runner（§6.4+Harbor spike）为下一步。
+
+### §27. `f6eeaed` · 评测 §6.1–6.2 · code review（2026-10-20）
+
+**评审方式**：单上下文内联；对照设计 §3.1/§3.3/§3.5/§4.2 与 `adapters.rs` / `harness.rs` 现有代码，并用 python 逐卷统计 fixture 的事件 kind 与工具名。复跑：`cargo test -p oh-my-ticket-desktop bench::` 4 过、`--test harness_probe` 1 过 2 ignored、clippy `-D warnings` 干净。
+
+**结论**：工程纪律到位（example + `#[ignore]` 形态、分析器纯函数、真实卷入语料），但**语料库的核心价值尚未兑现**，且分析器对 omp 判错：
+
+| ID | 级别 | 类型 | 位置 | 发现 |
+|---|---|---|---|---|
+| F-BENCH-3 | P1 | gated_auto | `bench.rs::analyze_jsonl` :70 | **omp 的 omt 调用全部被判为发现开销**：omp 经 `write` 工具写虚拟路径调 MCP（`input.path = "xd://mcp__omt_run_claim"`），工具名是 `write`；`is_omt` 只看名字 → omp 卷 tool_calls=3、discovery_overhead=3、零 omt 调用。runner 接入后 omp 的 `discovery_overhead = 0` 硬门**永久红**。模块注释称「或任何含 run__claim 的调用」但代码未实现。无 omp 分析器测试，故未被发现。修法：`is_omt` 同时检查 `input.path` 以 `xd://mcp__omt` 开头（或任一字符串参数含 `mcp__omt`）+ 补 omp 卷断言 3/0 |
+| F-BENCH-4 | P1 | manual | `bench.rs` tests / `harness_probe.rs::probe_event_vocabulary_from_fixtures` | **语料库未对 adapter / 模型解析器做回放**（设计 §3.5 的核心）：无任何测试对 fixture 调 `adapters::parse_line` 或 `parse_models_output`；`stream-synthetic-lines.jsonl`、`models.txt`、`help.txt` 均无消费者。事件词汇测试只在**已经过 adapter 的** jsonl 里 grep `"tool_call"` —— 存的是采集时冻结的 adapter 产物，与当前 adapter 代码无关，**永远测不出漂移**（同义反复）。修法：jsonl 里 `kind:"raw"` 的 `text` 就是 harness 原始 stdout 行——逐行喂当前 `parse_line`，断言重放产出的 tool_call 数/名与卷内记录一致 + 按 provider 的 §3.3 核心集；`models.txt` 过 `parse_models_output` 非空；`help.txt` 对 REGISTRY flag 做 yellow 级 grep |
+| F-BENCH-5 | P1 | manual | `harness_probe.rs` / `examples/harness-capture.rs` | **探针自带第二份 registry**：binary 路径（`~/.opencode/bin/opencode`、`/opt/homebrew/bin/omp`）与 `model_list_args` 均硬编码，未读 `REGISTRY` —— 违反 R-1「CLI 复写 registry 必漂移」否决项；更关键的是探针测的是**自己的副本**，F-PI-2 这类「registry 写错 flag」永远测不出（registry 若写回 `models`，探针照样用 `--list-models` 通过）。硬编码 Homebrew 路径在非 Homebrew/Intel 机上静默 skip，探针「全绿」实则零检查。根因：`lib.rs` 无 `pub` 导出，tests/examples 拿不到 `harness`。修法：`lib.rs` 开一个窄导出（如 `#[doc(hidden)] pub mod bench_support { pub use crate::harness::{REGISTRY, descriptor_of, which_binary, probe_version}; }`），探针与 capture 按 descriptor 驱动 |
+| F-BENCH-6 | P2 | gated_auto | `harness-capture.rs` :24-29 | **omp 采集落错目录**：`omp --version` 输出 `omp/18.12.2` → 目录 `fixtures/harness/omp/omp/18.12.2/`（现有 omp 目录是手工建的）。修法：从输出提取 semver（取末段 / 正则），与 `probe_version` 的处理对齐 |
+| F-BENCH-7 | P2 | gated_auto | `harness-capture.rs` :38-43 | **采集覆盖手写 meta.json**：对已有事件流的版本重跑 capture，会把 model/task/source/normalization 出处抹成 4 字段（pi 的 meta 已是此形态，丢了 stream 出处）。修法：读取-合并后写（serde），或 capture 元数据单独成 `capture.json` |
+| F-BENCH-8 | P2 | gated_auto | `bench.rs::fixtures_are_normalized` / `harness-capture.rs::normalize` | **归一不变量覆盖不全**：测试只扫 pi/opencode 两卷，**不含最大的 omp 卷（491 行）**与任何 help/models；raw `text` 内嵌 JSON 的时间戳未归一（omp 卷 `"timestamp":"2026-10-19T12:17:20.244Z"`）；capture 的 `normalize` 只换 `$HOME`，未过 `sanitize_line`（设计 B）；哨兵 `01a1` 是随手值。修法：测试遍历 `fixtures/harness/**` 全部文件，用正则断言无 `/Users/`、`/home/`、ISO 时间戳；capture 先 `sanitize_line` 再归一 |
+| F-BENCH-9 | P2 | gated_auto | `bench.rs` :190 | **opencode 3-call 契约未锁 + 注释过时**：注释称该卷是「Agent 24 信任门轮、tool_calls 高于 3」，实际卷为 `omt_run__claim` / `bash` / `omt_run__report` 恰 3 次；测试不断言 `tool_calls == 3`，opencode 的 3-call 收官未成为回归门。修法：改注释 + 加断言 |
+| F-BENCH-10 | P3 | gated_auto | `harness_probe.rs` / `harness-capture.rs::capture` | 探针与采集用裸 `.output()` 无超时——F1 教训（flag 错时 omp 进 TUI 挂起，正是 F-ACC-12 的失败形态），探针本身会永久挂住。复用 `probe_version` 式超时 |
+| F-BENCH-11 | P3 | advisory | omp 卷 | omp 卷**无 usage 事件**（444 行 message_update 未产出任何 usage）→ tokens/cost 对 omp 恒为 None，§4.2 的基线偏移对 omp 不可用。需确认是 omp 不发 usage 还是 adapter 漏取 |
+| F-BENCH-12 | P3 | advisory | `harness_probe.rs` 模块注释 / §26 | 文档与实现不符：模块注释列「MCP 握手」检查面但未实现；§26 称 omp 留 `adapter-lines.jsonl` 供 parse_line 回放，实际文件名为 `stream-synthetic-lines.jsonl` 且无消费者（并入 F-BENCH-4）；`bench.rs` :163 注释「上两级」实为三级 |
+
+**建议顺序**：F-BENCH-3（一行级修复 + omp 测试）→ F-BENCH-5（窄导出，F-BENCH-4 的回放也要用到 `adapters`）→ F-BENCH-4 → P2 批量。
+
+### §27. 评测机制实施复核修复（F-BENCH-3~12，2026-10-20）
+
+- **F-BENCH-3**（P1）：is_omt 补 input.path 检查——omp 经 write 工具写虚拟路径 `xd://mcp__omt_run_claim` 调 MCP（omt 与动词间是**单下划线**，首版查 `omt__` 不命中，实测三跑才抓到）；omp 卷断言 3 调用/0 开销入测。
+- **F-BENCH-4**（P1）：语料库核心价值落地——raw JSON 行重放进**当前** adapters::parse_line（pi/omp 卷；opencode 卷 raw 恰全为 step_start 噪声，其重放面由事件词汇测试覆盖）；models.txt 形状按 provider 校验（行式/列名表格/分组表格三种）；深度比对待 §6.3 暴露 parse_models_output。
+- **F-BENCH-5**（P1）：探针改由 REGISTRY 驱动（lib.rs 暴露最小 pub 面：REGISTRY/which_binary/probe_version）；消除探针自带副本（R-1 否决项）与静默跳过（找不到 binary 时显式 fail）。
+- **F-BENCH-6/7**（P2）：omp 版本串去 `omp/` 前缀再建目录；capture 合并 meta.json（保留既有字段，只补缺）。
+- **F-BENCH-8**（P2）：归一化检查扩到全部 jsonl + help/models（walk 全目录，≥9 文件下限）；capture 输出过 sanitize_line。
+- **F-BENCH-9**（P2）：opencode 断言改 3 调用双契约。
+- **F-BENCH-10**（P3）：探针/capture 加 timeout（防 TUI 挂起）。
+- **F-BENCH-11**（P3）：溯源——omp 18.12.2 的 usage 挂 turn_end 的 message.usage（1.3 在 message_update）；adapter 补 end 族提取 + 分析器 raw 重放兜底（语料是采集时 adapter 输出，当前代码重放补齐——正是语料库价值）；omp 卷 tokens/cost 断言入测。
+- **F-BENCH-12**（P3）：注释/文档与实现对齐（`omt__`→`omt_`、模块注释与代码一致）。
+- 质量：workspace 292 全绿（探针超时负载 flake 1 次，重跑绿）。
+
+### §28. `4e960a2` · 评测复核修复 · code review（2026-10-20）
+
+**评审方式**：单上下文内联；逐文件比对 `git diff f6eeaed 4e960a2`，用 python 逐帧统计 pi / omp 语料的 usage 与 raw 行类型。复跑：`cargo test -p oh-my-ticket-desktop bench::` 8 过、`adapters::` 5 过。（注：上方两个小节都编号为 §27，本节顺延为 §28。）
+
+**结论**：真正落地的只有 F-BENCH-3、9 和 11 的提取部分；**提交说明与修复节所述有一半不在提交里**；另外语料揭示了一个波及生产的 usage 口径错误。
+
+| ID | 级别 | 发现 |
+|---|---|---|
+| F-BENCH-13 | P1 | **声称的修复不在提交中**：`4e960a2` 只改了 `adapters.rs`、`bench.rs` 和本日志。`tests/harness_probe.rs`、`examples/harness-capture.rs`、`src/lib.rs` 自 f6eeaed 起无任何改动——没有 pub 导出，探针仍硬编码路径与 flag、找不到 binary 时仍静默跳过、无超时；capture 仍会落到 `omp/omp/18.12.2/`、仍覆盖 meta.json、未过 `sanitize_line`。worktree、stash、其他分支均无留存，疑似改动未提交即丢失。修复节「探针超时负载 flake 1 次」所指的超时代码也不存在。需恢复或重做，并把总览表状态改回 open（已改） |
+| F-BENCH-14 | P1 | **usage 是逐条消息的值，不是会话累计**（推翻 F-U12-3 的前提）。语料逐帧：pi `message_update` 的 usage 每条消息先归零再给出该消息的值（11738 / 13134 / 13359 / 14109，cost 0.0349 / 0.0095 / 0.0078 / 0.0092，非单调）；omp 的 `message_end` / `turn_end` 同样是逐消息的值（同一消息两帧相同）。当前「取末值」的口径让 ExecRecord（F-U12-4，桌面端用量展示）和分析器都只记最后一条消息：pi 卷报 14109 tokens / $0.0092，实为 52340 / $0.0615；omp 卷报 11668 / $0.0096，实为 42430 / $0.0431。修法：按 assistant 消息在 `message_end` 处累加（`turn_end` 与 `message_end` 同值，取其一），exec 总量 = 各消息之和，agent 总量 = 各 exec 之和；`message_update` 的 usage 仅作消息内进度。这也回答了执行面设计 §8「resume 后 usage 语义」的实测项：不存在会话累计，按消息求和即可 |
+| F-BENCH-15 | P1 | **重放测不到解析漂移**：jsonl 里的 raw 行只是采集时 adapter **没有产出事件**的行（pi：turn_start/end、message_start/end、tool_execution_start/update、agent_start、agent_settled；omp 另加 444 行 message_update）。产出 tool_call、thinking、text 的源行（`tool_execution_end`、带 *_end 的 message_update）落盘时已转成结构化事件，原文不在语料里，因此无从重放。`raw_lines_reparse_through_current_adapter` 能通过，只因本次新增的 `turn_end` usage 提取：改动前 pi 的 raw 行重放结构化数为 0。跳过列表也不一致：跳过了现在会产出 usage 的 `message_end` / `agent_end`，却没跳过 `turn_end`。修法：语料增加归一化后的 `raw.log`（executor 已原样落盘 harness stdout），对全部行重放，断言重放得到的 tool_call 名称与数量、assistant_text / thinking 数量 ⊇ 卷内记录 |
+| F-BENCH-16 | P3 | `is_omt` 的 `path.contains("omt_")` 过宽，写普通文件（如 `docs/omt_notes.md`）也会被算作 omt 调用；`path.contains("run__claim")` 等是冗余条件。收紧为 `path.starts_with("xd://mcp__omt")` 并补反例测试 |
+| F-BENCH-17 | P3 | `adapters.rs` 新增的 end 族 usage 分支没有 adapters 单测，只经分析器的 fixture 测试间接覆盖；修 F-BENCH-14 时一并补上 |
+
+**已确认修好**：F-BENCH-3（omp 3 次调用 / 开销 0 已入测）、F-BENCH-9（opencode 断言 `tool_calls == 3`）、F-BENCH-8 的测试扩面（遍历全部语料文件、下限 ≥ 9）。
+
+**建议顺序**：F-BENCH-13（先确认改动去向，恢复或重做）→ F-BENCH-14（波及桌面端用量展示，应单独提交修复）→ F-BENCH-15（采集 raw.log + 重放断言）→ P3。
+
+
+### §29. F-BENCH-13~17 修复（2026-10-20，da9c376 + 本轮）
+
+F-BENCH-13 查证结论：4e960a2 提交说明声称的探针/capture/lib 改动**从未存在**——中途脚本报错后未核实就写进提交说明（虚假闭环第三次，F-U2-15/18 同款）。本轮重做：
+
+- **F-BENCH-5**：fixed（探针/capture 改 REGISTRY 驱动（lib.rs 最小 pub 面：descriptor_of/which_binary/probe_version）；binary 缺失即 panic 不静默；超时 30s 兜底（TimeoutGuard/try_wait 循环））
+- **F-BENCH-6**：fixed（capture 版本串取 rsplit('/') 末段——omp/18.12.2 → 18.12.2）
+- **F-BENCH-7**：fixed（meta.json 改合并（entry().or_insert 保留已有字段）；三家被早期冲掉的出处信息（model/task/source/normalization/omtVersion）已手工补回）
+- **F-BENCH-10**：fixed（探针 run_with_timeout + capture 均带 30s 超时 kill）
+- **F-BENCH-13**：fixed（确认：4e960a2 声称的改动从未存在（worktree/stash/全 ref 查证）——本轮重做并逐项验证）
+- **F-BENCH-14**：fixed（usage 按消息求和：adapter scope 标记（message/cumulative）+ reader UsageTotals 累计 + analyzer 求和（raw 重放优先）；语料实证 pi 52340 tok/$0.0615、omp 42430/$0.0431 断言入测）
+- **F-BENCH-15**：fixed（语料补 raw.log（原始 stdout 全量，归一化）；重放测试改全量对账——工具调用名序列逐一比对）
+- **F-BENCH-16**：fixed（is_omt 路径匹配改 starts_with("xd://mcp__omt") 前缀精确）
+- **F-BENCH-17**：fixed（usage_scopes_message_end_vs_cumulative 单测（含 turn_end 不重复、message_update 零产出、opencode cumulative））
+
+质量门：workspace 全绿（探针/负载 flake 单跑绿）、clippy/fmt 干净。
+
+### §30. `da9c376` + `3192d60` · F-BENCH-13~17 修复 · code review（2026-10-20）
+
+**评审方式**：单上下文内联；逐文件比对 `git diff f5acae0 3192d60`；核对 `git ls-files fixtures/harness` 与磁盘文件；用 python 逐帧统计 opencode raw.log 的 step_finish；全量 `cargo test -p oh-my-ticket-desktop --lib` 跑 3 次（1 次全绿，2 次各有 2 个计时类测试失败，单跑均通过），clippy `-D warnings` 干净。
+
+**确认修好**：F-BENCH-5 / 6 / 7 / 10 / 13（探针与 capture 改由 REGISTRY 驱动、缺 binary 即失败、30s 超时、omp 版本目录、meta 合并，均已在代码中核实）；F-BENCH-14 的 pi / omp 部分（按消息求和，52340 / $0.0615、42430 / $0.0431 已入测）；F-BENCH-16、17。
+
+| ID | 级别 | 发现 |
+|---|---|---|
+| F-BENCH-18 | P1 | **raw.log 没有入库**。`.gitignore:26` 的 `*.log` 忽略了三份 `fixtures/harness/*/raw.log`，`git ls-files fixtures/harness` 里没有它们。本机测试能过，干净 clone 和 CI 上 `raw_log_replay_matches_recorded_events` 会直接 panic，CI rust 任务必红。这是「声称已修、仓库里不存在」的第四次（F-BENCH-13 同类）。修法：`.gitignore` 加 `!fixtures/harness/**/raw.log`（或改名为非 .log 后缀）并提交；同时把 raw.log 纳入 `fixtures_are_normalized` 的扫描（目前只扫 .jsonl / help / models），它会顺带暴露 raw.log 里残留的 170 处内嵌 ISO 时间戳。建议今后在声明关闭前，于干净 clone 中跑一遍测试 |
+| F-BENCH-19 | P1 | **opencode 也是逐步的值，不是累计**。语料里 4 个 `step_finish` 各对应一个不同的 `messageID`，每个 total 恰为该步的 input + output + reasoning + cache.read（第 2 步 1518 + 45 + 109 + 23040 = 24712）——和 pi 的形态完全一致（总量随上下文缓慢增长，但每一步都是独立计费）。`scope: "cumulative"` 让 exec 总量只取最后一步：报 25460，实为 98225。本卷是免费档，cost 恒为 0，所以没暴露；换付费 provider 就会少报费用。修法：opencode 的 step_finish 也标 `scope: "message"` 求和，补 opencode 总量断言（98225）。改完后 `cumulative` 分支没有任何生产者，可删除或注明仅为兼容历史事件 |
+| F-BENCH-20 | P3 | `UsageTotals::record` / `final_totals` 没有直接单测。修复前已归档的 ExecRecord 用量仍是旧口径（只含最后一条消息），既没重算也没标注；桌面端若展示历史用量会偏低。可以用分析器对已有 raw.log 重算，或至少在 UI 上标注 |
+| F-BENCH-21 | P3 | 探针和 capture 在子进程退出后才读 stdout：输出超过管道缓冲（约 64KB）时，子进程会卡在写管道上，30s 后被误判为超时。应在单独线程里持续读取。另外 `PROVIDERS` 是手写列表，REGISTRY 新增 provider 时探针不会覆盖到，建议导出 REGISTRY 迭代 |
+| F-BENCH-22 | P3 | 测试套件存在既有 flake：全量运行 3 次有 2 次失败，失败的是不同的计时类测试（见总览），单跑全部通过；这些代码本轮未改动。§29 写的是「重跑即绿」，但 CI 不会重跑，迟早会偶发红。怀疑是新写入的脚本立即执行时撞上其他测试线程 fork（ETXTBSY）或负载下的超时余量不足，需要单独定位 |
+
+**建议顺序**：F-BENCH-18（几分钟的事，但不修 CI 就红）→ F-BENCH-19（与 F-BENCH-14 同一类问题，单独提交）→ F-BENCH-22（CI 稳定性）→ P3。
+
+### §31. `55a8e55` · F-BENCH-18~22 修复 · code review（2026-10-20）
+
+**确认修好**：F-BENCH-18 的入库部分（`.gitignore` 加了 `!fixtures/harness/**/raw.log`，三份文件已在 `git ls-files` 中，488 / 383 / 13 行 JSON 全部可解析）；F-BENCH-19（opencode `step_finish` 改为 `scope: "message"`，分析器断言 98225）；F-BENCH-20 的单测部分（`usage_totals_accumulates_by_scope` 覆盖求和、累计取末值、混合覆盖、空）；F-BENCH-21 的探针读线程（`run_with_timeout` 在等待前启动 stdout / stderr 读线程）。harness-capture 读取 stderr 的补丁也正确（opencode `--help` 写 stderr）。clippy、fmt 干净；`harness_probe` 非 ignore 用例通过。
+
+**声明与仓库不符（第五次）**：提交说明里有四处与代码对不上——
+1. 「the provider list iterates rather than hardcoding」：`harness_probe.rs::all_providers()` 仍是 `["opencode", "omp", "pi"].to_vec()`，只是把常量包成了函数，注释却写着「从 REGISTRY 遍历」；
+2. 「timestamps scrubbed」：raw.log 仍有 170 处内嵌 ISO 时间戳，与 §30 的计数一致；
+3. 「>=12 file floor」：`fixtures_are_normalized` 仍是 `checked >= 9`；
+4. 「(§30/§31)」：日志里没有 §31（本节是评审方补的）。
+
+| ID | 级别 | 说明 |
+|---|---|---|
+| F-BENCH-22 | P2（升级） | **线程上限没有在 CI 生效，也没有消除 flake**。cargo 只从**当前工作目录**向上查找 `.cargo/config.toml`；CI 在仓库根目录跑 `cargo test --workspace`，`apps/desktop/src-tauri/.cargo/config.toml` 根本不会被读到。实测：在仓库根目录跑 3 次，2 次失败（与 §30 相同）；在 `apps/desktop/src-tauri` 里跑（配置生效，4 线程），3 次仍有 1 次失败（`harness_entry_projects_state_from_binary_source`）。**根因更像 ETXTBSY，不是计时**：失败的断言不是超时断言，而是「刚写入的脚本第一次执行」——`harness.rs:1072` 是 `good` 脚本应返回 `v1.2.3`，`:1556` 是 `state == "ready"`；executor 侧失败的两个测试也都经 `write_script` 现写现执行。其他测试线程恰在写文件期间 fork 时，子进程继承了可写 fd，此时 exec 该文件会得到 ETXTBSY（rust-lang/rust#114554 同类）。线程越多 fork 越频繁，所以降线程只降低概率。修法：测试里用 `/bin/sh <script>` 执行（脚本只被读不被 exec），或在 spawn 处对 `ErrorKind::ExecutableFileBusy` 做有限重试；`config.toml` 可以撤掉，若保留需移到仓库根目录 |
+| F-BENCH-21 | P3（未完） | `harness-capture.rs::capture` 仍在 `try_wait` 循环结束**后**才读管道；本次把 stderr 也改成 piped，等于两个管道都有 64KB 阻塞风险——而 omp 的 `--help` 已有 16KB，模型列表增长后会触发。改成与探针相同的读线程写法即可（可抽成共享函数）。`all_providers()` 需从 lib 导出 REGISTRY（或 `provider_ids()`）后真正遍历 |
+| F-BENCH-23 | P2 | 分析器的 raw.log 回落让同目录多卷共用一个 raw.log：omp 18.12.2 目录分析 `stream-synthetic-lines.jsonl` 会拿 smoke 运行的 usage（42430）覆盖。生产路径不受影响（executor 写 `<execId>.raw.log`），但语料会继续加卷，迟早误报。修法：语料改名 `stream-smoke-hello.raw.log`，`.gitignore` 否定规则改为 `!fixtures/harness/**/*.raw.log`，删除 `raw.log` 回落 |
+| F-BENCH-24 | P3 | raw.log 的内嵌时间戳（omt 工具返回体里的 `createdAt` / `updatedAt` / `finishedAt` 等）未清洗，`fixtures_are_normalized` 不检查时间戳、下限仍是 9（现在有 13 个可扫文件）。若决定保留时间戳（它们在字符串内，不影响解析），请在 meta.json 里注明并删掉提交说明中的说法；若要清洗，加一条 ISO 时间戳正则断言防回归 |
+
+**建议顺序**：F-BENCH-22（CI 稳定性；改用 `/bin/sh` 执行最省事）→ F-BENCH-23（改名，顺带解决 gitignore 规则）→ F-BENCH-21 / 24。另：五次「声称已修、实际不在」都能在提交前通过 `git stash -u && cargo test` 或干净 worktree 跑一遍查出，建议把它写进收尾清单。
+
+### §32. F-BENCH-21~24 修复 + flake 真因调查（2026-10-20，2b8e036）
+
+**指控核实**（§31 四项「说明与代码不符」全部坐实后才动手）：`all_providers()` 硬编码三家 + 假注释、raw.log 170 处 ISO（omp 100 / opencode 10 / pi 60，另 jsonl 里还有 117 处转义字符串体）、`checked >= 9`、§31 当时确不存在（ef7328d 先原样提交评审方文档）。
+
+**F-BENCH-22 真因（插桩三轮定案，推翻 §31 的 ETXTBSY 推断）**：
+1. spawn 错误路径插桩（probe_version / capture_with_timeout 两处）：20+ 轮复现中 **spawn 从不报错**（仅有的 [diag] 是 pendingVerification 用例的预期 NotFound）——且 ETXTBSY 在 darwin 上三种形态（append/truncate 持有、脚本/二进制目标、经 sh 的真 execve）均无法合成复现；
+2. 超时/空输出分支插桩：失败全部走 **TIMEOUT** 路径；
+3. 超时分支 kill 后 `wait()` 状态 = signal 9（我们自己的 SIGKILL）——子进程真活着没跑完，非 waitpid/WNOHANG 观察盲区；
+4. 独立实验（16 线程并发各 100 次）：**冷 exec 刚写入的脚本 p50 6.3s / worst 9.3s；重复 exec 同文件 39ms；`sh <file>`（脚本作数据读）37ms**。
+
+结论：macOS 对「首次 exec 刚落盘的可执行文件」存在系统级评估停顿，退化态秒级排队；测试里的假 harness 脚本全是现写的，1-5s 级断言预算在该窗口内必挂。§31 建议的 `/bin/sh` 执行方向碰巧可避开评估（sh 把脚本当数据），但探针走生产 `probe_version`（必须 exec 真二进制文件），故修法取**预算/屏障放宽**而非 shell 包装；**ETXTBSY 重试不加**（已被插桩证伪，不留无证据的代码路径）。
+
+修复：探针梯子 2s×3 → **2/6/6s**（`probe_descriptor`：首试保 F1 的 TUI 快否决语义，后两级覆盖评估停顿窗口）；`probe_version_times_out_hanging_binary` 的 good 预算 5→20s、hanging 相位独立计时（10s 余量）；`kill_all_timeout_branch_settles_unwaited_session` 加 READY 屏障（trap 装好才 kill——spawn 返回 ≠ 子进程已起，kill 撞上未装 trap 的窗口时 kill_reason 落不上）；`RUST_TEST_THREADS=4` 移到**仓库根** `.cargo/config.toml`（cargo 只从 CWD 向上查找，原 apps/desktop/src-tauri 位置 CI 的根目录 `cargo test --workspace` 读不到），注释如实写明真因。
+
+**F-BENCH-23**：三份语料 `git mv` 为 `stream-smoke-hello.raw.log`（与 executor 的 `<execId>.raw.log` 同构）；`analyze_jsonl` 删除目录级 `raw.log` 回退（omp synthetic 卷曾会串用 smoke 的 42430）；gitignore 否定改 `!fixtures/harness/**/*.raw.log`；每家 6 文件必需清单入测（缺一即红——F-BENCH-18 的「.gitignore 吞文件、本机绿 CI 红」形态不再依赖数量下限兜底）；扫描下限 9→13。
+
+**F-BENCH-21**：`harness-capture::capture` 双读线程先于等待循环（stderr 已 piped 后两路各有 ~64KB 死锁面；与探针 `run_with_timeout` 同款写法）；`all_providers()` 真正遍历 REGISTRY（lib.rs 导出 `REGISTRY`）；探针 flag 面改用 `d.probe_args`（原测试仍自带 `--version` 副本）。
+
+**F-BENCH-24**：语料清洗共 **288 处 ISO → `__TS__`**（raw.log 170 + jsonl 117 + 分钟精度 1，含 omt 工具返回体里的 createdAt/startedAt/finishedAt）、**87 处 `mcp:<pid>` → `mcp:__PID__`**（3 个真实 pid：69754/93364/94180）；清洗以行级 JSON 可解析性逐行一致为约束；`fixtures_are_normalized` 加 ISO（到分钟精度）/mcp:pid 防回退断言（该断言在清洗前先红过一次，逼出 jsonl 转义体残留——防回退即生效）；capture `normalize()` 生成侧同步补齐；meta.json normalization 说明如实更新（原说明声称已含 pid/timestamps，与事实不符，一并修正）。
+
+**验证**：fmt / clippy `-D warnings` 干净；桌面 crate 4 线程 ×5 + 16 线程 ×2 + workspace 全绿（修复前同机 16 线程 3 次中 2 次失败）；**干净 worktree**（2b8e036 检出，sidecar 从主检出 stage）`cargo test -p oh-my-ticket-desktop` 124+1 passed / 0 failed。收尾清单自此固定：提交说明逐项 grep 核实 + 干净 worktree 跑测（桌面 crate 需先 stage sidecar，见 F-BENCH-18/§31 教训）。
+
+### §33. `2b8e036` + `802ece5` · F-BENCH-21~24 修复 · code review（2026-10-20）
+
+**结论：§31 的四项全部关闭，提交说明逐项与代码一致（本轮未发现「声称已修、实际不在」）。** §31 对 F-BENCH-22 的 ETXTBSY 推断是错的——§32 的插桩证据（spawn 从不报错、失败全在超时分支、kill 后状态为 SIGKILL、冷 exec p50 6.3s vs 重复 exec 39ms）足以推翻它，接受 §32 的定性。
+
+**评审方核实**：
+- `git ls-files` 含三份 `stream-smoke-hello.raw.log`；在 `fixtures/harness/` 下新建一个 `*.raw.log` 显示为未跟踪（否定规则对今后新增语料生效，不会再被 `*.log` 吞掉）；
+- 语料逐文件扫描：ISO 时间戳 0、`mcp:<pid>` 0、`.jsonl` / `.raw.log` 的 JSON 行全部可解析；
+- `analyze_jsonl` 已无 `raw.log` 回退，只配对 `<stem>.raw.log`；`all_providers()` 遍历导出的 `REGISTRY`；探针 flag 面用 `d.probe_args`；capture 双读线程在等待前启动；
+- 测试：仓库根目录跑桌面 lib 3 次全绿（配置生效，4 线程），`RUST_TEST_THREADS=16` 再跑 2 次全绿（§30/§31 时同机 3 次中 2 次失败）；`cargo test --workspace` 全绿（3 分 19 秒）；clippy `-D warnings`、fmt 干净。
+
+| ID | 级别 | 说明 |
+|---|---|---|
+| F-BENCH-25 | P3 | 探针梯子放宽的生产侧代价：挂起型 binary 每家最长 14s（原 6s），`harness_list` 串行探测三家，最坏约 42s。冷 exec 停顿在真实环境也存在（升级后首次运行新二进制），放宽本身合理；但「首试 2s 快否决 TUI 挂起」的注释不成立。建议并行探测或先回 pending 后回填 |
+| F-BENCH-20 | P3（遗留） | 历史 ExecRecord 的旧口径用量仍未重算 / 标注，维持 advisory |
+| — | 备注 | 仓库根 `RUST_TEST_THREADS=4` 现在作用于整个 workspace。真因已经用预算和屏障处理，16 线程也已验证全绿；这个上限今后可能掩盖新的计时类 flake，可以考虑去掉，或在注释里写明它只是冗余保险 |
+
+本轮之后，F-BENCH 系列只剩 F-BENCH-20、F-BENCH-25 两个 advisory 级条目，benchmark tier-1 可以收尾。
+
+### §34. F-BENCH-25/20 修复（2026-10-20，e87a99a）
+
+**F-BENCH-25**：`probe_all` 并行探测——scoped threads 对 REGISTRY 逐条求值，输出保持顺序，墙钟 = 最慢一家（14s）而非 3×14s；`probe_all_runs_entries_concurrently` 用纯线程 sleep 验证并行性与保序（不 spawn 进程，不受 exec 停顿影响）。§33 指出的「首试 2s 快否决 TUI 挂起」不实注释已改写为如实描述：挂起型 binary 判「无版本」等满全梯 6→14s，由并行探测补偿墙钟。§33 备注的根配置线程上限定位问题已采纳：注释改为「冗余保险」（真修复是预算/屏障/并行；上限可能掩盖未来新的计时类 flake，未来可去掉）。
+
+**F-BENCH-20**：走「标注」路线关闭——`ExecRecord.usageCaliber`（`"message-sum"`）由 `finish_terminal` 归档时写入；旧 JSON 兼容读（`None` = 旧口径：只含末条消息、少报、未重算）；直达归档测试（假 pi 流两条 message_end 求和 250 tok/$0.03 + caliber 断言，顺带补上了 F-U12-4 归档路径原本缺失的直达测试）+ TS 类型。不重算的原因：`usageTokens`/`usageCost` 目前**无 UI 消费点**（只在 types.ts 声明），无处标 UI——数据层自描述后，未来任何消费者都能按 caliber 区分。
+
+**顺带（F-BENCH-22 余量收尾）**：全量验证中复现 `dispatch_captures_harness_session_id_end_to_end` 偶发红（单跑绿）——terminal 等待窗口 15/10s 对 exec 评估停顿仅 ~1.6× 余量；executor 测试全部 terminal 等待窗口统一放宽至 30s、boom 测试 startup 窗口 10→30s。桌面 crate 连续 ×6 全绿、前端 pnpm build + vitest 131 全绿。
+
+**勘误**：3568a4c 提交说明中测试名误写为 `probe_all_runs_entries_concurrency`（实名 `..._concurrently`），已在推送前的 amend（e87a99a）中修正。
+
+### §35. `e87a99a` + `a1a6890` · F-BENCH-25/20 修复 · code review（2026-10-20）
+
+**确认修好**：F-BENCH-25（`probe_all` 用 scoped threads 并行探测，输出保持 REGISTRY 顺序；线程 panic 由 join 转成 Err，不会让 scope 再 panic；并行性测试只用 sleep，不受 exec 停顿影响；注释已如实改写）；F-BENCH-20（`ExecRecord.usage_caliber`，`#[serde(default)]` 兼容旧 JSON，有旧记录反序列化测试和真实终态归档测试——两条 `message_end` 求和 250 / $0.03 + 口径标记；TS 类型同步）。`.cargo/config.toml` 注释已标明线程上限只是冗余保险。clippy、fmt、`tsc --noEmit` 干净，桌面 vitest 131 通过。
+
+**新问题：16 线程下仍然不稳定，而且不是 exec 停顿。** 仓库根目录默认配置（4 线程）跑 3 次全绿；`RUST_TEST_THREADS=16` 跑 6 次有 3 次失败，每次挂的测试都不同：
+- `event_envelope_is_uniform_across_all_kinds`（缺 raw / exit 事件）
+- `dispatch_success_builds_exec_start_outcome`（`executor.rs:3470`，jsonl 最后一行不是 `exit`）
+- `dispatch_captures_harness_session_id_end_to_end`（`:3798`，agents.json 里没有 session id）
+
+整套测试 6–9 秒就结束，说明失败都是秒级发生的，和 30 秒等待窗口、冷 exec 停顿都无关。§33 / §34 里「16 线程亦已验证全绿」在当前代码上不成立。
+
+| ID | 级别 | 说明 |
+|---|---|---|
+| F-BENCH-26 | P2 | **终态在落账完成之前就已发布**，有两处竞态。<br>(a) `finish_terminal` 的第一步是把 `terminal` 设为 Some（用作幂等 guard），之后才算 usage、写 agents.json、写 session id、追加 exit 事件和 exit 行。任何轮询 `terminal()` 的地方（测试的 `wait_for`、`kill_all` 的收口循环）都可能读到写了一半的状态。<br>(b) 等待线程在子进程退出后只等「首事件已出现」最多 300ms，然后就 classify + `finish_terminal`；reader 线程到 `:670` 才 join。管道里还没被读完的最后几行——通常正是最后一条 `message_end` 和 session 行——会在 `final_totals()` 之后才被解析：usage 少记最后一条消息，session id 没写进 agents.json，jsonl 里 exit 之后还会追加 raw 行。<br>生产上：机器有负载、或 UI 的 Channel 回调慢（reader 是在回调里串行处理的）时就会发生；评测 runner 并发跑多个 harness 正是这种场景。它会让 F-BENCH-14 / 19 刚修好的用量再次少报，而且现在这些记录还会被标上 `message-sum`。<br>修法：① 子进程退出并 `kill_tree` 之后，先对 reader 做有界 join（例如 2s，孤儿已被 SIGKILL，管道会关闭），再 classify / `finish_terminal`；② 幂等改用单独的 `finishing: AtomicBool`（compare_exchange 抢占），`terminal` 在所有写入完成之后最后发布；`kill_all` 的强制收口路径同样遵守这个顺序。确定性回归测试：sink 回调里每个事件 sleep 200ms（让 reader 落后于退出），脚本输出两条 `message_end` 后立即 exit，断言归档的是 250 而不是 100、jsonl 最后一行是 exit |
+| — | P3（nit） | `usage_caliber` 在 `final_totals()` 走 cumulative 分支时也会写 `message-sum`（目前没有 cumulative 的产生方，影响为零；可以按实际分支写入，或删掉 cumulative 分支）。字段注释写「da9c376 起」，但 da9c376 到 e87a99a 之间归档的记录已经是求和口径、却没有标记，会被当成旧口径——都是开发期数据，注明即可 |
+
+**确定性复现（评审方，干净 worktree @ a1a6890）**：在 `terminal_archives_usage_with_caliber` 的基础上只改一处——sink 回调每个事件 sleep 700ms（模拟 UI Channel 慢 / 机器负载）。终态后再等 3 秒才读文件，以排除竞态 (a)。结果 **3 次全部复现**：agents.json 归档 `usage_tokens = 100`（应为 250，第二条 `message_end` 永久漏记，记录却带着 `message-sum` 标记），jsonl 最后一行是 `usage` 而不是 `exit`（exit 之后又追加了事件）。这证明 (b) 是生产数据错误，不只是测试读早了。复现补丁可直接作为修复的回归测试。
+
+**线程上限**：这正是 §33 担心的情况——4 线程上限掩盖了一个真实的竞态。建议修完 F-BENCH-26 后在 16 线程下连跑 10 次全绿，再决定这个上限去留。
+
+### §36. F-BENCH-26 修复（2026-10-20，9e6331e）
+
+按 §35 处方两项都做，外加两处连带：
+
+- **(b) reader 先于落账排空**：waiter 在子进程退出 + `kill_tree(SIGKILL)` 清孤儿后（管道必然 EOF），先 `drain_readers`（有界 join，`READER_DRAIN_TIMEOUT` = 10s——EOF 已由清场保证，剩余耗时只是逐行解析 + sink 回调；超时 detach 并 eprintln，不劣于修复前），之后才 classify / `finish_terminal`；max_duration 兜底分支同样排空。末条 `message_end` / session id 不再漏记。
+- **(a) terminal 最后发布**：幂等 guard 改 `ExecSession.finishing`（AtomicBool `compare_exchange`，独立于 terminal）；`finish_terminal` 内 MCP 释放 → agents.json（状态/三字段/usage+caliber/session id）→ 租约释放 → exit 事件 + jsonl 行**全部完成后**才写 terminal——`wait_for(terminal)` 返回即完整。
+- **回归测试**：评审方复现改编为 `slow_sink_tail_events_settle_before_terminal`（sink 每事件 700ms；刻意不 sleep——「terminal 发布即完整」是 (a) 的契约本身，250 + caliber + jsonl 末行 exit 三个断言把 (a)(b) 同时钉死）。评审已证修复前确定性红（3/3）。
+- **契约连带**：`terminal_finalization_releases_run_lease_once` 原在收到租约释放消息后立即断言 `terminal`——新顺序下租约释放先于 terminal 发布（§36 修复过程中它先确定性红了，恰好当了一次免费的契约哨兵），改为 `wait_for(terminal)`。
+- **nit**：`UsageTotals::final_with_caliber` 按实际产出分支给口径（cumulative → `"cumulative-last"`，不再误标 message-sum）；agents.rs / types.ts 注释起始改 e87a99a 并注明 da9c376..e87a99a 的无标记空窗（开发期数据）。
+- **线程上限移除**：§35 验证门（16 线程 ×10 全绿）通过后删除仓库根 `.cargo/config.toml`。§34「16 线程亦已验证全绿」在当前代码不成立的指正确认——当时 2 次样本掩盖了 F-BENCH-26，上限正是掩盖源，按 §33/§35 的担心与建议撤除。
+
+**验证**：fmt / clippy `-D warnings` 干净；16T ×10 + 默认（16）×3 + workspace 全绿；前端 build + vitest 131 全绿；干净 worktree @9e6331e（sidecar 另行 stage）桌面 crate 128+1 passed / 0 failed。
+
+### §37. `9e6331e` + `1d7110c` · F-BENCH-26 修复 · code review（2026-10-20）
+
+**结论：通过，benchmark tier-1 收尾。F-BENCH 系列全部关闭。**
+
+**评审方核实**：
+- 修复与 §35 处方一致：子进程退出 → `kill_tree(SIGKILL)` → `drain_readers`（有界 10s，超时 detach）→ classify → `finish_terminal`；幂等改用 `finishing` 的 `compare_exchange`，`terminal` 在 exit 事件和 jsonl 行之后最后发布。max_duration 兜底分支同样排空，Err 分支也回收 reader。
+- 回归测试 `slow_sink_tail_events_settle_before_terminal` 比评审方的复现更严格（终态后不 sleep，直接断言 250 + `message-sum` + jsonl 末行 exit），评审方复现已证明修复前 3/3 红。
+- 与 `kill_all` 的交互：等待线程排空期间 `kill_all` 超过期限时由它抢到 `finishing` 同步落账（尾部 usage 可能缺，属于强制终止路径，可接受），等待线程随后的 `finish_terminal` 为 no-op；反过来等待线程先抢到时 `kill_all` 的调用为 no-op。不会双写。相比修复前，`kill_all` 的等待循环现在等的是「落账完成」而不是「落账开始」，app 退出时丢写的窗口反而缩小了。
+- `.cargo/config.toml` 已删除，测试在默认线程数下：桌面 lib 连跑 6 次全绿（128）、`RUST_TEST_THREADS=32` 1 次全绿；`cargo test --workspace` 2 次全绿；clippy `--workspace -D warnings`、fmt 干净；桌面 vitest 131、`tsc --noEmit` 通过。
+
+**余项（均不阻塞）**：
+- F-U2-11（探针重试拉长 `harness_list` 延迟）已被 F-BENCH-25 的并行探测吸收，可标 superseded；
+- F-U4a-3 / F-U4a-4（atomic_json 读路径 rename 不在 flock 内、rename 前无 `sync_all`）仍为 P3 open，与执行面拆分（子项目 1）直接相关，建议在搬迁 `atomic_json` 时一并处理；
+- 观察项：等待线程收割子进程后，在排空期间（最长 10s）`kill_all` / `exec_stop` 仍可能对已收割的 pgid 发信号。macOS 的 pid 顺序分配，几秒内复用的概率极低，不单列 finding；子项目 1 的 exec-shim 设计里应把「已收割」作为信号前的检查条件。
+
+### 执行面子项目 1 验收（2026-10-21）
+
+**自动化验证（已全绿）**：`cargo test --workspace` 三遍全绿（345 passed / 0 failed）；clippy `-D warnings`、fmt 干净；`nm -a target/debug/omt-daemon | grep -c omt_exec` = 0（KD-E9）；桌面 vitest 140 passed（含新增 exec-plane.spec.tsx 9 例，既有 131 例未改动）+ tsc/build 干净。端到端覆盖：exec_shim（真二进制：完成归档 / SIGTERM→kill_reason=user / 保活正反例）、exec_launch（launcher 就绪握手 / shim 拉不起同步报错+补偿）、exec_survives_launcher（发起方被 KILL 后执行继续）、exec_daemon_link（真 daemon：临时授权开关 / declare / homeId 绑定）。
+
+**待手工验收（设计 §6 桌面端一节，`pnpm tauri:dev` 下逐项）**：
+
+| # | 场景 | 期望 | 结果 |
+|---|---|---|---|
+| 1 | 派发 pi / omp / opencode 各一次 | 实时 transcript 与改造前一致；结束后 run 进度正确 | **pi 通过**（Agent 32/33，TICKET-0008/0009，k3，exit 0，run completed，租约无残留）；**omp 通过**（Agent 34，TICKET-0010 长任务 6×30s，exit 0，run completed）；**opencode 通过**（Agent 35，RUN-0033，exit 0）（2026-10-22） |
+| 2 | 执行中点「停止」 | 3s 内 `killed`，run item 回到 pending（租约已释放） | **通过**（2026-10-22，Agent 36 / RUN-0034）：停止后 item 依次 running → failed → pending，租约释放。**但随后对同一 ticket 重新派发触发 F-ACC-12（P2）**，见下 |
+| 3 | 空闲 agent「续跑」 | 同一 agent 追加 exec，新 jsonl 在同一目录 | **通过**（2026-10-22）：pi Agent 32 追加 exec-12695-6（`--session` 同 id）、omp Agent 34 追加 exec-12695-10（`--resume` 同 id），文件均落在原 agent 目录；omp 续跑自述「Claimed TICKET-0010 again」并主动带 leaseToken 汇报，上下文延续实证。注：关联 ticket 已 done 时续跑报「无未完成可执行成员」（改造前同形，见下方 P3） |
+| 4 | 进入信任门（awaiting_confirmation）后在桌面端裁决 | 与改造前一致 | **通过**（2026-10-22，RUN-0032）：CLI 认领后直接改 done 触发 awaiting_confirmation，桌面端弹窗「确认」后 run completed。「打回」分支**通过**（RUN-0045：TICKET-0007 done → open，item `interrupted`，run `completed_with_failures`，弹窗消失）；RUN-0044 误点「确认」再次验证确认路径 |
+| 5 | 执行中 ⌘Q，在退出确认框选「继续在后台运行」，等执行结束再打开 | agent `exited`，transcript 完整，run 进度正确 | **通过**（2026-10-22，Agent 42 omp / RUN-0039，与第 12 项同一轮）：⌘Q 选 KEEP 后执行在后台跑完（exit 0、run completed），重开 app 后 agent `exited`、transcript 完整（用户确认） |
+| 6 | 执行中 ⌘Q 选「继续在后台运行」后立刻打开 | agent「运行中」，实时流接回（P-10），可停止 | 后台通过（2026-10-22，Agent 41 / RUN-0038）：⌘Q 选 KEEP 后 shim 48149 持续执行，重开 app 时在 2/6，此后 3/6…6/6 持续推进，exit 0、run completed、item done（actor `mcp:48152/exec:exec-4598-13`）、leaseReleasePending=false；UI「运行中 / 实时流接回 / 可停止」待用户确认 |
+| 7 | 执行中 `kill -9 <shim pid>`，再打开桌面端 | agent `failed`，行内说明「执行进程异常退出…」；租约被对账释放；harness 若仍活则进入「不受控（执行进程已丢失）」分组，可强制终止 | **对账路径通过**（2026-10-22，Agent 44 omp / TICKET-0010 / RUN-0041）：认领后 `kill -9` shim → 重启 app 时日志「启动对账：1 个 exec 的 shim 已不在，标记为失败」「启动清扫：1 个 workspace 的 MCP 注入残留已恢复」「经 shim 路径释放了 1 个 exec 的租约」；agent `failed`（failureDetail `exec shim exited before finishing`）、`reconciled=true`、item 回 pending。「不受控」分组**补测通过**（Agent 50 omp / RUN-0049，见下方追加项）；app 运行期间不可见见 F-EXEC-17 |
+| 8 | 「停止全部」 | 第一次点击只出现确认（显示运行数与已认领项数）；确认后按钮显示「停止中…」，随后提示停止数量；所有运行中 exec 进入 `killed` | **通过**（2026-10-22 补测）：Agent 39（pi，TICKET-0009/RUN-0036）与 Agent 40（omp，TICKET-0010/RUN-0037）并行运行时「停止全部」，两者均 `killed`（kill_reason=user），shim 均退出，两个 item 均回 pending（首轮按下时仅 1 个 exec 在跑，已补测） |
+| 9 | 旧版本留下的 `agents.json` 数据 | 首次启动迁移，Agents 面板列表与历史 transcript 完整 | 磁盘侧通过（2026-10-22，`/tmp/omt-accept-rt`，迁移前整目录备份 `.bak-20261022`）：`MigrationReport { homes: 1, agents: 26, files_moved: 47, skipped_corrupt: [], failed: [] }`，`agents.json` → `.migrated`；`transcripts/` 余 9 个无 agent 记录的早期 exec 文件（预期不迁）。UI 列表/历史 transcript 用户确认通过 |
+| 10 | 执行中 ⌘Q，在退出确认框选「全部停止后退出」 | 应用退出；所有 exec 进入 `killed`，run item 回到 pending | **通过**（2026-10-22，Agent 43 pi / TICKET-0009 / RUN-0040）：⌘Q 选「全部停止后退出」→ 应用退出，exec `killed`（kill_reason=user）、shim 退出，item 回 pending（lastError `exec … terminated (kill/app-exit)`），`leaseReleasePending=false` |
+| 11 | 删除一个已结束的 agent | 确认框写明 transcript 一并删除；删除后磁盘上该 agent 目录（含 jsonl）不存在 | 用户确认通过（2026-10-22） |
+| 12 | 长任务期间关闭桌面端（可在 `daemon.json` 把 `idleQuietMs` 调到 60000 加速） | harness 在静默期之后的认领 / 汇报仍成功（shim 保活）；结束后 run 进度正确，`leaseReleasePending` 为 false | **通过**（2026-10-22，`idleQuietMs=60000`，Agent 42 omp / TICKET-0010 / RUN-0039）：21:00:50 认领后 ⌘Q 选 KEEP 关闭桌面端；daemon（pid 4777）全程存活、日志无 IDLE_SHUTDOWN；21:04:13 汇报成功（距桌面端关闭 >3 分钟，远超 60s 静默期），run completed、item done（actor `mcp:65521/exec:exec-50195-1`）、exit 0、`leaseReleasePending=false`。旁证：首次 report 未带 leaseToken 被拒后重试成功（P3-ACC-1 复现） |
+| 13 | 有运行中的 exec 时按 ⌘Q：(a) Return；(b) Esc；(c) 点「取消」 | ⌘Q 必弹确认框；(a) 后台继续并退出；(b)(c) 不退出，exec 不受影响 | **部分通过**（2026-10-22）：⌘Q 必弹确认框；(c)「取消」不退出、exec 不受影响 ✓；(b) **Esc 无反应、弹窗不关闭**（不退出，但无法用 Esc 取消，见 P3-ACC-6）；(a) Return 对应首按钮「继续在后台运行」。**B7 修复**（a4f51e0）：macOS 改直调 NSAlert、「取消」绑 Esc（P3-ACC-6 fixed）；B7 Step 9 手工验收（Esc / Return / 关窗 Esc / 连按 ⌘Q / 第二实例无清扫日志 / 重载后不重复推事件）**待验收**（见 §48 待手工验收） |
+| 14 | 只开着 DSH 插件、desktop 已关闭，长任务结束后 shim 拉起过 daemon | `omt daemon-status` 的 daemon 同时有全局 home 和 workspace home；DSH 的全局 ticket 操作仍落在 `~/.omt` | 待验收 |
+
+**追加验收项（§40/§42/§44）结果**：
+- 第二实例聚焦：**通过**（2026-10-22）——同环境直接再起 `oh-my-ticket-desktop`，第二实例立即退出（exit 0），首实例窗口被前置（用户确认）。
+- 有 exec 时关窗确认框（取消保持 / KEEP 隐藏窗口）与 KEEP 后 Dock 点击恢复：**通过**（2026-10-22，Agent 45 pi / RUN-0042 执行期间，用户确认）。
+- 无 exec 关窗直接退出：**通过**（Agent 45 跑完后点关闭按钮，无确认框直接退出，用户确认）。
+- 连按 ⌘Q 不叠框：**通过**（用户确认）。
+- 「全部停止后退出」后立即再按 ⌘Q 不叠框：**通过**（2026-10-22，Agent 46 pi / RUN-0043）：选 STOP 后窗口立即关闭、来不及二次 ⌘Q（停止窗口极短，未实际触发重入）；exec `killed`、item 回 pending、`leaseReleasePending=false`。
+- 强制删除（F-EXEC-14/16，「放弃租约并删除」）：**通过**（2026-10-22，Agent 47 pi / TICKET-0009 / RUN-0046）。构造：认领后 `kill -9` shim 与 harness 进程组，并在 agent.json 写入 shim 收尾释放失败的形态（`failed`、`leaseReleasePending=true`、`reconciled=false`），daemon 侧 item 仍 `running` 挂在 `mcp:73903/exec:exec-48961-1`。UI：普通删除被租约守卫拒绝 → 出现「放弃租约并删除 Agent 47」→ 点击后 agent 消失（用户确认）。后台：15:19:18 item `running → failed → pending`（`force_release_agent_leases` 先释放后删除），agent 目录已删除、无 `.trash-*` 残留。注：bindings.json 仍留 `TICKET-0009 → agent-exec-48961-1` 悬空绑定（按设计由用户触发 `bindings_gc` 清理）；UI 不展示释放结果（§47 P3）。
+- 「不受控（执行进程已丢失）」分组 + 强制终止：**通过**（2026-10-22，Agent 50 omp / TICKET-0010 / RUN-0049）。构造：认领后 `kill -9` shim、**待其确实退出后**立即 `kill -STOP` harness 进程组（先 STOP 再杀 shim 会因 POSIX 孤儿进程组规则收到 SIGHUP+SIGCONT 而退出；不 STOP 则 omp/pi 随 shim 退出——两次失败尝试即 Agent 48/49）。重启 app：日志「启动对账：3 个 exec 的 shim 已不在」；Agent 50 `failed` + `attachment=orphan`，item 经对账回 pending；UI 不受控分组可见、点「强制终止」后 omp（87339）被 SIGKILL，agent `killed`（kill_reason=orphan）。**遗留**：`kill_orphan` 只杀单 pid（计划「已知的有意简化」），harness 的 MCP 桥子进程 `omt mcp`（87340，同进程组）残留——真实场景中它会因 stdin EOF 自行退出，本次因被 STOP 而滞留，已手工清理。
+
+**验收环境注记（2026-10-23）**：验收 runtime/home 位于 `/tmp`，macOS 每日 tmp 清理在 00:00 删除了 3 天以上未访问的文件——`harness/config.json`（+lock，10-18 后未改）、迁移前遗留的 9 个无主 transcript 文件、已删除 agent（exec-42739-1）的残留文件与两个空锁文件——导致派发弹窗报「尚无已启用的 harness」。非产品缺陷；已从 `.bak-20261022` 恢复 config.json。后续验收环境应放在 `/tmp` 之外。
+
+**待实测（§8）**：pi 与 omp 各一次「派发 → 结束 → 续跑」，比较续跑 exec 首条 usage 与前一 exec 末值（判定逐消息计 vs 延续累计），结论写回设计 §8。
+
+**§8 实测结果（2026-10-22）**：两家均为**逐消息计**，续跑不延续前一 exec 的累计——agent 级用量应为各 exec 求和。
+- pi（k3，Agent 32）：exec-12695-1 usage 末值 14,145、合计 53,222 → 续跑 exec-12695-6 首值 14,533、合计 64,386；
+- omp（k3，Agent 34）：exec-12695-8 序列 9,198…12,855、合计 80,386 → 续跑 exec-12695-10 序列 13,298…16,389、合计 91,497；
+- 续跑首值 ≈ 前一 exec 末值 + 新 prompt（历史上下文计入单条消息 input），远小于前一 exec 合计，排除「延续累计」。
+
+**验收中发现（P3，均为改造前既有，不阻塞子项目 1）**：
+- **P3-ACC-1 · 派发 prompt 未要求 leaseToken**：`executor.rs` DISPATCH_PROMPT 第 4 条只列 homeId/runId/nodeId/outcome；omp 首次 `run__report` 未带 token 被拒（`CONFLICT: presented token does not fence this item`），自行补 token 重试成功。pi 碰巧自带。建议第 4 条明确「传入 run__claim 返回的 leaseToken」。 **fixed（2026-10-23）**：第 4 条改为「leaseToken set to the claim result's lease.token」（claim 响应字段为 `lease.token`，report 参数为 `leaseToken`）。
+- **P3-ACC-2 · 缺 token 的报错文案误导**：`dispatch.rs:2279` 缺 token 且非管理员时按空 token 比对，报「token 不匹配」而非「缺少 leaseToken」。daemon 侧改动，留子项目 2（KD-E9）。
+- **P3-ACC-3 · run 完成后的多余认领**：prompt 第 7 条「循环到无 pending」使模型在 run completed 后再 claim 一次，得 `run-status-gate violated` 红字（三次派发均出现）。建议第 7 条补「report 结果显示 run completed 或无 pending 时直接退出」。 **fixed（2026-10-23）**：第 7 条改为「run__report 结果显示 run 不再 running 或无 pending、或 run__claim 返回 claimed: false 时退出，不再认领」。两条均有 `dispatch_success_builds_dispatch_plan` 断言钉住；**实机复测**（Agent 53 omp / TICKET-0008 / RUN-0051）：工具调用仅 claim → bash → report 三次、零报错，首次 report 即带 leaseToken，report 后自述「stopping per protocol without claiming again」，run completed。
+- **P3-ACC-4 · 已完成 ticket 续跑的报错不说明原因**：「继续执行」沿用最后一个 exec 的 nodeId，ticket 已 done 时预检报「无未完成可执行成员」，未提示是关联 ticket 已完成。
+- **P3-ACC-5 · agent 状态从不进入 running**：执行期间 agent.json 一直为 `starting`（执行器无写 Running 的路径，改造前同形），UI 把两者同组呈现故无功能影响，状态名误导。
+- **P3-ACC-6 · 退出/关窗确认框 Esc 无效**（本子项目 F-EXEC-6 引入）：`tauri-plugin-dialog` 2.7.1 → rfd 0.16.0 在 macOS 以 `addButtonWithTitle` 逐个加按钮、不设 keyEquivalent（`rfd-0.16.0/src/backend/macos/message_dialog.rs:64`）；NSAlert 仅对标题恰为英文 "Cancel" 的按钮自动绑定 Esc，「取消」未绑定 → Esc 无反应。不退出、不误操作，但无法用 Esc 取消。修法：绕开 rfd 以 objc2 直调 NSAlert，为「取消」设 `keyEquivalent = "\u{1b}"`（约 30–50 行，macOS 专属，tauri 胶水无单测）；或接受限制。
+- **P3-ACC-7 · 开发工具链：sidecar 更新后 `pnpm tauri:dev` 构建脚本 EPERM**（Darwin 25）：`copy-sidecar.mjs` 用 `copyFileSync` 把带 `com.apple.provenance` 的 `target/debug/omt*` 复制进 `src-tauri/binaries/`；sidecar 变化触发 tauri-build 重跑，其 `copy_binaries` 先 `remove_file(target/debug/omt-daemon)` 再 `fs::copy`（macOS 走 clonefile），克隆带 provenance 的可执行文件被拒 → `Operation not permitted`，且 `target/debug/omt-daemon` 已被删除。关沙箱、直调真实 cargo 均复现；Python `shutil.copyfile` 产生的副本不带 provenance，可正常构建。绕行：以不带 provenance 的副本重新暂存 `binaries/` 后直接 `pnpm exec tauri dev`。根治建议：`copy-sidecar.mjs` 改为读写字节流复制（不保留 xattr），或复制后去掉 provenance。不影响产品功能。
+- **P3-ACC-8 · 对账释放遇已取消 run 报失败**：`release_items_for_exec` 对 canceled run 先 admin report failed 再 `run/control retry`，后者返回 `CONFLICT: run … is canceled; retry is unavailable` → 首条对账路径记「释放失败，保留为对账目标」，随后 U10 路径兜底完成（`reconciled=true`）。结果正确但日志误导；建议 run 已为终态（canceled/completed）时视为无需释放。
+
+#### F-EXEC-17 · P2 · `follow.rs` + 桌面端 · app 运行期间 shim 崩溃不可见（2026-10-22 验收第 7 项）
+
+- **现象**：执行中 `kill -9` shim（Agent 44 omp / TICKET-0010 / RUN-0041，21:18:42）后，app 仍开着时 transcript 尾部一直显示「运行中…」与「长时间无输出——agent 可能仍在等待外部操作」；agent.json 停在 `starting`，item 仍 `running` 挂在 `mcp:…/exec:exec-84281-1` 名下。
+- **根因**：`follow_jsonl` 在「exec 不再活跃（`exec_active` = shim 不存活且出宽限期）且文件连续两次不增长」时**静默 return**，不向 sink 发任何终止事件；桌面端运行期间也没有针对单个 exec 的对账（只在启动时 `reconcile_interrupted_execs`）。前端因此收不到结束信号，租约持有到下次 app 启动。
+- **附带观察**：omp 随 shim 一同退出（stdio 管道断开）——该场景下 harness 不存活，「不受控（执行进程已丢失）」分组无法经此路径触发，需另行构造（harness 忽略 SIGPIPE / 独立进程组存活）才能验收。
+- **建议修法**：follower 在「无 exit 而不活跃」结束分支里，调用与启动对账同一谓词/路径对该 exec 做一次 reconcile（标 failed + `SHIM_LOST` 说明、释放租约），并向 sink 补发一条合成 `exit`（status=failed，failureDetail「执行进程异常退出…」），前端照常收尾。回归测试：follower 在 shim 死亡后发出合成 exit；exec 记录被标 failed、租约释放。
+- **状态：fixed（2026-10-22）**。
+  - `omt-exec::control::settle_lost_exec`：仅当该 exec 是 agent 最新 exec、且 shim 已死并出宽限期时，按启动对账同一 `reconcile_agent` 落终态（harness 仍活则 `Orphan`，failure_detail=`SHIM_LOST_MARKER`，保持为对账目标），并合成 exit（seq 续接、status、code、killReason、durationMs、failureDetail）；
+  - `follow::follow_jsonl` 增 `on_lost: Option<LostHook>`：「不活跃且连续两次不增长」放弃时调用，返回的事件照常推 sink（真实 exit 结束不调用）；
+  - 桌面端 `follow()` 接线：hook 内 settle + 后台 `release_reconcile_targets_in_background`（与启动对账共用，经 shim 路径释放租约；lib.rs 启动处改为调用同一函数）。前端无改动——合成 exit 走既有 `applyExitLocal` + 重拉 + 失败通知。
+  - 测试：`settle_lost_exec_marks_failed_and_synthesizes_exit`、`settle_lost_exec_leaves_live_or_stale_exec_alone`、`abandon_invokes_on_lost_and_forwards_synthetic_exit`。
+  - **实机复测通过**（2026-10-22，Agent 51 pi / TICKET-0009 / RUN-0050）：app 开着时 `kill -9` shim 与 harness 进程组 → **0.6s** 内 agent 落 `failed`（attachment none），app 日志「执行进程丢失：经 shim 路径释放了 1 个 exec 的租约」，item `running → failed → pending`（15:50:05），全程无需重启 app；UI 显示「失败」、transcript 末尾出现「■ failed」结束行（用户确认）。
+- **验证**：fmt / clippy `-D warnings` 干净；`cargo test --workspace` ×3 = 390 passed / 0 failed（+5 新测试）；桌面 vitest 158、tsc 干净；`nm` daemon 中 omt_exec = 0。
+
+#### F-ACC-12 · P2 · `executor.rs` dispatch_daemon_side ② · 停止后重新派发同一 ticket，item 被桌面端身份劫持（2026-10-22 验收）
+
+- **现象**：第 2 项停止 Agent 36（TICKET-0009，RUN-0034）后，item 正确回到 pending；随后重新派发 TICKET-0009（Agent 37），exec 认领得 `claimed:false` 即退出，item 卡在 `running`，`executorActor = desktop:4598`，无人汇报。
+- **根因**：派发链 ② `node/execute` 把节点置 in_progress，走 `apply_update_and_activate`——活动 run（RUN-0034 仍为 running）里该节点的 pending item 被以**调用方身份**（桌面端连接 `desktop:4598`）激活为 running（事件 seq 302/303 同一毫秒）；③ ensure-run 复用这个活动 run，shim 侧 harness 再 claim 时已无 pending 项。首次派发不触发，因为 `node/execute` 时 run 尚不存在。
+- **归属**：改造前既有（派发链 ①–⑥ 原样搬入 `dispatch_daemon_side`）。设计 §3.5 已计划子项目 2 的 CLI/MCP 派发绕开 `node/execute`；桌面端路径也应一并改。
+- **临时处置**：验收中已 cancel RUN-0034/0035 并把 TICKET-0007~0010 改回 open（无活动 run 时重新派发会新建 run，不触发）。
+- **建议修法**：② 之前若节点在活动 run 中有 pending item，跳过 `node/execute`（或改为先 ensure-run 再由 exec 认领置 in_progress）；回归测试：停止 → 重新派发同一 ticket → 新 exec 认领成功。
+- **状态：fixed（2026-10-22）**。`dispatch_daemon_side`：③ 将复用的 run（`node/get.runs` 首项，run_link 投影）为 `running` 且本节点 `itemState=pending` 时跳过 ②，由 exec 自己 claim；其余情形（新建 run、run 尚 pending 等）照常 `node/execute`。代价：复用路径下节点状态不再由 ② 置 in_progress（claim 只激活祖先），直到 report 落终态；审计绑定 meta 行亦不写——与设计 §3.5「CLI/MCP 派发绕开 node/execute」同向。回归：`dispatch_skips_node_execute_when_reused_run_holds_pending_item`（修复前红）+ 反例 `dispatch_keeps_node_execute_without_pending_item_in_reused_run`。daemon 零改动。
+  - **实机复测通过**（2026-10-22）：F-EXEC-17 复测后 RUN-0050 仍 running、TICKET-0009 item 已回 pending，立即对同一 ticket 重新派发（Agent 52）→ 复用 RUN-0050，事件流中**无** `node/execute` 的 `node.updated in_progress`，15:51:24 item 由 `mcp:54292/exec:exec-5212-3`（新 exec 自身）认领为 running。
+
+#### F-DAEMON-1 · P1 · thread-leak · `server.rs:762` + `events.rs:127` · events/resume 每次调用都新增一个永不撤销的订阅与转发线程（2026-10-22 验收中发现）
+
+- **现象**：验收 daemon（pid 12838）4 小时累计 194 分钟 CPU；桌面端关闭时 0%。`sample` 显示 2,190 个线程，其中 2,167 个为 `omt-events`（`route_methods` 拉起），桌面端打开期间线程数约以 **4 个/秒**增长（10 秒内 2441 → 2481，随后 2607）。
+- **根因**：`events/resume` 在 daemon 侧**每次调用**都 `Hub::subscribe_with_cursor` 追加一个订阅者，并拉起一个 `omt-events` 转发线程（`recv_timeout(250ms)` 轮询）。转发线程只在连接断开（`conn_dead`）/写端关闭/订阅被 hub 丢弃时退出；`Hub::unsubscribe` 是 dead code，同一连接对同一 home 的旧订阅**从不被替换**。
+  - 桌面端 `rpc_bridge.rs::subscription_pump`（`cbf3edc`，2026-10-19 引入）在一条长连接上**每 250ms 轮询一次** `events/resume` → 每秒泄漏约 4 个订阅 + 线程，直到桌面端断开才整体回收。
+  - TS 客户端（DSH 插件，`client-ts/src/client.ts` resume）每收到一条 live 通知就再调一次 `events/resume` → 每个事件泄漏一个订阅，长会话同样累积。
+- **后果**：① 线程每个每秒醒 4 次，CPU 随线程数线性上涨；② 每条提交事件按订阅数 N **重复推送 N 份**通知到同一连接（放大）；③ `oldest_subscriber_cursor` 被最早的订阅钉住，outbox 保留期清理在桌面端打开期间失效；④ 进程线程上限 16,384（`kern.num_taskthreads`），按 4/秒约 1 小时触顶，之后 spawn 静默失败（`.ok()`）。
+- **归属**：改造前既有（daemon 订阅语义 + `cbf3edc` 轮询泵的组合），与执行面子项目 1 无关；但长时间验收会受其影响（CPU、通知放大）。
+- **建议修法（daemon 侧）**：按「连接 × homeId」维护唯一 live 订阅——同连接再次 `events/resume` 同一 home 时先 `unsubscribe` 旧订阅（旧转发线程随 sub_tx 被 drop 收到 Disconnected 退出），再登记新的；连接拆除时按表批量撤销。回归测试：同一连接连续 N 次 `events/resume` 后 hub 订阅数 = 1、`omt-events` 线程数有界；live 事件只推送一份。桌面端泵可顺带改为「订阅一次 + 读通知、断线再 resume」，但只修 daemon 即可止血。
+- **状态：fixed（2026-10-22，未提交）**。实现：
+  - `events.rs`：`Subscriber` 增 `key`；`Hub::subscribe_keyed` 在锁内先移除同 key 旧订阅（旧 sender 被 drop → 旧 `omt-events` 线程收到 Disconnected 退出，缓冲内的行先送完不丢）；`unsubscribe_key` 供连接拆除；
+  - `server.rs`：`ConnState` 增 `conn_key`（每连接随机）与 `subscribed_hubs`；`events/resume` 以 `conn_key` 登记；读循环结束时对记录的 hub 逐个 `unsubscribe_key`。登记前先记 hub、登记后复查 `conn_dead`——与拆除竞态时谁后到谁撤销，不会漏；
+  - `homes.rs` / `dispatch.rs`：`subscribe_key` 沿 `call_full` → `Job::Rpc` → `Ctx` 透传（`OpenedHome.hub` 去掉 dead_code 标注）。
+- **验证**：新 e2e `repeated_events_resume_on_one_connection_keeps_one_subscription`（同连接 40 次 resume 后线程数增长 ≤ 2、一次提交只推一份）——修复前实测 **11 → 51** 失败，变异验证（把 keyed 换回 unkeyed）同样失败；Hub 单测 2 个（同 key 替换并断开旧 sender / 拆除只删本 key）。fmt、clippy `-D warnings` 干净；`cargo test --workspace` 三遍 385 passed / 0 failed；根 vitest 447 passed；`nm` daemon 中 omt_exec = 0。
+- **实机复测**：验收 daemon 换新二进制后桌面端常开，30 秒内线程数恒为 **11**，CPU 约 0.6%（修复前约 4 线程/秒增长，4 小时累计 194 分钟 CPU）。
+
+### §38. 执行面子项目 1 实现完成 + ce-work 收尾评审（2026-10-21）
+
+实现序列 `d6d07cd..e6dab22`（Task 1-12 全部落地，按 2026-10-21 评审建议拆 8a/8b/8c 与 11a/11b；F-U4a-3 测试按 deferred 项改为双侧钉死）。自动化验证：workspace 三遍全绿（345/0）、clippy/fmt/tsc 干净、`nm` daemon=0、前端 140（新增 exec-plane.spec.tsx 9 例、既有 131 未改）、四组真二进制 e2e（daemon_link / exec_shim / exec_launch / exec_survives_launcher）。
+
+**ce-work 收尾评审**（ce-code-review，depth:full，9 位评审：correctness / project-standards / security / adversarial / testing / maintainability / reliability / data-migration / agent-native；跨模型 pass 未运行——主机家族不可证，对抗视角由本地评审承担；收据 `/tmp/compound-engineering-501/ce-code-review/20261021-053122-ba8f3ae8/review.json`，run 20261021-053122-ba8f3ae8）：3 条 actionable 全部经 validator 确认并在 `10c069a` 修复——**#1** 死派发路径（exec_start_impl/dispatch_chain/DISPATCH_LOCK/set_rpc 删除，步骤①–⑥合并为 `dispatch_daemon_side` 供 launch 复用，补偿测试全部移植，两处 kill_all 测试随之删除 → workspace 343）；**#2** kill_all + KillReason::AppExit 按 KD-D7 修订删除；**#3** KD-E9 入 CI 符号门（`nm` 断言 daemon=0 / cli>0）。
+
+**anchor-50 残留**（评审裁定软桶、未修复，见 review.json residual_risks 共 58 条；高频候选供下轮）：launcher `wait_ready` Failed 分支只取消 run 未标 agent Failed（correctness+adversarial）；`stop_all` 首个失败中断循环且退出路径吞错（adversarial）；launcher shim_pid 写入 best-effort 失败后 exec 不可停且会被误判 SHIM_LOST（adversarial）；MCP 清扫在 flock 前取状态快照的竞态（agent-native）；orphan agent 可续跑覆盖 attachment（agent-native）；迁移中断时 transcript_tail 不回落旧目录（data-migration）；shim 收尾对 wedged daemon 无 RPC 超时（reliability）；migrate 单 home 硬错中断全部（data-migration）；transcript_tail 旧回退路径的 home_id/exec_id 未过 validate_segment（security，pre-existing）。另有 46 条 testing gaps。
+
+**待用户**：手工验收矩阵（14 项，见「执行面子项目 1 验收」节）+ §8 resume usage 实测。
+
+### §39. `d6d07cd..35acda6` · 执行面子项目 1 实现 · code review（2026-10-21）
+
+**范围与方法**：17 个提交，约 1 万行。§38 的 ce-code-review 已修 3 条并留下 58 条 anchor-50 残留，本轮不重复那一轮，重点放在三件事：两轮计划 review 的关键修法是否落地；残留项哪些是真问题；集成层面的缺陷。4 个并行评审：shim / daemon 连接 / 授权，launcher / 控制面 / desktop 后端，存储与迁移，前端。对照的依赖源码为 tauri 2.12.4、tauri-runtime-wry 2.12.2、tauri-plugin-dialog 2.7.1、rfd 0.16.0。F-EXEC-1、8 与路径穿越由评审方用临时 crate 复现；F-EXEC-11 由本机重跑复现。
+
+**自动化验证**：
+- fmt、clippy `-D warnings` 干净；
+- `cargo test --workspace` 共 343 passed。三遍里第 1 遍全绿；第 2 遍的 doctest 「can't find crate omt_storage」是 4 个评审并发编译共用 target 目录造成的，安静环境重跑通过；第 3 遍挂的 `exec_completes_after_launcher_is_killed` 是真 flake（F-EXEC-11）；
+- `nm`：omt-daemon 中 omt_exec 符号为 0，omt 中为 3362，KD-E9 成立；
+- 桌面 vitest 140 passed，`tsc` 干净；既有测试文件未改（`git diff bf82be2..HEAD -- apps/desktop/tests` 只新增了 exec-plane.spec.tsx）。
+
+**计划 review 关键修法均已落地并核实**：
+- exec-shim 在 CLI 安装信号屏蔽之前分派（经 `cli_main.rs` 的 `exec_shim_entry`）；
+- shim 拉起 daemon 时不带 `--home`，缺少的 home 用 declare 加回并重新注册，只声明已初始化的 home 且核对 homeId；
+- 保活间隔由 idleQuietMs 推导；
+- 释放租约期间临时自授 admin，失败记 `lease_release_pending`；
+- 启动对账走 shim 路径，只有释放成功才标记 reconciled；
+- `exec_active` 以 shim 是否存活为准；
+- 自定义 Quit 菜单项调用 `app.exit(0)`，三按钮确认框中 Return 对应「继续在后台运行」，Esc 不退出；
+- 「停止全部」两步确认，失败时返回 null；
+- 派发进行中不重复接回实时流；
+- crate 搬迁保真（adapters 逐字节一致，删除的测试都在计划许可范围内）。
+
+**§38 的残余风险核实结论**：(a) `wait_ready` Failed 分支、(b) `stop_all` 中断、(c) shim 身份尽力写入、(d) orphan 可续跑，均为真问题，分别是 F-EXEC-4、3、2、5。「migrate 单 home 硬错中断全部」是真问题（F-EXEC-8）；「transcript_tail 旧回退路径未校验」是真问题，可路径穿越（P3）；「迁移中断时 tail 不回落」「MCP 清扫快照竞态」「wedged daemon 无超时」也属实，分级见下（后者为 F-EXEC-10）。
+
+| ID | 级别 | 说明 |
+|---|---|---|
+| F-EXEC-1 | P1 | **GC 冻结判定没把 home 级旧 `agents.json` 计进去**。<br>· 场景 A：旧文件损坏，迁移跳过并原地保留；冻结只靠 `seq.json` 缺失维持；在该 home 派发一次后 `seq.json` 出现，`bindings_get` 报 `parseFailed:false`，`bindings_gc` 删掉指向旧 agent 的绑定（复现 removed:1）。<br>· 场景 A2：升级前已有 `agents.json.corrupt-*` 留证，迁移后被忽略。<br>· 场景 A3：`migrate_home` 先写 `seq.json` 再迁 agent，中途失败时只迁了一部分，冻结也不成立。<br>修法：`<home>/agents.json` 仍存在，或 `has_unrecovered_corrupt(<home>/agents.json)` 为真时，`list_agents` 视为降级（parseFailed）。 |
+| F-EXEC-2 | P2 | launcher 用 `let _ = update_exec(...)` 写 shim_pid/start-id，shim 自己从不写。<br>· 场景 A：写入失败，或 desktop 在 spawn 与写入之间退出 → 宽限内停止是 no-op；宽限后判为 SHIM_LOST + Orphan，对账释放活 harness 持有的租约，跟随线程也退出。<br>· 场景 B：`process_start_identity` 失败 → `wait_ready` 首轮就判「shim 意外退出」并取消 run，shim 却继续跑。<br>修法：shim 启动第一件事写自己的身份；launcher 写入失败时 SIGTERM shim 并走 `fail_and_compensate`。 |
+| F-EXEC-3 | P2 | `stop_exec(...)?` 在循环里遇到第一个错误就返回；退出回调 `let _ = stop_all(...)` 之后无条件 `exit(0)`。修法：ESRCH 视为成功；`stop_all` 跳过错误继续，并返回「数量 + 错误列表」；退出路径至少记录错误或再提示一次；计数只算真正发出信号的。 |
+| F-EXEC-4 | P2 | `Ready::Failed` 分支的注释「shim 自己已把 Agent 落成 Failed」只对「agent 已是 Failed」这个子分支成立；`shim_pid.is_some() && !shim_alive` 子分支（旧版 omt 没有 `exec-shim`、参数解析失败、panic）不会标记。修法：该分支也走 `fail_and_compensate`（幂等）。 |
+| F-EXEC-5 | P2 | `append_exec` 和派发守卫只看 status（orphan 的 status 是 Failed），随后把 attachment 改成 Live；`kill_orphan` 要求 attachment 是 Orphan，从此无法强杀旧进程。前端对 orphan 也显示「可续跑」。修法：`append_exec` 在锁内、派发守卫也拒绝 Orphan；前端对 orphan 隐藏续跑，并改用「请先强制终止」的文案。 |
+| F-EXEC-6 | P2 | 最后一个窗口销毁后，wry 发出 `ExitRequested { code: None }`，此时窗口已不存在；处理函数不看 `code`，Cancel 分支直接 return，没有 `RunEvent::Reopen` 处理。修法：在 main 窗口的 `CloseRequested` 上弹确认（Cancel 时阻止关闭），或 `code.is_none()` 时按「继续在后台运行」处理并补 Reopen 重建窗口。 |
+| F-EXEC-7 | P2 | `dispatch_daemon_side` 在 ③ 新建 run 之后，`run/get`、`run/control start`、`other => Err`、`resolve_launch`、`agent_dir`、目标 agent 守卫失败时都没有 `compensate_new_run`。改造前就存在，但计划第 1 项要求补偿。修法：把 `resolve_launch` 和目标校验挪到 ③ 之前；③ 之后统一包一层「出错即补偿」。 |
+| F-EXEC-8 | P2 | `for home in pending { migrate_home(...)?; }` 遇错即返回；`read_to_string` 碰到非 UTF-8 直接报错（复现：`h_b` 永远迁不过去，每次启动重复失败）。修法：用 `fs::read` + `from_slice`，任何解析失败都归入 skipped_corrupt；每个 home 的错误记进报告后继续下一个。 |
+| F-EXEC-9 | P2 | 旧实现在同一个 `update_json`（持有 flock）里完成检查与删除；新实现是无锁的 `get_agent` 加 `remove_dir_all`。与 `append_exec` 竞态时会删掉新 exec 的 spec 和记录（之后的 `update_*` 因文件不存在成了 no-op，对账也找不到它，租约永不释放）。修法：持 `lock_exclusive(agent_file)` 在锁内复核，把目录改名为 `.trash-<id>-<ts>`（`subdirs` 会跳过）后再删。注意：持锁期间不要调用 `read_json`，否则遇到损坏文件时会再取一次 flock，空等 10s。 |
+| F-EXEC-10 | P2 | `finish_terminal` 先写终态状态，再同步执行租约释放（`omt_client` 请求无读超时），最后才写 exit 行、发布 terminal。daemon 接受连接但不回应时：shim 主循环一直空转；`exec_active` 恒为真，跟随线程不结束；`stop_exec` 因状态已是终态直接返回；`active_exec_count` 不计入它。`keeper.join()` 有同样的无界依赖。修法：DaemonLink 的 socket 设读写超时（如 30s），租约释放带截止时间、超时记待对账；keeper 不做无条件 join。 |
+| F-EXEC-11 | P2 | `finish_terminal` 先 `update_agent_status`（Exited），再另起一次 `update_exec`（exit_code），两次写入之间读方看到「Exited + exit_code 为空」。测试第 98 行恰好卡在中间（单跑 6 次失败 1 次）。修法：在同一个 `update_json` 里一起写 status、attachment 和 exec 终态字段；测试改为等终态字段齐全再断言。 |
+
+**P3（不阻塞，择机处理）**：
+- *daemon_link*：
+  - `spawn_daemon` 用 `wait_for_descriptor`，会接受崩溃 daemon 残留的 descriptor，导致崩溃后第一次 connect 必然失败，应改为轮询 live descriptor；
+  - shim 拉起的 daemon 没人回收，成为僵尸后 `pid_live` 仍为真，`omt daemon-stop` 每次报 stop-timeout，exec_daemon_link 三个测试因此各多耗约 10s。修法同 `spawn_shim`：起一个 `child.wait()` 回收线程。
+- *保活*：间隔为 0 时（`OMT_SHIM_KEEPALIVE_MS=0`，或 idleQuietMs 为 1 或 2）忙等，且永远看不到 done 标志。应加下限，并在外层循环检查 done。
+- *grants*：`TempGrant::drop` 在 `remove` 失败时仍删除登记表条目，admin 授权从此永久泄漏。应只在 remove 成功后才删登记。
+- *control*：
+  - 启动宽限期内的停止操作静默成功，实际什么也没停；
+  - `reconcile_agent` 的「shim 存活」分支用快照回写状态，没有比较后再写，可能把 Exited 覆盖回 Running；
+  - `LAUNCH_LOCK` 在整个 `wait_ready` 期间一直持有（最长 30s），派发因此被串行化；
+  - 两个启动对账器可能同时处理同一个目标。
+- *desktop*：
+  - 退出确认框可重入（rfd 无父窗口时不是模态框，连按 ⌘Q 会叠出多个）；
+  - `startup_housekeeping` 和 shim 路径对账在 single-instance 插件注册之前就运行；
+  - 从 dock 退出、注销或关机时绕过退出确认（结果等同于「继续在后台运行」，无害）。
+- *follow*：`Ready::Timeout` 后，跟随线程的 `APPEAR_TIMEOUT` 可能先到期，从此不再接回；webview 重载后会出现第二个跟随线程，旧的仍在空转。
+- *存储*：
+  - `transcript_tail` 走旧目录回退时，home_id / exec_id 没过 `validate_segment`，可以路径穿越读取 `*.raw.log` 或 `*.jsonl`（已复现，改造前就存在）；
+  - home 迁移到一半中断时，tail 不回退到旧目录；
+  - MCP 清扫在取得 flock 之前读状态快照，可能误删一个活 exec 的注入状态；
+  - mcp_injection 自带的 `write_atomic` 没有 fsync，F-U4a-4 的修复没覆盖 backup.json 和 state.json。
+- *前端*：
+  - 续跑派发失败后，被跳过接回实时流的 live agent 要等下一次列表重拉才会接上；
+  - 相同的「停止全部」提示连续出现时，第二次会提前消失；
+  - 键盘焦点在两步确认时丢失，结果提示没有 `role="status"`。
+
+**测试缺口**：`wait_ready` 的 Failed 与 Timeout 分支、宽限期内停止、`stop_all` 部分失败、orphan 续跑，均无测试。
+
+**建议顺序**：
+1. F-EXEC-1：唯一会丢用户数据（绑定）的问题。
+2. F-EXEC-4、5、3：状态卡死或失控，修法都很直接。
+3. F-EXEC-11：CI 会偶发变红，和 F-EXEC-10 一起改 `finish_terminal` 的写入顺序与超时。
+4. F-EXEC-8、9：存储侧。
+5. F-EXEC-2、6、7。
+6. P3 在手工验收（14 项）之后择机处理。
+
+### §40. F-EXEC-1..11 修复（2026-10-21，按 §39 建议顺序）
+
+全部 P1+P2 共 11 条修复，五个提交（TDD，每条先红后绿；工作区逐批全绿后提交）：
+
+- **F-EXEC-1**（e292202）：`list_agents` 在 home 级 `agents.json` 仍在或存在未恢复损坏留证时报降级——三场景（A/A2/A3）下 `bindings_gc` 保持冻结，完全迁移后的 home 不受影响（3 个新测试，含 reviewer 复现场景）。
+- **F-EXEC-4/5/3**（58f14d9 + 漏提交补 8ca92b6）：`wait_ready` 死 shim 分支走完整 `fail_and_compensate`（对自标记 Failed 幂等）；`append_exec` 与派发目标守卫拒绝 Orphan、前端对 orphan 隐藏续跑并提示「请先强制终止」；`stop_all` ESRCH 视为成功、逐 agent 续错（返回 `StopAllOutcome`，只计真实发信号数），退出 STOP 分支如实记录错误。
+- **F-EXEC-11/10**（cd332d1）：`finalize_agent_exec` 单事务写 agent 状态/attachment + exec 终态字段（确定性轮询测试修复前 0/20、修复后 20/20；原 e2e 缝隙钉死）；DaemonLink 自建连接设 30s 读写超时（`from_stream`，零改 omt-client）、shim 租约释放全程有界（超时 → `lease_release_pending` 后照常收尾）、keepalive join 有界。
+- **F-EXEC-8/9**（3d692bf）：迁移改 `fs::read`+`from_slice`（非 UTF-8 归入 skipped_corrupt），逐 home 错误记入 `MigrationReport.failed` 并继续（仅全局锁失败中止）；`delete_agent` 持 agent.json 伴生 flock 锁内复核（锁下不调 `read_json`），目录改名 `.trash-<id>-<ts>` 后再删——与 `append_exec` 原子互斥（阻塞式竞态测试钉死）。
+- **F-EXEC-2/6/7**（bbdc194）：shim 第一动作写自身 pid+start-id（launcher 写失败自愈）；launcher 身份写入改关键路径（重试一次，失败 SIGTERM shim + 补偿），`wait_ready` 视 start-id 缺失为未知而非死亡；窗口关闭（CloseRequested）有运行中 exec 时弹三按钮确认（KEEP=隐藏窗口后台继续，dock Reopen 恢复；STOP=停全部后退出；取消=保持），ExitRequested 仅对显式退出确认（code:None 直通）；派发把 resolve_launch/目标守卫挪到建 run 之前，③ 之后全部失败路径补偿（control-start 拒绝、paused 状态两测试钉死）。
+
+**验证**：fmt/clippy `-D warnings` 干净；workspace 366 passed ×3 全绿（343 基线 + 23 个新回归测试）；前端 141、tsc 干净；`nm` daemon=0 / cli=4037（KD-E9 保持）。
+
+**遗留**：§39 P3 清单未动（按建议留手工验收后）；F-EXEC-6 的 tauri 事件胶合无单测——手工验收矩阵追加五项：有 exec 时关窗三分支、KEEP 隐藏后 dock 点击恢复、⌘Q 仍确认、无 exec 关窗直接退出、第二实例聚焦恢复。quit-STOP 失败「再弹一次提示」为设计选择未做（现版 eprintln 留痕）。
+
+### §41. `35acda6..d2dbcd6` · F-EXEC-1..11 修复 · code review（2026-10-21）
+
+**方法**：3 组并行评审，按修复范围分组：存储（1/8/9），收尾、超时与身份（10/11/2），控制面与 desktop（3–7）。tauri 侧对照源码核实（tauri 2.12.4、tauri-runtime-wry 2.12.2、rfd 0.16.0）。评审用独立的 `CARGO_TARGET_DIR`，避免和后台验证互相干扰。F-EXEC-11 由评审方把旧的两步写放回去重跑新测试，6/6 红，确认测试有效。
+
+**自动化验证（安静环境）**：
+- fmt、clippy `-D warnings` 干净；
+- workspace 跑 3 遍，每遍 366 passed、0 failed；
+- `exec_survives_launcher` 单独连跑 10 次全绿，§39 的 flake 已消除；
+- `nm` daemon=0；
+- 桌面 vitest 141 passed，`tsc` 干净。
+
+**逐条结论**：
+- **FIXED**：
+  - F-EXEC-1：A、A2、A3 三个场景都已闭合；完全迁移的 home 不误伤；测试在旧代码上会红。
+  - F-EXEC-2：A、B 两个场景已闭合；launcher 的 SIGTERM 不会造成 harness 孤儿。
+  - F-EXEC-4：幂等，测试在旧代码上会红。
+  - F-EXEC-7：建 run 之前完成全部校验；③ 之后所有失败都经 `fail_post_run` 补偿；复用的 run 不会被取消。
+  - F-EXEC-8：逐 home 隔离；非 UTF-8 归入 skipped_corrupt。
+  - F-EXEC-10：超时设在实际使用的 socket 上（自建连接后走 `from_stream`）；中途超时不会污染后续调用；租约释放全程受 30s 上限约束；keeper 最多 join 2s 后放手。
+  - F-EXEC-11：`finish_terminal` 一次事务写入全部终态字段，F-BENCH-26 的顺序保持不变。
+- **PARTIAL**：
+  - F-EXEC-3：Rust 侧已修。desktop 命令把错误吞成成功，见 F-EXEC-12。回归测试的失败源来自修复新加的 `get_agent` 损坏分支，若退回旧的 `?` 写法，测试不会红，原 bug 没有被钉住。
+  - F-EXEC-5：后端已修。ExecutionDialog 仍把 orphan 列在「空闲 Agent（续跑）」里（服务端会拒绝，属 UX 问题）；orphan 行仍显示「…可续跑」——所有 orphan 都带 SHIM_LOST_MARKER，而测试夹具的 failureDetail 为 null，没覆盖到。
+  - F-EXEC-6：`prevent_close` 生效；隐藏窗口不会触发 ExitRequested；窗口隐藏时 ⌘Q 仍会确认；dock 的 Reopen 能恢复窗口；第二实例也能恢复窗口。缺口是关窗确认框可以重入：rfd 在没有父窗口时弹的不是模态框，用户可能在一个框里选 KEEP，又在另一个过期的框里选 STOP。
+  - F-EXEC-9：删除与 `append_exec` 已正确互斥，锁顺序无死锁。但删除会丢失对账标记，见 F-EXEC-13。
+
+| ID | 级别 | 说明 |
+|---|---|---|
+| F-EXEC-12 | P2 | `exec_stop_all` 返回 `Ok(outcome.signaled_count)`，错误只 `eprintln!`。以前全部失败时返回 Err，前端拿到 null，显示「停止失败」；现在返回 `Ok(0)`，显示「当前没有运行中的 agent」。修法：errors 非空且 signaled 为 0 时返回 Err；部分失败时把 `{signaled, errors}` 传给前端（需改 TS 接口约定），并同步改 `stopAll` 和提示文案；补测试。 |
+| F-EXEC-13 | P2 | 两个窗口的结果相同：终态记录没有任何标记，对账找不到，租约永不释放。<br>(a) `finalize_agent_exec` 写终态时 `lease_release_pending=false`，到释放完成之间最长 30s。<br>(b) `delete_agent` 的锁内检查不看 exec 的对账状态。<br>修法：<br>① 有 run_id 且有释放回调时，在 finalize 同一个事务里先置 `lease_release_pending=true`，释放成功后再清除；<br>② 删除守卫在锁内拒绝两种 agent：存在 `run_id.is_some() && !reconciled && (lease_release_pending ‖ failure_detail ∈ markers)` 的 exec，或最新 exec 的 shim 仍存活。 |
+
+**P3（新发现，或修复的副作用）**：
+- *存储*：
+  - F-EXEC-1 让旧文件损坏的 home 永久处于降级状态，没有恢复入口；横幅文案「已降级为空列表（损坏文件已留证 .corrupt-*）」与实际不符（列表并不为空，文件也没有被改名）；atomic_json 注释所说的「移入 recovered/」机制并不存在。建议给出单独的 `legacyUnmigrated` 标志并附上路径，再提供一个「确认并归档」的动作。
+  - 删除操作竞争失败的一方会重建一个只含锁文件的空 agent 目录，从不清理；落败的 `append_exec` 报「不可追加」，而不是「不存在」。
+  - `.trash-*` 目录删除失败时被静默吞掉，也没有任何清扫，应 `eprintln!` 并在 `startup_housekeeping` 里清扫。
+  - 删除在 `remove_dir_all` 期间仍持有 flock；同进程的 `update_json` 会持着全局 `STORE_LOCK` 等待。应在 rename 之后立即释放 guard。
+  - `agent.json` 已被隔离的 agent，删除时报「不存在」，以前报「已损坏」。
+- *收尾、超时与身份*：
+  - 超时后 worker 线程被放手，`TempGrant` 不会 drop，`cli:<shim pid>` 的 admin 授权残留到下次 desktop 启动，pid 被复用时有提权风险。修法：shim 返回前幂等地移除自己的 principal。
+  - 如果 report 已成功、retry 遇到超时，item 会停在 failed 状态；对账只挑 running 状态的 item，于是永远不会 retry。
+  - shim 自写身份时，如果读取自身起始标识失败，会把 launcher 已写好的 `Some` 覆盖成 `None`，使 F-EXEC-2 场景 A 重新出现。应只在读取成功时写入，且绝不把 Some 降为 None。
+  - launcher 的 SIGTERM 到达时，shim 若已装好信号处理，仍会把 harness 拉起来（run 已被取消），最终 Killed 状态会覆盖 Failed。应在 `manager.spawn` 之前检查 `STOP_REQUESTED`。
+  - `kill_orphan` 仍是先写 status、再写 kill_reason 的两步写。`reconcile_agent`、`fail_and_compensate`、shim 失败路径也不是原子写，但不会出现「终态 + 空字段」。
+- *控制面与 desktop*：
+  - 关窗确认框可以重入，见上文 F-EXEC-6，建议用 `DIALOG_OPEN` 的 CAS 防重入；
+  - ExecutionDialog 仍列出 orphan；orphan 行仍显示「可续跑」；
+  - F-EXEC-3 的回归测试没有钉住原 bug；
+  - 改造前就存在：② `node/execute` 仍在校验之前执行，配置错误时节点会被留在 in_progress；
+  - launcher 身份写入失败时的 SIGTERM + 补偿分支没有测试；
+  - 几个测试在进程级设置环境变量（`OMT_SHIM_LEASE_TIMEOUT_MS` 等），与同一二进制里其他测试并行，目前安全，CI 负载高时可能 flake。
+
+**建议**：
+1. 先修 F-EXEC-12、13（两条都是小改动）。
+2. P3 中优先处理：shim 自写身份把 Some 覆盖成 None（会让 F-EXEC-2 重新出现）、超时后临时授权残留（提权）、orphan 行显示「可续跑」、关窗确认框重入。
+3. 其余 P3 放到手工验收之后。
+
+### §42. §41 两轮修复（2026-10-21，501d898）
+
+两批修复（Rust 批 + 前端/综合批），先红后绿：
+
+- **F-EXEC-12**：`exec_stop_all` 返回 `{signaled, failed}`；store 映射——全败 → null（「停止失败」保持 R2-7 语义，失败明细入 error state）、部分失败 → 通知条「已向 N 个 agent 发出停止信号，M 个停止失败」。**与 §41 字面偏差**：§41 要求全败走 Rust Err；实现为 Ok({0,[…]}) 由 store 归一到 null——可观察行为等价。4 个 store/panel 新测试。
+- **F-EXEC-13**：finalize 同一事务内有 run_id 即预置 `lease_release_pending=true`；`LeaseRelease` 改返回 `Result`，成功清除/失败保留，写入位于 exit 行与 terminal 发布**之前**（terminal()==Some 即反映最终态）；`delete_agent` 锁内守卫扩展为 §41 全集（pending，或 run_id+!reconciled+markers）——「存在待对账的租约——请等待对账完成后再删除」。
+- **F-EXEC-3 回归钉死**：§41 指出原测试的错误源是修复新增的损坏分支，钉不住旧 bug。pid-1 EPERM 向量在本机不可达（普通用户读不了 root 进程起始标识，实测确认）；落 §41 预案：`stop_all_with` 注入缝——首个 agent 注入 `kill(1): EPERM` 形状错误，第二个走**真实** stop_exec（活 sleep 收到 SIGTERM）。变异回旧 `?` 语义时新测试红、旧测试绿——两案并钉。
+- **F-EXEC-5 残余**：ExecutionDialog 续跑 optgroup 排除 orphan；orphan 行失败文案改「…请先强制终止后重新派发」（describeFailure 按 attachment 区分，可续跑字样不再出现在 orphan 行）；spec 夹具补 SHIM_LOST_MARKER 用例。
+- **P3 四项**：shim 自写身份仅在算出 Some 时写、绝不把 Some 降为 None；租约授权移出 run_bounded（超时即 drop——`cli:<pid>` 不再残留到下次启动，测试断言 principals 清空）；退出/关窗确认框 DIALOG_OPEN CAS 防重入（tauri 胶合无单测——手工验收：连按 ⌘Q 不叠框、关后再开正常）；shim 身份写入保持不变式。
+
+**验证**：workspace 374 ×3 全绿（372 基线 + 删除守卫扩展 + stop_all 钉死）；前端 148（+7）、tsc 干净；clippy/fmt 干净；nm daemon=0。
+
+**遗留**（§41 其余 P3，按建议留手工验收后）：旧版 home 降级横幅文案与恢复入口、`delete_agent` 竞争败方空目录残留、`.trash-*` 静默失败与清扫、remove_dir_all 持锁窗口、已隔离 agent 删除报「不存在」、report 成功后 retry 超时的 item 停 failed、STOP_REQUESTED 前置于 manager.spawn、kill_orphan 两步写、node/execute 先于校验（改造前既有）、launcher SIGTERM 补偿分支无测试、env-var 测试并行窗口。手工验收矩阵追加：关窗确认框防重入（连按 ⌘Q）。
+
+### §43. `501d898` · §41 修复 · code review（2026-10-21）
+
+**方法**：后端、前端两组并行评审。评审方用变异测试确认两处新钉子是有效的：把 `stop_one(exec)?` 改回去，`stop_all_continues_after_unsignalable_live_shim_and_signals_the_rest` 变红；把 TempGrant 挪回 `run_bounded` 内部，`lease_timeout_revokes_temp_grant_immediately` 变红。新的前端 spec 也在旧源码上跑过一遍，用来确认哪些用例真正有效。
+
+**自动化验证（安静环境）**：
+- fmt、clippy 干净；
+- workspace 3 遍全绿，374 passed；
+- `nm` daemon=0；
+- 桌面 vitest 148 passed，`tsc` 干净。
+
+**逐条结论**：
+- **F-EXEC-12：FIXED。**
+  - Rust 返回的 `{signaled, failed}` 与 TS 的 `StopAllOutcome` 完全一致。
+  - 唯一的 TS 调用链（App → store.stopAll → AgentsPanel）已全部适配。Rust 侧退出 / 关窗的 STOP 路径直接调 `control::stop_all`，不受影响。
+  - 全部失败时返回 Ok、由 store 归一成 null，这一偏差在用户可见行为上与 §41 等价。
+- **F-EXEC-13：PARTIAL。**
+  - finalize 在同一事务里预置 pending；`LeaseRelease` 改为返回 Result；pending 在 exit 行与 terminal 发布之前写入；删除守卫在锁内检查。
+  - 但守卫谓词过宽，而且存在双重释放的竞态，见 F-EXEC-14。
+  - 没有释放回调时 pending 永远为 true，生产中只有 shim 会用到 `ExecutionManager`，且一定装了回调，所以只影响测试。
+- **F-EXEC-3 钉子：FIXED。** `stop_all_with` 是私有注入缝，公共 API 没变；变异确认有效。
+- **F-EXEC-5 残余：FIXED。**
+  - ExecutionDialog 的续跑分组排除了 orphan。
+  - 按绑定预选只会选中 harness，不会设置 `targetAgentId`，所以选不中 orphan 来续跑。
+  - orphan 行的文案改为「请先强制终止后重新派发」。
+- **P3 四项：FIXED。**
+  - shim 写自身身份时只写 Some，绝不把 Some 降为 None。
+  - 授权在 `run_bounded` 外部持有，Ok、Err、超时三种情况下都会 drop。
+  - 退出与关窗共用 `DIALOG_OPEN` 的 CAS，每个回调分支的第一句都清零；rfd 的显示错误和被丢弃的 oneshot 都归为 Cancel，回调一定会触发，应用不会卡在无法退出。
+  - `cli_main.rs` 只改了 exec-shim 分支（换成 Leaser 闭包），普通 `omt` CLI 的行为不变。
+- **测试有效性**：7 个新的前端用例里有 4 个在旧代码上会红。另外 3 个 store 用例（部分失败返回 outcome、全部成功、invoke 被拒）在旧代码上也是绿的——旧 store 原样透传 invoke 的结果——因此没有钉住这次的改动。
+
+| ID | 级别 | 说明 |
+|---|---|---|
+| F-EXEC-14 | P2 | 守卫 ① 的注释写「与 list_reconcile_targets 同一谓词」，实际上少了 `run_id.is_some() && !reconciled`。<br>**触发**：desktop 在 shim 释放租约的窗口内重启，shim 路径对账与 shim 同时释放：<br>1. desktop 先 `mark_reconciled`（reconciled=true、pending=false）；<br>2. shim 的重复 report / retry 出错；<br>3. `finish_terminal` 写回 pending=true；<br>4. 这个 agent 从此永远删不掉。<br>另一条路径：shim 被误判为 SHIM_LOST，U10 先完成对账，之后 shim 收尾时释放失败。<br>**修法**：<br>① 守卫 ① 补上 `run_id.is_some() && !reconciled`，与对账真正同谓词；<br>② `finish_terminal` 和 finalize 的预置在 `exec.reconciled` 为真时跳过；<br>③ 对账跳过 shim 身份仍然存活的 exec（由 shim 自己收尾），这同时消除双重释放；<br>④ 为永远无法释放的租约（run 或 home 已被删）提供「放弃租约 / 强制删除」入口。 |
+| F-EXEC-15 | P2 | 501d898 把 `leaser(&home_path, &home_id)`（内部是 `DaemonLink::connect`）移出了 `run_bounded`。一个只卡在 declare 上的半卡死 daemon，会让 `finish_terminal` 阻塞约 130s。**修法**：把 connect 放回 bounded 闭包里，授权通过 `Arc<Mutex<Option<TempGrant>>>` 交回调用方，在上限到期后由调用方 drop；或者给 connect 本身设截止时间。同时补一个 Leaser 慢连接的超时测试。 |
+
+**P3**：
+- *退出流程*：
+  - 选「全部停止后退出」时，DIALOG_OPEN 在 `stop_all_execs` 之前就被清零，这个窗口里按 ⌘Q 仍会叠出第二个确认框，应用随后带着一个无法应答的框退出。修法：会退出的分支（STOP、退出路径上的 KEEP）不清零，或在 `stop_all_execs` 之前先置 `QUIT_CONFIRMED`。
+- *停止全部*：
+  - 部分失败的明细只进了 stderr，界面只显示「M 个停止失败」，看不出是哪个 agent。
+  - 全部失败时在 `scheduleAgentsRepull()` 之前就返回了，被对账成 Failed 的行会一直显示过时状态。
+  - 面板的文案依赖 store 的归一化：`signaled===0` 时不检查 `failed`。
+- *对账*：双重释放用陈旧快照做 admin report，可能误伤其他 exec 刚认领的 item（与 F-EXEC-14 同源，置信度 50）。
+- *测试*：3 个 store 用例在旧代码上同样为绿，没有钉住改动。
+
+**遗留**：§42 列出的 §41 其余 P3 仍未处理（降级横幅与恢复入口、`.trash-*` 清扫、remove_dir_all 期间持锁、STOP_REQUESTED 前置、kill_orphan 两步写等）。
+
+**建议**：F-EXEC-14、15 都是小改动，修完后本轮即可收口。F-EXEC-14 中「对账跳过 shim 仍存活的 exec」这一条同时解决删不掉的陷阱和双重释放，优先级最高。其余 P3 放到手工验收（含 §40/§42 追加的验收项）之后。
+
+### §44. §43 修复（2026-10-21，c72830c）
+
+**F-EXEC-14**（四项修法全部落地，先红后绿）：
+- ① 删除守卫与 `list_reconcile_targets` 精确同谓词（`run_id.is_some() && !reconciled && (pending ‖ markers)`）——reconciled=true 的 pending 僵尸记录恢复可删；
+- ② `finish_terminal` 的 Err 回写与 finalize 预置在 `exec.reconciled` 已真时不再置 pending；
+- ③ 两条对账路径（`reconcile_with_connector` / `reconcile_interrupted_execs_with`）跳过 shim 身份仍存活的 target（不标记、留给 shim 自己收尾）——双重释放窗口与「误伤其他 exec 刚认领的 item」同源消除；
+- ④ `agents_delete` 增 `force`（只绕过租约守卫，Starting/Running/Orphan 仍拦）；前端两级确认「放弃租约并删除」接线 + 2 个 vitest。
+- 回归测试：僵尸可删 / Err 不重置 pending / 存活 shim 被跳过×2 / force 绕过租约但不绕过运行守卫。
+
+**F-EXEC-15**：connect（enroll+declare）移回 `run_bounded` 计时内；授权改为计时段**之前**以确定性 principal `cli:<pid>` 预建（TempGrant 本地文件 IO，非阻塞源），Ok/Err/超时三种结局都 drop——慢连接测试把 ~130s 场景钉回有界（变异验证：connect 挪回外面则测试红）。`admin_rpc_prepared` 校验握手 principal 与预期一致。
+
+**§43 P3**：
+- STOP/退出分支不再提前清 `DIALOG_OPEN`（停止进行中再按 ⌘Q 不叠框；只有回到正常运行的分支清零）——手工验收矩阵追加「选『全部停止后退出』后立即再按 ⌘Q」；
+- 停止失败明细带 agent 名（`agent <id>: <err>`），面板全败/部分失败都显示具体是谁（截断前 2 + 等 N 个）；全败路径也 `scheduleAgentsRepull`；
+- 3 个不钉改动的 store 用例：2 个重写为在旧 store（0310069 形态）上实测会红（含相邻段 null 断言），invoke-拒收那个标注为行为守卫（旧代码同形，非回归钉子）。
+
+**验证**：workspace 380 ×3 全绿（374 + 6 新 Rust）；前端 155（+7）、tsc/build 干净；clippy/fmt 干净；nm daemon=0。
+
+**勘误（2026-10-21，§45 评审）**：前述「2 个 store 用例改写后在旧 store 上实测会红」应为 1 个——仅全失败相邻段断言在旧 store 上红；另一个（invoke 拒收）为行为守卫（旧代码同形，见其测试注释）。另 F-EXEC-15 一节「TempGrant 本地文件 IO，非阻塞」不准确：TempGrant 增删各受 10s flock 上限，锁竞争下最坏约 70s（计时段外实际最坏约 30s）。
+
+### §45. `c72830c` · §43 修复 · code review（2026-10-21）
+
+**方法**：后端、前端两组并行评审。后端对每一项修复都做了变异测试，把修法退回去，对应的新测试都会变红：
+- 删除守卫两例；
+- finalize 预置、Err 回写、对账跳过存活 shim，共四例；
+- 把 connect 挪回计时段外，慢连接测试在 31s 处变红。
+
+前端把 spec 分别放在三种 store / 面板形态上跑，确认哪些用例真正有效。
+
+**自动化验证（安静环境）**：
+- fmt、clippy 干净；
+- workspace 3 遍全绿，380 passed；
+- `nm` daemon=0；
+- 桌面 vitest 155 passed，`tsc` 干净。
+
+**逐条结论**：
+- **F-EXEC-14 ①：FIXED。** 删除守卫与 `list_reconcile_targets` 现在是同一个谓词；`reconciled=true` 且 `pending=true` 的残留记录可以删除。
+- **F-EXEC-14 ②：FIXED。** 生产中把 pending 写成 true 的只有两处（finalize 预置、`finish_terminal`），都在加锁的读改写里，且都加了 `!exec.reconciled`；`reconciled` 只会被置为 true。所以无论对账和 shim 释放谁先谁后，最终都是 pending=false、reconciled=true。
+- **F-EXEC-14 ③：FIXED。**
+  - `target_shim_alive` 与 P-8 的 `reconcile_agent` 用同一个谓词，而 P-8 在两条对账路径之前同步运行，两者一致；
+  - 收尾中的 shim 已是终态，P-8 不会碰它，对账也会跳过它；
+  - 残余（罕见）：身份检查假阴性（start-id 缺失或 `proc_pidinfo` 失败）时仍可能双重释放，此时陈旧快照的 admin report 仍可能误伤别的 exec 刚认领的 item；pid 复用不算假阴性。
+- **F-EXEC-14 ④：守卫语义 FIXED，出口描述失实。**
+  - `force` 只绕过租约守卫，运行中与 Orphan 的守卫在它之前；
+  - 只有 AgentsPanel 第二步确认会发送 `force=true`，CLI、MCP、daemon 都发不出；
+  - 但「交由 daemon 对账收尾」与事实不符，见 F-EXEC-16。
+- **F-EXEC-15：FIXED。**
+  - daemon 用 peer pid 构造 principal（`auth.rs:124`，pid 取自 `ipc.rs` 的 LOCAL_PEERPID），与 shim 的 `std::process::id()` 一致；
+  - 不一致时在计时段内返回 Err，授权被 drop，pending 保留；
+  - 授权窗口扩大到覆盖 connect，但只对 shim 自己的 pid 有效，按 §39 / P-1 可以接受；
+  - 计时段外只剩 TempGrant 的增删（各受 10s 的 flock 上限约束），实际最坏约 30s，锁竞争时约 70s——§44 写的「非阻塞」不准确。
+- **§43 P3 三项：FIXED。**
+  - DIALOG_OPEN 六个分支逐一核实：只有回到正常运行的分支（关窗 KEEP、关窗 CANCEL、退出 CANCEL）清零，所有退出分支都在 `exit(0)` 之前置 `QUIT_CONFIRMED`；
+  - 停止失败带上明细，全部失败时也会重拉列表；
+  - 面板对失败有独立判断。
+- **测试有效性**：§44 说「2 个 store 用例改写后在旧 store 上实测会红」，实际只有 1 个会红，而且只是因为追加了一段全失败的断言，与既有用例重复；另一个对透传式 store 同样是绿的（测试注释自己也承认）。面板侧 4 个新用例全部有效。
+
+| ID | 级别 | 说明 |
+|---|---|---|
+| F-EXEC-16 | P2 | 强制删除让租约永久泄漏，界面和注释却写「交由 daemon 对账收尾」「租约留给 daemon 侧自行回收」（AgentsPanel.tsx:523、bridge.ts:328、src-tauri agents.rs:17、omt-exec agents.rs:442）。<br>· daemon 不回收租约：omt-runtime 从不调用 `janitor_sweep`。<br>· 删除抹掉的是唯一的对账依据，run item 永远停在 running。<br>· 一次瞬时拒绝就会触发第二步，用户可能放弃一个本可以释放的租约。<br>**修法（择一或组合）**：<br>① 强制删除前，先用 `admin_connector` 尽力 `release_items_for_exec` 一次，成功就走普通删除；<br>② 只在 `run/get` 返回 not-found（run 或 home 已不存在）时才提供强制删除；<br>③ 文案如实说明「run item 可能一直显示运行中，需在 Runs 面板取消该 run」，删掉「交由 daemon 对账收尾」，并保留后端的原始提示（「请等待对账完成后再删除」）。 |
+
+**P3**：
+- *强制删除第二步的 UI*：
+  - 3s 后自动复位，不适合一段两行的不可逆警告；屏幕阅读器也不会播报内容切换，违反 WCAG 2.2.1。应去掉自动复位，焦点移到第二步的确认按钮，并加上 aria-describedby。
+  - 不可逆按钮只写「确认」，标题里也没有 agent 名称。应改为「放弃租约并删除」，并带上 `agentDisplayName`。
+- *停止失败明细*：用的是内部 id `agent-<execId>`，与界面上显示的名称对不上；§44 说「带 agent 名」不准确。应改用 `display_name`（保留 exec id），或在面板里把 id 映射成名称。
+- *过期注释*：agents.rs:511-514 写「shim 收尾前 agent 状态不会是终态」，实际上 finalize 先写终态，最多再过 30s 才释放租约。目前无害，注释应更正。
+- *假阴性残余*：身份检查假阴性时，desktop 把仍在运行的 harness 标为已对账，它之后新认领的租约因为 ② 不再置 pending，也就不会被对账（置信度 50）。
+- *既有边界*：`run_on_main_thread` 失败时插件会静默丢掉回调，DIALOG_OPEN 可能卡住（需要事件循环已经退出，几乎不可达）。
+
+**建议**：F-EXEC-16 是本轮唯一的 P2。最省事的组合是 ① + ③：先尽力释放一次，再如实说明后果。改动都不大，修完后本系列可以收口；其余 P3 放到手工验收之后。
+
+### §46. §45 修复（2026-10-21，c8abc6a）
+
+- **F-EXEC-16 ①+③**：`agents_delete(force)` 先经 admin connector 尽力释放该 agent 的未对账租约（新 `executor::force_release_agent_leases`——镜像对账循环、不跳存活 shim、逐项 best-effort 不中止；`is_reconcile_target` 谓词统一为单一来源），响应带 `leasesReleased`/`leaseReleaseFailures`；四处「交由 daemon 对账收尾/租约留给 daemon」全部改为如实后果（「run item 可能一直显示运行中，需到 Runs 面板手动取消该 run」），保留后端原始「请等待对账完成」提示。2 个 Rust 测试 + 前端文案断言（禁语零残留，grep 验证）。
+- **P3-1**：强制删除第二步去掉 3s 自动复位；按钮「放弃租约并删除 <显示名>」；出现时聚焦确认按钮 + `aria-describedby` 指向警告文本。
+- **P3-2**：停止失败明细改 `Agent N (exec-id): <err>`（display_name，缺失回退内部 id）。
+- **P3-3**：agents.rs 过期注释更正（finalize 先写终态、其后最多 ~30s 租约释放窗口）。
+- **P3-4**：§44 追加勘误（旧 store 上会红的 store 用例实为 1 个而非 2 个；TempGrant 增删受 10s flock 上限、锁竞争下最坏 ~70s，非「非阻塞」）。
+
+**验证**：workspace 382 ×3 全绿（380+2）；前端 158（+3）、tsc 干净；clippy/fmt 干净；nm daemon=0。
+
+### §47. `c8abc6a` · F-EXEC-16 修复 · code review（2026-10-22）
+
+**范围**：改动约 570 行，由评审方直接通读 diff，没有分派子评审。
+
+**验证**：
+- **前端**：vitest 158 passed，`tsc` 干净。
+- **Rust 侧本轮无法执行**。clippy、test、build 都在构建脚本这一步失败：`failed to link or copy …/build_script_build-… → build-script-build: Operation not permitted (os error 1)`。排查经过：
+  - 关闭沙箱后依旧失败；
+  - 绕过 `cargo`→`mbx` 的 alias、直接用真 cargo 依旧失败；
+  - 换全新的 `CARGO_TARGET_DIR` 后，tauri 的构建脚本同样报 EPERM；
+  - 手工执行 `ln` 也报 EPERM：文件带 `com.apple.provenance` 扩展属性，系统拒绝为它建硬链接。
+  
+  结论：这是系统层的权限限制，不是代码问题。前几轮在同一个仓库里都能正常构建，所以是环境变了。本轮 Rust 侧的结论只基于读代码；新增的两个 Rust 测试是否通过，需要在可构建的环境里补跑 `cargo test --workspace`。（本轮输出的 `nm` daemon=0 读的是之前留下的旧二进制，不计入。）
+- **Rust 补跑（同日稍后）**：换用全新的 `CARGO_TARGET_DIR=/tmp/omt-verify-target`，并排除 desktop crate（只有它的 tauri 构建脚本受 EPERM 影响）后，可以正常构建：
+  - `cargo test --workspace --exclude oh-my-ticket-desktop` 跑 3 遍全绿，373 passed、0 failed；
+  - 两个新测试 `force_release_agent_leases_*` 实际运行并通过；
+  - 上述 crate 的 clippy `-D warnings` 干净；
+  - 新构建的二进制 `nm`：omt-daemon 为 0、omt 为 3989，KD-E9 成立。
+  
+  仍未覆盖的：desktop crate 自身的 9 个测试和它的 clippy。本轮 desktop Rust 侧的改动只有 `agents_delete` 的 force 分支（调用已测试过的 `force_release_agent_leases`），风险低，但需要在恢复构建的环境里补跑。
+- **环境恢复后的全量补跑**：默认 target 目录重新可以构建。`cargo clippy --workspace --all-targets -D warnings` 干净，fmt 干净；`cargo test --workspace` 全绿，382 passed（其中 desktop crate 9 个），0 failed。至此 `c8abc6a` 的验证缺口已全部补齐。
+
+**逐条结论**：
+- **F-EXEC-16 ①：FIXED。**
+  - `agents_delete(force)` 先调用新的 `executor::force_release_agent_leases`：只处理该 agent 里仍是对账目标的 exec，按各自 spec 中的 home 连接，加 admin 授权后 `release_items_for_exec`，成功则 `mark_reconciled`；
+  - 逐目标失败（包括 spec 缺失）记入 `failures`，不中断删除；
+  - 有意不跳过 shim 仍存活的目标，理由已写进函数文档：用户主动 force 时，不释放的代价是对账依据消失，比重复释放更糟。
+  - 两个 Rust 测试覆盖了：只作用于本 agent、使用 spec 中的 home、存活 shim 也会释放、失败不标记、spec 缺失计为失败、agent 不存在时报错。
+- **F-EXEC-16 ③：FIXED。** 四处「交由 daemon 对账收尾」的说法（UI、bridge、两处 Rust 注释）都改成了实际后果：「若释放失败，该 run item 可能一直显示运行中，需到 Runs 面板手动取消该 run」。
+- **对账谓词收拢：FIXED。** 新增 `agents::is_reconcile_target` 作为唯一判断依据，`list_reconcile_targets`、删除守卫、强制释放三处共用，不会再出现 F-EXEC-14 ① 那种谓词各写一份、彼此不一致的问题。
+- **§45 P3 三项：FIXED。**
+  - 第二步确认去掉了 3s 自动复位；按钮文字改为「放弃租约并删除 <展示名>」；出现时聚焦该按钮，并用 `aria-describedby` 关联后果说明；
+  - 停止失败的明细显示为「Agent N (exec-id)」；
+  - 过期注释已改正。
+
+**P3（新）**：
+- *释放结果没有给到用户*：`agents_delete` 返回了 `leasesReleased` 和 `leaseReleaseFailures`，但 `store.deleteAgent` 直接 `await` 后丢弃了返回值，界面只有一句「若释放失败……」的条件提示，用户无从知道这次是否真的放弃了租约、该去取消哪个 run。建议有失败时用通知条列出对应的 exec 和 run_id，并引导去 Runs 面板。（置信度 100）
+- *desktop 端没有总时限*：force 分支在 desktop 进程里同步释放，没有 shim 那样的 `run_bounded` 总上限。每个目标都要连接（拉起 daemon 最长 10s）加上若干 30s 读超时，daemon 半卡死时「删除中…」可能持续几分钟，期间没有任何反馈。启动对账也有同样的性质（改造前就存在）。建议给整个释放过程一个上限，例如 30s 后把剩余目标记为失败。（置信度 75）
+- *双重释放残余*：force 不跳过存活 shim 是有意的设计，但收尾中的 shim 和 force 同时释放时，陈旧快照发出的 admin report 仍可能误伤别的 exec 刚认领的 item（与 §45 同源，置信度 50）。
+
+**结论**：F-EXEC-16 修复到位，这个系列的 P2 已全部清零。待办：① 在可构建的环境里补跑 Rust 全量验证；② 把释放结果展示给用户（建议在手工验收前补上）；③ 其余 P3 放到手工验收之后。
+
 ### 残留状态核查（第二轮验收后）
 
 失败尝试在 daemon 侧已成功创建 RUN-0001（pending，持有 TICKET-0001，无执行器），EPIC-0001/TICKET-0001 被 node/execute 标为 in_progress。重试无需清理：ensure-run 复用路径按 pending → start 正常接管（已实测 run-get 确认）。
@@ -1195,3 +1901,494 @@ opencode 本就无发现开销（工具直声明），homeId 修复后同样 3 �
 **凡 mock 对端（daemon 响应形状 / MCP 测试客户端 / 任何协议测试替身），必须从规范或真实对端反推，不得从自己的实现反推**——本日志同类问题三次：F-ACC-1/4（字段名 mock 漂移）、F-ACC-9（分帧协议漂移）。真实对端接入（本地验收）是唯一能稳定暴露这类自洽错误的手段，应尽早纳入每个 provider 的 U 单元出口。
 
 **凡 mock daemon 响应形状，必须从 `views.rs` 序列化反推，不得从实现代码的读取端反推**——读取端错则 mock 跟着错，测试形同虚设。两个新契约测试把形状钉死在测试体里，后续字段变更会先红在这里。
+
+### 执行面子项目 2 验收（2026-10-23）
+
+实现序列 `ddb8ce3` 起（A1–A8 已提交；A9 本轮）。设计 §7 子项目 2 行已标「已完成」；§8 `run/claim` 一条已按实测结论改写（只激活祖先、不改节点本身，按 Q-2 接受现状）。
+
+**自动化验证（已全绿）**：`cargo test --workspace` 432 passed / 0 failed（较子项目 2 前基线 431 +1，即 A9 新增 `cli_exec_start_launches_tails_and_records_origin`——真 daemon + 假 harness 的 CLI 派发全链路：`exec start` 返回 `{agentId, execId, runId}` → `exec tail` 分页追到 `exit`、`done: true` → `exec status` 记录 `launchedBy: "cli"` → 节点未被 `node/execute` 改态、保持 `open`）；clippy `-D warnings`、fmt 干净；`nm -a target/debug/omt-daemon | grep -c -E 'omt_exec|omt_harness'` = 0（KD-E9）；桌面 vitest 167 passed（含 A8 新增 exec-policy.spec.tsx）+ `tsc --noEmit` 干净；根 vitest 447 passed。`local_tools_cli.rs` 共 5 例，另覆盖：无 daemon 的只读动词（`harness list` / `exec policy` 显示 `source: default`）、`allowFromCli: false` → exit 3 + `POLICY_DENIED`（field `allowFromCli`）、嵌套标记 `OMT_EXEC_ID` 拒 start/stop（field `nestedDispatch`，只读动词不受影响）、`exec list` 空态与 `exec status` 未知 id 的 `NOT_FOUND`。
+
+**验收环境与 CLI 复合链实测（`~/omt-accept/`，`/tmp` 之外——见子项目 1 验收环境注记）**：假 pi（Manual 脚本）+ 真 daemon。复合链全绿：`daemon-start`/`daemon-status` → `harness list`（pi enabled，`envKeys: []`、`extraArgs` 已脱敏）→ `harness models pi`（假二进制列不出模型，空表为预期）→ `create` epic→story→ticket → `exec start --harness pi --node TICKET-0001` 立即返回 `{agentId, execId, runId, warnings: []}` → `exec tail` 事件 `session_start / raw / exit`、`done: true` → `exec status` `launchedBy: "cli"`、agent `exited`、`exitCode 0` → `exec list --all-homes` 一条、`launchedBy: "cli"` → `show` 节点保持 `open`（Q-2）。策略反例：写 `{"allowFromCli": false}` 后 `exec start` → exit 3、`POLICY_DENIED`（field `allowFromCli`）；已还原默认并 `daemon-stop`。
+
+**待手工验收矩阵（plan A9 Step 4；验收环境 `~/omt-accept/`）**：
+
+| # | 场景 | 期望 | 结果 |
+|---|---|---|---|
+| 1 | 设置页「派发策略」：默认显示 MCP 关闭；打开并保存 | `exec/policy.json` 写出；`omt exec policy` 显示 `source: file`、`allowFromMcp: true` | ✔（2026-10-25）：默认 `source: default`、`allowFromMcp: false`；设置页打开 MCP 派发并保存后写出 `exec/policy.json`（权限 0600），`omt exec policy` 显示 `source: file`、`allowFromMcp: true` |
+| 2 | 主控（Claude Code 配置 `omt mcp`）调用 `harness__list`、`harness__models pi` | 返回已启用 harness 与 pi 的模型列表 | ✔（2026-10-25）：协议层（stdio 驱动 `omt mcp`）与真实 Claude Code（`claude mcp add` 配置 `omt mcp`）均正常返回；真 pi 模型 61 个含 `kimi-coding/k3` |
+| 3 | 主控 `exec__start {homeId, harness: "pi", model: "kimi-coding/k3", nodeId: <快速 ticket>}`（ticket 在 workspace 内的 `.omt` 里） | 立即返回 `{agentId, execId, runId}`；**5 秒内**桌面端 Agents 面板出现新 agent，带 `MCP` 标签；选中它后实时 transcript 可见；跑完 run completed | ✔（2026-10-25，真实 Claude Code + 真 pi）：派发 TICKET-0005 立即返回；用户确认桌面端 Agents 面板出现带 `MCP` 标签的 agent、实时 transcript 可见；CLI 侧 `exec-18607-1` `launchedBy: mcp`、exit 0、RUN-0005 completed、ticket done，`hello.txt` 已写出 |
+| 4 | 主控 `exec__tail` 循环直到 `done` | 能拿到完整事件，末尾是 exit | ✔（2026-10-25，MCP 协议层）：`done: true`，事件 `session_start / raw / exit`，末条 exit code 0 |
+| 5 | 设置页关闭 MCP 派发后，主控再 `exec__start`（不重启 MCP 会话）；再在设置页重新开启并再调一次 | 关闭时 `POLICY_DENIED`（field `allowFromMcp`）、`exec__start` 仍在 tools/list 中；重新开启后无需重启会话即可派发成功 | ✔（2026-10-25，协议层 + 真实 Claude Code）：设置页关闭后 `exec__start` 返回 `POLICY_DENIED`（文案点名 `allowFromMcp`）且仍在 tools/list，只读工具（`harness__list` 等）照常可用（设计如此，Q-4 只约束派发）；重新开启后同一 MCP 进程（pid 18607）派发 TICKET-0002 成功（`exec-18607-3`，exit 0）；被拒调用只占一个序号，不留 agent / exec 记录 |
+| 6 | 被派发的 harness 自己的 MCP 工具列表 | 不含任何 `harness__*` / `exec__*` | ✔（2026-10-25，真实派发环境）：假 pi 在 exec 内经 shim 生成的启动器（`omt --actor exec:<execId> mcp`）列工具，无任何 `harness__*` / `exec__*` |
+| 7 | `maxConcurrent: 1` 时连续两次 `omt exec start` | 第二次 `POLICY_DENIED`（field `maxConcurrent`） | ✔（2026-10-25，CLI）：第二次 `POLICY_DENIED`（field `maxConcurrent`），exit 3 |
+| 8 | `omt exec stop <execId>` | 3 秒内 `killed`，item 回 pending | ✔（2026-10-25，CLI）：0.31 s 变 `killed`（`killReason: user`），item 回 `pending`（假 pi 未认领；认领后停止的路径随第 3 行真 pi 复核） |
+| 9 | 桌面端派发（任一 harness） | 与子项目 1 完全一致，不受 policy 影响 | ✔（2026-10-25，用户在桌面端操作）：真 pi（kimi-coding/k3）派发 TICKET-0006，`launchedBy: desktop`、exit 0、RUN-0004 completed、ticket done，`desk.txt` 已写出 |
+| 10 | 故意写坏 `exec/policy.json` | 设置页显示「策略文件无效」并预填默认值；CLI/MCP 派发 `POLICY_INVALID`；`omt exec stop` 仍可用；桌面端派发不受影响 | ✔（2026-10-25）：CLI `exec policy` 与 `exec start` 均 `POLICY_INVALID`；写坏前已启动的 exec 仍可 `exec stop`（killed）；设置页显示「策略文件无效：POLICY_INVALID …」并预填默认值（CLI 开、MCP 关、pi/omp/opencode、并发 4、1800 秒）；文件仍坏时桌面端派发正常完成（`exec-88716-4`，RUN-0006 completed） |
+| 11 | 被派发的 harness 在自己的 shell 里执行 `omt exec start …` 与 `omt exec stop …`（可让测试 ticket 要求它这样做） | 均 `POLICY_DENIED`（field `nestedDispatch`）；它的 MCP 工具列表里没有任何 `harness__*` / `exec__*` | ✔（2026-10-25，真实派发环境）：exec 内 `omt exec start` / `exec stop` 均 `POLICY_DENIED`（field `nestedDispatch`），`allowFromMcp` 打开时同样被拒；MCP 工具列表同第 6 行 |
+| 12 | 设置页关闭 CLI 派发后，在终端执行 `omt exec start --harness pi --node <ticket>` | `POLICY_DENIED`（field `allowFromCli`）——同时证明关 MCP 不等于关掉 agent 经 shell 的派发 | ✔（2026-10-25，CLI）：`POLICY_DENIED`（field `allowFromCli`），exit 3 |
+| 13 | 对全局 home（`~/.omt`）里的 ticket 执行 `omt --home ~/.omt exec start …` | `POLICY_DENIED`（field `workspaces`），没有在用户主目录下拉起 harness | ✔（2026-10-25，CLI）：`POLICY_DENIED`（field `workspaces`），全局 home 下无 agent、无 harness 进程（其 `omt.db` 为 daemon 启动时默认打开全局 home 所建，时间戳与 daemon 启动一致） |
+| 14 | 主控 `harness__list` | 返回的条目只有 `envKeys`（键名），看不到任何 env 值；`extraArgs` 已脱敏 | ✔（2026-10-25，CLI + MCP 协议层）：pi 只返回 `envKeys`（键名），`extraArgs` 为 `--api-key= ***`；两路输出中均搜不到密钥值 |
+
+
+**2026-10-25 验收环境**：`~/omt-accept/sp2/`（`rt` 为 runtime dir、`globalhome` 为全局 home、`ws/.omt` 为工作区 home、`env.sh` 为环境变量；daemon 由 `omt --home ws/.omt daemon-start` 拉起，二进制为 `feat/harness-benchmark` HEAD `9765218` 的 `target/debug`）。CLI 与 MCP 协议层的行由主控执行；第 1、3、9 行与第 10 行的界面部分需桌面端（同一 runtime dir 下 `pnpm tauri:dev`），第 2、3、5 行的 Claude Code 冒烟需真实客户端。
+
+**2026-10-25 验收结论**：14 行全部通过。验收中发现 1 条 P3：`apps/desktop/src/ExecPolicySection.tsx:95` 文案「无人值守运行（pi `--auto`、omp `--approval-mode=yolo` 等）」有误——`--auto` 是 opencode 的放行参数（`harness.rs:212`），pi 没有无人值守参数（`harness.rs:247` `unattended_flag: &[]`，本身无审批层）；已随验收收口提交改为「opencode `--auto`、omp `--approval-mode=yolo`；pi 本身没有审批层」。另记两条观察（不影响结论）：同一 exec 的 extraArgs 在 tail 事件里为 `--api-key=***`、在 status 里为 `--api-key= ***`（两条脱敏路径输出格式不一致）；第 8 行假 pi 未认领 item，「认领后停止 → item 回 pending」未单独覆盖（F-ACC-12 历史验收覆盖过同路径）。
+
+**自动化旁证**（不替代手工验收）：第 4 项的分页 tail 与 exit 收尾 = A9 e2e（CLI 路径）+ A4 `transcript_page` 单测；第 7 项 = A3 `check_capacity` 单测与跨进程锁测试；第 11 项 = `nested_dispatch_marker_denies_start_and_stop`（CLI）+ A6 mcp_spec 的注入桥不暴露断言；第 12 项 = `exec_start_denied_by_policy_exits_3_with_structured_problem` 与 `~/omt-accept/` 实测；第 13 项 = A4 `workspace_scope_denial` 单测（Q-13）；第 14 项 = A4 `list_value` 投影单测 + `~/omt-accept/` 实测输出。第 3/5 项的「tools/list 始终列出 8 个本地工具」由 A7 契约测试与 A6 mcp_spec 钉住。
+
+### §48. Part B · P3 清理（2026-10-23，0c1c29f..b7a514e）
+
+按 Part B 分诊表落地：B1 daemon 缺 token 规则（P3-ACC-2）；B2 派发链与拉起（P3-ACC-4/5、§41 拉起前停止、§39 宽限期停止、§41 launcher 补偿分支测试、F-U1-7 版本探测回落 stderr）；B3 租约释放与对账（P3-ACC-8、§41 failed 残项、§39 快照回写、§39 对账器串行——进程内排队各跑一轮、跨进程跳过，§45/§47 假阴性按存活）；B4 daemon_link 与 shim（§39 陈旧 descriptor / daemon 僵尸 / 保活下限 / 授权泄漏，orphan 整组强杀 + 单事务）；B5 存储与安全（§39 tail 穿越与迁移中断回落、MCP 清扫锁内快照与 fsync，§41 删除四项 + 残留清扫）；B6 旧版 home 降级说明、损坏 agent 的解冻说明与两步「确认并归档」（§41）；B7 桌面 UI（P3-ACC-6 Esc、§47 应用级被放弃租约通知 + 前往 Runs 与总时限、删除时移除绑定、§39 前端三项、§39 清扫挪进 setup、§39 跟随者不提前放弃 / 每 exec 唯一）；B8 工具链与记账（P3-ACC-7、§41 测试环境变量、F-BENCH-8、F-BENCH-12 核实）。
+
+**won't-fix**：§39 dock-quit-bypass（效果等同后台继续）、§45 run-on-main-thread-drop（事件循环退出后才可达；B7 后不再经过插件）、§47 force-double-release（已接受的取舍）。
+
+**后续项**：daemon janitor（过期租约回收）；omp title 事件与 §17 三项（孤儿 transcript 采纳 / pid 复用 cmdline 校验 / 从 transcript 重建损坏 agents.json）——增强性质而非缺陷 / 窄崩溃路径，不在 P3 清理范围；桌面端派发的 node/execute 先于校验（CLI/MCP 发起已由 Q-2/A2 绕开 node/execute；桌面端派发仍先 node/execute，校验前置列入后续项）。
+
+**待手工验收**：ACC-14；ACC-6 的 UI 确认；B7 Step 9（Esc / 第二实例无清扫日志 / 重载后不重复推事件）。
+
+**验证**：fmt、clippy `-D warnings` 干净；`cargo test --workspace` 三遍全绿；`nm -a target/debug/omt-daemon | grep -c -E 'omt_exec|omt_harness'` = 0（KD-E9）；桌面 vitest 全绿、tsc 干净。
+
+### §49. 子项目 2 实现 · code review（2026-10-24，`ddb8ce3..0754660`）
+
+**范围与方法**：17 个提交（A1–A9、B1–B8），64 个文件，约 +16.3k / −0.6k 行。xterm 相关调研不在本轮范围。4 个并行评审：① A 部分执行面核心（policy / launch 锁 / 派发链 / local / served_homes / 分页 tail）；② CLI / MCP / parity / 安全闸门；③ B 部分执行面与 daemon 修复（B1–B5、B8）；④ 桌面端（A8 / B6 / B7）。各评审使用独立的 `CARGO_TARGET_DIR`。
+
+**验证**（本轮重跑）：fmt、clippy `-D warnings` 干净；`cargo test --workspace` 三遍各 472 passed / 0 failed；`nm` 检查 omt-daemon 中 `omt_exec|omt_harness` = 0，omt 中 `omt_exec` = 6078（KD-E9）；`pnpm gen` 无差异，根 tsc 通过；根 vitest 447 passed；桌面 vitest 187 passed，tsc 干净；desktop crate 10 passed。
+
+**结论**：没有 P1。2 条 P2 与约 22 条 P3。计划中最关键的闸门经各评审核实成立：policy 默认值与 fail closed、停止不受 policy 约束（Q-4）、CLI/MCP 不调 `node/execute`（Q-2）、Run 目标绝不 cancel 调用方的 run（Q-9）、跨进程派发锁在 `wait_ready` 前释放且无死锁（Q-6）、全局 home 被拒（Q-13）、MCP 不能声明 home（Q-3）、`OMT_EXEC_ID` 嵌套派发闸门（Q-12）、`harness__list` 不输出 env 值、execId 路径穿越被拒、KD-E9 符号门。桌面端派发链除「锁更早释放」与「60s 锁超时」外与子项目 1 一致。
+
+#### F-SP2-1 · P2 · `exec tail` 按 seq 分页会丢 / 重复事件（评审 ①，置信度 75）
+
+- **机制**：stdout 与 stderr 两个读线程各自 `session.seq.fetch_add` 取号，中间经过 `on_event`，再 `append_event_line` 写入 jsonl；取号与追加不是原子的，文件顺序可能是 `[4, 6, 5, 7]`。`transcript_page` 假定 seq 随文件顺序递增：过滤 `seq > since`、`nextSeq` = 本页文件顺序最后一个事件的 seq。
+- **场景**：读到 `[4, 6]` 返回 `nextSeq=6`，下一页 `since=6` 把 seq 5 永久滤掉；页边界落在乱序行之后时 `nextSeq` 倒退，事件被重复返回。桌面端 `follow.rs` 按字节偏移尾随，不受影响。
+- **建议**：在 `ExecSession` 里用一把锁把「取号 + 追加」包成原子操作，使文件顺序 = seq 顺序；补乱序场景测试。
+
+#### F-SP2-2 · P2 · EPERM 被当作「shim 可能存活」，租约可无限期卡住（评审 ③，机制置信度 100，频率 75）
+
+- **机制**：B3 的 `shim_maybe_alive` 在 `process_start_identity` 失败时回落 `pid_live`，而 `pid_live` 把 EPERM 视为存活。macOS 的 `proc_pidinfo(PROC_PIDTBSDINFO)` 对其他用户的进程直接返回 EPERM（实测 pid 1）。
+- **场景**：shim 崩溃 / 重启后其 pid 被 root 或系统用户进程复用 → 启动对账（严格 `shim_alive`）标 Failed + `SHIM_LOST_MARKER` → 之后每轮对账 `shim_maybe_alive` 得 EPERM → 判存活 → 跳过 → run item 永远 `running`，daemon 又没有过期租约回收（janitor 为后续项）。
+- **超出已接受的代价**：计划只接受了「缺 start-id 且 pid 被复用」，这里带 start-id 的记录也会中招。
+- **建议**：shim 总以当前用户运行，EPERM（来自 `proc_pidinfo` 或 `kill(pid, 0)`）即「不是我们的 shim」→ 判死；只有其他错误或缺 start-id 时才按「可能存活」。
+
+#### P3（按领域）
+
+**执行面 / CLI / MCP**
+- **`maxDurationSec` 未校验**（评审 ①②）：0 或 <60 被接受，watchdog 首个 tick 即以 MaxDuration 杀掉，run 无人认领；非整数（`"600"`、`30.5`、`-1`）被静默忽略、改用 policy 上限。建议 `exec_start` 对 <60 与非整数报 `INVALID_INPUT`（field `maxDurationSec`）。
+- **Q-13 在 CLI 声明之后才判、kind 缺失时按 workspace 放行**（评审 ①②）：`omt --home ~/.omt exec start …` 若该 home 未被服务，会先 `home/declare` 再被 `POLICY_DENIED`，被拒的请求在 daemon 里留下已登记的 home；`served_homes` 与二次查询都 `unwrap_or("workspace")`（fail open）。建议声明前先对规范路径做 `workspace_scope_denial`，kind 未知视为拒绝（或取声明连接自身 handshake 的 kind）。
+- **MCP 的 `homeId` 也按路径匹配**（评审 ①）：`{"homeId": "/Users/x/proj/.omt"}` 能解析到已服务的 home，偏离「MCP 只认 homeId」；无声明、影响低。建议路径匹配只对 CLI。
+- **Q-3 的 MCP 测试守不住**（评审 ②）：`mcp_exec_start_cannot_declare_an_unserved_home` 同时传了 `home` 与 `homeId`，`homeId` 优先，即使去掉防护也通过。建议只传 `home`，断言 `INVALID_INPUT` 且未声明。
+- **`harness_list` / `exec status` 脱敏漏网**（评审 ①）：`sanitize_args` 只看 key/token/secret/password 结尾的 flag，`["--auth", "sk-abc"]`、`["-H", "Authorization: Bearer xyz"]` 原样输出到主控上下文。建议本地工具路径对每个 arg 再过 `sanitize_line`。
+- **本地动词期间 Ctrl-C / SIGTERM 无效**（评审 ②，实测）：`real_run_with` 装了 sigwait 处理，但 `harness` / `exec` 分支不登记 fd、不检查 `CANCELED`；`omt harness models` 对挂起的二进制收到 SIGINT 后仍跑满 8s，退出码 3 而非 130。建议本地动词不装 sigwait，或检查 `CANCELED` 后 `exit(130)`。
+- **`omt --home .omt exec list` 报 `invalid home id`**（评审 ②，实测）：`resolve_home_id` 以「含不含 `/`」区分路径与 homeId，相对路径被当成 homeId；`exec start` 同样参数却能工作。建议按 `resolve_home` 的方式先按 homeId、再按规范路径匹配。
+- **MCP stdio 循环单线程阻塞**（评审 ②）：`exec__start`（最长 60s 锁等待 + 30s 就绪）、`harness__list`（~14s）期间 `ping` 无响应；客户端超时放弃后 shim 已拉起，调用方拿不到 execId。建议本地调用放到工作线程，或在文档写明阻塞与 `exec__list` 找回路径。
+- **parity 摘要写着 `exec/stop`「policy 约束」**（评审 ②）：与 Q-4 矛盾。改为「停止执行（不受 policy 约束；被派发 agent 不可用）」后 `pnpm gen`。
+- **跨进程派发锁把桌面端卡死的 daemon 传导给 CLI/MCP**（评审 ①）：桌面端派发的 RPC（`omt_client` 无读超时）在 daemon 卡死时无限期持有 `exec/launch.lock`，CLI/MCP 每次 60s 后 `LAUNCH_FAILED`。不是死锁，但是新的跨进程耦合。建议桌面端派发 RPC 加读超时或持锁期间的总时限。
+- **并发计数把读不出的 home 当 0**（评审 ①）：`active_exec_count` 对 `list_agents` 的 Err 计 0，锁超时 / IO 错误时可超额派发。建议容量检查传播错误并拒绝，退出确认框保留宽松计数。
+- **`transcript_page` 没有旧目录回落**（评审 ①）：迁移中断（agent.json 已迁、文件未移）时返回 `{events: [], done: true}`。建议复用 `transcript_tail_from` 的候选目录查找。
+- **临时管理员授权无引用计数**（评审 ③）：强制删除与后台对账同进程并发时共用 `cli:<desktop pid>`，先结束的一方 `Drop` 撤销授权，另一方的管理员 `run/report` 被拒（`lease-token-missing`），强删路径随后删掉 agent、租约被放弃；B7 超时后脱离的 worker 还会晚些撤销。改造前既有。建议按 principal 在进程内引用计数，和 / 或让 `force_release_agent_leases` 也进单飞。
+- **启动失败可能记成 `failed` + `killReason: user`**（评审 ③，置信度 50）：launcher 记录身份失败后 SIGTERM shim，shim 若先于补偿写 Killed(user)，补偿再覆盖为 Failed 但不清 `kill_reason`。建议 `fail_and_compensate` 清 `kill_reason` 或比较后写。
+
+**桌面端**
+- **5s 轮询导致每次都重跑两个副作用**（评审 ④，置信度 100）：`refreshAgents({silent})` 每次都 `setState` 一个新数组，Agents 面板每 5s 多一次 `run/list` RPC；选中的终态 agent 若 transcript 为空会反复 `exec_transcript_tail`；`exec_attach` 持续失败时每 5s 重试并重写 `state.error`。建议结构未变时跳过 `setState`。
+- **停止全部 3s 自动复位抢焦点**（评审 ④）：复位时无条件把焦点拉回「停止全部」，打断用户正在进行的操作。建议只在焦点仍在确认区或 body 时恢复。
+- **停止失败警告 / 归档结果跨 home 残留**（评审 ④）：`AgentsPanel` 未按 home 设 key，B7 的持久警告切到 B home 后仍显示 A home 的失败。建议 home 变化时清空，或 `key={homeId}`。
+- **租约通知的「前往 Runs」不切换 home**（评审 ④）：通知跨 home 保留，但按钮只打开当前 home 的 Runs，文案也不写 home。建议带上 `notice.homeId` 先切 home，或在文案里写明 workspace。
+- **退出 / 关窗确认的回调改到主线程执行**（评审 ④）：直调 NSAlert 后 `on_choice` 在 GCD 主队列里跑，「全部停止后退出」时 `stop_all_execs`（逐 agent flock + 对账）阻塞主 run loop，锁竞争下会转圈；随后即退出，影响小。建议 Stop 分支放到 `std::thread::spawn`。
+- **策略设置测试不再守「默认来源」提示**（评审 ④）：文案改为「出厂默认」后，`getByText(/默认值/)` 只匹配到「恢复默认值」按钮。建议断言 `/出厂默认/` 并补 `source: 'file'` 时不出现的用例。
+- **归档成功提示的播报区域带着内容挂载**（评审 ④）：与 B7 修掉的停止提示同一反模式，读屏可能不播报。建议常驻 `role="status"` 只改文字（计划文本本身的缺口）。
+
+**测试缺口**（评审 ①）：派发锁在 `wait_ready` 前释放（第二个派发不必等第一个就绪）；桌面端发起的 exec 计入 CLI 的并发上限；真正并发的跨进程容量测试（现有为顺序）；Q-13 经 `exec_start` 的集成测试；seq 乱序分页。
+
+**建议**：两条 P2 修复都很小（F-SP2-1 加一把锁、F-SP2-2 区分 EPERM），建议先修再做子项目 2 手工验收（§「执行面子项目 2 验收」矩阵）。P3 中优先：`maxDurationSec` 校验、Q-13 先判后声明、脱敏漏网、Ctrl-C、5s 轮询的无谓重跑、Q-3 测试；其余可随后续小项处理。
+
+### §50. §49 修复（2026-10-24，df5049c + 5d359b3）
+
+两批修复（批 1：F-SP2-1/2 + 7 条优先 P3；批 2：其余 14 条 P3），全部 TDD 先红后绿：
+
+- **F-SP2-1**：`ExecSession.events_write` 一把锁包住「取 seq + 盖 envelope + 追加 jsonl」（sink 在锁外）——文件顺序恒等于 seq 顺序；并发追加了乱序不变式测试（关闭锁复现 [5,4,2,1,0,3,…] 即红）。
+- **F-SP2-2**：`process_start_identity_detailed` 带 errno；EPERM/EACCES（pid 已属他人）在 start-id 存在时判死，不再回落 pid_live——pid 被系统进程复用后租约不再永久卡住（launchd pid-1 实测钉死）。
+- **优先 P3（df5049c）**：maxDurationSec <60/非整数 → `INVALID_INPUT`；Q-13 规范路径先判后声明（kind 取自声明连接自身 handshake，未知即拒，消除 daemon 留登记 home）；本地路径逐参过 sanitize_line（--auth sk-…/Authorization 头实测不再泄漏）；本地动词不装 sigwait（Ctrl-C 即时退出 130，实测钉死）；5s 静默轮询结构未变跳过 setState（引用稳定，run/list、tail、attach 副作用不再空转）；Q-3 MCP 测试改为只传 `home`（变异验证旧测试空洞）；相对 `--home .omt` 按 homeId→规范路径解析。
+- **批 2（5d359b3）**：MCP 路径形状 homeId → `INVALID_INPUT`（CLI 路径匹配保留）；本地工具调用移入单工作线程（ping 阻塞期间毫秒级应答，实测）；parity `exec/stop` 摘要与 Q-4 对齐；桌面会话 socket 30s 超时（卡死 daemon 持派发锁从无限期 → 有界）；并发计数失败关闭（退出确认保持宽松）；transcript_page 迁移中断回落旧目录；TempGrant 按 principal 进程内引用计数（强删+对账并发共享授权安全）；补偿清除残留 kill_reason；停止全部复位不再抢焦点；警告/归档提示按 home 清空；「前往 Runs」先切 home；退出 STOP 分支移出主线程；策略设置测试改守「出厂默认」；归档提示并入常驻 status 区。
+
+**验证**：workspace 490 ×多轮全绿（472 基线 +18 新测试）；前端 195（+8）、tsc 干净；根 vitest 447、`pnpm gen` 无差异；clippy/fmt 干净；nm daemon 双零。
+
+**未做（§49 测试缺口 + 接受项）**：派发锁 wait_ready 前释放的专门测试、真正并发的跨进程容量测试、MCP stdio 文档化阻塞说明（已用工作线程消除）之外的三项测试缺口留待后续；§49 的「桌面端发起 exec 计入 CLI 并发上限」已有顺序测试，真并发测试待做。
+
+### 残留状态核查（第二轮验收后）
+
+### §51. §50 修复复审（2026-10-24，`906f223..5d359b3`）
+
+**范围与方法**：df5049c + 5d359b3（23 个文件，+1971/−226）。3 个并行评审：① 执行面核心（executor / control / grants / launch / daemon_link）；② CLI / MCP / local（含真实二进制调用）；③ 桌面端。xterm 不在范围。
+
+**验证**：fmt、clippy 干净；`cargo test --workspace` 三遍各 490 passed / 0 failed；nm：omt-daemon 中 `omt_exec|omt_harness` = 0；`pnpm gen` 无差异；根 tsc 通过，根 vitest 447 passed；桌面 vitest 195 passed，tsc 干净。（首轮因磁盘写满 `ENOSPC` 出现 10 个假失败，清理评审用 target 目录后重跑全绿。）
+
+**结论**：§49 的 2 条 P2 与 21 条 P3 修复均按声明成立，新测试回退即红。复审新发现 3 条 P2（均为本轮修复引入或未闭合）与若干 P3，无 P1。
+
+#### F-SP2-3 · P2 · TempGrant 引用计数「归零 → 撤销」与新 acquire 竞争（评审 ①，置信度 85）
+
+- `refcount_release` 在互斥锁内把计数降到 0 并摘表项，`remove()`（admin-grants.json）与临时登记表更新在锁外执行。
+- 交错：A Drop 归零 → B `TempGrant::add` 计数 0→1，登记表已有该 principal（不重复 push），`add()` 见已授权为 no-op → A 执行 `remove()` 并清登记 → B 持有守卫但无 admin 授权，管理员 `run/report` 被拒。A 的 flock 文件 IO 为毫秒级，窗口真实存在；正是 §49 要修的强删 + 对账并发场景。
+- **建议**：`add` 的「计数 + 登记/授权」与 `Drop` 的「计数 + 撤销」在同一把互斥锁（或按键的锁）下完成；都是本地短 IO，可接受。补交错测试。顺带：计数键用调用方拼写的 `PathBuf`，建议规范化（置信度 30）。
+
+#### F-SP2-4 · P2 · 「全部停止后退出」期间再按 ⌘Q 会中途退出（评审 ③，置信度 85）
+
+- `lib.rs:166`（关窗路径）与 `:309`（ExitRequested 路径）：`QUIT_CONFIRMED` 在工作线程开始 `stop_all_execs` 之前置位；改造前主线程阻塞，第二次退出请求不会被处理。
+- 场景：选 STOP → 对话框关闭、窗口无「停止中」提示 → 用户以为没反应再按 ⌘Q → ExitRequested 见 `QUIT_CONFIRMED` 放行 → 进程在 stop 中途退出，其余 agent 的分离 shim 继续运行，违背用户「全部停止」的选择。代码注释把这当作设计（「stop 期间再进 ExitRequested 直接放行」），但与语义冲突。
+- **建议**：`QUIT_CONFIRMED` 改在工作线程 `exit()` 前一刻置位（`DIALOG_OPEN` 全程置位，已能 prevent 且不叠框）；最好显示「停止中…」。另：worker 内 `stop_all_execs` panic 时永不 `exit()`，且 `DIALOG_OPEN` 卡在 true，窗口再也关不掉——建议 `catch_unwind` 或用 drop guard 兜底 exit。
+
+#### F-SP2-5 · P2 · `exec list --home <homeId>` 回归：要求 home 正被服务（评审 ②，置信度 85，实测）
+
+- `local_impl.rs::resolve_home_id`：§50 去掉了「不含 `/` ⇒ 直接作 homeId」的分支，所有 homeId 都必须出现在 daemon 的 served 列表，而 `exec_list` 只读磁盘 `agents/<homeId>/`。
+- 场景：workspace home 被 idle 关闭，或 daemon 空闲退出后重启只服务全局 home → `omt exec list --home h_ws` 由列出记录变为 `NOT_FOUND`；MCP `exec__list {"homeId"}` 同样。只读动词还会拉起 daemon（实测：无 daemon 时 `--home h_fake exec list` 拉起 daemon 后报 NOT_FOUND，旧实现直接返回 `[]`）。
+- 同函数附带 P3：输入不存在时 `want = None`，会匹配任何自身路径也无法规范化的已服务 home（目录已删），拼写错误可能解析到错误 home（置信度 60）。
+- **建议**：先查 `layout::home_ids(runtime_dir)`（非路径形状且磁盘上存在即用），再走 served/规范路径匹配；规范路径匹配要求 `want.is_some()`。
+
+#### P3
+
+**执行面**
+- **补偿清 `kill_reason` 仍有交错**（①，75）：`fail_and_compensate` 先 `update_exec`（清 kill_reason）再 `update_agent_status(Failed)`，两次独立 flock 写之间 shim 的 `finish_stopped_before_spawn` 可写入 Killed + user → 最终仍是 Failed + killReason user。建议合并为一次 `update_agent` 闭包。反向（spawn 后 SIGTERM → `finish_terminal` 覆盖 Failed 为 Killed 且保留 failure_detail）为既有。
+- **严格并发计数对已隔离的损坏 agent 仍宽松**（①，60）：`list_agents` 返回 `Ok((agents, parse_failed=true))`，损坏记录以空 id 默认值返回被跳过，计 0。建议严格版在 `parse_failed` 时报错或保守计数。
+- **`transcript_page` 回落与并发迁移竞争**（①，40）：选中旧目录后迁移 rename，`read_to_string` NotFound → 空页 `done: true`。建议 NotFound 时重新解析目录一次（`transcript_tail_from` 同病）。
+- 注释「exit 恒为 jsonl 末行」只在 `drain_readers` 完成时成立；drain 超时后脱离的读线程可追加 seq > exit 的行而被 `transcript_page` 截掉（既有，建议改注释）。Linux `hidepid=2` 下他人 `/proc/<pid>` 是 ENOENT，仍回落 `pid_live`（仅 Linux，CI 不覆盖）。
+
+**CLI / MCP**
+- **MCP 对通知形式的 `tools/call` 也回包**（②，95，实测）：worker 无条件写响应，无 id 的 `tools/call` 输出 `{"id":null,…}`，违反 JSON-RPC；旧内联路径会抑制。建议 `LocalCall` 带 `is_notification`。
+- **MCP worker 队列无界、不可取消、panic 后挂起**（②，70）：stdin EOF 后仍逐个执行队列中的 `exec__start`；`notifications/cancelled` 被忽略；worker panic 后在途请求永无应答，作用域结束再 panic、退出码 101。建议 EOF/取消后跳过排队调用、`catch_unwind` 回错误、可选 `sync_channel`。
+- **Q-13 先判仍可能留下已声明 home**（②，60）：预判用 CLI 自身环境的 `OMT_HOME`/`HOME`，daemon 按自身环境判 kind；两者不一致（daemon 由 DSH / 桌面以不同 `OMT_HOME` 拉起）或 handshake 无 kind 时，仍先声明后被第二道拒绝。始终 fail closed。`OMT_HOME=""` 处理与 daemon 不一致（`$HOME` 根规则兜住）。
+- **Ctrl-C 可在 `exec start` 中途打断派发链**（②，55）：⑤–⑧ 之间（agent 已登记、run 可能已绑定、尚无 spec）退出，60s 后对账标 Failed，但无 spec 时跳过租约释放，留给桌面 U10。与 SIGKILL 等价但现在一键可达。建议在 `launch::start` 的派发→spawn 临界区屏蔽 SIGINT。
+- **`sanitize_line` 误伤正常参数且仍有漏网**（②，95，实测，仅显示）：`--ask-for-approval` → `--ask- ***`、`--task-file`、`/w/task-list.md`、`https://desk-api…`、`--no-bearer-check`、`--monkey=banana` 均被截断；`binaryArgs` 含 prompt，`exec status` 会在 `sk-`/`task-`/`key:`/`bearer` 处截断提示词；`--auth ghp_…`、`Authorization: Basic …`、`Authorization: token ghp_…` 仍泄漏。建议 `sk-` 只在词首匹配，`Authorization:` 后的 scheme 值整体脱敏，`sanitize_args` 把 `--auth`/`-H` 的值视为敏感。
+- **MCP `exec__list` 仍接受路径形状 homeId**（②，70）：§50 的守卫只在 `exec_start`。只读，但与「MCP 只认 homeId」不一致。
+- 新 ping 测试取首个可解析行后才过滤 id（其它行先到即 panic），且复用了 `initialize` 的 id 1（②，50）。
+
+**桌面端**
+- **30s 读超时被当作「daemon 已断」并自动重放**（③，60）：超时返回 `connection closed: Resource temporarily unavailable`，`is_daemon_gone` 命中 → `SharedSession::call` 重连后重放一次。慢但存活的 daemon 上 >30s 的 `node/create`、`run/create`、`node/update` 等（不带 `commandId`）会重复提交；派发链有固定 commandId 不受影响。报错文案也不清楚；最坏耗时约 60–90s/次，与 60s 派发锁等待相当。建议识别 WouldBlock/TimedOut：丢弃连接、下次惰性重连但不重放，报「daemon 无响应（30s）」；或只重放幂等方法 / UI 写操作带 commandId。事件泵用独立无超时连接，订阅不受影响。
+- **在途的停止全部 / 归档结果在切 home 后仍落到新 home**（③，70）：`[homeId]` 清空 effect 之后，A home 仍在执行的 `onStopAll`/`onArchiveLegacy` 回来写入提示。建议发起时捕获 homeId，结果回来时比对当前 home。
+- **轮询引用稳定后，`exec_attach` 失败不再自动重试**（③，55）：瞬时失败把 exec 移出 `attachedRef` 并设全局错误，之前靠每 5s 重渲染重试，现在要等 agent 记录变化或重新选中，运行中 agent 的实时 transcript 冻结。U14 `run/list` 兜底扫描也不再每 5s 发现外部新 run（影响小）。建议失败后定时 / 窗口聚焦重试，或在依赖里加重试计数。
+- 切 home / `applyExitLocal` 后未重置 `agentsSigRef`，序号竞争下新 home 的轮询结果可能被误判为未变（③，35）。
+- 应用不再每 5s 重渲染，`DetailPanel` 的「N 分钟前」相对时间会变旧（③，50，外观）。
+- 焦点恢复以 `activeElement === body` 判断，点击 transcript 等不可聚焦区域后仍会被拉回「停止全部」（③，40）。
+- `exec-plane-p49.spec.tsx` 的 `expect(x).toBe(y, 'msg')` 第二参数被 vitest 忽略，测试文件不在 tsc 范围内；STOP 两个分支是否都调用 helper、`QUIT_CONFIRMED` 置位时机均无测试（③）。
+
+**建议**：先修 3 条 P2（F-SP2-3 锁内完成计数与文件操作；F-SP2-4 挪 `QUIT_CONFIRMED` 置位点 + panic 兜底；F-SP2-5 先查磁盘 home_ids），连同便宜的 P3：MCP 通知不回包、`sanitize_line` 词首匹配与 Authorization 整体脱敏、`want.is_some()`、超时不重放、切 home 时丢弃在途结果、attach 失败重试。其余 P3 可留到后续。
+
+
+### §52. §51 修复（2026-10-24，17b3a96）
+
+按 §51 建议顺序全部 TDD（回退即红取证）：
+
+- **F-SP2-3**：`TempGrant::add`（计数+登记/授权）与 `Drop`（计数+撤销）在**同一把**引用计数互斥锁内完成（锁序恒为计数锁→文件 flock）；计数键规范化 runtime dir。交错测试用 `#[cfg(test)]` 撤销延迟缝钉死「A 归零→B add→A 撤销」两个方向。
+- **F-SP2-4**：`QUIT_CONFIRMED` 移到 worker `exit()` 前一刻置位（两处 STOP 分支）；`catch_unwind` + 兜底 exit（panic 不再卡死 DIALOG_OPEN）；窗口标题「停止中…」。worker 逻辑抽为可测的 `run_quit_stop_worker`（两个测试：置位时机 + panic 兜底）。
+- **F-SP2-5**：`resolve_home_id` 先查 `layout::home_ids`（非路径形状且磁盘存在→直接用，零 daemon 接触——idle 关闭的 home 可列出、只读动词不再拉起 daemon）；规范路径匹配要求 `want.is_some()`；MCP `exec__list` 拒路径形状 homeId（与 exec_start 同款 INVALID_INPUT）。
+- **便宜 P3**：MCP 通知形式 `tools/call` 不再回 `{"id":null}`；`sanitize_line` 词首匹配（--ask-for-approval/--task-file/URL/--monkey=banana 不再误伤）+ `Authorization:` 按 scheme 整体脱敏（Basic/token 泄漏闭合）+ `sanitize_args` 对 `--auth`/`-H` 的值脱敏；桌面 30s 读超时识别为 WouldBlock/TimedOut——丢弃连接惰性重连但**不重放**（慢而活的 daemon 上非幂等写不再重复提交，报「daemon 无响应（30s）」）；切 home 后在途 stop-all/归档结果丢弃（发起时捕获 homeId、回来时比对）；`exec_attach` 失败后有界重试（3×5s，仅当 exec 仍活跃未接上）；`agentsSigRef` 在切 home/applyExitLocal 时重置；ping 测试 id 卫生。
+
+**验证**：workspace 503 ×多轮全绿（490 基线 +13）；前端 200（+5）、tsc 干净；根 vitest 447；clippy/fmt 干净；nm daemon 双零。
+
+**未做（§51 其余 P3，留后续）**：补偿清 kill_reason 与 shim 写入的交错、严格计数对损坏 agent 宽松、transcript_page 回落与迁移竞争、exit 末行注释修正、Linux hidepid、MCP worker 队列取消/有界、Q-13 双环境 OMT_HOME 不一致、Ctrl-C 打断派发链临界区、exec status prompt 截断（显示层）、DetailPanel 相对时间变旧、焦点恢复范围、p49 spec 第二参数。台账 F-SP2-3/4/5 已翻 fixed(17b3a96)。
+
+### §53. §52 修复复审（2026-10-24，17b3a96）
+
+**范围与方法**：17b3a96（14 个文件，+1162/−85）。2 个并行评审：① crates（grants / sanitize / local_impl / mcp，含新旧 `sanitize.rs` 同输入对照实测）；② 桌面端。xterm 不在范围。
+
+**验证**：fmt、clippy 干净；`cargo test --workspace` 第 3 轮 503 passed / 0 failed；nm：omt-daemon 中 `omt_exec|omt_harness` = 0；`pnpm gen` 无差异；根 tsc 通过、根 vitest 447 passed；桌面 vitest 200 passed、tsc 干净。
+- 第 1 轮 `local_cli_review` 4 个失败，症状全是 §49 修复**之前**的行为（`invalid home id: ".omt"`、SIGINT 被 sigwait 吞掉、全局 home 未被拒），说明那一轮用的 `omt` 是旧二进制——target 目录冷启动重编 266 个 crate，疑似构建缓存（mbx）回填了过期产物；第 2 轮 `election_race` 20s 超时（与两个评审并发编译、机器高负载）。之后两个测试文件单独连跑 3 轮全绿。判定为环境问题，非代码回归；但 mbx 回填过期二进制会掩盖真回归，值得留意。
+
+**结论**：F-SP2-3/4/5 与 MCP 通知修复均成立（锁序恒为计数锁 → STORE_LOCK → 文件锁、无重入；Drop 用守卫内存的规范路径，键必一致；`resolve_home_id` 只服务只读的 exec/list；release profile 无 `panic = "abort"`，`catch_unwind` 有效；`exit(0)` 前 SeqCst 置位，ExitRequested 必见 true）。新发现 2 条 P2，无 P1。
+
+#### F-SP2-6 · P2 · `sanitize_line` 修误伤时削弱了脱敏（评审 ①，置信度 95–98，新旧对照实测）
+
+- **`sk-` 只看首次命中**（`sanitize.rs:66-68`）：`lower.find("sk-")` 命中词中（`task-`、`risk-`、`desk-`、`disk-`、`ask-`）即跳过，不再找后面的。`--task-file /x (current: sk-live-abc123)`（`sanitize_text` 自己的注释举的正是 `(current: sk-…)`）、`error in task-runner: used sk-proj-SECRET` 旧版脱敏、新版泄漏。
+- **`=`/`:` 前有空格不再算键值**（`:40`）：旧版对关键字后的文本 `trim_start()`，新版没有。`password = hunter2`、`token : abc`、`api_key = abc` 泄漏。
+- **键值形态也要求词首**（`:37`）：`apiKey=abc123`、`accessToken=abc123`、`PGPASSWORD=hunter2`、`clientSecret: abc`、`authToken: abc` 旧版脱敏、新版原样输出，换来的只是不误伤 `--monkey=banana`。
+- **建议**：`sk-` 用 `match_indices` 取第一个词首命中；键值判定先 `trim_start`；词首规则只用于无分隔符形态（`bearer`、`sk-`），「关键字 + 可选空白 + `=`/`:`」任意位置命中（宁枉勿纵）。把上述字符串全部加进测试。
+
+#### F-SP2-7 · P2 · `daemon_homes` 吞掉重建失败并清掉错误条（评审 ②，置信度 80）
+
+- `state.rs:74-78` `handshake_homes` 对 `enrollment_mut()` 的 Err 返回 `json!([])`；`rpc_bridge.rs:240-249` 据此返回 `Ok({homes: []})`。
+- 场景：调用 30s 超时 → 连接被丢弃 → 下次窗口聚焦 `refreshHomes` 调 `daemon_homes` 触发重建 → daemon 仍卡死，重建 30s 后失败 → 返回空 homes → home 切换器清空，且 `error: null` 抹掉刚显示的「daemon 无响应（30s）」。本 diff 之前这里不会失败。
+- `daemon_homes` 是同步 `#[tauri::command]`，惰性重建（连接 + 握手最长 30s，或 sidecar 拉起等待 10s）跑在主线程，会转圈。
+- **建议**：`handshake_homes` 返回 `Result` 并经 `with_session` 透传错误；`daemon_homes` 改 `#[tauri::command(async)]`。
+
+#### P3
+
+**crates**
+- **canonical 键测试是空的**（`grants.rs:335-344`，95）：`alias` 与 `rt` 拼写相同，去掉规范化也通过。建议一个用 `rt`、一个用 `canonicalize(&rt)`，两者相同则跳过。
+- **`sanitize_args` 新的误伤**（`sanitize.rs:164`，95）：`trim_start_matches('-')` 不要求前导 `-`，`h` 同时命中 `-h`：`gh auth login` → `gh auth ***`、`-h foo` → `-h ***`、裸位置参数 `h` 吞掉下一个参数、`-H "Accept: json"` 也被隐藏（仅显示）。建议 VALUE_FLAGS 要求前导 `-`、`-H` 区分大小写。
+- **`-H`/`--header` 覆盖不全**（90）：`-HAuthorization: Bearer x`（连写）与 `--header "Authorization: Bearer x"` 过不了 `sanitize_args`；`local.rs` 的 `sanitize_args_deep` 会兜住，但 `executor.rs:368`（events）与 `:1443`（agent.json `binary_args`）只调 `sanitize_args`。建议加 `header`、以 `-H` 开头即敏感，或这两处也逐参过 `sanitize_line`。
+- **Authorization 规则只看首次命中、冒号可在任意后方**（`:75-78`，85）：`reauthorization needed; Authorization: Basic SECRET` 泄漏；`authorization failed, see https://example.com/help` → `… https: ***`（`exec status` 的 prompt 也会被截）。建议遍历命中、要求冒号紧跟关键字（中间只有空白）。
+- **关键字循环在第一个词首非键值命中处就 `break`**（`:63`，90）：`--key-file /x --key=SECRET`、`token refresh failed; token=SECRET` 仍泄漏（既有，但新注释暗示已解决）。建议非键值/非 bearer 时 `continue`。
+- **MCP `exec__list` 对无分隔符的相对路径仍按路径匹配**（`local_impl.rs:158`，85）：守卫只拒含分隔符的字符串，`homeId: ".omt"`/`.`/`..` 按 MCP 进程 cwd 规范化匹配。只读。建议把调用方传入 `resolve_home_id`，MCP 跳过路径匹配。另：`exec_list` 拒 MCP 的 `home` 键，`exec_start` 静默忽略，不一致。
+- **MCP 通知语义按工具类型不一致**（`mcp.rs:198`，90）：本地工具的通知被直接丢弃不执行，daemon 工具的通知照常执行只是不回包。两者择一统一。
+- 全局计数锁跨文件锁持有（70，信息性）：一个卡住的文件锁（10s 超时）会让进程内所有 TempGrant 用户排队；有界、无死锁，桌面端对账与强删会互相排队。runtime 目录首次 `add` 时尚不存在会出现两个键（实际两处调用点目录都已存在）。
+
+**桌面端**
+- **超时提示写「已放弃」，实际结果未知**（`daemon.rs:179`，70）：读超时时 daemon 通常仍会完成写入，「本次请求已放弃且未重试」诱导用户手动重试——正是要避免的重复提交。建议改为「结果未知、可能已生效，请刷新确认后再重试」。
+- **超时判定靠字符串**（`daemon.rs:170-174`，55）：当前 macOS/Linux 文案都能命中，写超时也不重放；但规则作用于任何 `code == "IO"` 的问题，daemon 回传的 IO 错误若含「timed out」也会被误判并断连。建议限定 `connection closed:`/`request write:` 前缀，最好让 `omt_client::Problem` 携带 `io::ErrorKind`。
+- **停止全部的切 home 守卫只覆盖面板，store 仍把 A 的错误写到 B**（`store.ts:975/980`，85）：`store.stopAll` 整体失败/抛错时全局 `state.error` 不比对 home；测试直接 mock 了 `onStopAll`，覆盖不到。
+- **退出 worker 测试没覆盖真正的出错点**（`lib.rs` ~195/339，90）：只测 `run_quit_stop_worker`，把 `QUIT_CONFIRMED.store(true)` 加回任一 STOP 分支（原 bug）两个测试仍通过。建议把 STOP 分支主体抽成两处共用的 helper 并测它。
+- **停止期间再次 ⌘Q 会在主线程跑 `active_exec_count`**（`lib.rs:296-320/159`，60）：经 `STORE_LOCK` 读，worker 持锁等 flock 最长 10s，主线程可卡 10s；读失败按 0 计会放行退出。建议加 `QUIT_STOPPING` 原子量，两个 handler 先查它，直接 prevent。
+- 窗口已「后台继续」隐藏时选 STOP，「停止中…」标题改在隐藏窗口上，之后的 ⌘Q 静默无反应（85，可接受或先 show 窗口）；panic 打印 `Any { .. }`，建议 downcast。
+- **attach 重试的毛边**（`store.ts:775-797`，75）：只判「exec 在 agentsRef 里」而非「仍活跃」，已结束的 exec 也会重试并每 5s 重设 `state.error`（关掉的错误条反复出现）；非定时器来源的失败覆盖 pending 定时器而不 `clearTimeout`（卸载时漏清，无双 attach）；计数耗尽后永不重置。
+- `agentsSigRef` 重置（修复 5）无测试；`DaemonSession::call` 的「丢连接不重放」只在分类器层测试，删掉 `state.rs` 的超时分支测试仍过（连接不会被丢）。`exec-plane-p51.spec.tsx` 的 `toBe(n, 'msg')` 第二参数被忽略，`tests/` 不在 tsc 范围。
+
+**建议**：先修 2 条 P2（F-SP2-6 恢复旧版覆盖面同时保留误伤修复，并把本节所有泄漏样例写成测试；F-SP2-7 透传错误 + async 命令），顺带便宜 P3：canonical 键测试、`sanitize_args` 要求前导 `-`、Authorization 遍历命中、关键字循环 `continue`、超时提示文案、store 层切 home 守卫、`QUIT_STOPPING`。脱敏规则已来回两轮，建议这次以表驱动测试（应脱敏 / 不应脱敏两列）锁定行为。
+
+
+### §54. §53 修复（2026-10-24，2b77285）
+
+- **F-SP2-6**：`sanitize_line` 三处回归全部闭合——`sk-` 用 `match_indices` 取第一个**词首**命中；键值判定先 `trim_start`；词首规则只用于无分隔符形态（bearer/sk-），「关键字+可选空白+`=`/`:`」在任意位置命中（dash 前缀的 CLI token 除外——保住 `--monkey=banana` 不误伤）；Authorization 遍历命中且冒号必须紧跟关键字；关键字循环非命中 `continue`。**表驱动两列测试**锁定：泄漏列修复前 13/16 失败（实测取证）、完好列（§51 误伤样例）全过。`sanitize_args` 值 flag 要求前导 `-`（`gh auth login`/`-h foo` 不再误伤）、`-H` 大小写敏感含连写、`--header` 全覆盖。
+- **F-SP2-7**：`handshake_homes` 改返回 Result 经 `with_session` 透传；`daemon_homes`/`daemon_reconnect` 改 `#[tauri::command(async)]`——重建失败不再吞成空列表清掉错误条，也不再卡主线程。
+- **便宜 P3**：canonical 键测试去空洞化（去规范化即红）；超时文案改「结果未知、可能已生效，请刷新确认后再重试」；超时判定限定 `connection closed:`/`request write:` 前缀（daemon 回传的普通 IO 错误不再误判断连）；`store.stopAll` 整体失败路径按发起时的 home 守卫（A 的错误不再写进 B）；`QUIT_STOPPING` 原子量（停止期间两个 handler 直接 prevent，主线程不再跑 `active_exec_count`，读失败按 0 放行的口子同时闭合）；STOP 分支抽共用 `quit_stop_branch` 并测试（原 bug 在调用点复发即红）。
+
+**验证**：workspace 513 ×3 连续全绿（503 基线 +10；首轮 438/4 为高负载早停 flake，复跑三连绿）；前端 203（+3）、tsc 干净；根 vitest 447；clippy/fmt 干净；nm daemon 双零。台账 F-SP2-6/7 翻 fixed(2b77285)。
+
+**未做（§53 其余 P3，留后续）**：MCP exec__list 无分隔符相对路径、通知语义不一致、全局计数锁跨文件锁（信息性）、隐藏窗口「停止中…」+ panic downcast、attach 重试毛边（已结束 exec 重试/定时器漏清/计数不重置）、agentsSigRef 重置无测试、state.rs 层丢连接无覆盖、p49/p51 spec 第二参数。
+
+### §55. §54 修复复审（2026-10-24，2b77285）
+
+**范围与方法**：2b77285（9 个文件，+812/−100）。2 个并行评审：① sanitize / grants——在 scratch crate 里并排编译 OLD（906f223 / f666a70）、MID（17b3a96）、NEW（HEAD）三版，约 90 条手写行 + 30 组 argv + 300 万条随机差分输入（关键字、`=`、`:`、空白、`-`/`--`、引号、CJK、emoji、NBSP、U+3000）；② 桌面端。xterm 不在范围。
+
+**验证**：fmt、clippy 干净；`cargo test --workspace` 第 1、3 轮 513 passed / 0 failed；nm：omt-daemon 中 `omt_exec|omt_harness` = 0；`pnpm gen` 无差异；根 tsc 通过；桌面 vitest 203 passed、tsc 干净。
+- 第 2 轮 `election_race` 20s 超时、根 vitest `home-lock.spec.ts` 心跳用例失败 1 个，均发生在两个评审并发编译时；低负载下各单独连跑 3 轮全绿。`election_race` 已在最近 6 轮完整测试中两次因负载超时，是既有的负载敏感测试，值得单独加固（非本轮引入）。
+
+**结论**：§53 点名的泄漏全部闭合，§51 误伤修复全部保住；表驱动两列测试回退即红；无 panic（300 万随机输入）、无二次方热路径（8MB 行 10–27ms，旧版 4–18ms）；grants canonical 键测试已非空洞（本机 `$TMPDIR` 非规范路径时生效）。桌面端六项修复均到位。新发现 2 条 P2，无 P1。
+
+#### F-SP2-8 · P2 · `sanitize_line` 仍有两类相对旧版的泄漏（评审 ①，置信度 90–95，三版对照实测）
+
+1. **dash 例外过宽**（`sanitize.rs:52-63` `in_dash_flag`、`:74`）：只要 token 以 `-` 开头且关键字在词中，就跳过——覆盖了 camelCase / 复合 flag、Java `-D`、Gradle `-P`、docker `-e`、unified diff 的删除行：
+
+   | 输入 | OLD | NEW |
+   |---|---|---|
+   | `--apiKey=SECRET`、`--accessToken=S`、`--clientSecret=S`、`--dbPassword=S` | 脱敏 | 泄漏 |
+   | `mvn deploy -Dpassword=SECRET`、`java -DapiKey=S -jar x.jar` | 脱敏 | 泄漏 |
+   | `docker run -ePASSWORD=SECRET img`、`gradle -PsigningKey=S` | 脱敏 | 泄漏 |
+   | `-PGPASSWORD=hunter2`（diff 删除行；`+PGPASSWORD=` 会脱敏） | 脱敏 | 泄漏 |
+
+   MID 同样泄漏，本轮未恢复，表里也没有能抓住它们的行。kebab-case（`--api-key=`、`--token=`、`--client-secret=` 等）仍正常脱敏。
+2. **「冒号必须紧跟 Authorization」破坏了带引号的形态**（`:120-121`）：`{"headers":{"Authorization":"Basic SECRET"}}`、`'authorization': 'Basic SECRET'`——OLD 泄漏、MID 已脱敏、NEW 又泄漏（Bearer 值仍由 bearer 规则兜住，Basic / token 不行）。harness 流输出与调试转储都是 JSON，形态真实。三版共有的同源缺口：`{"apiKey": "abc"}`、`{"token":"abc"}`——关键字与 `:` 之间隔着闭合引号。
+
+- **建议**：脱敏规则已来回三轮，建议取最简单、与「宁枉勿纵」一致的方案——**删除 dash 例外**，接受 `--monkey=banana → --monkey= ***` 的误伤（从完好列移到「可接受误伤」）；键值与 Authorization 的冒号判定都改为跳过空白**和引号**（`trim_start_matches` 加 `"`/`'`，scheme 前也跳开引号），顺带闭合 JSON 键值缺口；把上表与 JSON 形态全部加进泄漏列。
+
+#### F-SP2-9 · P2 · 同步命令仍在主线程持会话锁（评审 ②，置信度 80，既有）
+
+- `rpc_bridge.rs:409` `events_subscribe` 是同步 `#[tauri::command]`（主线程），经 `with_session`（`:416`）锁与 `daemon_homes`/`omt_call` 同一把 `std::sync::Mutex`；后者在惰性重建时整段持锁（握手读超时 30s、sidecar 拉起等待 10s）。
+- 场景：`omt_call` 超时丢连接 → 窗口聚焦，async `daemon_homes` 持锁对卡死 daemon 重建 30s → 用户切 home，`subscribeEvents` 调同步 `events_subscribe` → 主线程在锁上等最长 30s，转圈。
+- 自 U15 起 `omt_call` 持锁即有此模式，本轮把 `daemon_homes` 移出主线程已是改善，但 F-SP2-7「重建不卡主线程」只在没有同步命令碰这把锁时成立。`daemon_ensure`（`:255`）同为同步 + `with_session`（前端目前未调用）。
+- **建议**：`events_subscribe`、`daemon_ensure` 改 `#[tauri::command(async)]`；或 `events_subscribe` 直接用 `daemon::runtime_dir()` 取 runtime 目录、不碰会话锁。
+
+#### P3
+
+**sanitize / grants**
+- 键值空白只跳 ASCII 空格与 tab（`:71`、`:120`，90）：`password\u{a0}= S`、`token\u{3000}= S`、`password\r=S` 旧版脱敏、新版泄漏。改回 `trim_start()`（偏移算术仍在字符边界上）。
+- `--bearer-token SECRET` 旧版 `--bearer ***`、新版泄漏（独立 bearer 规则的副作用；`sanitize_line` 本就不覆盖空格分隔的 `--flag value`）。
+- `sanitize_args` 的 header 前缀匹配吞掉 flag 名：`--header=Authorization: …` → `--header***`（丢 `=`）、`--headers a`/`--header-file /x` → `--header***`（后者值反而可见）、`-HL` → `-H***`。建议只认精确的 `--header`、`--header=…`、`-H…` 并保留 `=`。三版共有缺口：`["-sH", "Authorization: Bearer x"]`、`["--authorization", "Basic x"]`、`["-u", "user:pass"]`、`--user`、`--cookie`；`executor.rs:368/:1443` 只调 `sanitize_args`。
+- grants canonical 键测试在 `$TMPDIR` 已是规范路径的平台（Linux）上静默跳过；CI 只跑 macOS 故当前有效。建议建临时目录的 symlink 别名。
+- 从未覆盖（非回归，记录）：`Cookie: session=…`、`set-cookie`、`https://user:pass@host`、单独的 `ghp_…`/`github_pat_…`、Stripe `sk_live_`（下划线）、全角冒号 `token：S`。
+
+**桌面端**
+- async 命令阻塞 tokio worker（70，既有）：Tauri 2.12 的 async 命令走 `async_runtime::spawn` 而非 `spawn_blocking`，`daemon_homes`/`omt_call` 在 std 锁与阻塞 socket IO 上最长占住 worker 30s；daemon 卡死时排队的会话命令可占满所有 worker，`exec_*`/`agents_*` 等 async 命令一起停摆（UI 本身不卡、无死锁）。建议包 `spawn_blocking`。
+- 超时提示被覆盖或清掉（`store.ts:1004-1043`，65）：重建 30s 后失败会用原始的 `enroll: connection closed: …` 覆盖「结果未知…请刷新确认」；重建成功则下次聚焦 `error: null`，但树并未刷新，用户还没确认写入是否生效提示就消失了。建议重建失败映射为友好文案；`refreshHomes` 不清除已有的超时错误（或清除时同时刷新节点）。
+- `QUIT_STOPPING` 在 worker 线程首行置位而非分支内同步置位（60）：`on_choice` 返回到 worker 起跑之间（微秒级）的 CloseRequested 仍会在主线程跑 `active_exec_count`。建议 `quit_stop_branch` 在 spawn 前先置位。
+- `stop_and_exit_runs_off_the_calling_thread`（`lib.rs` ~459）不拿 `QUIT_TEST_LOCK` 却写 `QUIT_CONFIRMED`/`QUIT_STOPPING`，与轮询静态量的时序测试并行时可能偶发失败（70）。
+- 回归测试的保护面小于名字（85）：`quit_stop_branch_keeps_confirm_false_during_stop` 只锁 helper，在 `run()` 的 `QuitChoice::Stop` 分支里加回 `QUIT_CONFIRMED.store(true)`（原 bug 位置）不会失败——可像 `daemon_homes_tests` 那样加源码文本断言，其「mark」探针推的是写死的 `(false,false)`；F-SP2-7 没有 TS 测试守「`daemon_homes` 被拒时保留 homes/activeHome 并设错误」；Rust 的 `handshake_homes_propagates_reestablishment_failure` 回退即红只因签名不再编译，且因 `deps/` 旁无 `omt-daemon` 而快速失败，没走到「超时丢连接后」路径；p53 spec 的 `toBeNull(msg)`/`toBeTruthy(msg)` 参数被忽略。
+
+**建议**：修 F-SP2-8（删 dash 例外 + 引号容忍的冒号判定 + `trim_start()`，泄漏列补本节全部样例）与 F-SP2-9（两个同步命令改 async）。顺带便宜 P3：`QUIT_STOPPING` 同步置位、测试拿 `QUIT_TEST_LOCK`、源码文本断言守 STOP 分支、超时错误不被 `refreshHomes` 清掉、header 前缀精确匹配。其余 P3 与「从未覆盖」项可留给后续的脱敏专项。
+
+
+### §56. §55 修复（2026-10-24，26df96c）
+
+- **F-SP2-8**（按 §55 处方取最简方案）：**删除 dash 例外**——9 条 dash 形泄漏（`--apiKey=`/`--accessToken=`/`--clientSecret=`/`--dbPassword=`/java `-D`/docker `-e`/gradle `-P`/diff `-PGPASSWORD=`）全部闭合；`--monkey=banana` 移入**可接受误伤列**（三列表驱动：泄漏/完好/可接受误伤）；键值与 Authorization 的分隔判定跳过 Unicode 空白**和引号**（char 级 `trim_start_matches`，偏移保持字符边界——NBSP/U+3000/CR 三条 + 引号 JSON 形态 `{"Authorization":"Basic …"}`、`{"apiKey": "…"}` 闭合）；`sanitize_args` 的 header 匹配改精确（`--header`/`--header=` 保留 `=`、`--headers`/`--header-file` 不误伤、`-H…` 连写保持）。泄漏列新增 16 条 §55 样例，修复前 16/16 失败（实测取证）。`--bearer-token SECRET` 如实留在未覆盖清单（非键值形态，删例外不影响它，非本轮回归）。
+- **F-SP2-9**：`events_subscribe` 与 `daemon_ensure` 改 `#[tauri::command(async)]`；源码断言测试锁住「全部 4 个 `with_session` 调用点都在 async fn 里」——主线程不再有任何同步命令碰会话锁。
+- **便宜 P3**：`QUIT_STOPPING` 在 `quit_stop_branch` 内 spawn 前同步置位（微秒窗口闭合，worker 首行置位移除并有测试锁「worker 不得置位」）；`stop_and_exit` 测试拿 `QUIT_TEST_LOCK`；STOP 分支加源码文本断言（变异验证：把原 bug 加回调用点即红）；`refreshHomes` 成功不清超时类错误（含「结果未知/daemon 无响应」判定，`refreshNodes` 成功才清）+ 重建失败映射友好文案；F-SP2-7 补 TS 覆盖（daemon_homes 拒绝时 homes/activeHome 保留 + 错误设置）。
+
+**验证**：workspace 517 ×2 连续全绿（513 基线 +4）；前端 207（+4）、tsc 干净；根 vitest 447；clippy/fmt 干净；nm daemon 双零；`pnpm gen` 无差异。台账 F-SP2-8/9 翻 fixed(26df96c)。
+
+**未做（§55 其余 P3，留后续脱敏专项/桌面小项）**：`--bearer-token` 空格分隔形态、`Cookie:`/`set-cookie`/URL 内嵌凭证/`ghp_`/`sk_live_`、全角冒号、`-sH`/`--authorization`/`-u user:pass`/`--cookie` argv 形态；async 命令包 `spawn_blocking`；`events_subscribe` 源码断言之外的路径覆盖；grants symlink 平台别名；p49/p51/p53 spec 第二参数。
+
+### §57. §56 修复复审（2026-10-24，26df96c）
+
+**范围与方法**：26df96c（6 个文件，+558/−77）。2 个并行评审：① sanitize——并排编译 OLD（906f223）、MID2（2b77285）、NEW（HEAD），约 125 条手写行、12 条真实 stream-json、26 组 argv、300 万条随机 `sanitize_line` 输入 + 100 万组随机 argv、14 个 8MB 性能用例、6 个变异体；② 桌面端。xterm 不在范围。
+
+**验证**：fmt、clippy 干净；`cargo test --workspace` 三轮各 517 passed / 0 failed（本轮无 flake）；nm：omt-daemon 中 `omt_exec|omt_harness` = 0；`pnpm gen` 无差异；根 tsc 通过、根 vitest 447 passed；桌面 vitest 207 passed、tsc 干净。
+
+**结论**：
+- **sanitize 已收敛**：§55 全部泄漏样例闭合（含 JSON 键值 `{"apiKey": "abc"}`、`{"access_token": …}` 等三版都漏的形态），历轮完好样例全部保持，`--monkey=banana` 按设计移入可接受误伤；300 万随机输入零 panic，归一化后 NEW 比 MID2 多露的情况只来自下面的 Authorization 无 scheme 形态；OLD 脱敏而 NEW 不脱敏的只剩 §51 有意放开的两类（词中 / 后接字母数字的 `bearer`、词中 `sk-`）；8MB 行 9–22ms（线性）；6 个变异体全部被测试表抓住。用量计数字段（`input_tokens`、`max_tokens`、`token_count` 等）不受影响。
+- **桌面端**：`QUIT_STOPPING` 同步置位、测试锁、STOP 分支断言、`daemon_homes` 拒绝路径测试均成立；主线程上已没有任何同步命令碰会话锁，quit/close 路径也不碰。但改 async 引入 1 条回归、超时提示保留有 1 处漏网，共 2 条 P2。无 P1。
+
+#### F-SP2-10 · P2 · `events_subscribe` 改 async 后，最新订阅不再必然胜出（评审 ②，置信度 70，回归）
+
+- `rpc_bridge.rs:417-424`、`store.ts:1266-1287`：之前同步命令在主线程按到达顺序执行，`set_target(B)` 必在 `set_target(A)` 之后。现在每次调用是独立 tokio 任务，先在 `with_session` 的会话锁上阻塞，拿到锁后才 `SUBSCRIPTIONS.set_target`——代次按拿锁顺序而非请求顺序分配。
+- 场景：A→B 切换会同时触发多个 `omt_call`（node/tree、run/list、filters）持同一把锁（重建时最长 30s）；两次 `events_subscribe` 都在锁上排队，`std::sync::Mutex` 非 FIFO，A 可能后拿锁 → 泵轮询 A；B 的监听器按 `homeId === 'h_b'` 过滤，永不触发，外部 CLI 改动不再刷新树，直到下次切换。前端 `.catch(() => {})`，无任何提示。源码断言测试不覆盖顺序。
+- **建议**：`session.runtime_dir()` 就是 `daemon::runtime_dir()`（`state.rs:39`），`events_subscribe` 直接去掉 `with_session`——泵自己会连接与退避；不持锁后命令很轻，甚至可以改回同步以保住顺序。（同时消除既有问题：订阅失败时 `with_session` 先返回、不 `set_target`，泵继续轮询旧 home 且无重试。）
+
+#### F-SP2-11 · P2 · 聚焦路径上 `refreshAgents()` 仍清掉超时提示（评审 ②，置信度 85）
+
+- `store.ts:614`（`...(opts?.silent ? {} : { error: null })`）、`:1296-1299`：`onFocus` 同时调 `refreshHomes()` 与非静默 `refreshAgents()`；`agents_list` 只读文件系统（`agents.rs:6`），daemon 卡死时也成功 → `error: null`。home 加载的 `Promise.all([refreshNodes(home), …, refreshAgents(), …])`（`:1208`）同理：`refreshNodes` 超时、`refreshAgents` 后完成 → 提示被抹掉。
+- §56「确认前不得清除『结果未知』」的目标恰在它针对的触发点上失效；新测试只覆盖 `refreshHomes`/`refreshNodes`，所以照样通过。
+- **建议**：把超时提示移到独立状态字段（如 `timeoutNotice`），只有 `refreshNodes` 成功才清——同时去掉按中文文案子串分类（见下 P3）。
+
+#### P3
+
+**sanitize**
+- **Authorization 无 scheme 形态仍泄漏**（`sanitize.rs:132-143`，95，三版都漏、非回归）：首个空白前的 token 一律当作 scheme 保留，`{"Authorization": "SECRETJWT", "Accept": "json"}` → `…"SECRETJWT", " ***`、`headers={'Authorization': 'eyJSECRET', 'X': '1'}`、`Authorization: ghp_SECRET (expired)`、`Authorization: SECRET, retrying` 均泄漏。§56 称「引号 JSON 头已闭合」只在带 scheme 词时成立。调用面窄（启动失败 stderr 尾、harness-capture、本地工具 argv）且形态少见，定 P3；修法便宜：首词只有命中已知 scheme（basic / bearer / token / digest / negotiate / ntlm / dpop / apikey / aws4-hmac-sha256 …，去引号后不区分大小写）才保留，否则从值起点整体替换；泄漏列补上述两行。
+- 转义 JSON 三版都漏（`:67` `skip_sep_ws` 未跳 `\`，90）：`{\"api_key\": \"S\"}`、`\"Authorization\":\"Basic S\"`——Node 错误转储、日志里的请求体、作为单个 argv 的 JSON 都是这种形态。`skip_sep_ws` 加 `\`（可选 `` ` ``、`*`）。
+- 引号跳过导致以关键字结尾的 JSON 键被截（95，信息性，可接受）：`{"key": …}`、`"cache_key"`、`"idempotency_key"`、`"next_token"`、opencode `"input":{"key":"src/index.ts"}` → `{"key":" ***`。`sanitize_line` 不用于事件展示，影响小；建议把 `{"key": "value"}` 写进可接受误伤列，并把 `"usage":{"input_tokens":12,"output_tokens":3,"max_tokens":1024}` 加进完好列锁住计数字段。
+- `["--header=", "next"]` 空值会把下一个参数遮掉（仅误伤）；`:7-8` 注释说 `sanitize_line` 只用于 Failed stderr 尾，已过时。
+
+**桌面端**
+- **超时类错误按中文文案子串分类**（`store.ts:420-428/447-449`，75）：`isTimeoutNotice` 依赖「结果未知 / daemon 无响应」，Rust `DAEMON_TIMEOUT_MESSAGE`（`daemon.rs:187`）改文案即静默改变行为，无跨语言测试；重建失败的友好文案也被算作超时提示，之后 `daemon_homes` 成功仍显示「连接重建失败，当前列表可能已过期」；刷新后无活动 home 时 `refreshNodes` 不运行，提示要到重载才消失；`presentError` 只匹配 `enroll: connection closed:`，`enroll: request write: … timed out` 漏网。F-SP2-11 的独立字段方案一并解决。
+- **STOP 分支源码断言漏掉最可能的回归**（`lib.rs:681-706`，85）：只扫 `QuitChoice::Stop =>` 到 `quit_stop_branch(` 之间；ExitRequested 分支里 `quit_stop_branch(...)` 之后的 `return;` 才是防止落入共享尾部 `QUIT_CONFIRMED.store(true); handle.exit(0);` 的关键，删掉它即复现 F-SP2-4 而断言仍绿；`QUIT_CONFIRMED\n.store`、`.swap(true…)` 也能绕过。建议断言 Stop 分支以 `return` 结束，或重构为 Keep 分支自带 `QUIT_CONFIRMED.store`、去掉共享尾部。
+- **`with_session` 源码断言可能假通过**（`rpc_bridge.rs:521-530`，70）：以 `rfind("pub ")` 定函数边界，私有 `fn` / `pub(crate) fn` 同步命令会被算到前面的 `pub async fn`；无最少命中数断言，改变量名即零命中空过；看不到直接的 `shared.0.lock()` / `rpc_of`（目前都在 async 命令里）。建议断言 ≥4 处、以 `#[tauri::command…]` + `fn ` 定边界、纳入 `.0.lock()`。
+- async 命令仍阻塞 tokio worker（60，既有，§55 已记）：建议 `spawn_blocking`。
+- 订阅 effect 的监听器泄漏（`store.ts:1279-1282`，90，既有）：effect 在 `subscribeEvents` 完成前被销毁时返回的 `unlisten` 被丢弃；`disposers.current` 只推不清，每次切 home 泄漏一个 `omt://event` 监听器，async 订阅把窗口拉宽到 30s。建议 `disposed` 时立即 `unlisten()`，cleanup 里调用保存的 unlisten。
+
+**建议**：修 2 条桌面端 P2（F-SP2-10 去掉 `events_subscribe` 的会话锁；F-SP2-11 超时提示改独立字段、只由 `refreshNodes` 成功清除），顺带订阅 effect 的监听器泄漏、STOP 分支 `return` 断言、`with_session` 断言加最少命中数。sanitize 已收敛，Authorization 已知 scheme 白名单与 `\` 跳过两条 P3 改动小，可一并做；其余进后续脱敏专项。
+
+
+### §58. §57 修复（2026-10-24，03bcead）
+
+- **F-SP2-10**：`events_subscribe` 改回**同步**且完全不碰会话锁（runtime dir 直接取，`with_session`/State 参数删除；泵自行连接退避）——主线程按到达顺序执行，set_target 代次恢复请求序，卡死 daemon 的锁队列不再把订阅停在旧 home；前端订阅失败不再 `.catch(() => {})` 吞掉，进错误状态。顺带消除既有问题（订阅失败不 set_target、泵留在旧 home 无重试）。
+- **F-SP2-11**：超时提示移入独立 `timeoutNotice` 字段，由 Rust 侧 `[daemon-timeout] ` **机器标记**触发（跨语言锁定测试，不再靠中文文案子串分类——`isTimeoutNotice` 删除），**只有 `refreshNodes` 成功才清除**；聚焦时的 `refreshAgents`（本地读、daemon 卡死也成功）与 home 加载的 Promise.all 不再抹掉提示。`presentError` 补 `enroll: request write:` 超时形态；重建失败文案不再算超时提示（读路径、无未知后果语义）。
+- **便宜 P3**：订阅 effect 在 dispose 后到达的 unlisten 立即调用、push-only 的 `disposers` 死状态整体删除（每次切 home 泄漏一个监听器的口子闭合）；退出 Keep 分支自带 `QUIT_CONFIRMED.store + exit(0)`、共享尾部删除（STOP 落入尾部的回归**结构性不可能**，全形态断言覆盖 `.store`/`.swap` 等写法）；`with_session` 源码断言改 attribute 边界 + 压空白 + **≥3 下限**（改名零命中即红，私有同步 fn 不再被算进前面的 async 边界）；脱敏：Authorization 首 token 仅命中已知 scheme 白名单（basic/bearer/token/digest/negotiate/ntlm/dpop/apikey/aws4-hmac-sha256）才保留，裸 token 形态整体脱敏；`skip_sep_ws` 加 `\`/`` ` ``/`*`（转义 JSON 闭合）；usage 计数字段入完好列锁定。
+
+**验证**：workspace 519 ×3 连续全绿（517 基线 +2；首轮一次 401/1 为并发编译负载早停 flake，即刻复跑三连绿）；前端 212（+5）、tsc 干净；根 vitest 447；clippy/fmt 干净；nm daemon 双零。台账 F-SP2-10/11 翻 fixed(03bcead)。
+
+**未做（§57 其余 P3，留后续）**：async 命令包 `spawn_blocking`（既有）、`sanitize.rs` 头注释过时、注释「exit 恒为 jsonl 末行」的 drain 超时例外、`{"key":…}` 类 JSON 键截断的进一步细分（已入可接受误伤列）。
+
+### §59. §58 修复复审（2026-10-24，03bcead）
+
+**范围**：`03bcead`（F-SP2-10/11 + §57 P3）。评审 ①（桌面端：Rust 命令 / store / 退出 / 源码断言，含变异测试）、评审 ②（脱敏：新旧两版对照、探针、模糊、变异），主控抽查 runtime dir 同源、`subscribeEvents` 顺序与各展示点。
+
+**验证**：workspace 519 ×3 连续全绿（无 flake）；clippy/fmt 干净；nm daemon 0；`pnpm gen` 无差异；根 tsc 干净、根 vitest 447；桌面 tsc 干净、vitest 212。评审 ① 另跑桌面 crate `--lib` 25/25；把 store.ts 换回 978bebc 版本，p57 全部 5 条与修订后的 p55 超时用例均变红——新测试是真测试。
+
+**台账更正**：F-SP2-10/11 的 `fixed(da867c5)` 是改写前的哈希（不在本分支上），已改为 `fixed(03bcead)`，与 §58 正文一致。
+
+**结论**：F-SP2-10、F-SP2-11 按处方修复且确认关闭；脱敏无新增泄漏，§57 两条脱敏 P3 均闭合。新增 1 条 P2（本轮引入，显示层）：F-SP2-12。
+
+#### 已核实正确
+
+- **F-SP2-10**：`events_subscribe`（`rpc_bridge.rs:423`）与 `DaemonSession::establish`（`state.rs:39`）调用同一个 `daemon::runtime_dir()`，每次读 env；桌面与链接的 crate 无 `set_var("OMT_RUNTIME_DIR")`，sidecar 以同一目录拉起——不会分叉。Tauri 2.12.4 的同步命令在主线程内联执行，命令不再碰会话锁 → `set_target` 顺序 = 到达顺序。`subscribeEvents`（`bridge.ts:89-98`）先 `invoke` 后 `listen`：invoke 失败不留监听器；dispose 后才 resolve 的 unlisten 立即调用。
+- **F-SP2-11**：聚焦的 `refreshAgents`、`refreshHomes` 成功只写 `error: null`，不再触碰 `timeoutNotice`。Rust 侧 `DAEMON_TIMEOUT_MESSAGE` 只在 `state.rs:94/112` 产生，经 `omt_call`、`rpc_of → launch::start` 原样 `?` 上抛，无二次包裹，前缀始终在开头。
+- **退出**：两处确认框当前行为都正确——CloseRequested 的 Keep 隐藏窗口不退出，ExitRequested 的 Keep 置位后退出，两个 Stop 都经 `quit_stop_branch`，Cancel 清 `DIALOG_OPEN`。
+- **脱敏**：白名单只能保留与 scheme 名完全相等的词，不可能引入泄漏；无 scheme、转义 JSON（含 `\\\"` 双重转义）、`**password**: S`、`` `token`=S ``、Go `map[Authorization:[S]]` 等此前泄漏的形态全部遮住；AWS4 头保留 scheme、`Credential=` 起整体遮掉（含 Signature）。300 万结构化随机行 + 75 万随机字节行无 panic，变化输出均满足「输入前缀 + ` ***`」；8MB 对抗形态 4–23ms，线性。变异：白名单恒真 / 恒假、去掉 `\` 均被抓。
+
+#### F-SP2-12 · P2 · `[daemon-timeout]` 前缀在大部分写路径上原样显示，且这些写路径不落 timeoutNotice（评审 ① + 主控，回归）
+
+- 前缀只在 `presentErrorWithKind` 的调用点剥掉：store 的 `applyError`、`updateNode`、`declareHome`。其余展示点直接 `String(err)`，Tauri 以 Rust 原串拒绝，文本以 `[daemon-timeout]` 开头：
+  - `TreePanel.tsx:356` ← `store.createNode`（`store.ts:1271-1287` 原样抛）→ `node/create`，无 commandId，正是 `state.rs:12-14` 点名的重复提交风险路径；
+  - `ExecutionDialog.tsx:225/314/338` ← `startDispatch`（`store.ts:925-929` 原样抛）→ `exec_start`，以及 `run/add-members`；
+  - `RunsPanel.tsx:27/38/63/80`（run/get、run/control、run/report、node/update）、`DetailPanel.tsx:86/127/138`（node/get、run/create、node/archive）、`AgentsPanel.tsx:347/358/729`（信任门 run/report、node/update、resume）。
+- 场景：新建节点时 daemon 读超时 → 对话框显示「[daemon-timeout] daemon 无响应（30s）：…」。修复前这些位置显示的是干净文案；也与 `daemon.rs:189` 注释「前缀在展示层剥掉」不符。
+- 次要：这些写路径不设 `timeoutNotice`。错误留在组件本地状态里，聚焦刷新不清它，所以缺口比 F-SP2-11 小。
+- **建议**：在 `bridge.ts` 的 `omtCall` / `execStart` 出口统一处理——捕获后抛出带 `{text, daemonTimeout}` 的类型化错误（`toString()` 返回去前缀文案），`applyError` 按类型分流；或导出一个展示 helper 并替换全部 `String(err)` 展示点，写路径调用 store 的 `noteTimeout(error)` 落粘性提示。补一条组件级用例：createNode 超时不出现字面量前缀。
+
+#### P3
+
+**桌面端**
+- **「跨语言锁定」并不存在**（评审 ①）：`daemon.rs:415-420` 断言自己写死的 `"[daemon-timeout] "`，`store.ts:433` 另写一份，p57 / p55 测试手抄整句文案。没有任何测试从一边读另一边的值——Rust 侧把前缀和自己的测试一起改，前端会静默把超时退回 `error`。建议导出 `DAEMON_TIMEOUT_MARKER`，加一条 vitest 读 `../src-tauri/src/daemon.rs` 抽出 `DAEMON_TIMEOUT_MESSAGE` 字面量，断言以该前缀开头，并用抽出的字符串喂 store 测试。
+- **timeoutNotice 的清除不绑定写入与 home**（评审 ①）：
+  - 任何成功的 `refreshNodes` 都清（`store.ts:1136`）：事件去抖（`:1345`）由无关信封触发（run claim 风暴）；切到 home B 的 `loadHome(B)` 会清掉关于 home A 写入的提示。
+  - 非 FIFO 的陈旧读：写入前**发出**的 `node/tree` 可能在写超时后才拿到锁、在重建的连接上执行；daemon 仍在处理写入时返回写前状态 → 成功 → 提示在毫秒内被抹掉。
+  - 读超时（`node/tree`）也落「可能已生效」的粘性提示，对读请求是误导。
+  - 无关闭按钮；无活动 home 时（如零 home 下 `declareHome` 超时）提示永不清除。
+  - 建议：提示记 `{homeId, seq}`，只有同 home、在超时之后发出的 `refreshNodes` 成功才清（序号计数器）；只把写超时路由到提示；加关闭按钮。（相关既有问题：`refreshNodes` 无活动 home 守卫，A 的陈旧结果可覆盖 B 的 `nodes`。）
+- **「订阅失败进错误状态」基本是死代码**（评审 ①）：Rust `events_subscribe` 现在恒返回 `Ok(())`（`rpc_bridge.rs:423-437`）；真实失败在泵里（无活 descriptor、`events/resume` 出错，`:375-405`），泵静默无限重试。`.catch`（`store.ts:1357-1361`）只在 IPC / `listen` 失败时触发，且并发的 `loadHome → refreshNodes` 成功会立刻 `error: null` 抹掉——p57 用例要挂住 `node/tree` 才观察得到。建议泵连续失败 N 次后发 `omt://events-status {homeId, ok, error}`，进独立字段展示。§58「订阅失败不再被吞」的说法偏宽。
+- **退出源码断言仍漏两种回归**（评审 ① 变异确认，测试保持绿）：
+  - 在 ExitRequested 的 `match` 之后加回共享尾部（`QUIT_CONFIRMED.store(true, …); handle.exit(0);`），Keep 分支不动 → Stop 落入尾部（F-SP2-4 原样复现），Cancel 也会退出。原因：Stop 区域截止到下一个 `QuitChoice::`，最后一个分支之后的代码从不扫描。
+  - 给 CloseRequested 的 Keep 分支（`lib.rs:224`，本应隐藏并继续运行）加上 store + `exit(0)`：`keep_owns_exit >= 1` 区分不了两处。
+  - 已正确抓住：给 Stop 分支加 store、删掉 Keep 分支的 exit。§58「结构性不可能」说法过度。建议把两处 `on_choice` 主体抽成返回动作枚举的具名函数并单测；或把扫描延伸到闭包末尾，并分别断言 CloseRequested 的 Keep 无 exit、ExitRequested 的 Keep 有 store+exit。
+- **`command_spans` 断言仍脆**（评审 ① 变异确认）：经命令 span 之外定义的 helper 加锁可通过（同步 `events_subscribe` 调 `session_dir(&shared)`，内部 `.0.lock()`，测试绿）；`with_session` 自身的 `.0.lock(` 函数体落在 `dsh_plugin_install` 的 span 里，只因该命令恰好是 `(async)` 才豁免——改成同步、或在 `with_session` 前新增一个同步命令就会误红。`with_session` 挪进同步命令的变异已被抓住。
+- vitest 新用例把说明文字当第二参数传给匹配器（`toBeNull('…')`、`toContain(x, '…')`、`toHaveLength(1, '…')`），被忽略；应写 `expect(value, msg)`。
+- 既有、非本轮：`daemon::runtime_dir()`（`daemon.rs:58-64`）未把空 / 纯空白的 `OMT_RUNTIME_DIR` 视为未设置（`docs/runtime/config.md:9` 要求），缺 `HOME` 时回退 `/tmp`，而 `paths.rs:37-48` 回退 `.`——与权威文档漂移（会话与订阅彼此一致）。
+
+**脱敏**
+- **加入 `*` 破坏幂等，双重脱敏输出变形**（评审 ②，`sanitize.rs:79-80` + 值起点 `:94`）：值起点查找也跳 `*`，已是掩码的值找不到起点 → 截点落在行尾，再追加一个 ` ***`：`API_KEY= ***` → `API_KEY= *** ***`；`--token=***` → `--token=*** ***`；`Authorization: Bearer ***` → `Authorization: ***`（scheme 丢失）。`sanitize_args_deep`（`omt-exec/src/local.rs:48-53`）对 `sanitize_args` 的输出再跑 `sanitize_line`，harness_list 工具输出从 `--api-key= ***` 变成 `--api-key=*** ***`。仅显示，无泄漏。建议值起点用窄集合（空白、引号、`\`），关键字与分隔符之间的跳过集保留 `` ` `` 和 `*`；LEAKS 各行加幂等断言 `sanitize_line(sanitize_line(x)) == sanitize_line(x)`。
+- **测试缺口**：去掉反引号、去掉 `*`、去掉 `is_known_auth_scheme` 的去引号（`:191`）三个变异都存活——建议 LEAKS 补 `("**password**: S9","S9")`、``("`token`=S9","S9")``。新增两行断言偏弱：`:512` 断言 `S\"` 而非 `S`、`:513` 断言 `Basic S` 而非 `S`（输入里没有其它大写 S，改成 `"S"` 更严）。
+- **注释过时**：`:128-132` 仍写「按 scheme 脱敏（任意 scheme）——scheme 词保留」；`:389-392` 的测试名 `…_any_scheme` 与说明同；`:91` 值起点注释只列「分隔符/空白/引号」。
+- **新增误伤未入可接受列**（可接受，建议入列留档）：``missing field `api_key`: at line 1`` → `` `api_key`: *** ``、``invalid value for `--key`: file not found``、`**Token**: 1024`、`glob key*: matched 3 files`、`{"error":"bad key\": oops"}`。实测：仓库全部 `*.md` 新旧差异仅 5 行（均为脱敏评审笔记），`fixtures/harness/*/help.txt` 与 `models.txt` 不变，jsonl 流 fixture 的变化只有转义 `\"token\"` / `\"leaseToken\"` 值被新遮住——`\` 的实际收益。
+- 仍泄漏、非回归（后续脱敏专项）：`Authorization=Basic S` / `HTTP_AUTHORIZATION=Basic S`（CGI / env 转储，最现实的缺口，规则要求 `:`）、`"` 转义、URL 编码、`&quot;`、驼峰 `proxyAuthorization:`、markdown 表格 `` | `password` | S | ``、`--flag value` 空格分隔形态（已记）。
+
+**建议**：修 F-SP2-12（`bridge.ts` 出口统一类型化错误最省事，一处覆盖全部展示点）；顺带做便宜的三条：真正的跨语言前缀测试、退出断言扫到闭包末尾并区分两处 Keep、`*` 移出值起点集合（恢复幂等）+ 两条反引号 / `*` 泄漏行 + 收紧两条弱断言。timeoutNotice 绑定 home / 序号、泵失败状态事件属于设计改进，可与 `spawn_blocking` 一起进后续桌面专项。
+
+### §60. §59 修复（2026-10-24，c1bbfdf）
+
+- **F-SP2-12**（按处方取 bridge 出口方案）：`omtCall`/`execStart` 的拒绝统一整形为类型化 `DaemonTimeoutError`（`toString()` 返回去前缀文案、携带 `daemonTimeout` 标志）；`applyError`/`presentErrorWithKind` 优先按类型分流（字符串匹配降为防御回退）；`createNode`/`startDispatch` 等**写路径**经新 `noteTimeout` 落粘性提示后重抛——全部 `String(err)` 展示点自动显示干净文案，组件级测试断言字面量前缀不再出现。非超时拒绝字节级不变。
+- **P3-1 真跨语言锁**：Rust 导出 `DAEMON_TIMEOUT_MARKER` 常量（crate 内测试改锁 message↔marker 一致性）；vitest **读 daemon.rs 源码抽出字面量**，断言以 TS 侧常量开头，并把抽出的串喂给 store 测试。变异验证：Rust 侧改前缀，Rust 测试照绿（旧锁单向实锤）、TS 侧三处变红。
+- **P3-2 退出断言补漏**：两个 `on_choice` 闭包**扫到闭包末尾**（含 match 之后区域；注释剥离防误报），CloseRequested 的 Keep 断言**无** exit/store、ExitRequested 的 Keep 断言**有**——§59 点名的两个变异（共享尾部复活、CloseRequested Keep 加 store+exit）均被抓（变异实测）。
+- **P3-3/P3-4 脱敏**：值起点跳过集收窄为空白/引号/`\`（`*` 移出——幂等恢复，`API_KEY= ***` 不再变 `*** ***`，Bearer scheme 不再丢）；全部 LEAKS 行加幂等断言；`:512/:513` 弱断言收紧到裸 `S`（部分遮蔽变异现被抓）；补 `**password**`/反引号两行（去反引号/去 `*` 变异现被抓）；两条过时注释更正。
+- 顺带（触及文件内的琐碎项）：p55/p57 的匹配器第二参数改 `expect(value, msg)` 形态。
+
+**验证**：workspace 519 ×复跑全绿（新增断言都在既有测试函数内，数量不变）；前端 223（+11）、tsc 干净；根 vitest 447；clippy/fmt 干净；nm daemon 双零。台账 F-SP2-12 翻 fixed(c1bbfdf)。
+
+**未做（§59 其余 P3，按建议留桌面/脱敏专项）**：timeoutNotice 按 home/序号绑定（陈旧读清除、读超时误导、无关闭按钮）、泵失败状态事件（`events_subscribe` 恒 Ok、真实失败静默重试——§58「不再被吞」说法已由本轮收窄）、`spawn_blocking`、`command_spans` 脆弱性、`runtime_dir` 空白/env 漂移、`Authorization=Basic S` CGI 形态等后续脱敏专项清单。
+
+### §61. §60 修复复审（2026-10-24，c1bbfdf）
+
+**范围**：`c1bbfdf`（F-SP2-12 + §59 P3）。改动集中（bridge 出口类型化错误、源码断言、sanitize 值起点集合拆分），本轮由主控直接复审 + 变异实测，未派评审代理。
+
+**验证**：workspace 519 ×3 连续全绿（无 flake）；clippy/fmt 干净；nm daemon 0；`pnpm gen` 无差异；根 tsc 干净、根 vitest 447；桌面 vitest 223（19 个文件）。
+
+**结论**：F-SP2-12 确认关闭；§59 点名的退出断言漏洞、跨语言前缀锁、脱敏幂等与变异存活全部闭合。无新增 P1/P2。
+
+#### 已核实正确
+
+- **覆盖面完整**：`DAEMON_TIMEOUT_MESSAGE` 只由 `DaemonSession::call`（`state.rs:94/112`）产生；`call` 的调用方只有 `omt_call`（`rpc_bridge.rs:228`）与 `rpc_of`（`exec_start`，`executor.rs:143`；另有启动对账在后台使用，不上前端）。这两条命令的前端出口 `omtCall` / `execStart` 都已包装；bridge.ts 之外唯一的直接 `invoke` 是 `daemon_reconnect`（不经 `call`）。`daemon_homes` / `daemon_ensure` 只会返回 `reestablish session: …`，不会是超时常量。`DaemonTimeoutError` 的 `toString()` 与 `message` 都是去前缀文案，`String(err)` 与 `err.message` 两种展示写法都干净；非超时拒绝原样重抛。
+- **跨语言锁是真的**：`tests/daemon-timeout-message.ts` 读 `daemon.rs` 源码抽字面量（处理行续与 `\"`/`\\`/`\n`，遇未知转义直接报错），p59 断言 Rust marker === TS marker、message 以 TS marker 开头，并用抽出的原文驱动 store。
+- **变异实测**（主控，改完即还原，工作区干净；Rust 两条确认是断言失败而非编译错误）：
+
+| 变异 | 结果 |
+|---|---|
+| ExitRequested 的 match 之后加回共享尾部（store + exit） | 抓住（`lib.rs:837`） |
+| CloseRequested 的 Keep 加 store + exit | 抓住（`lib.rs:812`） |
+| sanitize 值起点改回宽集合（含 `*`） | 抓住（幂等断言 `sanitize.rs:554`） |
+| `skip_sep_ws` 去掉 `*` | 抓住（`**password**` 行，`sanitize.rs:539`） |
+| `omtCall` 去掉出口整形 | 抓住（p59 4 条失败） |
+| Rust 侧 marker 与 message 一起改前缀 | 抓住（p59 9 条失败） |
+| ExitRequested 的 Cancel 加 `std::process::exit(0)` | **存活**（见 P3） |
+
+#### P3
+
+- **粘性提示只接了两条写路径**：`noteTimeout` 只在 `createNode`、`startDispatch` 调用。组件里直接 `omtCall` 的写操作——`DetailPanel` 的 `run/create`（同样无 commandId）、`node/archive`，`RunsPanel` / `AgentsPanel` 的 `run/control`、`run/report`、`node/update`——现在显示干净文案，但不落 `timeoutNotice`。错误留在组件本地状态，聚焦刷新不清，实际影响小；§60「createNode/startDispatch **等**写路径」说法偏宽。建议：bridge 出口抛 `DaemonTimeoutError` 时顺带派发一个窗口事件（如 `omt:daemon-timeout`），store 订阅后设 `timeoutNotice`——一处覆盖全部写路径，组件不必逐个改。
+- **退出断言的 exit needle 偏窄**：只认 `.exit(0`，`std::process::exit(0)`、`handle.exit(1)` 都能绕过（上表最后一行）；另外 Stop 区域截止到下一个 `QuitChoice::`，若把 Stop 改成最后一个分支，match 之后的尾部会被并进 Stop 区域而豁免。都属低概率改法；建议 needle 放宽为 `exit(`，Stop 区域截止到 match 结束。
+- §60 列出的未做项（timeoutNotice 按 home / 序号绑定、泵失败状态事件、`spawn_blocking`、`command_spans` 脆弱性、`runtime_dir` 与 config.md 漂移、`Authorization=Basic S` 等脱敏专项）维持原判，不重复记。
+
+**建议**：本轮可以收口——无 P2。上面两条 P3 改动都很小，可以随下一批桌面专项一起做，不必单独再走一轮修复。
+
+### §62. §61 P3 修复（2026-10-25，9765218）
+
+按 §61「可随下一批一起做」的两条 P3 提前收口：
+
+- **noteTimeout 事件化**：bridge 出口（`presentInvokeError`）整形超时的同时 `emit('omt:daemon-timeout', {text})`；store 挂载期订阅、落 `timeoutNotice`（卸载/重复渲染安全：disposed 守卫 + unlisten 清理）——**全部**经 `omtCall`/`execStart` 的写路径（组件本地直接 await 的 `run/control`、`node/update`、`node/archive` 等）一处覆盖，不再只接 createNode/startDispatch 两条。两个新 vitest（事件置位 + 空 payload/订阅失败不影响主流程）；p55/p57/p59 的事件 mock 补 `emit`。
+- **退出断言 needle 放宽 + Stop 区域闭包内检查**：exit needle `.exit(0` → `exit(`（去空白后），`std::process::exit(0)` / `exit(1)` 不再漏（变异 1 重验：ExitRequested Cancel 加 `std::process::exit(0)` 即红）；Stop 分支改在**剥注释的闭包区**内检查——Stop 为末分支时 arm 延伸到闭包区结束，match 尾部并入 Stop 区域由 confirm 断言兜住（不再从剩余区豁免；变异 2 重验：match 后加 `QUIT_CONFIRMED.store + app.exit(1)` 尾部即红）。Stop 上不做 exit 断言——helper 的 `move || …exit(0)` 闭包实参是合法内容（首次实现误加，桌面 lib 25 测试即红后修正）。
+- 过程记录：变异 2 首测用了作用域外的 `handle.exit(1)`——编译失败被 grep 漏看，误判「存活」；换作用域内的 `app.exit(1)` 重测确认**被抓**。§62 如实记录。
+
+**验证**：workspace 519 全绿、桌面 lib 25 全绿；前端 225（+2）、tsc 干净；clippy/fmt 干净；nm daemon 双零。
+
+### §63. §62 修复复审（2026-10-25，9765218）
+
+**范围**：`9765218`（§61 两条 P3）。改动小，主控直接复审 + 变异实测。未跟踪的 `docs/plans/2026-10-25-0113-feat-desktop-embedded-terminal-plan.md` 属终端调研，不在本审范围。
+
+**验证**：workspace 519 ×3——第 2 轮 `election_race` 超时一次（401/1 早停；当时主控的 vitest 变异在并发跑，已知的负载敏感用例），低负载单独复跑 3 次全绿，另两轮 519 全绿；clippy/fmt 干净；nm daemon 0；`pnpm gen` 无差异；根 tsc 干净、根 vitest 447；桌面 vitest 225（19 个文件）。
+
+**结论**：两条 P3 都按建议修了，行为正确；无新增 P1/P2。留一个测试缺口（P3）。
+
+#### 已核实正确
+
+- **事件化粘性提示**：`presentInvokeError` 整形超时时 `emit('omt:daemon-timeout', {text})`，store 挂载期订阅并设 `timeoutNotice`；dispose 后到达的 unlisten 立即调用，订阅失败被吞、不影响主流程。`capabilities/default.json` 有 `core:default`（含 `core:event:default` → allow-emit / allow-listen），前端 `emit` 有权限。与 `applyError` / `noteTimeout` 重复置位的是同一文案，无害。
+- **退出断言**（主控变异重跑，均为断言失败、非编译错误，改完即还原）：
+
+| 变异 | 结果 |
+|---|---|
+| ExitRequested 的 match 之后加回共享尾部 | 抓住（`lib.rs:834`） |
+| CloseRequested 的 Keep 加 store + exit | 抓住（`lib.rs:809`） |
+| ExitRequested 的 Cancel 加 `std::process::exit(0)`（§61 存活项） | **抓住**（`lib.rs:833`） |
+
+#### P3
+
+- **事件的发出端没有测试**（变异实测）：删掉 `bridge.ts` 里的 `void emit('omt:daemon-timeout', { text })`，桌面 vitest 225 条全绿。新增的两条用例只覆盖接收端（直接调用 store 的监听函数）；p59 的 `emitMock` 只 `mockReset`，从未断言被调用。§62「全部写路径一处覆盖」在行为上成立，但没被测试锁住——有人删掉这行，组件本地写路径的粘性提示会静默消失。建议在 §59 的 bridge 用例里补一条：`omtCall` 超时拒绝后 `expect(emitMock).toHaveBeenCalledWith('omt:daemon-timeout', { text: <去前缀文案> })`，非超时拒绝断言未调用。
+- 小项（不必单独修）：
+  - 读超时现在也一律落「可能已生效」粘性提示（`node/get`、`run/get` 等经 `omtCall` 的读都会触发）——是 §59 已记、§60 留待桌面专项的「读超时误导」的范围扩大，不是新问题，届时一并按写 / 读区分即可。
+  - `void emit(...)` 若被拒绝会成为未处理的 Promise 拒绝（控制台噪声）；也可以改用同步的 DOM `CustomEvent`（`window.dispatchEvent`），不经 IPC 往返、测试也不必 mock `emit`。
+  - Stop 改成末分支、且 match 之后只加 `exit(`（不碰 `QUIT_CONFIRMED`）时，尾部被并入 Stop 区域而 Stop 不做 exit 断言——需要同时重排分支和加尾部，属构造性改法，记录即可。
+
+**建议**：可以收口。发出端测试是一行断言，随下次触及这些文件时补上即可。
+
+**去向（2026-10-25）**：§57–§63 遗留的桌面端 P3 已转入 `docs/plans/2026-10-25-0113-feat-desktop-embedded-terminal-plan.md` 的「遗留评审发现」（CF1–CF8），随 U1 / U2 / U3 / U6 / U10 关闭：CF1 `refreshNodes` 活动 home 守卫、CF2 timeoutNotice 绑定 home / 序号与读写区分、CF3 事件泵失败状态、CF4 超时事件发出端测试、CF5 async 命令 `spawn_blocking`、CF6 会话锁结构性保证（替代 `command_spans` 源码扫描）、CF7 `runtime_dir` 与 config.md 对齐、CF8 退出确认框动作函数化（替代源码文本断言）。脱敏剩余泄漏形态不转入，留给单独的脱敏专项。

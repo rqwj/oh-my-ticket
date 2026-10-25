@@ -14,7 +14,7 @@
 
 use tauri::{AppHandle, Emitter, State};
 
-use crate::harness::{augmented_path, probe_version, which_binary};
+use omt_harness::harness::{augmented_path, probe_version, which_binary};
 
 /// 检测本机已安装的 agent harness（dsh / opencode）：PATH 查找 +
 /// 版本探针。渲染进程无 fs/shell 能力，探测只能在 Rust 侧做。
@@ -206,8 +206,8 @@ fn with_session<R>(
             if !RECONCILED_ONCE.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 let reconciler = crate::state::SharedSession(shared.0.clone());
                 std::thread::spawn(move || {
-                    crate::executor::reconcile_interrupted_execs(
-                        &reconciler,
+                    omt_exec::executor::reconcile_interrupted_execs(
+                        &crate::executor::rpc_of(&reconciler),
                         &daemon::runtime_dir(),
                     );
                 });
@@ -237,18 +237,28 @@ pub fn daemon_status() -> Result<daemon::DaemonStatus, String> {
 /// (pull-based freshness — the store re-invokes on window focus; v1 has
 /// no cross-surface push signal and homes-changed deliberately never
 /// enters the per-home outbox).
-#[tauri::command]
-pub fn daemon_homes(shared: State<'_, SharedSession>) -> Result<serde_json::Value, String> {
+/// §53 F-SP2-7：改 async 命令——惰性重建（连接 + 握手最长 30s，或 sidecar
+/// 拉起等待 10s）跑在主线程会卡 UI；且重建失败经 `?` 上抛（此前吞成
+/// `homes: []`，home 切换器清空、前端 `error: null` 抹掉超时提示）。
+#[tauri::command(async)]
+pub async fn daemon_homes(shared: State<'_, SharedSession>) -> Result<serde_json::Value, String> {
     with_session(&shared, |session| {
         Ok(serde_json::json!({
-            "homes": session.enrollment.handshake["homes"].clone(),
+            // §51：经 session 的惰性重建缝（超时丢弃连接后也能恢复）；
+            // §53：重建失败必须上抛（`?`），不得回落成空列表
+            "homes": session.handshake_homes()?,
             "homeDir": std::env::var("HOME").unwrap_or_default(),
         }))
     })
 }
 
-#[tauri::command]
-pub fn daemon_ensure(shared: State<'_, SharedSession>) -> Result<daemon::DaemonStatus, String> {
+/// §55 F-SP2-9：改 async——`daemon_ensure` 经 with_session 惰性建立会话
+///（连接 + 握手最长 30s），同步命令跑在主线程；与 daemon_homes/omt_call
+/// 共享同一把会话 Mutex，后者持锁重建时主线程会在锁上等最长 30s（转圈）。
+#[tauri::command(async)]
+pub async fn daemon_ensure(
+    shared: State<'_, SharedSession>,
+) -> Result<daemon::DaemonStatus, String> {
     with_session(&shared, |_session| Ok(()))?;
     daemon_status()
 }
@@ -256,8 +266,11 @@ pub fn daemon_ensure(shared: State<'_, SharedSession>) -> Result<daemon::DaemonS
 /// Force a FRESH session (drop the cached enrollment and re-handshake) —
 /// used after home/declare so the new home enters the credential's scoped
 /// grant (requiresRehandshake semantics, KTD3 client half).
-#[tauri::command]
-pub fn daemon_reconnect(shared: State<'_, SharedSession>) -> Result<serde_json::Value, String> {
+/// §53 F-SP2-7：随 daemon_homes 一并 async（重握手同样可能等 30s/10s）。
+#[tauri::command(async)]
+pub async fn daemon_reconnect(
+    shared: State<'_, SharedSession>,
+) -> Result<serde_json::Value, String> {
     {
         let mut guard = shared
             .0
@@ -265,7 +278,7 @@ pub fn daemon_reconnect(shared: State<'_, SharedSession>) -> Result<serde_json::
             .map_err(|_| "session lock poisoned".to_string())?;
         *guard = None;
     }
-    daemon_homes(shared)
+    daemon_homes(shared).await
 }
 
 // ---------------------------------------------------------------------------
@@ -398,14 +411,18 @@ fn subscription_pump(
 
 /// U10 seam（U15 重构）：登记/切换某 home 的事件订阅。幂等线程预算——
 /// 全 app 仅一条泵线程（首次调用时启动），此后调用只更新注册表。
+/// §55 F-SP2-9 → §57 F-SP2-10：§55 为避开会话锁改 async，§57 复审取
+/// 更优解——**完全去掉 with_session**：runtime 目录直接取
+/// `daemon::runtime_dir()`（与 state.rs 建会话同源），泵线程自己连接/
+/// 退避重试，命令无需会话。由此（a）快速切 home A→B 时 set_target 的
+/// 到达顺序得到保住（改回**同步**命令——主线程按到达顺序串行执行；
+/// §56 的 async 形态下各调用是独立 tokio 任务，先在非 FIFO 的会话
+/// Mutex 上排队，A 可能后拿锁 → 泵停在 A，B 的监听器按 homeId 过滤
+/// 永不触发）；（b）消除「订阅失败时 with_session 先返回、不
+/// set_target，泵继续轮询旧 home 且无重试」的既有问题。
 #[tauri::command]
-pub fn events_subscribe(
-    app: AppHandle,
-    shared: State<'_, SharedSession>,
-    home_id: String,
-    since: u64,
-) -> Result<(), String> {
-    let runtime_dir = with_session(&shared, |session| Ok(session.runtime_dir.clone()))?;
+pub fn events_subscribe(app: AppHandle, home_id: String, since: u64) -> Result<(), String> {
+    let runtime_dir = daemon::runtime_dir();
     SUBSCRIPTIONS.set_target(home_id, since);
     if !SUBSCRIPTIONS
         .started
@@ -458,3 +475,129 @@ mod subscription_tests {
 
 #[cfg(test)]
 mod other_tests_placeholder {}
+
+#[cfg(test)]
+mod daemon_homes_tests {
+    /// §57 P3：只扫生产代码（测试模块的注释/needle 会混进扫描造出假命中）。
+    fn production_source() -> String {
+        let full =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/rpc_bridge.rs"))
+                .expect("read rpc_bridge.rs source");
+        let test_module = ["#[cfg(", "test)]"].join("");
+        full[..full.find(&test_module).expect("rpc_bridge.rs 应有测试模块")].to_string()
+    }
+
+    /// §57 P3：按 `#[tauri::command…]` 属性切命令 span（attr 起点 → 下一个
+    /// attr 起点），返回 (span 去空白文本, 是否 async 命令)。以属性定边界
+    /// 而非 `rfind("pub ")`——私有 / pub(crate) 同步 fn 不会再被算进前面
+    /// 的 pub async fn（§57 点名的假通过形态）；去空白让 needle 命中
+    /// rustfmt 拆行的形态（`.\n0\n.\nlock(`）。
+    fn command_spans(src: &str) -> Vec<(String, bool)> {
+        let attr = ["#[tauri::", "command"].join("");
+        let starts: Vec<usize> = src.match_indices(&attr).map(|(i, _)| i).collect();
+        starts
+            .iter()
+            .enumerate()
+            .map(|(n, &start)| {
+                let end = starts.get(n + 1).copied().unwrap_or(src.len());
+                let span = &src[start..end];
+                let attr_args_end = span.find(']').expect("attribute 应闭合");
+                let is_async = span[..attr_args_end].contains("(async)");
+                let collapsed: String = span.chars().filter(|c| !c.is_whitespace()).collect();
+                (collapsed, is_async)
+            })
+            .collect()
+    }
+
+    /// §53 F-SP2-7：`daemon_homes` 必须是 `#[tauri::command(async)]`——
+    /// 惰性重建（连接 + 握手最长 30s，或 sidecar 拉起等待 10s）跑在主线程
+    /// 会卡 UI（同步命令在主线程执行）。tauri 胶水无运行时缝，按源文本
+    /// 锁定属性；`?` 透传由 state.rs 的缝级测试覆盖。
+    #[test]
+    fn daemon_homes_command_is_async_attributed() {
+        let src = production_source();
+        assert!(
+            src.contains("#[tauri::command(async)]\npub async fn daemon_homes"),
+            "daemon_homes 必须保持 #[tauri::command(async)]（重建不得跑主线程）"
+        );
+        assert!(
+            src.contains("session.handshake_homes()?"),
+            "daemon_homes 必须透传 handshake_homes 的错误（§53 F-SP2-7）"
+        );
+    }
+
+    /// §57 F-SP2-10：`events_subscribe` 不得经 with_session 碰会话锁——
+    /// §56 改 async 后各调用是独立 tokio 任务，先在会话 Mutex（std 锁非
+    /// FIFO）上排队，拿到锁才 set_target：快速切 home A→B 时 A 可能后拿
+    /// 锁 → 代次按拿锁顺序分配，泵停在 A，B 的监听器按 homeId 过滤永不
+    /// 触发（外部 CLI 改动不再刷新树）。修复取 §57 处方：runtime 目录
+    /// 直接取 `daemon::runtime_dir()`（与 state.rs 建会话同源），泵自己
+    /// 连接/退避——命令不碰会话，且改回**同步**命令以保住到达顺序
+    /// （同步命令在主线程按到达顺序串行执行；同时消除「订阅失败时
+    /// with_session 先返回、不 set_target，泵停在旧 home 无重试」）。
+    #[test]
+    fn events_subscribe_is_sync_and_session_lock_free() {
+        let src = production_source();
+        let needle = ["fnevents_", "subscribe"].join("");
+        let spans = command_spans(&src);
+        let subscribe_spans: Vec<&(String, bool)> = spans
+            .iter()
+            .filter(|(span, _)| span.contains(&needle))
+            .collect();
+        assert_eq!(
+            subscribe_spans.len(),
+            1,
+            "应恰好有一个 events_subscribe 命令 span，实际 {} 个",
+            subscribe_spans.len()
+        );
+        let (span, is_async) = subscribe_spans[0];
+        assert!(
+            !is_async,
+            "events_subscribe 必须是同步命令（§57 F-SP2-10：不持锁后命令极轻，\
+             同步保住 set_target 的到达顺序；async 形态下会话锁排队非 FIFO）"
+        );
+        let with_session = ["with_", "session"].join("");
+        let direct_lock = [".0", ".lock("].join("");
+        let rpc_fn = ["rpc", "_of("].join("");
+        for shape in [&with_session, &direct_lock, &rpc_fn] {
+            assert!(
+                !span.contains(shape),
+                "events_subscribe 不得触碰会话锁（形态 {shape:?}）：{span:?}"
+            );
+        }
+    }
+
+    /// §55 F-SP2-9 → §57 P3 修订：会话锁（with_session / 直接 `.0.lock()` /
+    /// `rpc_of`）只允许出现在 **async 命令**里——同步命令在主线程执行，
+    /// daemon_homes/omt_call 惰性重建（握手读超时 30s / sidecar 拉起 10s）
+    /// 整段持锁时会在主线程锁上等最长 30s（转圈）。§57 点名旧断言两处假
+    /// 通过：`rfind("pub ")` 定边界漏私有/pub(crate) 同步 fn；无最少命中数
+    /// （with_session 改名 = 零命中 = 空过）。本测按 `#[tauri::command…]`
+    /// 属性定边界 + 断言 ≥3 处调用点（omt_call / daemon_homes / daemon_ensure；
+    /// §57 起 events_subscribe 不再持锁）。
+    #[test]
+    fn session_lock_shapes_live_only_in_async_commands() {
+        let src = production_source();
+        let with_session_call = ["with_session", "(&shared"].join("");
+        let direct_lock = [".0", ".lock("].join("");
+        let rpc_fn = ["rpc", "_of("].join("");
+        let mut calls = 0usize;
+        for (span, is_async) in command_spans(&src) {
+            calls += span.match_indices(&with_session_call).count();
+            if is_async {
+                continue;
+            }
+            for shape in [&with_session_call, &direct_lock, &rpc_fn] {
+                assert!(
+                    !span.contains(shape),
+                    "同步命令不得触碰会话锁（形态 {shape:?}，主线程会在锁上等 30s）：{span:?}"
+                );
+            }
+        }
+        assert!(
+            calls >= 3,
+            "with_session 调用点应 ≥3（omt_call / daemon_homes / daemon_ensure）——\
+             改名后零命中空过是 §57 点名的假通过，实际 {calls} 处"
+        );
+    }
+}

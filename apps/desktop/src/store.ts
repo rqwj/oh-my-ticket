@@ -31,22 +31,40 @@ import {
   sendNotification,
 } from '@tauri-apps/plugin-notification'
 import { Channel, invoke } from '@tauri-apps/api/core'
+import { listen as tauriListen } from '@tauri-apps/api/event'
 import {
+  agentsArchiveLegacy,
   agentsList,
   bindingsGet,
   bindingsGc,
+  daemonTimeoutText,
+  DAEMON_TIMEOUT_MARKER,
+  execAttach,
   execKillOrphan,
   execStart,
   execStop,
+  execStopAll,
   execTranscriptTail,
   agentsDelete,
   omtCall,
   subscribeEvents,
+  type AgentsDeleteResult,
   type EventEnvelope,
   type ExecStartOutcome,
+  type StopAllOutcome,
   type TranscriptEvent,
 } from './bridge'
-import type { AgentRecord, HomeInfo, OmtNode, RunDetail, RunSummary, SavedFilters } from './types'
+import type {
+  AgentRecord,
+  CorruptAgent,
+  HomeInfo,
+  LeaseNotice,
+  LegacyUnmigrated,
+  OmtNode,
+  RunDetail,
+  RunSummary,
+  SavedFilters,
+} from './types'
 
 const FILTERS_KEY = 'tauri:ui' // KD3: surface-prefixed bag key
 const LAST_HOME_KEY = 'omt-desktop-last-home' // 启动恢复：最后选择的 workspace homeId
@@ -56,6 +74,15 @@ const RECENT_KEY = 'recent' // KD3's single shared cross-surface key (R4)
 const TRANSCRIPT_TAIL_CAP = 2000 // 每 exec 尾窗上限：丢最旧（内存上界 = agent 数 × cap）
 const RAW_FLUSH_MS = 50 // raw 行合并刷新窗口（避免每行一渲染）
 const EXIT_REPULL_MS = 400 // exit 后 agents_list 防抖重拉（等 Rust 侧落盘收敛）
+// A8 / Q-10：窗口可见时的 agents_list 静默轮询周期（外部 CLI / MCP 发起的
+// 执行由此在桌面端无需切换焦点即可见）
+const AGENTS_POLL_MS = 5_000
+// §51 attach-retry：exec_attach 瞬时失败后的有界重试——§49 让 silent 轮询
+// 结果结构未变时跳过 setState（agents 引用稳定），失败后 AgentsPanel 键在
+// [agents] 上的接回 effect 不再每 5s 重跑，运行中 agent 的实时 transcript
+// 会冻结。失败后按轮询周期重试，上限 3 次（仍在列表且未 attached 才重试）。
+const ATTACH_RETRY_MS = 5_000
+const ATTACH_RETRY_MAX = 3
 
 const EMPTY_TRANSCRIPT: TranscriptEvent[] = []
 
@@ -347,6 +374,12 @@ export interface TreeState {
   agents: AgentRecord[]
   /** agents.json 解析失败（前端提示降级；U9 据此冻结 GC） */
   parseFailed: boolean
+  /** §41：旧版存储未迁移的说明（横幅 + 「确认并归档」） */
+  legacyUnmigrated: LegacyUnmigrated | null
+  /** §41：agent.json 已损坏的 agent（目录 + 留证文件名） */
+  corruptAgents: CorruptAgent[]
+  /** §47：强制删除时被放弃的租约通知（应用级，逐条关闭；换 home 不清） */
+  leaseNotices: LeaseNotice[]
   selectedAgentId: string | null
   /** 本 home 未查看的 Failed agent id（tab badge；选中即清除） */
   unviewedFailedIds: string[]
@@ -358,6 +391,14 @@ export interface TreeState {
   transcriptVersion: number
   loading: boolean
   error: string | null
+  /**
+   * §57 F-SP2-11：daemon 超时类失败（结果未知、可能已生效）的**粘性**
+   * 提示——独立于 error：refreshAgents / refreshHomes 的成功路径清 error
+   * 不清它（agents_list 只读本地文件、daemon 卡死时也成功；home 列表拉回
+   * 来了不等于节点树刷新过，用户还没确认上次写入是否生效）。只有
+   * refreshNodes **成功**才清（确认过实际状态后回到正常）。
+   */
+  timeoutNotice: string | null
 }
 
 const INITIAL: TreeState = {
@@ -372,6 +413,9 @@ const INITIAL: TreeState = {
   runs: [],
   agents: [],
   parseFailed: false,
+  legacyUnmigrated: null,
+  corruptAgents: [],
+  leaseNotices: [],
   selectedAgentId: null,
   unviewedFailedIds: [],
   bindingsByHome: {},
@@ -379,11 +423,57 @@ const INITIAL: TreeState = {
   transcriptVersion: 0,
   loading: true,
   error: null,
+  timeoutNotice: null,
+}
+
+/**
+ * presentError 的结构化伴生（§57 F-SP2-11）：text = 展示文案；
+ * daemonTimeout = 超时类失败（结果未知、可能已生效——Rust 超时原文带
+ * 机器前缀），供错误写入点分流（超时类 → 粘性 timeoutNotice，只有
+ * refreshNodes 成功才清；其余照旧进可被常规刷新清除的 error）。
+ * §59 F-SP2-12：bridge 出口（omtCall / execStart）已把超时类失败整形为
+ * DaemonTimeoutError（text 剥前缀）——这里优先按**类型**分流（错误到达
+ * 时前缀已剥，字符串匹配不再命中）；字符串回判保留为不经 bridge 出口的
+ * 防御路径。
+ */
+export function presentErrorWithKind(error: unknown): { text: string; daemonTimeout: boolean } {
+  // §59 F-SP2-12：类型化路径——bridge 出口的 DaemonTimeoutError
+  const typed = daemonTimeoutText(error)
+  if (typed !== null) {
+    return { text: typed, daemonTimeout: true }
+  }
+  const text = String(error)
+  // §57 F-SP2-11（防御路径）：不经 bridge 出口整形的 Rust 超时原文（tauri
+  // 命令错误以字符串拒绝，但调用方/测试也可能包一层 Error —— `Error: `
+  // 前缀容忍）。剥前缀展示（文案仍以 Rust 常量为唯一来源），flag 分流到
+  // 粘性提示
+  const bare = text.replace(/^Error:\s*/, '')
+  if (bare.startsWith(DAEMON_TIMEOUT_MARKER)) {
+    return { text: bare.slice(DAEMON_TIMEOUT_MARKER.length).trim(), daemonTimeout: true }
+  }
+  // §55 P3 + §57 P3：连接重建失败的原始报错（`enroll: connection closed: …`
+  // / `enroll: request write: …`——超时形态与 Rust is_read_timeout 同族，
+  // §57 补上写超时形态）映射为友好文案。重建失败是读路径（homes 握手），
+  // 无重复提交风险 → 不进粘性 timeoutNotice（§57：daemon_homes 恢复后
+  // 这条提示就该随常规 error 一起消失）。
+  if (
+    (text.includes('enroll: connection closed:') || text.includes('enroll: request write:'))
+    && (text.includes('Resource temporarily unavailable') || text.toLowerCase().includes('timed out'))
+  ) {
+    return {
+      text: 'daemon 无响应（30s）：连接重建失败，当前列表可能已过期——请稍后重试或刷新确认。',
+      daemonTimeout: false,
+    }
+  }
+  return { text: presentKnownContractError(text), daemonTimeout: false }
 }
 
 /** QUOTA_EXCEEDED(rule=open-homes) must name the limit and the remedy. */
 export function presentError(error: unknown): string {
-  const text = String(error)
+  return presentErrorWithKind(error).text
+}
+
+function presentKnownContractError(text: string): string {
   if (text.includes('QUOTA_EXCEEDED') && text.includes('open-homes')) {
     return `同时打开的 home 数量已达 daemon 配额上限。解法：调大 daemon.json 的 limits.max_open_homes，或重启 daemon 释放空闲 home。(${text})`
   }
@@ -410,6 +500,34 @@ export function claimedCountForExec(
   return items.filter(i => typeof i.executorActor === 'string' && i.executorActor.endsWith(suffix)).length
 }
 
+/**
+ * §47 release-results-hidden：被放弃租约的通知文案。Rust 侧明细形如
+ * `exec <execId>: <err>`（force_release_agent_leases）；run id 从被删 agent
+ * 的 execs 反查；形状不符的明细原样列出。agent 记录已不在列表时退回 id。
+ */
+export function leaseNoticeOf(
+  agent: AgentRecord | undefined,
+  agentId: string,
+  homeId: string,
+  failures: string[],
+): LeaseNotice {
+  const runIds: string[] = []
+  const parts = failures.map(failure => {
+    const execId = /^exec (\S+): /.exec(failure)?.[1]
+    if (!execId) return failure
+    const runId = agent?.execs.find(e => e.execId === execId)?.runId
+    if (runId && !runIds.includes(runId)) runIds.push(runId)
+    return runId ? `${execId}（${runId}）` : execId
+  })
+  const name = agent ? (agent.title ?? agent.displayName) : agentId
+  return {
+    agentId,
+    homeId,
+    runIds,
+    text: `已删除 ${name}，但 ${failures.length} 个租约释放失败、已被放弃：${parts.join('；')}。对应 run item 可能一直显示运行中，请到 Runs 页手动取消该 run。`,
+  }
+}
+
 /** 尾窗入窗（有界：丢最旧；与选中无关，全部活跃 exec 都保）。 */
 function appendTail(
   windows: Map<string, TranscriptEvent[]>,
@@ -424,7 +542,6 @@ function appendTail(
 
 export function useTreeStore() {
   const [state, setState] = useState<TreeState>(INITIAL)
-  const disposers = useRef<Array<() => void>>([])
   // Synchronous mirror of state.filters: saveFilters must compute the
   // merged bag WITHOUT relying on React's async setState updater.
   const filtersRef = useRef<SavedFilters>({})
@@ -454,9 +571,60 @@ export function useTreeStore() {
   const repullTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   // 已查看过的 Failed agent（选中即记入）：badge 重算时不复活
   const viewedFailedRef = useRef<Set<string>>(new Set())
+  // §49 5s-poll-side-effects：上一次 refreshAgents 落账结果的结构签名——
+  // silent 轮询结果结构未变时跳过 setState（保持 agents 引用稳定，
+  // AgentsPanel 键在 [agents] 上的 effect——run/list 兜底扫描、历史尾部
+  // 回载、exec_attach 重试——不再每 5s 重跑）
+  const agentsSigRef = useRef<string | null>(null)
+  // P-10：本会话已接上实时流的 execId（startDispatch 的 Channel 也算）——防重复 attach
+  const attachedRef = useRef<Set<string>>(new Set())
+  // §51 attach-retry：失败重试的计数与在途定时器（execId 键控）
+  const attachRetryCountsRef = useRef<Map<string, number>>(new Map())
+  const attachRetryTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
+  // §51 attach-retry：定时器回调里取「最新」的 attachTranscript（闭包不重建）
+  const attachTranscriptRef = useRef<(execId: string, homeId: string) => void>(() => {})
+  // review R2-9：派发进行中的计数（含续跑的就绪握手，最长 30s）——进行中不接回
+  // 实时流，否则 exec_start 返回后会出现第二个跟随者，事件全部显示两次
+  const dispatchingRef = useRef(0)
+  // §39 fe-resume-fail-reattach：派发进行中被推迟的接回请求（execId → homeId），
+  // 派发结束（成功或失败）后补接——此前失败路径不重拉列表，被跳过的 live
+  // agent 要等下一次列表重拉才接上
+  const deferredAttachRef = useRef<Map<string, string>>(new Map())
 
   const bumpTranscriptVersion = useCallback(() => {
     setState(s => ({ ...s, transcriptVersion: s.transcriptVersion + 1 }))
+  }, [])
+
+  /**
+   * §57 F-SP2-11：全局错误写入的统一落点——超时类失败（结果未知、可能已
+   * 生效）只进**粘性** timeoutNotice，不进 error：refreshAgents（非静默）
+   * 与 refreshHomes 的成功路径都写 `error: null`（agents_list 只读本地
+   * 文件、daemon 卡死时也成功；home 列表拉回来了不等于节点树刷新过），
+   * 落在 error 里的超时提示会被照常抹掉——§56 的保留规则恰在它针对的
+   * 触发点上失效。timeoutNotice 只有 refreshNodes **成功**才清（用户
+   * 确认过实际状态后回到正常）。extra 供调用方附带额外 patch（如
+   * refreshHomes 的 `loading: false`）。
+   */
+  const applyError = useCallback((error: unknown, extra?: Partial<TreeState>) => {
+    const { text, daemonTimeout } = presentErrorWithKind(error)
+    setState(s => ({
+      ...s,
+      ...extra,
+      ...(daemonTimeout ? { timeoutNotice: text } : { error: text }),
+    }))
+  }, [])
+
+  /**
+   * §59 F-SP2-12：**写路径**超时 → 粘性提示的统一落点。createNode /
+   * startDispatch 这类把拒绝值抛给组件就地展示（`String(err)`）的写路径，
+   * 此前从不进 timeoutNotice——错误留在组件本地状态里，结果未知、可能已
+   * 生效的语义丢失。出口（omtCall / execStart）已把超时整形为类型化错误
+   * （daemonTimeout flag），这里按类型路由：超时 → 粘性提示（只有
+   * refreshNodes 成功才清）；非超时静默（就地错误已是全部语义）。
+   */
+  const noteTimeout = useCallback((error: unknown) => {
+    const typed = daemonTimeoutText(error)
+    if (typed !== null) setState(s => ({ ...s, timeoutNotice: typed }))
   }, [])
 
   const flushPendingRaw = useCallback(() => {
@@ -477,7 +645,9 @@ export function useTreeStore() {
   // agents_list pull（§四）：tab 首开 / window focus / 派发后主动拉；
   // agents 是机器本地数据，不进 daemon 事件流。Failed badge 集合随 pull
   // 重算（viewedFailedRef 保证已查看的不复活）。
-  const refreshAgents = useCallback(async () => {
+  // A8 / Q-10：`silent` 时不清除全局错误——5s 定时轮询用它，避免错误
+  // 提示一闪而过；显式拉取（focus / 派发后）仍按原语义清错误。
+  const refreshAgents = useCallback(async (opts?: { silent?: boolean }) => {
     const home = activeHomeRef.current
     if (!home) return
     const requestSeq = ++agentsRequestSeqRef.current
@@ -490,14 +660,27 @@ export function useTreeStore() {
       // 归一化放 setState 之外：updater 在 React 渲染期执行，落到本函数
       // try/catch 之外（测试 mock 返回 {} 时不得炸渲染）
       const agents = result.agents ?? []
+      // §49 5s-poll-side-effects：silent 轮询结果与上次落账结构相同 → 跳过
+      // setState（引用稳定压住 AgentsPanel 的 effect 重跑）。非 silent 调用
+      // 仍走原路径（focus / 派发后重拉要清全局 error）。
+      const signature = JSON.stringify({
+        agents,
+        parseFailed: result.parseFailed ?? false,
+        legacyUnmigrated: result.legacyUnmigrated ?? null,
+        corruptAgents: result.corruptAgents ?? [],
+      })
+      if (opts?.silent && signature === agentsSigRef.current) return
+      agentsSigRef.current = signature
       setState(s => ({
         ...s,
         agents,
         parseFailed: result.parseFailed ?? false,
+        legacyUnmigrated: result.legacyUnmigrated ?? null,
+        corruptAgents: result.corruptAgents ?? [],
         unviewedFailedIds: agents
           .filter(a => a.status === 'failed' && !viewedFailedRef.current.has(a.id))
           .map(a => a.id),
-        error: null,
+        ...(opts?.silent ? {} : { error: null }),
       }))
     } catch {
       /* agents 面是补充面——拉取失败不打断主流程 */
@@ -537,9 +720,21 @@ export function useTreeStore() {
       await bindingsGc(home.homeId)
       await refreshBindings()
     } catch (error) {
-      setState(s => ({ ...s, error: presentError(error) }))
+      applyError(error)
     }
-  }, [refreshBindings])
+  }, [refreshBindings, applyError])
+
+  // §41：「确认并归档」旧版存储——成功后重拉 agents（降级解除）与绑定表
+  //（GC 冻结解除后悬空计数才可信），返回移走的文件名供面板显示。失败**抛出**、
+  // 不写 state.error：全局错误会被其他刷新清掉，归档失败由横幅就地呈现。
+  const archiveLegacyAgents = useCallback(async (): Promise<string[]> => {
+    const home = activeHomeRef.current
+    if (!home) throw new Error('无活动 workspace')
+    const { archived } = await agentsArchiveLegacy(home.homeId)
+    await refreshAgents()
+    await refreshBindings()
+    return archived
+  }, [refreshAgents, refreshBindings])
 
   // exit 后防抖重拉：本地乐观更新让 UI 即时反应，重拉收敛 Rust 落盘后的
   // 权威形态（exit code / failure detail）。
@@ -551,6 +746,9 @@ export function useTreeStore() {
   // exit 事件的本地联动：更新对应 agent 的 status/attachment（乐观），
   // Failed 计入未查看 badge。
   const applyExitLocal = useCallback((ev: Extract<TranscriptEvent, { kind: 'exit' }>) => {
+    // §51：本地乐观更新后重置轮询签名——序号竞争下下一次 silent 轮询结果
+    // 不得被误判为「与上次相同」而跳过落账
+    agentsSigRef.current = null
     setState(s => {
       let failedAgentId: string | null = null
       const agents = s.agents.map(a => {
@@ -643,6 +841,69 @@ export function useTreeStore() {
     [scheduleFlush, applyExitLocal, scheduleAgentsRepull, bumpTranscriptVersion],
   )
 
+  /** P-10：重启后接回仍在运行的 exec。afterSeq 取本窗口最后一个事件的 seq。
+   * §51 attach-retry：瞬时失败不再永久放弃——按轮询周期有界重试（上限
+   * ATTACH_RETRY_MAX 次；exec 仍在当前 agents 列表且未 attached 才重试），
+   * 否则轮询引用稳定化后无人再触发，运行中的实时 transcript 冻结。 */
+  const attachTranscript = useCallback(
+    (execId: string, homeId: string) => {
+      if (attachedRef.current.has(execId)) return
+      // review R2-9：派发进行中（续跑的就绪握手最长 30s）先不接——新 exec 的
+      // 跟随者会由 exec_start 建立。§39：记下来，派发结束后补接
+      if (dispatchingRef.current > 0) {
+        deferredAttachRef.current.set(execId, homeId)
+        return
+      }
+      attachedRef.current.add(execId)
+      const channel = new Channel<TranscriptEvent>()
+      channel.onmessage = ev => ingestTranscriptEvent(ev)
+      const existing = transcriptsRef.current.get(execId)
+      const last = existing && existing.length > 0 ? existing[existing.length - 1] : undefined
+      const afterSeq = last ? last.seq : null
+      void execAttach({ homeId, execId, afterSeq, channel })
+        .then(() => {
+          // 成功才清重试计数（尝试开始时不清——否则重试链永远从 0 数起）
+          attachRetryCountsRef.current.delete(execId)
+        })
+        .catch(error => {
+        attachedRef.current.delete(execId)
+        applyError(error)
+        // §51 attach-retry：失败重试（有界；间隔一个轮询周期）
+        const attempts = (attachRetryCountsRef.current.get(execId) ?? 0) + 1
+        if (attempts > ATTACH_RETRY_MAX) return
+        attachRetryCountsRef.current.set(execId, attempts)
+        const timer = setTimeout(() => {
+          attachRetryTimersRef.current.delete(execId)
+          if (agentsRef.current.some(a => a.execs.some(e => e.execId === execId))) {
+            attachTranscriptRef.current(execId, homeId)
+          } else {
+            attachRetryCountsRef.current.delete(execId)
+          }
+        }, ATTACH_RETRY_MS)
+        attachRetryTimersRef.current.set(execId, timer)
+      })
+    },
+    [ingestTranscriptEvent, applyError],
+  )
+  attachTranscriptRef.current = attachTranscript
+
+  // §51 attach-retry：卸载时清掉在途的重试定时器
+  useEffect(
+    () => () => {
+      for (const timer of attachRetryTimersRef.current.values()) clearTimeout(timer)
+      attachRetryTimersRef.current.clear()
+    },
+    [],
+  )
+
+  /** §39：所有派发结束后补接被推迟的 exec（新 exec 已在 attachedRef 里，自然跳过）。 */
+  const flushDeferredAttach = useCallback(() => {
+    if (dispatchingRef.current > 0) return
+    const pending = [...deferredAttachRef.current]
+    deferredAttachRef.current.clear()
+    for (const [execId, homeId] of pending) attachTranscript(execId, homeId)
+  }, [attachTranscript])
+
   // U6：Channel 由 startDispatch 按次创建（Rust 泵随子进程生命周期，KD-D3），
   // onmessage 直入归并管线；onEvent 兜底供调用方旁路观察。
   const startDispatch = useCallback(
@@ -661,23 +922,41 @@ export function useTreeStore() {
         ingestTranscriptEvent(ev)
         options.onEvent?.(ev)
       }
-      const outcome = await execStart({
-        homeId: options.home.homeId,
-        homePath: options.home.path ?? '',
-        nodeId: options.nodeId,
-        harness: options.harness,
-        unattended: options.unattended,
-        model: options.model ?? null,
-        resumeSession: options.resumeSession ?? null,
-        agentId: options.agentId ?? null,
-        channel,
-      })
+      // review R2-9：派发进行中（就绪握手最长 30s）不计接回实时流——新 exec
+      // 的跟随者由 exec_start 建立
+      dispatchingRef.current += 1
+      let outcome: ExecStartOutcome
+      try {
+        outcome = await execStart({
+          homeId: options.home.homeId,
+          homePath: options.home.path ?? '',
+          nodeId: options.nodeId,
+          harness: options.harness,
+          unattended: options.unattended,
+          model: options.model ?? null,
+          resumeSession: options.resumeSession ?? null,
+          agentId: options.agentId ?? null,
+          channel,
+        })
+      } catch (error) {
+        dispatchingRef.current -= 1
+        flushDeferredAttach()
+        // §59 F-SP2-12：exec_start 是不带 commandId 的写——超时 = 结果未知、
+        // 可能已生效，拒绝值抛给弹窗就地展示的同时落粘性提示
+        noteTimeout(error)
+        throw error
+      }
+      dispatchingRef.current -= 1
+      // P-10：startDispatch 的 Channel 即本会话的实时跟随者——记入防重复 attach
+      attachedRef.current.add(outcome.execId)
+      attachRetryCountsRef.current.delete(outcome.execId)
+      flushDeferredAttach()
       // pull 契约：派发后拉 agents_list（防抖等 Rust 侧 ⑤ 落盘收敛）；
       // 绑定表重拉由 App 的派发成功回调统一触发（单一落点，避免双拉）
       scheduleAgentsRepull()
       return outcome
     },
-    [ingestTranscriptEvent, scheduleAgentsRepull],
+    [ingestTranscriptEvent, scheduleAgentsRepull, flushDeferredAttach, noteTimeout],
   )
 
   const selectAgent = useCallback((agentId: string) => {
@@ -717,29 +996,87 @@ export function useTreeStore() {
     [startDispatch],
   )
 
-  /** F-DEL：删除 agent（终态守卫在服务端）；成功后清选中态并重拉列表。 */
+  /** F-DEL / F-EXEC-14(4)：删除 agent（终态守卫在服务端）。`force=true` =
+   * 「放弃租约并删除」——只绕过待对账租约守卫（面板在常规删除被租约守卫
+   * 拒绝后以两段式确认提供该入口）；成功后清选中态并重拉列表。
+   * §47 release-results-hidden：返回 agents_delete 的释放结果，释放失败的
+   * 租约登记为应用级通知（App 呈现，任何页面可见）。 */
   const deleteAgent = useCallback(
-    async (agentId: string) => {
+    async (agentId: string, force?: boolean): Promise<AgentsDeleteResult> => {
       const home = activeHomeRef.current
       if (!home) throw new Error('无活动 workspace')
-      await agentsDelete(home.homeId, agentId)
+      const result = await agentsDelete(home.homeId, agentId, force ?? false)
+      const failures = result?.leaseReleaseFailures ?? []
       setState(s => ({
         ...s,
         selectedAgentId: s.selectedAgentId === agentId ? null : s.selectedAgentId,
         unviewedFailedIds: s.unviewedFailedIds.filter(id => id !== agentId),
+        // §47：被放弃的租约进应用级通知列表——按被删 agent 追加，不覆盖先前的
+        // 通知（updater 在 refreshAgents 之前执行，s.agents 里还有这条记录）
+        leaseNotices:
+          failures.length > 0
+            ? [
+              ...s.leaseNotices.filter(n => n.agentId !== agentId),
+              leaseNoticeOf(
+                s.agents.find(a => a.id === agentId),
+                agentId,
+                home.homeId,
+                failures,
+              ),
+            ]
+            : s.leaseNotices,
       }))
       await refreshAgents()
+      return result
     },
     [refreshAgents],
   )
+
+  /** §47：关闭一条被放弃租约的通知。 */
+  const dismissLeaseNotice = useCallback((agentId: string) => {
+    setState(s => ({ ...s, leaseNotices: s.leaseNotices.filter(n => n.agentId !== agentId) }))
+  }, [])
 
   const stopAgent = useCallback(async (execId: string) => {
     try {
       await execStop(execId)
     } catch (error) {
-      setState(s => ({ ...s, error: presentError(error) }))
+      applyError(error)
     }
-  }, [])
+  }, [applyError])
+
+  /** P-10 / review F14 / R2-7 / F-EXEC-12 / §43 P3：停止当前 home 的全部运行中
+   * exec。返回 `{ signaled, failed }`（部分失败如实上抛供面板提示「N 个停止
+   * 失败：明细」）；失败返回 null（不能与「本来就没有运行中的」0 混淆）：
+   * - invoke 拒绝（home 级失败）→ 全局 error + null（既有语义）。
+   * - 全部失败（signaled=0 且有 failed）→ 全局 error（合并明细）+ null
+   *   （R2-7 的「停止失败」语义保留——F-EXEC-12 在 Rust 侧以 Ok 数据携带
+   *   明细而非 Err，此处折算回等价的可观察行为）。
+   * - 部分失败（signaled>0 且有 failed）→ 返回结果本身，面板拼接
+   *   「已向 N 个 agent 发出停止信号，M 个停止失败」。
+   * §43 P3：repull 在映射前无条件执行——全失败路径此前跳过重拉，行内残留
+   * 的运行态不会被刷新（对账收尾后 agents.json 已变，UI 需要跟上）。
+   * §53 stop-all-error：整条失败路径（invoke 拒绝 / 全失败）的**全局 error
+   * 只写回发起时的 home**——§52 的切 home 守卫只覆盖面板提示；结果回来时
+   * 已切走，A home 的错误不得写进 B home 的错误条。 */
+  const stopAll = useCallback(async (): Promise<StopAllOutcome | null> => {
+    const home = activeHomeRef.current
+    if (!home) return null
+    try {
+      const outcome = await execStopAll(home.homeId)
+      scheduleAgentsRepull()
+      if (outcome.failed.length > 0 && outcome.signaled === 0) {
+        if (activeHomeRef.current?.homeId !== home.homeId) return null
+        applyError(outcome.failed.join('；'))
+        return null
+      }
+      return outcome
+    } catch (error) {
+      if (activeHomeRef.current?.homeId !== home.homeId) return null
+      applyError(error)
+      return null
+    }
+  }, [scheduleAgentsRepull, applyError])
 
   const killOrphan = useCallback(
     async (agentId: string, execId: string) => {
@@ -749,10 +1086,10 @@ export function useTreeStore() {
         await execKillOrphan(home.homeId, agentId, execId)
         scheduleAgentsRepull()
       } catch (error) {
-        setState(s => ({ ...s, error: presentError(error) }))
+        applyError(error)
       }
     },
-    [scheduleAgentsRepull],
+    [scheduleAgentsRepull, applyError],
   )
 
   const refreshHomes = useCallback(async () => {
@@ -785,11 +1122,16 @@ export function useTreeStore() {
           // adopts the home's persisted filters.
           filters: autoPicking ? {} : s.filters,
           loading: false,
+          // §57 F-SP2-11：成功路径清普通 error（含「连接重建失败」友好文案
+          // ——homes 拉回来了它就该消失）；**超时类提示**不在这里——它在
+          // 独立的 timeoutNotice 字段（本 setState 不触碰），只有
+          // refreshNodes 成功才清（树未随 homes 刷新，用户还没确认上次
+          // 写入是否生效）。
           error: null,
         }
       })
     } catch (error) {
-      setState(s => ({ ...s, loading: false, error: presentError(error) }))
+      applyError(error, { loading: false })
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
@@ -808,11 +1150,13 @@ export function useTreeStore() {
           normalize(child as OmtNode & { nodeId?: string }),
         ),
       })
-      setState(s => ({ ...s, nodes: (result.trees ?? []).map(normalize), error: null }))
+      // §57 F-SP2-11：成功的节点拉取 = 用户确认过实际状态——同时清普通
+      // error 与粘性 timeoutNotice
+      setState(s => ({ ...s, nodes: (result.trees ?? []).map(normalize), error: null, timeoutNotice: null }))
     } catch (error) {
-      setState(s => ({ ...s, error: presentError(error) }))
+      applyError(error)
     }
-  }, [])
+  }, [applyError])
 
   const refreshRuns = useCallback(async (home: HomeInfo) => {
     try {
@@ -922,6 +1266,8 @@ export function useTreeStore() {
         // U5：切换 home 重置 agents 视图态（尾窗按 execId 键控，跨 home 保留）
         agents: [],
         parseFailed: false,
+        legacyUnmigrated: null,
+        corruptAgents: [],
         selectedAgentId: null,
         unviewedFailedIds: [],
         // U9：绑定降级标志随 home 切换重置（表按 home 键保留）
@@ -929,6 +1275,9 @@ export function useTreeStore() {
       }))
       viewedFailedRef.current.clear()
       filtersRef.current = {}
+      // §51：切 home 重置轮询签名——上一 home 的签名不得让新 home 的首个
+      // silent 轮询结果被误判为「结构未变」而跳过落账（空列表签名尤其常见）
+      agentsSigRef.current = null
       activeHomeRef.current = home
       window.localStorage.setItem(LAST_HOME_KEY, home.homeId)
       // U1b：切 home 装载 per-home 数据时顺带执行 bag v2 迁移（幂等）
@@ -937,24 +1286,33 @@ export function useTreeStore() {
     [refreshNodes, refreshRuns, loadFilters, refreshAgents, refreshBindings, migrateHarnessBag],
   )
 
-  /** 新建节点（树面板入口）：node/create → 刷新树 → 选中新节点。 */
+  /** 新建节点（树面板入口）：node/create → 刷新树 → 选中新节点。
+   * §59 F-SP2-12：node/create 不带 commandId——超时 = 结果未知、可能已生效
+   * （state.rs 点名的重复提交风险路径），拒绝值抛给表单就地展示的同时经
+   * noteTimeout 落粘性提示。 */
   const createNode = useCallback(
     async (input: { type: string; title: string; body?: string; parentId: string | null }) => {
       const home = activeHomeRef.current
       if (!home) throw new Error('无活动 workspace')
-      const result = await omtCall<{ node?: { nodeId?: string } }>('node/create', {
-        homeId: home.homeId,
-        type: input.type,
-        title: input.title,
-        ...(input.parentId ? { parentId: input.parentId } : {}),
-        ...(input.body !== undefined ? { body: input.body } : {}),
-      })
+      let result: { node?: { nodeId?: string } }
+      try {
+        result = await omtCall<{ node?: { nodeId?: string } }>('node/create', {
+          homeId: home.homeId,
+          type: input.type,
+          title: input.title,
+          ...(input.parentId ? { parentId: input.parentId } : {}),
+          ...(input.body !== undefined ? { body: input.body } : {}),
+        })
+      } catch (error) {
+        noteTimeout(error)
+        throw error
+      }
       await refreshNodes(home)
       const newId = result.node?.nodeId
       if (newId) selectNode(newId)
       return newId ?? ''
     },
-    [refreshNodes],
+    [refreshNodes, noteTimeout],
   )
 
   // Declare flow (U5 consumer): register an unregistered home directory,
@@ -975,7 +1333,11 @@ export function useTreeStore() {
         if (text.includes('NOT_FOUND') || text.includes('method')) {
           return '当前 daemon 版本不支持动态收录 home（缺少 homeDeclare 能力位）— 请升级 daemon 后重试。'
         }
-        return presentError(error)
+        // §57 F-SP2-11：home/declare 超时同样结果未知——返回给切换器就地
+        // 展示，并落粘性 timeoutNotice
+        const presented = presentErrorWithKind(error)
+        if (presented.daemonTimeout) setState(s => ({ ...s, timeoutNotice: presented.text }))
+        return presented.text
       }
     },
     [refreshHomes],
@@ -990,11 +1352,19 @@ export function useTreeStore() {
   )
 
   // Event-driven refresh (external CLI edits → second-level consistency).
+  // §57 F-SP2-10：订阅失败不再 `.catch(() => {})` 静默——泵停在旧 home 时
+  // 外部 CLI 改动不再刷新树，必须可见（经 applyError 进错误状态）。
+  // §57 P3（监听器泄漏）：effect 在 subscribeEvents 完成前被销毁时，返回的
+  // unlisten 曾被丢弃（旧的 disposers 数组只 push 从不执行/清理——每次切
+  // home 泄漏一个 omt://event 监听器，§56 改 async 把窗口拉宽到 30s）。
+  // 现在：销毁后才 resolve → 立即 unlisten()；销毁前 resolve → 存下来由
+  // cleanup 调用（数组整体退役——不再有只进不出的积累点）。
   useEffect(() => {
     const home = state.activeHome
     if (!home) return
     let disposed = false
     let timer: ReturnType<typeof setTimeout> | undefined
+    let unlisten: (() => void) | undefined
     subscribeEvents(home.homeId, (_envelope: EventEnvelope) => {
       if (disposed) return
       // Debounce bursts (a run claim storms dozens of envelopes).
@@ -1004,18 +1374,50 @@ export function useTreeStore() {
         void refreshRuns(home)
       }, 300)
     })
-      .then(unlisten => {
-        if (!disposed) disposers.current.push(unlisten)
+      .then(fn => {
+        if (disposed) {
+          // effect 已销毁（切 home / 卸载）——立即注销，不得丢 unlisten
+          fn()
+        } else {
+          unlisten = fn
+        }
       })
-      .catch(() => {})
+      .catch(error => {
+        // 已切走/卸载的 home 的订阅失败不再打扰（新 home 的 effect 在跑）
+        if (disposed) return
+        applyError(error)
+      })
     return () => {
       disposed = true
       clearTimeout(timer)
+      unlisten?.()
     }
-  }, [state.activeHome, refreshNodes, refreshRuns])
+  }, [state.activeHome, refreshNodes, refreshRuns, applyError])
 
   // Boot + pull-based home freshness on window focus (v1 contract).
   // U5：agents_list 同享 focus 重拉；U9：bindings_get 同（§四 pull 契约）。
+  // §61 P3：bridge 出口 emit 的 `omt:daemon-timeout` 落粘性提示——一处
+  // 覆盖全部经 omtCall / execStart 的写路径（组件本地直接 await 的
+  // run/control、node/update 等也计入），不再依赖各调用点逐个接 noteTimeout。
+  useEffect(() => {
+    let disposed = false
+    let unlisten: (() => void) | undefined
+    void tauriListen<{ text: string }>('omt:daemon-timeout', event => {
+      if (disposed) return
+      const text = event.payload?.text
+      if (typeof text === 'string' && text.length > 0) {
+        setState(s => ({ ...s, timeoutNotice: text }))
+      }
+    }).then(fn => {
+      if (disposed) fn()
+      else unlisten = fn
+    }).catch(() => {/* 事件订阅失败不影响主流程（超时错误仍走类型化路径） */})
+    return () => {
+      disposed = true
+      unlisten?.()
+    }
+  }, [])
+
   useEffect(() => {
     void refreshHomes()
     void loadKnownHomes()
@@ -1028,6 +1430,16 @@ export function useTreeStore() {
     window.addEventListener('focus', onFocus)
     return () => window.removeEventListener('focus', onFocus)
   }, [refreshHomes, loadRecent, refreshAgents, refreshBindings])
+
+  // Q-10：CLI / MCP 发起的执行在桌面端无需切换焦点即可见——窗口可见时每 5s
+  // 静默重拉 agents（不清除全局错误）。外部 agent 由此出现在列表中；选中后由
+  // AgentsPanel 的 P-10 effect 接回实时流。
+  useEffect(() => {
+    const timer = setInterval(() => {
+      if (document.visibilityState === 'visible') void refreshAgents({ silent: true })
+    }, AGENTS_POLL_MS)
+    return () => clearInterval(timer)
+  }, [refreshAgents])
 
   // Load per-home data whenever the active home changes.
   useEffect(() => {
@@ -1064,12 +1476,16 @@ export function useTreeStore() {
     killOrphan,
     ingestTranscriptEvent,
     loadHistoryTail,
+    attachTranscript,
+    stopAll,
     resumeAgent,
     createNode,
     deleteAgent,
+    dismissLeaseNotice,
     // ── U9：绑定切片（R-C）───────────────────────────────────────────────
     refreshBindings,
     gcBindings,
+    archiveLegacyAgents,
     /** 某 exec 的尾窗（无则空数组）；数组原地追加，UI 以 transcriptVersion 感知 */
     transcriptWindow: (execId: string): TranscriptEvent[] =>
       transcriptsRef.current.get(execId) ?? EMPTY_TRANSCRIPT,
@@ -1090,7 +1506,13 @@ export function useTreeStore() {
         await refreshNodes(home)
         return null
       } catch (error) {
-        return presentError(error)
+        // §57 F-SP2-11：node/update 不带 commandId——超时 = 结果未知、可能
+        // 已生效（重复提交风险最高的路径）。除返回给调用方就地展示外，
+        // 还要落粘性 timeoutNotice（focus 的 refreshAgents 成功清 error
+        // 不得抹掉它）
+        const { text, daemonTimeout } = presentErrorWithKind(error)
+        if (daemonTimeout) setState(s => ({ ...s, timeoutNotice: text }))
+        return text
       }
     },
   }

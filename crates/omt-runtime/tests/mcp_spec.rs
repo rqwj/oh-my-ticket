@@ -3,12 +3,17 @@
 //! Coverage:
 //! - tools/list equals the parity matrix's agent_available ∩
 //!   non-human_administrative set MINUS home/declare (R7 home-family
-//!   exclusion), asserted against the schema file itself;
+//!   exclusion) UNION the 8 local tools (A6/Q-5: a top-level session
+//!   always lists them; policy is checked at call time), asserted against
+//!   the schema file itself;
 //! - full CRUD + run claim/report flows through MCP tools;
 //! - negative: a tool call outside the credential's operations (no
 //!   home-family grant) surfaces a structured isError refusal;
 //! - stderr carries no credential/token material (regex scan);
-//! - features.homeDeclare does not add a declare tool to MCP.
+//! - features.homeDeclare does not add a declare tool to MCP;
+//! - Q-5 / Q-12 / Q-3: injected bridges (`--actor exec:*`, `OMT_EXEC_ID`)
+//!   get no local tools, `exec__start` is policy-checked at call time, and
+//!   MCP cannot declare an unserved home through a `home` path argument.
 
 #![allow(dead_code)]
 
@@ -25,17 +30,32 @@ struct McpProcess {
     stdout: BufReader<std::process::ChildStdout>,
     next_id: u64,
     stderr_path: std::path::PathBuf,
+    /// §49 worker-thread 验证：request() 跳过的行（乱序先到的其他响应）
+    /// 记在这里供测试断言本地调用的响应确实另行写出。
+    skipped: Vec<String>,
 }
 
 impl McpProcess {
     fn spawn(ctx: &TestCtx) -> McpProcess {
+        McpProcess::spawn_with(ctx, &[], &[])
+    }
+
+    /// A6：带全局参数（插在 `mcp` 之前，如 `--actor exec:<execId>`）与
+    /// 追加环境变量（如 Q-12 的 `OMT_EXEC_ID`）的 spawn 变体。
+    fn spawn_with(ctx: &TestCtx, extra_args: &[&str], envs: &[(&str, &str)]) -> McpProcess {
         let stderr_path = ctx.dir.path().join("mcp.stderr");
         let stderr = std::fs::File::create(&stderr_path).expect("create mcp stderr");
-        let mut child = Command::new(std::path::PathBuf::from(env!("CARGO_BIN_EXE_omt")))
+        let mut command = Command::new(std::path::PathBuf::from(env!("CARGO_BIN_EXE_omt")));
+        command
             .arg("--runtime-dir")
             .arg(ctx.runtime_dir_str())
+            .args(extra_args)
             .arg("mcp")
-            .env("OMT_RUNTIME_DIR", ctx.runtime_dir_str())
+            .env("OMT_RUNTIME_DIR", ctx.runtime_dir_str());
+        for (key, value) in envs {
+            command.env(key, value);
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::from(stderr))
@@ -49,6 +69,7 @@ impl McpProcess {
             stdout,
             next_id: 0,
             stderr_path,
+            skipped: Vec::new(),
         }
     }
 
@@ -76,7 +97,15 @@ impl McpProcess {
             if value["id"].as_u64() == Some(self.next_id) {
                 return value;
             }
+            self.skipped.push(trimmed.to_string());
         }
+    }
+
+    /// §49 worker-thread 验证：不等应答地发一条请求（id 手工指定），让测试
+    /// 在本地调用阻塞期间继续与 server 交互。
+    fn send_raw(&mut self, body: &str) {
+        writeln!(self.stdin, "{body}").expect("write raw line");
+        self.stdin.flush().expect("flush raw line");
     }
 
     fn notify(&mut self, method: &str) {
@@ -199,13 +228,27 @@ fn mcp_tools_list_matches_parity_matrix_minus_home_family() {
     // MCP credential excludes the home family — the tools omit them.
     expected.retain(|action| !action.starts_with("home/"));
 
+    // A6 / Q-5：顶层会话始终列出全部 8 个本地工具（`omt mcp` 不声明
+    // listChanged，按 policy 隐藏会让中途开启派发的主控看不到 exec__start）；
+    // `exec__start` 的 policy 在调用时检查。
+    const LOCAL: &[&str] = &[
+        "harness__list",
+        "harness__models",
+        "exec__start",
+        "exec__stop",
+        "exec__status",
+        "exec__list",
+        "exec__tail",
+        "exec__policy",
+    ];
     let mut expected_wire: Vec<String> = expected.iter().map(|a| a.replace('/', "__")).collect();
+    expected_wire.extend(LOCAL.iter().map(|s| s.to_string()));
     expected_wire.sort();
     let mut actual = names.clone();
     actual.sort();
     assert_eq!(
         actual, expected_wire,
-        "tools/list == matrix agent_available − home family"
+        "tools/list == daemon 子集 ∪ 全部本地工具"
     );
     assert!(
         !names.iter().any(|n| n.contains("declare")),
@@ -522,4 +565,377 @@ fn mcp_restricted_credential_refuses_out_of_scope_actions() {
 
     let _stderr = mcp.shutdown();
     daemon.kill();
+}
+
+/// Q-3 / R7：MCP 不能借 `home` 路径让 daemon 声明一个未被服务的 home。
+/// §49 测试加固：只传 `home`（不带 homeId——旧测试两个都传，homeId 优先，
+/// 去掉防护也能通过，守不住 Q-3），断言 INVALID_INPUT 且未声明。
+#[test]
+fn mcp_exec_start_cannot_declare_an_unserved_home() {
+    let (ctx, homes) = TestCtx::spawn_with_homes("mcp-local-home", 2);
+    // 先用 home-01 起一次 daemon 再停掉 → home-01 已初始化（有 omt.db）但随后不被服务
+    {
+        let mut first = common::DaemonProcess::spawn(&ctx, &["--home", homes[1].to_str().unwrap()]);
+        common::wait_for_descriptor(&ctx.runtime_dir, std::time::Duration::from_secs(20))
+            .expect("daemon");
+        first.kill();
+        assert!(common::wait_descriptor_gone(
+            &ctx.runtime_dir,
+            std::time::Duration::from_secs(20)
+        ));
+    }
+    let _daemon = common::DaemonProcess::spawn(&ctx, &["--home", homes[0].to_str().unwrap()]);
+    wait_endpoint(&ctx);
+    std::fs::create_dir_all(ctx.runtime_dir.join("exec")).unwrap();
+    std::fs::write(
+        ctx.runtime_dir.join("exec/policy.json"),
+        r#"{"allowFromMcp": true}"#,
+    )
+    .unwrap();
+    let mut mcp = McpProcess::spawn(&ctx);
+    initialize(&mut mcp);
+    // 只传 home 路径（已初始化、未被服务——若防护失效即可被声明的最大威胁
+    // 形态），不带 homeId：MCP 只认 homeId，home 键必须被拒绝为 INVALID_INPUT
+    let result = call_tool(
+        &mut mcp,
+        "exec__start",
+        serde_json::json!({
+            "home": homes[1].to_str().unwrap(),
+            "harness": "pi", "nodeId": "TICKET-1"
+        }),
+    );
+    assert_eq!(result["result"]["isError"], true, "{result}");
+    assert!(
+        result["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("INVALID_INPUT"),
+        "MCP 只认 homeId；只给 home 路径必须是 INVALID_INPUT（不是借它查找/声明）: {result}"
+    );
+    // home-01 仍未被服务（没有被声明）
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_omt"))
+        .args(["--runtime-dir", ctx.runtime_dir_str(), "daemon-status"])
+        .output()
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("home-01"));
+    // 直接看 daemon 的握手 home 清单：只有 home-00，没有 home-01
+    let descriptor =
+        common::wait_for_descriptor(&ctx.runtime_dir, std::time::Duration::from_secs(20))
+            .expect("live daemon descriptor");
+    let mut client = common::TestClient::connect(&descriptor.endpoint).expect("connect");
+    let handshake = client
+        .call(
+            "handshake/request",
+            json!({
+                "protocolVersion": "1.0",
+                "client": { "kind": "cli", "name": "mcp-spec-home-check" },
+            }),
+        )
+        .expect("helper handshake");
+    let served = handshake["homes"].as_array().cloned().unwrap_or_default();
+    assert_eq!(served.len(), 1, "home-01 未被声明: {served:?}");
+    assert!(
+        !serde_json::to_string(&served).unwrap().contains("home-01"),
+        "daemon 只服务 home-00: {served:?}"
+    );
+    mcp.shutdown();
+}
+
+/// Q-12：进程环境带 OMT_EXEC_ID 的 omt mcp（被派发 harness 自己起的）同样不暴露本地工具。
+#[test]
+fn mcp_with_nested_exec_marker_exposes_no_local_tools() {
+    let ctx = TestCtx::spawn_named("mcp-local-nested");
+    let _daemon = common::DaemonProcess::spawn(&ctx, &["--home", ctx.home_str()]);
+    wait_endpoint(&ctx);
+    let mut mcp = McpProcess::spawn_with(&ctx, &[], &[("OMT_EXEC_ID", "exec-parent")]);
+    initialize(&mut mcp);
+    let names = tool_names(&mut mcp);
+    assert!(
+        !names
+            .iter()
+            .any(|n| n.starts_with("harness__") || n.starts_with("exec__")),
+        "{names:?}"
+    );
+    mcp.shutdown();
+}
+
+#[test]
+fn injected_harness_bridge_exposes_no_local_tools() {
+    let ctx = TestCtx::spawn_named("mcp-local-bridge");
+    let _daemon = common::DaemonProcess::spawn(&ctx, &["--home", ctx.home_str()]);
+    wait_endpoint(&ctx);
+    std::fs::create_dir_all(ctx.runtime_dir.join("exec")).unwrap();
+    std::fs::write(
+        ctx.runtime_dir.join("exec/policy.json"),
+        r#"{"allowFromMcp": true}"#,
+    )
+    .unwrap();
+    let mut mcp = McpProcess::spawn_with(&ctx, &["--actor", "exec:exec-1"], &[]);
+    initialize(&mut mcp);
+    let names = tool_names(&mut mcp);
+    assert!(
+        !names
+            .iter()
+            .any(|n| n.starts_with("harness__") || n.starts_with("exec__")),
+        "{names:?}"
+    );
+    // 直接调用也拒绝（tools/list 之外的兜底）
+    let reply = mcp.request(
+        "tools/call",
+        serde_json::json!({"name": "exec__list", "arguments": {}}),
+    );
+    assert_eq!(reply["error"]["code"], -32602, "{reply}");
+    mcp.shutdown();
+}
+
+#[test]
+fn exec_start_via_mcp_is_policy_denied_by_default() {
+    let ctx = TestCtx::spawn_named("mcp-local-deny");
+    let _daemon = common::DaemonProcess::spawn(&ctx, &["--home", ctx.home_str()]);
+    wait_endpoint(&ctx);
+    let mut mcp = McpProcess::spawn(&ctx);
+    initialize(&mut mcp);
+    // 未列出但被直接调用：调用时再检一次 policy（Q-5）
+    let result = call_tool(
+        &mut mcp,
+        "exec__start",
+        serde_json::json!({
+            "homeId": "h_x", "harness": "pi", "nodeId": "TICKET-1"
+        }),
+    );
+    assert_eq!(result["result"]["isError"], true, "{result}");
+    assert!(
+        result["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("POLICY_DENIED"),
+        "{result}"
+    );
+    mcp.shutdown();
+}
+
+/// §49「MCP 的 homeId 也按路径匹配」：把**已服务 home 的路径**塞进 homeId
+/// 不得被解析成功——「MCP 只认 homeId」，路径匹配是 CLI 专属。旧实现按
+/// 规范路径匹配到已服务 home 后继续派发链（最后才因 ticket 不存在报
+/// LAUNCH_FAILED），而不是 INVALID_INPUT。
+#[test]
+fn mcp_exec_start_rejects_a_path_shaped_home_id() {
+    let ctx = TestCtx::spawn_named("mcp-local-homeid-path");
+    let _daemon = common::DaemonProcess::spawn(&ctx, &["--home", ctx.home_str()]);
+    let endpoint = wait_endpoint(&ctx);
+    std::fs::create_dir_all(ctx.runtime_dir.join("exec")).unwrap();
+    std::fs::write(
+        ctx.runtime_dir.join("exec/policy.json"),
+        r#"{"allowFromMcp": true}"#,
+    )
+    .unwrap();
+    let mut mcp = McpProcess::spawn(&ctx);
+    initialize(&mut mcp);
+    let result = call_tool(
+        &mut mcp,
+        "exec__start",
+        serde_json::json!({
+            "homeId": ctx.home_str(),
+            "harness": "pi",
+            "nodeId": "TICKET-1"
+        }),
+    );
+    assert_eq!(result["result"]["isError"], true, "{result}");
+    let text = result["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.starts_with("INVALID_INPUT"),
+        "路径形态的 homeId 必须是 INVALID_INPUT（field homeId），不是按路径解析: {result}"
+    );
+    assert!(text.contains("homeId"), "结构化 field：{text}");
+    // daemon 侧该 home 仍被服务（没有触发任何按路径的副作用）
+    let mut client = common::TestClient::connect(&endpoint).expect("connect");
+    let handshake = client
+        .call(
+            "handshake/request",
+            json!({
+                "protocolVersion": "1.0",
+                "client": { "kind": "cli", "name": "mcp-spec-path-homeid-check" },
+            }),
+        )
+        .expect("helper handshake");
+    assert_eq!(
+        handshake["homes"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .len(),
+        1
+    );
+    mcp.shutdown();
+}
+
+/// §51 P3「MCP 对通知形式的 tools/call 也回包」：无 id 的 `tools/call`（本地
+/// 工具路径，走 §49 工作线程）是 JSON-RPC 通知——不得有任何响应写出（旧实
+/// 现无条件回包，输出 `{"id":null,…}` 违反协议）。手法：先发通知形式的
+/// exec__list，再发一个哨兵 ping 请求；request() 按 id 配对，其余行全部落进
+/// skipped——断言其中没有 id 为 null 的行（即通知没有产生响应）。
+#[test]
+fn mcp_notification_form_tools_call_gets_no_response() {
+    let ctx = TestCtx::spawn_named("mcp-local-notify");
+    let _daemon = common::DaemonProcess::spawn(&ctx, &["--home", ctx.home_str()]);
+    wait_endpoint(&ctx);
+    let mut mcp = McpProcess::spawn(&ctx);
+    initialize(&mut mcp);
+    // 通知形式：无 id 的 tools/call（本地工具 → 工作线程路径）
+    mcp.send_raw(
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": { "name": "exec__list", "arguments": {} }
+        })
+        .to_string(),
+    );
+    // 哨兵请求：等它应答的窗口里，通知的（非法）响应若存在必已到达
+    let sentinel = mcp.request("ping", json!({}));
+    assert!(sentinel.get("result").is_some(), "{sentinel}");
+    // 工作线程的写出与哨兵应答无顺序保证——再泵几轮 ping 收集迟到行
+    for _ in 0..5 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let _ = mcp.request("ping", json!({}));
+    }
+    assert!(
+        mcp.skipped.iter().all(|line| !line.contains("\"id\":null")),
+        "通知形式的 tools/call 不得产生响应（JSON-RPC 通知无响应）: {:?}",
+        mcp.skipped
+    );
+    mcp.shutdown();
+}
+
+/// §51 P3「MCP exec__list 仍接受路径形状 homeId」：§50 的守卫只在 exec_start
+/// ——只读动词同样守卫（MCP 只认 homeId，路径查找是 CLI 专属）。
+#[test]
+fn mcp_exec_list_rejects_a_path_shaped_home_id() {
+    let ctx = TestCtx::spawn_named("mcp-local-list-homeid-path");
+    let _daemon = common::DaemonProcess::spawn(&ctx, &["--home", ctx.home_str()]);
+    wait_endpoint(&ctx);
+    let mut mcp = McpProcess::spawn(&ctx);
+    initialize(&mut mcp);
+    let result = call_tool(
+        &mut mcp,
+        "exec__list",
+        serde_json::json!({ "homeId": ctx.home_str() }),
+    );
+    assert_eq!(result["result"]["isError"], true, "{result}");
+    let text = result["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.starts_with("INVALID_INPUT"),
+        "路径形态的 homeId 必须是 INVALID_INPUT（field homeId），不是按路径解析: {result}"
+    );
+    assert!(text.contains("homeId"), "结构化 field：{text}");
+    mcp.shutdown();
+}
+
+/// §49「MCP stdio 循环单线程阻塞」：本地工具调用（exec__start 阻塞在跨进程
+/// 派发锁上，获取超时 60s）期间 ping 必须保持应答——旧实现里 serve 循环被
+/// 本地调用占死，客户端超时放弃后 shim 已拉起、调用方拿不到 execId。
+/// 手法：测试进程持有 exec/launch 的 flock，先发 exec__start（id 1），再
+/// ping——ping（id 2）必须在界内应答；随后放锁，exec__start 的响应（乱序、
+/// 按 id 配对）另行到达。
+#[test]
+fn mcp_ping_stays_responsive_while_a_local_tool_call_blocks() {
+    let ctx = TestCtx::spawn_named("mcp-local-worker");
+    let _daemon = common::DaemonProcess::spawn(&ctx, &["--home", ctx.home_str()]);
+    let endpoint = wait_endpoint(&ctx);
+    std::fs::create_dir_all(ctx.runtime_dir.join("exec")).unwrap();
+    std::fs::write(
+        ctx.runtime_dir.join("exec/policy.json"),
+        r#"{"allowFromMcp": true}"#,
+    )
+    .unwrap();
+    let mut mcp = McpProcess::spawn(&ctx);
+    initialize(&mut mcp);
+    // 已服务 home 的 homeId（daemon handshake）
+    let mut helper = common::TestClient::connect(&endpoint).expect("connect");
+    let handshake = helper
+        .call(
+            "handshake/request",
+            json!({
+                "protocolVersion": "1.0",
+                "client": { "kind": "cli", "name": "mcp-spec-worker-home" },
+            }),
+        )
+        .expect("helper handshake");
+    let home_id = handshake["homes"][0]["homeId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 持有跨进程派发锁：exec__start 的工作线程阻塞在 lock_exclusive 上
+    let runtime = std::path::PathBuf::from(ctx.runtime_dir_str());
+    let launch_lock = omt_harness::atomic_json::lock_exclusive(
+        &omt_exec::layout::launch_lock_file(&runtime),
+        std::time::Duration::from_secs(30),
+    )
+    .expect("test holds the launch lock");
+
+    // 先发 exec__start（不等应答），再发 ping——ping 必须在本地调用
+    // 阻塞期间立刻应答（旧实现：ping 要等 exec__start 拿到锁并走完派发链）
+    // §51 测试卫生：id 用 9001（不与 initialize 的 id 1 复用——复用会与
+    // 乱序配对逻辑相混，响应归属不清）
+    mcp.send_raw(
+        &json!({
+            "jsonrpc": "2.0", "id": 9001, "method": "tools/call",
+            "params": { "name": "exec__start",
+                        "arguments": { "homeId": home_id, "harness": "pi", "nodeId": "TICKET-1" } }
+        })
+        .to_string(),
+    );
+    let (ping_tx, ping_rx) = std::sync::mpsc::channel();
+    let reader = {
+        let mut mcp_for_ping = mcp; // 所有权转进线程，应答后经 join 取回
+        std::thread::spawn(move || {
+            let reply = mcp_for_ping.request("ping", json!({}));
+            let _ = ping_tx.send(reply);
+            mcp_for_ping
+        })
+    };
+    let started = std::time::Instant::now();
+    let ping = ping_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("ping 必须在本地工具调用阻塞期间保持应答（serve 循环不得被本地调用占死）");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "ping 应答耗时 {:?}",
+        started.elapsed()
+    );
+    assert!(
+        ping.get("result").is_some(),
+        "ping 是 result 不是 error: {ping}"
+    );
+
+    // 放锁：exec__start 继续走链（ticket 不存在 → LAUNCH_FAILED），其响应
+    // 乱序到达——被后续 request() 当作「跳过行」读到（id == 9001）
+    drop(launch_lock);
+    let mut mcp = reader.join().expect("ping reader thread");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !mcp.skipped.iter().any(|line| {
+        serde_json::from_str::<serde_json::Value>(line)
+            .ok()
+            .and_then(|v| v["id"].as_u64())
+            == Some(9001)
+    }) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "exec__start 的响应（id 9001）应在放锁后 20s 内到达: {:?}",
+            mcp.skipped
+        );
+        let _ = mcp.request("ping", json!({})); // 泵一行，顺带收集跳过行
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let exec_reply = mcp
+        .skipped
+        .iter()
+        .find_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|v| v["id"].as_u64() == Some(9001))
+        .expect("id 9001 的响应");
+    assert_eq!(
+        exec_reply["result"]["isError"], true,
+        "ticket 不存在 → exec__start 报错（证明响应确实来自被阻塞的那个调用）: {exec_reply}"
+    );
+    mcp.shutdown();
 }

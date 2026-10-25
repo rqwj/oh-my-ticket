@@ -12,18 +12,21 @@ trust policy backstop.
 
 The repo has **two runtime planes across four main source surfaces**:
 
-1. **`crates/`** — the Rust core (`omt-domain`, `omt-storage`, `omt-client`, `omt-runtime`). This is
+1. **`crates/`** — the Rust core (`omt-domain`, `omt-storage`, `omt-client`, `omt-contracts`,
+   `omt-runtime`, plus the exec-plane crates `omt-harness` and `omt-exec`). This is
    the single source of truth for domain logic, persistence, and the daemon. Ships two binaries:
-   `omt-daemon` (JSON-RPC server over UDS) and `omt` (operator CLI).
+   `omt-daemon` (JSON-RPC server over UDS) and `omt` (operator CLI, hosting the hidden
+   `exec-shim` verb).
 2. **`src/`** (repo root) — the DSH plugin (`dsh-oh-my-ticket` npm package): a *thin* TS adapter
    over the daemon (host half `src/host/`, browser half `src/client/`). It does **not** touch
    SQLite/Markdown directly — everything routes through `@omt/client-ts` → `omt-daemon`.
 3. **`packages/client-ts/`** (`@omt/client-ts`) — shared TS protocol bindings + daemon
    discover-or-spawn/handshake/reconnect client, generated from `schema/*.schema.json`. Consumed
    by both the DSH plugin and the desktop app.
-4. **`apps/desktop/`** — a Tauri 2 desktop app. Its React UI uses a Rust backend that both talks to
-   `omt-client` and owns a separate local execution plane: harness configuration, agent/binding
-   persistence, child-process lifecycle, dispatch, and temporary MCP injection.
+4. **`apps/desktop/`** — a Tauri 2 desktop app. Its React UI uses a Rust backend that talks to
+   `omt-client` and wraps the shared execution plane (`omt-harness` + `omt-exec`): thin Tauri
+   commands plus jsonl tailing into UI channels. Execution itself runs in detached
+   `omt exec-shim` processes, so quitting the app does not stop running execs.
 
 `schema/*.schema.json` is the single source of truth for the wire protocol; both the Rust bindings
 (`omt-contracts`, via `typify`/`schemars`) and `@omt/client-ts` are generated from it — never
@@ -123,21 +126,24 @@ daemon (discovery is descriptor-based) — never introduce a second directory co
   All `omt_*` tool calls and RPC/SSE traffic route through this one client lifecycle.
 - The daemon binary is intentionally the *same* binary across the DSH plugin, the CLI, and the
   desktop sidecar. Ticket/domain logic lives once in the daemon-facing Rust crates; do not port it
-  into TypeScript. The desktop Tauri backend is not only an adapter: its local execution plane is
-  implemented in `harness.rs`, `agents.rs`, `executor.rs`, `atomic_json.rs`, and
-  `mcp_injection.rs`.
+  into TypeScript. `omt-daemon` never links `omt-exec` (KD-E9) — the exec plane reaches the daemon
+  only as a JSON-RPC client (`omt_exec::daemon_link`).
 
-### Desktop execution plane (`apps/desktop/`)
+### Desktop execution plane (`omt-harness` + `omt-exec`)
 
-- `src-tauri/src/harness.rs` owns harness discovery, configuration, launch resolution, and
-  environment policy.
-- `src-tauri/src/agents.rs` and `atomic_json.rs` own persisted local agent/binding state.
-- `src-tauri/src/executor.rs` owns dispatch, child processes, transcript events, terminal cleanup,
-  and run-lease release.
-- `src-tauri/src/mcp_injection.rs` owns temporary provider-specific MCP configuration and crash
-  recovery.
-- React execution state is centralized in `src/store.ts`; UI coverage lives in
-  `apps/desktop/tests/`, while Rust execution tests live beside the Tauri modules.
+- `crates/omt-harness`: harness REGISTRY/probing/launch composition (`harness.rs`), stream
+  adapters, the benchmark analyzer (`bench.rs`), and atomic JSON state (`atomic_json.rs` with
+  flock-protected corrupt recheck and fsync-before-rename).
+- `crates/omt-exec`: per-agent storage (`agents/<home>/<agentId>/agent.json` + per-exec
+  jsonl/raw.log/prompt/spec files, `layout.rs`), legacy migration (`migrate.rs`), MCP injection
+  with cross-process flock (`mcp_injection.rs`), the executor kernel (`executor.rs`), locked
+  admin grants + shim-side daemon link (`grants.rs` / `daemon_link.rs`), launch spec + the
+  `omt exec-shim` process (`spec.rs` / `shim.rs`), launcher with ready handshake and
+  control/reconcile (`launch.rs` / `control.rs`), and jsonl tailing (`follow.rs`).
+- The desktop app (`apps/desktop/src-tauri/`) keeps only Tauri command wrappers, quit
+  confirmation (background-continue by default), and Channel tailing; React execution state is
+  centralized in `src/store.ts`; UI coverage lives in `apps/desktop/tests/`, Rust execution
+  tests beside their crates (plus real-binary e2e in `crates/omt-runtime/tests/exec_*.rs`).
 
 ### DSH plugin internals (`src/`)
 

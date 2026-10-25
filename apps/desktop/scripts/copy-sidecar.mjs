@@ -17,10 +17,11 @@
  *
  * Usage: node scripts/copy-sidecar.mjs [--dev]
  */
-import { copyFileSync, chmodSync, existsSync, mkdirSync } from 'node:fs'
+import { existsSync, mkdirSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { copyBytes } from './copy-bytes.mjs'
 
 const SRC_TAURI = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'src-tauri')
 const REPO_ROOT = resolve(SRC_TAURI, '..', '..', '..')
@@ -49,8 +50,8 @@ mkdirSync(stagingDir, { recursive: true })
 for (const bin of sidecars) {
   const source = join(binDir, bin)
   const staged = join(stagingDir, `${bin}-${triple}`)
-  copyFileSync(source, staged)
-  chmodSync(staged, 0o755)
+  // P3-ACC-7：字节流复制，不携带 com.apple.provenance（见 copy-bytes.mjs）
+  copyBytes(source, staged)
   console.log(`sidecar staged: ${staged} (from ${profile})`)
 }
 
@@ -65,8 +66,7 @@ if (dev) {
     // workspace target dir, so no copy is needed when they coincide. If a
     // future layout splits target dirs, copy here.
     if (devCopy !== source) {
-      copyFileSync(source, devCopy)
-      chmodSync(devCopy, 0o755)
+      copyBytes(source, devCopy)
     }
   }
   console.log(`dev sidecars in place: ${sidecars.join(', ')} under ${devDir}`)

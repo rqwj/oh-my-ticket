@@ -19,7 +19,7 @@ use omt_storage::clock::MillisClock;
 use omt_storage::{Problem, Result};
 
 const EXIT_OK: i32 = 0;
-const EXIT_USAGE: i32 = 2;
+pub const EXIT_USAGE: i32 = 2;
 const EXIT_PROBLEM: i32 = 3;
 const EXIT_CANCELED: i32 = 130;
 
@@ -53,6 +53,17 @@ ONLINE VERBS (connect to the serving daemon; enrollment is persisted at
   daemon-stop
   daemon-status
 
+LOCAL TOOLS (no daemon round-trip for reads; launches obey <runtime-dir>/exec/policy.json):
+  harness list
+  harness models <harness>
+  exec start  --harness H (--node ID | --run ID) [--model M] [--agent AGENT_ID]
+              [--parent AGENT_ID] [--max-duration SECS]   (home: global --home PATH|ID)
+  exec stop   <execId>
+  exec status <execId>
+  exec list   [--all-homes]
+  exec tail   <execId> [--since SEQ] [--limit N]
+  exec policy
+
 OFFLINE MAINTENANCE (refuses while a daemon serves the home):
   reindex   <home-path>
   doctor    <home-path>
@@ -76,29 +87,46 @@ impl MillisClock for SystemClock {
 // ── entry ───────────────────────────────────────────────────────────────
 
 pub fn run() -> std::process::ExitCode {
-    let code = real_run();
+    let code = real_run_with(None);
     std::process::ExitCode::from(code as u8)
 }
 
 /// Integer exit-code surface for the thin `omt` binary entry.
 pub fn real_run_code() -> i32 {
-    real_run()
+    real_run_with(None)
 }
 
-fn real_run() -> i32 {
-    // Arm SIGINT/SIGTERM handling: the wake closure flips CANCELED and
-    // shuts the active socket down so a blocked call aborts promptly.
-    crate::signal::install(Box::new(|| {
-        CANCELED.store(true, Ordering::SeqCst);
-        if let Some(fd) = *ACTIVE_FD.lock().expect("fd slot") {
-            unsafe {
-                libc::shutdown(fd, libc::SHUT_RD);
-            }
-        }
-    }));
+/// 子项目 2：`omt` 二进制注入本地工具实现（omt-daemon 链接的 lib 不构造它，KD-E9）。
+pub fn real_run_code_with(local: Option<&dyn crate::local_tools::LocalTools>) -> i32 {
+    real_run_with(local)
+}
 
+fn real_run_with(local: Option<&dyn crate::local_tools::LocalTools>) -> i32 {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match dispatch_args(args) {
+    // §49「本地动词期间 Ctrl-C 无效」：harness / exec 本地动词不装 sigwait
+    // 处理——它们不登记 ACTIVE_FD、不检查 CANCELED，装了只会把 SIGINT 吞掉
+    //（`omt harness models` 对挂起的二进制要跑满 8s 探测超时、以 exit 3 收
+    // 场）。保持默认信号语义：Ctrl-C 立即终止（shell 报 130）。在线动词与
+    // `mcp` 保留优雅取消路径（shutdown 活动 socket + CANCELED）。
+    // （`omt exec-shim` is dispatched in cli_main.rs BEFORE this runs — the
+    // shim keeps the default signal mask for its own handler, F1.)
+    let local_verb = split_globals(&args)
+        .ok()
+        .and_then(|split| split.rest.first().cloned())
+        .is_some_and(|verb| verb == "harness" || verb == "exec");
+    if !local_verb {
+        // Arm SIGINT/SIGTERM handling: the wake closure flips CANCELED and
+        // shuts the active socket down so a blocked call aborts promptly.
+        crate::signal::install(Box::new(|| {
+            CANCELED.store(true, Ordering::SeqCst);
+            if let Some(fd) = *ACTIVE_FD.lock().expect("fd slot") {
+                unsafe {
+                    libc::shutdown(fd, libc::SHUT_RD);
+                }
+            }
+        }));
+    }
+    match dispatch_args(args, local) {
         Ok(()) => EXIT_OK,
         Err(CliError::Usage(message)) => {
             eprintln!("{message}\n\n{USAGE}");
@@ -129,6 +157,44 @@ enum CliError {
     Usage(String),
     Problem(Problem),
     Canceled,
+}
+
+/// `omt [--runtime-dir <d>] exec-shim <homeId> <agentId> <execId>`（设计
+/// §3.2 / KD-E1）：launcher 拉起的隐藏动词，不进 USAGE。本函数只做**解析**——
+/// `omt_exec` 的接线留在 `omt` 二进制（`cli_main.rs`），lib（因而 omt-daemon）
+/// 不经本模块引用到 omt_exec（KD-E9，Task 8 Step 8 的 nm 验证）。
+pub struct ExecShimTarget {
+    pub runtime_dir: std::path::PathBuf,
+    pub home_id: String,
+    pub agent_id: String,
+    pub exec_id: String,
+}
+
+/// exec-shim 调用的解析结果：`NotExecShim` = 其他动词（含 split_globals 的
+/// 用法错误——交给正常分派报 USAGE）；`Usage` = 是 exec-shim 但位置参数不对。
+pub enum ExecShimParse {
+    NotExecShim,
+    Usage,
+    Target(ExecShimTarget),
+}
+
+/// 位置参数——全局 `--home` 会被 split_globals 吞掉。
+pub fn parse_exec_shim(args: &[String]) -> ExecShimParse {
+    let Ok(split) = split_globals(args) else {
+        return ExecShimParse::NotExecShim;
+    };
+    if split.rest.first().map(String::as_str) != Some("exec-shim") {
+        return ExecShimParse::NotExecShim;
+    }
+    match &split.rest[1..] {
+        [home_id, agent_id, exec_id] => ExecShimParse::Target(ExecShimTarget {
+            runtime_dir: crate::paths::resolve(split.globals.runtime_dir.as_deref()),
+            home_id: home_id.clone(),
+            agent_id: agent_id.clone(),
+            exec_id: exec_id.clone(),
+        }),
+        _ => ExecShimParse::Usage,
+    }
 }
 
 impl From<Problem> for CliError {
@@ -208,6 +274,11 @@ fn split_globals(args: &[String]) -> CliResult<Split> {
     Ok(Split { globals, rest })
 }
 
+/// cli_main.rs 构造 LocalImpl 需要 runtime dir：只取全局 `--runtime-dir`。
+pub fn runtime_dir_arg(args: &[String]) -> Option<String> {
+    split_globals(args).ok().and_then(|s| s.globals.runtime_dir)
+}
+
 fn flag_value(args: &mut std::collections::VecDeque<String>, name: &str) -> CliResult<String> {
     args.pop_front()
         .ok_or_else(|| usage_err(format!("missing value for {name}")))
@@ -223,7 +294,10 @@ fn parse_bool(raw: &str) -> CliResult<bool> {
 
 // ── verb dispatch ───────────────────────────────────────────────────────
 
-fn dispatch_args(all: Vec<String>) -> CliResult<()> {
+fn dispatch_args(
+    all: Vec<String>,
+    local: Option<&dyn crate::local_tools::LocalTools>,
+) -> CliResult<()> {
     // U1 (R22): `--version` short-circuits before any verb/runtime-dir work —
     // the anchor for install smoke (`./omt --version`) and brew formula checks.
     if all.iter().any(|a| a == "--version") {
@@ -275,7 +349,30 @@ fn dispatch_args(all: Vec<String>) -> CliResult<()> {
         "reindex" => offline_reindex(&split.globals, rest.make_contiguous()),
         "doctor" => offline_doctor(&split.globals, rest.make_contiguous()),
         "takeover" => offline_takeover(&split.globals, rest.make_contiguous()),
-        "mcp" => crate::mcp::serve(&split.globals)
+        // 子项目 2（A5）：本地工具族动词（harness / exec）。lib 只解析与转发；
+        // 实现由 `omt` 二进制经 real_run_code_with 注入（Q-1 / KD-E9）。
+        "harness" | "exec" => {
+            let local = local.ok_or_else(|| usage_err("本地工具族只在 omt 二进制中可用"))?;
+            let mut argv = vec![verb.clone()];
+            argv.extend(rest.drain(..));
+            let (action, mut args) = crate::local_tools::parse_cli(&argv).map_err(usage_err)?;
+            // 全局 --home（路径或 homeId）承载 home 选择（Q-3）
+            if matches!(action, "exec/start") {
+                if let Some(home) = split.globals.homes.first() {
+                    args["home"] = serde_json::json!(home);
+                }
+            }
+            if action == "exec/list" && args.get("allHomes").is_none() {
+                if let Some(home) = split.globals.homes.first() {
+                    args["home"] = serde_json::json!(home);
+                }
+            }
+            let result = local
+                .call(crate::local_tools::LocalCaller::Cli, action, args)
+                .map_err(CliError::Problem)?;
+            print_result(result, split.globals.json)
+        }
+        "mcp" => crate::mcp::serve(&split.globals, local)
             .map(|_| ())
             .map_err(CliError::Problem),
         "run-create" => online(&split.globals, |client, home_id| {

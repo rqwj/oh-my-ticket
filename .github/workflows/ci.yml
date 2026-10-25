@@ -60,6 +60,18 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo test
         run: cargo test --workspace
+      # KD-E9: the daemon must never link the exec plane (omt-exec AND
+      # omt-harness). omt-runtime's package-level [dependencies] includes
+      # omt-exec for the omt CLI bin, so a daemon-side `use omt_exec` would
+      # silently link omt-exec into the omt-daemon sidecar with nothing in
+      # the build graph failing — assert it on the built binaries' symbols
+      # instead (A5: the gate also covers omt_harness, reached transitively
+      # via the local tools implementation in the omt bin).
+      - name: "KD-E9: omt-daemon must not link the exec plane"
+        run: |
+          cargo build -p omt-runtime --bins
+          test "$(nm -a target/debug/omt-daemon | grep -c -E 'omt_exec|omt_harness')" = "0"
+          test "$(nm -a target/debug/omt | grep -c omt_exec)" -gt "0"
 
   node:
     name: node (typecheck · test)

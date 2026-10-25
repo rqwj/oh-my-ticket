@@ -31,6 +31,11 @@ getrandom = { workspace = true }
 # Direct SQL reads/writes on the home actor thread (run-plane transactions,
 # reindex's dedicated connection).
 rusqlite = { workspace = true }
+# exec-shim dispatch in the `omt` CLI (design §3.2 / KD-E1). daemon code paths
+# never reference this crate (KD-E9; verified by the Task 8 nm check).
+omt-exec = { path = "../omt-exec" }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# exec_shim.rs rig: write the fake harness into harness/config.json
+omt-harness = { path = "../omt-harness" }

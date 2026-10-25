@@ -1,0 +1,18 @@
+[package]
+name = "omt-exec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Exec plane: agent storage, MCP injection, executor, launcher and the per-exec shim (design §3.1–§3.3). Never linked into omt-daemon."
+
+[dependencies]
+omt-client = { path = "../omt-client" }
+omt-domain = { path = "../omt-domain" }
+omt-harness = { path = "../omt-harness" }
+libc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

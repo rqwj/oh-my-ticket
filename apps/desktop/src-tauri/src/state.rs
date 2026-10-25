@@ -8,6 +8,13 @@
 //! the call ONCE; protocol problems propagate untouched. Reconnection
 //! mints a FRESH credential — the events subscription is re-established
 //! by the bridge afterwards (it owns the reader thread).
+//!
+//! §51 timeout-no-replay: a 30s READ TIMEOUT is NOT daemon-gone — the
+//! daemon is slow but alive, so replaying would double-submit writes that
+//! carry no commandId (node/create, run/create, node/update …). The
+//! timeout path DROPS the connection (the enrollment slot is emptied and
+//! lazily re-established on the next call) and surfaces
+//! [`crate::daemon::DAEMON_TIMEOUT_MESSAGE`] without retrying.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -17,9 +24,11 @@ use omt_client::Enrollment;
 use crate::daemon;
 
 /// Live daemon session: enrollment + the runtime dir it serves.
+/// §51：enrollment 变为 Option——超时路径丢弃连接（置 None），下次调用经
+/// [`DaemonSession::enrollment_mut`] 惰性重建。
 pub struct DaemonSession {
-    pub enrollment: Enrollment,
-    pub runtime_dir: PathBuf,
+    enrollment: Option<Enrollment>,
+    runtime_dir: PathBuf,
 }
 
 impl DaemonSession {
@@ -39,30 +48,72 @@ impl DaemonSession {
             let _ = daemon::register_admin_grant(&runtime_dir, &principal);
         }
         Ok(Self {
-            enrollment,
+            enrollment: Some(enrollment),
             runtime_dir,
         })
     }
 
+    /// 惰性（重）建立（§51 timeout-no-replay 丢弃连接后的下一次调用）。
+    fn enrollment_mut(&mut self) -> Result<&mut Enrollment, String> {
+        if self.enrollment.is_none() {
+            let (enrollment, _spawned) = daemon::discover_or_spawn_and_enroll(&self.runtime_dir)?;
+            self.enrollment = Some(enrollment);
+        }
+        Ok(self
+            .enrollment
+            .as_mut()
+            .expect("enrollment just established"))
+    }
+
+    /// handshake 的 homes 投影（daemon_homes 命令用；必要时先惰性重建）。
+    /// §53 F-SP2-7：重建失败必须**上抛**——此前 Err 被吞成 `json!([])`，
+    /// rpc_bridge 据此返回 `Ok({homes: []})`：home 切换器被清空，且前端
+    /// 成功路径的 `error: null` 抹掉刚显示的「daemon 无响应（30s）」。
+    pub fn handshake_homes(&mut self) -> Result<serde_json::Value, String> {
+        let enrollment = self.enrollment_mut()?;
+        Ok(enrollment.handshake["homes"].clone())
+    }
+
     /// One authenticated call with single-shot daemon-gone recovery.
+    /// §51 timeout-no-replay：读超时 → 丢弃连接、不重放（避免非幂等写重复
+    /// 提交）；只有真正的 daemon-gone（断连 / 合法退出）才重连 + 重放一次。
     pub fn call(
         &mut self,
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        match self.enrollment.client.call(method, params.clone()) {
+        let attempt = match self.enrollment_mut() {
+            Ok(enrollment) => enrollment.client.call(method, params.clone()),
+            Err(establish) => return Err(format!("reestablish session: {establish}")),
+        };
+        match attempt {
             Ok(value) => Ok(value),
+            Err(problem) if daemon::is_read_timeout(&problem.message, problem.code) => {
+                // 慢但存活的 daemon：丢弃连接（下次调用惰性重建），绝不重放
+                self.enrollment = None;
+                Err(daemon::DAEMON_TIMEOUT_MESSAGE.to_string())
+            }
             Err(problem) if daemon::is_daemon_gone(&problem.message, problem.code) => {
                 // The daemon exited legally (idle watchdog) or the endpoint
                 // died: rediscover-or-respawn, re-enroll, retry ONCE.
                 let (enrollment, _spawned) =
                     daemon::discover_or_spawn_and_enroll(&self.runtime_dir)
                         .map_err(|err| format!("rediscover after daemon loss: {err}"))?;
-                self.enrollment = enrollment;
-                self.enrollment
+                self.enrollment = Some(enrollment);
+                let retry = self
+                    .enrollment_mut()
+                    .expect("enrollment just established")
                     .client
-                    .call(method, params)
-                    .map_err(|retry| format!("{} ({})", retry.message, retry.code))
+                    .call(method, params);
+                match retry {
+                    // 重放的那次也超时：同样丢弃连接、报超时（下次不再重放）
+                    Err(problem) if daemon::is_read_timeout(&problem.message, problem.code) => {
+                        self.enrollment = None;
+                        Err(daemon::DAEMON_TIMEOUT_MESSAGE.to_string())
+                    }
+                    Err(problem) => Err(format!("{} ({})", problem.message, problem.code)),
+                    Ok(value) => Ok(value),
+                }
             }
             Err(problem) => Err(format!("{} ({})", problem.message, problem.code)),
         }
@@ -79,18 +130,28 @@ impl SharedSession {
     }
 }
 
-/// U2: 所有执行会话的持有者（照 SharedSession 模式 manage）。构造即执行
-/// 启动 demote（F-U4a-2：重启后 Live 记录不再可控）。
-pub struct ExecutionState(pub crate::executor::ExecutionManager);
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl ExecutionState {
-    pub fn new() -> Self {
-        Self(crate::executor::ExecutionManager::new())
-    }
-}
-
-impl Default for ExecutionState {
-    fn default() -> Self {
-        Self::new()
+    /// §53 F-SP2-7：`handshake_homes` 的惰性重建失败必须上抛——此前 Err
+    /// 被吞成 `json!([])`，rpc_bridge 据此返回 `Ok({homes: []})`：home
+    /// 切换器被清空，且前端成功路径的 `error: null` 抹掉刚显示的
+    /// 「daemon 无响应（30s）」。缝级测试：连接已被丢弃（enrollment =
+    /// None）、重建注定失败（runtime 目录不存在 → 探活失败 → 测试二进制
+    /// 旁无 omt-daemon sidecar → spawn 失败）——错误必须穿透出来。
+    #[test]
+    fn handshake_homes_propagates_reestablishment_failure() {
+        let mut session = DaemonSession {
+            enrollment: None,
+            runtime_dir: PathBuf::from("/nonexistent-omt-53/runtime"),
+        };
+        let err = session
+            .handshake_homes()
+            .expect_err("重建失败必须上抛（§53 F-SP2-7），不得回落空 homes");
+        assert!(
+            !err.is_empty(),
+            "错误信息非空（前端要靠它呈现 daemon 无响应）"
+        );
     }
 }

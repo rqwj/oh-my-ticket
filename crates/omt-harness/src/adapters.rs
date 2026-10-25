@@ -162,9 +162,11 @@ fn parse_opencode(ev: &serde_json::Value) -> Vec<serde_json::Value> {
                 return Vec::new();
             }
             vec![serde_json::json!({
-                "kind": "usage",
-                "tokens": tokens,
-                "cost": cost,
+                // F-BENCH-19：opencode 的 step_finish 也是**逐步**计（语料
+                // 分解实证：每步 total = 该步 input+output+reasoning+cache，
+                // 4 步相加 98225 而非末值 25460；免费档 cost 恒 0 曾掩盖）
+                "kind": "usage", "scope": "message",
+                "tokens": tokens, "cost": cost,
             })]
         }
         // step-start 与未知 part 类型：忽略
@@ -181,18 +183,10 @@ fn parse_pi_family(ev: &serde_json::Value) -> Vec<serde_json::Value> {
     match ev_type {
         // assistantMessageEvent 增量流：只取聚合终点
         "message_update" => {
+            // F-BENCH-14：本类型的 usage 是**消息内流式快照**（F-U12-3 刷屏
+            // 的来源）——定值在 message_end（pi 1.3.0 / omp 18.12.2 实测均如此），
+            // 此处不再提取，避免与 message_end 双计。
             let mut out = Vec::new();
-            if let Some(usage) = ev.get("usage").filter(|u| !u.is_null()) {
-                let tokens = usage["totalTokens"].as_u64();
-                let cost = usage["cost"]["total"].as_f64();
-                if tokens.is_some() || cost.is_some() {
-                    out.push(serde_json::json!({
-                        "kind": "usage",
-                        "tokens": tokens,
-                        "cost": cost,
-                    }));
-                }
-            }
             let ame = &ev["assistantMessageEvent"];
             match ame["type"].as_str().unwrap_or_default() {
                 "thinking_end" => {
@@ -247,6 +241,28 @@ fn parse_pi_family(ev: &serde_json::Value) -> Vec<serde_json::Value> {
                 "isError": ev["isError"].as_bool().unwrap_or(false),
             })]
         }
+        // F-BENCH-14：usage 是**每条 assistant 消息各自的值**（非会话累计，
+        // 语料实证：cost 序列 0.0349/0.0095/0.0078/0.0092 不递增）。定值挂
+        // message_end 的 message.usage；turn_end / agent_end 携带同值（重复，
+        // 不提取以免双计）。scope=message 告知 reader/analyzer 按消息求和。
+        "message_end" => {
+            let Some(usage) = ev
+                .pointer("/message/usage")
+                .filter(|u| u.is_object() && u.get("totalTokens").is_some())
+            else {
+                return Vec::new();
+            };
+            match (
+                usage["totalTokens"].as_u64(),
+                usage["cost"]["total"].as_f64(),
+            ) {
+                (Some(tokens), cost) => vec![serde_json::json!({
+                    "kind": "usage", "scope": "message", "tokens": tokens, "cost": cost,
+                })],
+                (None, _) => Vec::new(),
+            }
+        }
+        "turn_end" | "agent_end" => Vec::new(),
         "error" => {
             let message = ev["error"]
                 .as_str()
@@ -286,7 +302,9 @@ mod tests {
         let step = r#"{"type":"step_finish","part":{"type":"step-finish","tokens":{"total":17137,"input":17101,"output":5},"cost":0}}"#;
         assert_eq!(
             parse_line("opencode", step),
-            vec![serde_json::json!({ "kind": "usage", "tokens": 17137u64, "cost": 0.0 })]
+            vec![
+                serde_json::json!({ "kind": "usage", "scope": "message", "tokens": 17137u64, "cost": 0.0 })
+            ]
         );
 
         // step-start 忽略；非 JSON 回落 raw
@@ -335,14 +353,12 @@ mod tests {
             ]
         );
 
-        // text_end + usage（message_update 同帧携带 usage）
+        // F-BENCH-14：message_update 的 usage（消息内快照）不再提取；
+        // 定值在 message_end（scope=message）
         let text_end = r#"{"type":"message_update","usage":{"input":6979,"totalTokens":6979,"cost":{"total":0.020937}},"assistantMessageEvent":{"type":"text_end","contentIndex":0,"content":"DONE"}}"#;
         assert_eq!(
             parse_line("pi", text_end),
-            vec![
-                serde_json::json!({ "kind": "usage", "tokens": 6979u64, "cost": 0.020937 }),
-                serde_json::json!({ "kind": "assistant_text", "text": "DONE" }),
-            ]
+            vec![serde_json::json!({ "kind": "assistant_text", "text": "DONE" })]
         );
 
         // 系统消息巨型载荷必须被忽略（不透传进 transcript）
@@ -416,6 +432,37 @@ mod tests {
         assert_eq!(
             parse_line_auto("plain"),
             vec![serde_json::json!({ "kind": "raw", "stream": "stdout", "text": "plain" })]
+        );
+    }
+
+    /// F-BENCH-14/17/19：usage 语义——三家全是**每步/每条消息各自计**
+    /// （scope=message，exec 总量求和）；turn_end/agent_end 同值重复与
+    /// message_update 流式快照均不提取。
+    #[test]
+    fn usage_scopes_message_per_step() {
+        let msg_end = r#"{"type":"message_end","message":{"role":"assistant","usage":{"totalTokens":13134,"cost":{"total":0.009486}}}}"#;
+        assert_eq!(
+            parse_line("pi", msg_end),
+            vec![serde_json::json!({
+                "kind": "usage", "scope": "message", "tokens": 13134u64, "cost": 0.009486
+            })]
+        );
+        assert_eq!(parse_line("omp", msg_end).len(), 1, "omp 同 schema");
+        // turn_end / agent_end：同值重复——零产出
+        let turn_end = r#"{"type":"turn_end","message":{"role":"assistant","usage":{"totalTokens":13134,"cost":{"total":0.009486}}}}"#;
+        assert!(parse_line("pi", turn_end).is_empty());
+        let agent_end = r#"{"type":"agent_end","messages":[]}"#;
+        assert!(parse_line("omp", agent_end).is_empty());
+        // 非 assistant / 无 usage 的 message_end：零产出
+        let plain = r#"{"type":"message_end","message":{"role":"system"}}"#;
+        assert!(parse_line("pi", plain).is_empty());
+        // opencode step_finish：逐步计（F-BENCH-19——分解实证后同 pi 求和）
+        let step = r#"{"type":"step_finish","part":{"type":"step-finish","tokens":{"total":17137},"cost":0}}"#;
+        assert_eq!(
+            parse_line("opencode", step),
+            vec![serde_json::json!({
+                "kind": "usage", "scope": "message", "tokens": 17137u64, "cost": 0.0
+            })]
         );
     }
 

@@ -18,6 +18,7 @@ import { DetailPanel } from './DetailPanel'
 import { RunsPanel } from './RunsPanel'
 import { SettingsPanel } from './SettingsPanel'
 import { AgentsPanel } from './AgentsPanel'
+import { LeaseNoticeBanner } from './agentUi'
 import { ExecutionDialog } from './ExecutionDialog'
 import type { ExecStartOutcome } from './bridge'
 import './styles.css'
@@ -74,6 +75,20 @@ export function App() {
     setDispatchWarnings([])
   }, [state.activeHome?.homeId])
 
+  // §49 lease-notice-switch-home：通知跨 home 保留——「前往 Runs」先切到该条
+  // 所属 home 再打开 Runs（homeId 对不上时找不到当前展示的 home 就不动，
+  // 仍只切视图）。
+  const openRunsOfHome = useCallback(
+    (homeId: string) => {
+      if (state.activeHome?.homeId !== homeId) {
+        const target = state.homes.find(h => h.homeId === homeId)
+        if (target) void store.selectHome(target)
+      }
+      setView('runs')
+    },
+    [state.activeHome?.homeId, state.homes, store],
+  )
+
   // Drag-to-resize the tree/center splitter: pointer captured on the
   // divider, width clamped 240–720px, persisted across launches.
   const startDrag = useCallback((down: React.PointerEvent) => {
@@ -108,6 +123,15 @@ export function App() {
         </button>
       </nav>
       {state.error && <p className="error-banner">{state.error}</p>}
+      {/* §57 F-SP2-11：超时类提示（结果未知、可能已生效）的粘性横幅——
+          独立于 error（focus 的 agents/homes 刷新不清它），成功的节点拉取
+          （refreshNodes）才清；文案引导先刷新确认结果再决定是否重试。 */}
+      {state.timeoutNotice && <p className="error-banner timeout-notice">{state.timeoutNotice}</p>}
+      <LeaseNoticeBanner
+        notices={state.leaseNotices}
+        onDismiss={store.dismissLeaseNotice}
+        onOpenRuns={openRunsOfHome}
+      />
       <div className="content">
         {/* U8/R-D：树与 splitter 仅 Tickets 视图渲染——Runs/设置自然全宽 */}
         {view === 'detail' && state.activeHome && (
@@ -174,6 +198,9 @@ export function App() {
                   <AgentsPanel
                     agents={state.agents}
                     parseFailed={state.parseFailed}
+                    legacyUnmigrated={state.legacyUnmigrated}
+                    corruptAgents={state.corruptAgents}
+                    onArchiveLegacy={store.archiveLegacyAgents}
                     selectedAgentId={state.selectedAgentId}
                     nodes={state.nodes}
                     bindings={state.bindingsByHome[state.activeHome.homeId] ?? EMPTY_BINDINGS}
@@ -182,10 +209,12 @@ export function App() {
                     eventsOf={store.transcriptWindow}
                     homeId={state.activeHome.homeId}
                     loadHistoryTail={store.loadHistoryTail}
+                    attachTranscript={store.attachTranscript}
+                    onStopAll={store.stopAll}
                     onSelectAgent={store.selectAgent}
                     onStopAgent={execId => void store.stopAgent(execId)}
                     onResumeAgent={store.resumeAgent}
-                    onDeleteAgent={agent => store.deleteAgent(agent.id)}
+                    onDeleteAgent={async (agent, force) => { await store.deleteAgent(agent.id, force) }}
                     onKillOrphan={(agentId, execId) => void store.killOrphan(agentId, execId)}
                     onGcBindings={() => void store.gcBindings()}
                     onOpenHarnessSettings={() => setView('settings')}

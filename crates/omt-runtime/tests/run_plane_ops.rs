@@ -150,3 +150,87 @@ fn add_members_nudge_and_interrupt_semantics() {
 
     proc.kill();
 }
+
+/// P3-ACC-2（端到端）：非管理员、未带 leaseToken 的 run/report 返回
+/// CONFLICT + rule `lease-token-missing`；带上 run/claim 返回的 lease.token
+/// 即成功。
+#[test]
+fn report_without_lease_token_names_the_missing_parameter() {
+    let (_ctx, mut proc, endpoint) = ready();
+    let (mut client, cred) = connected_client(&endpoint, "cli").expect("client");
+    let epic = client
+        .call(
+            "node/create",
+            authed(json!({ "type": "epic", "title": "token epic" }), &cred),
+        )
+        .expect("epic");
+    let story = client
+        .call(
+            "node/create",
+            authed(
+                json!({ "type": "story", "title": "token story", "parentId": epic["node"]["nodeId"] }),
+                &cred,
+            ),
+        )
+        .expect("story");
+    let ticket = client
+        .call(
+            "node/create",
+            authed(
+                json!({ "type": "ticket", "title": "token ticket", "parentId": story["node"]["nodeId"] }),
+                &cred,
+            ),
+        )
+        .expect("ticket");
+    let ticket_id = ticket["node"]["nodeId"].as_str().unwrap().to_string();
+    let run = client
+        .call(
+            "run/create",
+            authed(json!({ "nodeIds": [&ticket_id], "config": {} }), &cred),
+        )
+        .expect("run");
+    let run_id = run["run"]["runId"].as_str().unwrap().to_string();
+    client
+        .call(
+            "run/control",
+            authed(json!({ "runId": run_id, "action": "start" }), &cred),
+        )
+        .expect("start");
+    let claim = client
+        .call("run/claim", authed(json!({ "runId": run_id }), &cred))
+        .expect("claim");
+    assert_eq!(claim["item"]["nodeId"], json!(ticket_id));
+    let token = claim["lease"]["token"]
+        .as_str()
+        .expect("lease.token")
+        .to_string();
+
+    let err = client
+        .call(
+            "run/report",
+            authed(
+                json!({ "runId": run_id, "nodeId": ticket_id, "outcome": "done" }),
+                &cred,
+            ),
+        )
+        .unwrap_err();
+    match &err {
+        RpcError::Problem { code, details } => {
+            assert_eq!(code, "CONFLICT", "{err:?}");
+            assert_eq!(details["rule"], json!("lease-token-missing"), "{err:?}");
+        }
+        other => panic!("expected a Problem, got {other:?}"),
+    }
+
+    client
+        .call(
+            "run/report",
+            authed(
+                json!({ "runId": run_id, "nodeId": ticket_id, "outcome": "done", "leaseToken": token }),
+                &cred,
+            ),
+        )
+        .expect("report with the claim's lease.token");
+
+    proc.kill();
+}

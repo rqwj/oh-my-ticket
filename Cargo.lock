@@ -2617,11 +2617,16 @@ dependencies = [
 name = "oh-my-ticket-desktop"
 version = "0.6.6"
 dependencies = [
+ "dispatch2",
  "libc",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
  "omt-client",
+ "omt-exec",
+ "omt-harness",
  "serde",
  "serde_json",
- "sha2",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
@@ -2663,6 +2668,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "omt-exec"
+version = "0.6.6"
+dependencies = [
+ "libc",
+ "omt-client",
+ "omt-domain",
+ "omt-harness",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
+name = "omt-harness"
+version = "0.6.6"
+dependencies = [
+ "libc",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "omt-runtime"
 version = "0.6.6"
 dependencies = [
@@ -2671,6 +2701,8 @@ dependencies = [
  "omt-client",
  "omt-contracts",
  "omt-domain",
+ "omt-exec",
+ "omt-harness",
  "omt-storage",
  "rusqlite",
  "serde",

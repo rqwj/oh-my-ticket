@@ -1,25 +1,61 @@
 /**
  * U5 (R-E): Agents 面板 —— agent 列表（运行中 + 历史，跨重启保留）+
  * 选中 agent 的 TranscriptView。列表按 status 分组（Running/Starting 在
- * 前，Exited/Failed/Killed 次之）；Orphan 行带「不受控·只读」角标：只读
- * 尾随、不可 exec_stop，仅提供「强制 kill pid」（§3.2）。
+ * 前，Exited/Failed/Killed 次之）；Orphan 行带「不受控·只读」角标：执行
+ * 进程已丢失、harness 仍活，只能强制终止，不可 exec_stop，仅提供「强制
+ * kill pid」（§3.2）。
  *
  * run item 统计走 run/get 单 run 拉取（§四：不挂 run/list 全量刷新），
  * 按 runId 缓存避免重复拉取；claimed 判定 =
  * executorActor.endsWith('/exec:<execId>')（嵌套命名空间，KD 定稿）。
  */
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { omtCall, type TranscriptEvent } from './bridge'
-import type { AgentRecord, ExecRecord, OmtNode, RunDetail, RunItemView } from './types'
+import { omtCall, type StopAllOutcome, type TranscriptEvent } from './bridge'
+import type {
+  AgentRecord,
+  CorruptAgent,
+  ExecRecord,
+  LegacyUnmigrated,
+  OmtNode,
+  RunDetail,
+  RunItemView,
+} from './types'
 import { claimedCountForExec, danglingBindingsOf, nodeTitlesById } from './store'
-import { agentDisplayName, ConfirmStopButton } from './agentUi'
+import {
+  agentDisplayName,
+  ConfirmStopAllButton,
+  ConfirmStopButton,
+  describeFailure,
+} from './agentUi'
 import { TranscriptView } from './TranscriptView'
 import { DeleteIcon } from './icons'
+
+// §41：无降级时的稳定空表（默认参数；避免每渲染新建数组击穿下游 memo）
+const EMPTY_CORRUPT: CorruptAgent[] = []
 
 /** 最新 exec：lastExecId 指针优先，缺失时回退 execs[] 末位。 */
 function latestExecOf(agent: AgentRecord): ExecRecord | null {
   if (agent.execs.length === 0) return null
   return agent.execs.find(e => e.execId === agent.lastExecId) ?? agent.execs[agent.execs.length - 1]
+}
+
+/** A8：发起方标签——按来源分别说明（cli / mcp）；desktop 与旧记录不显示 */
+export function originLabel(origin: 'cli' | 'mcp'): { text: string; title: string } {
+  return origin === 'mcp'
+    ? { text: 'MCP', title: '由 MCP（主控 agent）发起' }
+    : { text: 'CLI', title: '由 CLI 发起' }
+}
+
+/**
+ * A8 发起方小标签：只标 cli / mcp（desktop 派发是桌面自身的常规路径、旧
+ * 记录无该字段——两者都不标）。标签反映的是**当前显示的那次 exec**：
+ * 经 MCP 拉起、后来在桌面端续跑的 agent 标签会消失——如实反映「当前
+ * 这次执行由谁发起」。
+ */
+function OriginChip({ origin }: { origin?: 'desktop' | 'cli' | 'mcp' | null }) {
+  if (origin !== 'cli' && origin !== 'mcp') return null
+  const { text, title } = originLabel(origin)
+  return <span className="chip origin-chip" title={title} aria-label={title}>{text}</span>
 }
 
 /** 列表分组：活跃在前、Orphan（不受控）居中、终态殿后。 */
@@ -54,9 +90,117 @@ function statsOf(detail: RunDetail): RunStat {
   }
 }
 
+/**
+ * §41 legacy-degraded-permanent：降级横幅如实说明来源——旧版 home 级文件
+ * 未迁移（损坏 / 尚未迁移 / 只剩留证）与单个 agent 记录损坏分别呈现。旧文案
+ * 「已降级为空列表（损坏文件已留证 .corrupt-*）」与事实不符：列表并不为空，
+ * 旧文件也没有被改名。
+ * - 旧文件不可解析：两步控件「确认并归档」→「确认归档」/「取消」（与
+ *   ConfirmStopAllButton 同形），进行中禁用；失败就地显示在按钮旁（不依赖
+ *   全局 error——其他刷新会清掉它）。成功提示由面板持有（横幅随降级解除消失）。
+ * - 单个 agent 损坏：写明目录与留证文件名，以及解冻办法。
+ */
+export function DegradedBanner({
+  legacy,
+  corruptAgents,
+  onArchive,
+}: {
+  legacy: LegacyUnmigrated | null
+  corruptAgents: CorruptAgent[]
+  onArchive?: () => Promise<void>
+}) {
+  const [step, setStep] = useState<'idle' | 'armed' | 'busy'>('idle')
+  const [archiveError, setArchiveError] = useState<string | null>(null)
+  const lines: string[] = []
+  if (legacy && legacy.parseable) {
+    lines.push(
+      `旧版 agents.json 尚未迁移（${legacy.path}）：重启桌面端会自动迁移；迁移完成前绑定清理已冻结。`,
+    )
+  } else if (legacy) {
+    const evidence =
+      legacy.corruptEvidence.length > 0 ? `；损坏留证：${legacy.corruptEvidence.join('、')}` : ''
+    lines.push(
+      legacy.present
+        ? `旧版 agents.json 已损坏、未能迁移（${legacy.path}${evidence}）：其中的 agent 不在下方列表中，为防误删，绑定清理已冻结。`
+        : `旧版 agents.json 曾损坏，留证尚未处理（${legacy.path}${evidence}）：为防误删，绑定清理已冻结。`,
+    )
+  }
+  for (const corrupt of corruptAgents) {
+    const evidence =
+      corrupt.evidence.length > 0 ? `留证 ${corrupt.evidence.join('、')}` : 'agent.json 无法解析'
+    lines.push(
+      `agent 记录已损坏：${corrupt.dir}（${evidence}），该 agent 未在列表中显示，绑定清理已冻结。删除该留证文件，或修复后改名回 agent.json，下次刷新即解冻。`,
+    )
+  }
+  if (lines.length === 0) lines.push('部分 agent 记录读取失败；绑定清理已冻结。')
+  const archivable = legacy !== null && !legacy.parseable && onArchive !== undefined
+  const runArchive = async () => {
+    if (!onArchive) return
+    setStep('busy')
+    setArchiveError(null)
+    try {
+      await onArchive()
+    } catch (err) {
+      setArchiveError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setStep('idle')
+    }
+  }
+  return (
+    <div className="error-banner degraded-banner" role="alert">
+      {lines.map(line => (
+        <p key={line}>{line}</p>
+      ))}
+      {archivable && (
+        <>
+          <p className="hm-hint">
+            「确认并归档」会把旧文件与留证移入同目录的 .recovered/，绑定清理随之解冻——指向这些旧 agent
+            的绑定会被视为失效。
+          </p>
+          <div className="chip-row">
+            {step === 'idle' && (
+              <button
+                className="chip"
+                onClick={() => {
+                  setArchiveError(null)
+                  setStep('armed')
+                }}
+              >
+                确认并归档
+              </button>
+            )}
+            {step === 'armed' && (
+              <>
+                <button className="chip active" onClick={() => void runArchive()}>
+                  确认归档
+                </button>
+                <button className="chip" onClick={() => setStep('idle')}>
+                  取消
+                </button>
+              </>
+            )}
+            {step === 'busy' && (
+              <button className="chip" disabled>
+                归档中…
+              </button>
+            )}
+            {archiveError && <span className="archive-error">归档失败：{archiveError}</span>}
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
 interface Props {
   agents: AgentRecord[]
   parseFailed: boolean
+  /** §41：旧版存储未迁移的说明（缺省 null） */
+  legacyUnmigrated?: LegacyUnmigrated | null
+  /** §41：agent.json 已损坏的 agent（缺省空） */
+  corruptAgents?: CorruptAgent[]
+  /** §41：「确认并归档」（App → store.archiveLegacyAgents），返回移走的文件名；失败抛出 */
+  onArchiveLegacy?: () => Promise<string[]>
   selectedAgentId: string | null
   nodes: OmtNode[]
   /** U9：显式绑定表 + 降级标志——悬空绑定计数与清理按钮的数据源 */
@@ -67,12 +211,19 @@ interface Props {
   homeId: string
   /** F-PI-3：历史尾部回载（窗口空且非 live 时从 raw.log 拉取） */
   loadHistoryTail: (execId: string, homeId: string) => void
+  /** P-10：选中仍在运行、但本会话无事件的 agent 时接回实时流（桌面重启后） */
+  attachTranscript?: (execId: string, homeId: string) => void
+  /** P-10：停止全部运行中 exec（替代桌面退出即终止）。返回 F-EXEC-12 的
+   * `{ signaled, failed }`（部分失败供提示「M 个停止失败」）；失败为 null。 */
+  onStopAll?: () => Promise<StopAllOutcome | null>
   onSelectAgent: (id: string) => void
   onStopAgent: (execId: string) => void
   /** U10：空闲 agent 一键续跑（App → store.resumeAgent） */
   onResumeAgent: (agent: AgentRecord) => Promise<void>
-  /** F-DEL：删除 agent（确认弹窗在面板内；终态守卫在服务端） */
-  onDeleteAgent: (agent: AgentRecord) => Promise<void>
+  /** F-DEL / F-EXEC-14(4)：删除 agent（确认弹窗在面板内；终态守卫在服务端）。
+   * `force=true` = 常规删除被「待对账租约」守卫拒绝后的「放弃租约并删除」
+   * （第二步确认提供该入口；force 只绕过租约守卫，其余守卫仍在服务端）。 */
+  onDeleteAgent: (agent: AgentRecord, force?: boolean) => Promise<void>
   onKillOrphan: (agentId: string, execId: string) => void
   onOpenHarnessSettings: () => void
   /** U9：一键清理悬空绑定（bindings_gc，成功后 App/store 侧重拉绑定表） */
@@ -82,6 +233,9 @@ interface Props {
 export function AgentsPanel({
   agents,
   parseFailed,
+  legacyUnmigrated = null,
+  corruptAgents = EMPTY_CORRUPT,
+  onArchiveLegacy,
   selectedAgentId,
   nodes,
   bindings = {},
@@ -90,6 +244,8 @@ export function AgentsPanel({
   eventsOf,
   homeId,
   loadHistoryTail,
+  attachTranscript,
+  onStopAll,
   onSelectAgent,
   onStopAgent,
   onResumeAgent,
@@ -99,6 +255,8 @@ export function AgentsPanel({
   onGcBindings,
 }: Props) {
   const [stats, setStats] = useState<Record<string, RunStat>>({})
+  /** §41：归档成功提示（横幅随降级解除消失，提示由面板持有，手动关闭） */
+  const [archiveNotice, setArchiveNotice] = useState<string | null>(null)
   /** U10：一键续跑失败的就地报错（成功无需提示——事件流自己会出现） */
   const [resumeError, setResumeError] = useState<string | null>(null)
   /** U14：信任门弹窗动作报错 */
@@ -107,6 +265,54 @@ export function AgentsPanel({
   const [deleteTarget, setDeleteTarget] = useState<AgentRecord | null>(null)
   const [deleting, setDeleting] = useState(false)
   const [deleteError, setDeleteError] = useState<string | null>(null)
+  /** F-EXEC-14(4)：删除弹窗处于第二步（常规删除被待对账租约守卫拒绝后的
+   * 「放弃租约并删除」确认）。
+   * §45 P3-1：第二步是**不可逆**的两行警告——不做 3s 自动复位（旧实现
+   * CONFIRM_RESET_MS 无操作还原第一步，既不适合不可逆操作，屏幕阅读器也
+   * 不播报内容切换，违反 WCAG 2.2.1）；改为出现即聚焦确认按钮 +
+   * aria-describedby 关联后果说明。CONFIRM_RESET_MS 仍用于停止全部/单个
+   * 终止的 arming（agentUi 内部），那是可逆的防误点。 */
+  const [forceArming, setForceArming] = useState(false)
+  const forceConfirmRef = useRef<HTMLButtonElement | null>(null)
+  // 进入第二步即聚焦确认按钮。`deleting` 也入 deps：进入第二步的首帧按钮
+  // 可能仍是 disabled（deleting 在稍后的微任务里才复位——disabled 元素的
+  // focus() 是 no-op），复位后补聚焦。
+  useEffect(() => {
+    if (forceArming && !deleting) forceConfirmRef.current?.focus()
+  }, [forceArming, deleting])
+  /** review F14（P-10）/ §39：停止全部的进行中状态与结果。
+   * - 成功 / 无事可做：写入常驻挂载的 `role="status" aria-live="polite"` 区域，
+   *   只换文字（重新挂载的 live region 不会被读屏软件播报），5 秒后清空；
+   *   计时器按 seq 重置——同一文案连续出现时不会沿用上一次的计时器提前消失。
+   * - 含失败（调用失败 / 全部失败 / 部分失败）：进需手动关闭的 alert，不随 5 秒消失。 */
+  const [stoppingAll, setStoppingAll] = useState(false)
+  const [stopAllNotice, setStopAllNotice] = useState<{ text: string; seq: number } | null>(null)
+  const [stopAllAlert, setStopAllAlert] = useState<string | null>(null)
+  const noticeSeqRef = useRef(0)
+  const showStopAllNotice = (text: string) => {
+    noticeSeqRef.current += 1
+    setStopAllNotice({ text, seq: noticeSeqRef.current })
+  }
+  const noticeSeq = stopAllNotice?.seq
+  useEffect(() => {
+    if (noticeSeq === undefined) return
+    const timer = setTimeout(() => setStopAllNotice(null), 5000)
+    return () => clearTimeout(timer)
+  }, [noticeSeq])
+  // §49 notices-leak-across-homes：停止失败警告 / 停止结果 / 归档结果都是
+  // home 作用域的持久提示——切到别的 home 即清空（此前 A home 的失败警告
+  // 在 B home 仍显示）。退出确认的并发计数（Rust 侧宽松计数）不在此列。
+  useEffect(() => {
+    setStopAllAlert(null)
+    setStopAllNotice(null)
+    setArchiveNotice(null)
+  }, [homeId])
+  // §51 in-flight-stop-all-archive：homeId 的「最新值」镜像——在途的停止全部
+  // / 归档结果回来时比对发起时的 home，切了 home 就整个丢弃（此前 A home
+  // 的结果会落到切换后的 B home 面板上）。渲染期赋值保证异步回调拿到的
+  // 永远是当前 home。
+  const homeIdRef = useRef(homeId)
+  homeIdRef.current = homeId
   // U14：全面板待裁决项（底部弹窗）——跨所有已拉取的 run 聚合。普通计算
   //（不得用 useMemo——须位于提前 return 之前且避免 hooks 位点抖动；stats 规模小）
   const awaitingItems: Array<{ runId: string; nodeId: string; title?: string }> = []
@@ -228,8 +434,47 @@ export function AgentsPanel({
     }
   }, [agents, fetchRun, homeId])
 
+  // §41：降级横幅（空列表分支与列表分支共用）。条件包含 corruptAgents——单个
+  // agent 损坏时 parseFailed 也为真，但横幅不依赖这一点
+  const handleArchive = onArchiveLegacy
+    ? async () => {
+        // §51 in-flight-stop-all-archive：发起时捕获 home；结果回来时已切走就丢弃
+        const homeAtStart = homeId
+        const archived = await onArchiveLegacy()
+        if (homeIdRef.current !== homeAtStart) return
+        setArchiveNotice(`已归档 ${archived.length} 个文件到 .recovered/：${archived.join('、')}`)
+      }
+    : undefined
+  const degradedBanner =
+    parseFailed || legacyUnmigrated || corruptAgents.length > 0 ? (
+      <DegradedBanner
+        legacy={legacyUnmigrated}
+        corruptAgents={corruptAgents}
+        onArchive={handleArchive}
+      />
+    ) : null
+  // §49 archive-notice-live：归档成功文案此前与内容一起挂载（读屏不播报，
+  // B7 给停止结果修过的同一反模式）——改为常驻 status 区域只改文字。停止
+  // 结果与归档结果共用该区域（空串时被 .agents-notice:empty 隐藏）；
+  // 「知道了」按钮在区域外（按钮挂载不进 live region）。
+  const noticeText = [stopAllNotice?.text, archiveNotice]
+    .filter((text): text is string => text !== null && text !== undefined)
+    .join('；')
+  const noticeRegion = (
+    <>
+      <p className="agents-notice" role="status" aria-live="polite">
+        {noticeText}
+      </p>
+      {archiveNotice !== null && (
+        <button className="chip" onClick={() => setArchiveNotice(null)}>
+          知道了
+        </button>
+      )}
+    </>
+  )
+
   // U9：悬空绑定（agentId 不在当前 agents 列表）。降级期间冻结悬空判定
-  // （bindingsDegraded / parseFailed——降级空表会把全部绑定误判失效）。
+  //（bindingsDegraded / parseFailed——降级空表会把全部绑定误判失效）。
   const dangling = bindingsDegraded || parseFailed ? [] : danglingBindingsOf(bindings, agents)
   const gcBar =
     onGcBindings && dangling.length > 0 ? (
@@ -243,6 +488,7 @@ export function AgentsPanel({
 
   // F-PI-3：选中非 live 的 exec 且本会话无事件 → 从 raw.log 尾部回载一次
   //（跨重启的历史 agent；live exec 的事件由 Channel 实时推送，不走此路）。
+  // P-10：live 且本会话无事件 = 重启后的存活 exec → 接回实时流（exec_attach）。
   // 选中态在 effect 内自算——hooks 须位于提前 return 之前。
   useEffect(() => {
     const selectedAgent = agents.find(a => a.id === selectedAgentId) ?? null
@@ -251,7 +497,11 @@ export function AgentsPanel({
     const live =
       selectedAgent.attachment === 'live' &&
       (selectedAgent.status === 'running' || selectedAgent.status === 'starting')
-    if (live) return
+    if (live) {
+      // P-10：本会话没有事件 = 重启后的存活 exec，接回实时流
+      if (eventsOf(exec.execId).length === 0) attachTranscript?.(exec.execId, homeId)
+      return
+    }
     if (eventsOf(exec.execId).length > 0) return
     loadHistoryTail(exec.execId, homeId)
     // 每个 execId 只需触发一次；eventsOf 为尾窗快照读
@@ -261,9 +511,8 @@ export function AgentsPanel({
   if (agents.length === 0) {
     return (
       <div className="agents-empty">
-        {parseFailed && (
-          <p className="error-banner">agents.json 解析失败——已降级为空列表（损坏文件已留证 .corrupt-*）</p>
-        )}
+        {degradedBanner}
+        {noticeRegion}
         <p className="empty-hint">尚无 Agent——在 ticket 详情点『运行』派发</p>
         {gatePopup}
         {gcBar}
@@ -275,6 +524,49 @@ export function AgentsPanel({
   }
 
   const groups = groupAgents(agents)
+  // review F7（P-10）：确认框里显示的已认领项总数（拉不到 run 详情的 agent 不计入）
+  const activeClaimed = groups.active.reduce<number | null>((sum, a) => {
+    const exec = latestExecOf(a)
+    const stat = exec?.runId ? stats[exec.runId] : undefined
+    if (!exec || !stat) return sum
+    return (sum ?? 0) + claimedCountForExec(stat.items, exec.execId)
+  }, null)
+  /** §43 P3：停止失败明细的截断呈现——最多列前 2 条，余者以「等 N 个」带过
+   * （Rust 失败串形如 `agent <agentId>: <err>`，agent id 是用户定位线索）。 */
+  const describeStopAllFailures = (failed: string[]): string =>
+    failed.length <= 2 ? failed.join('；') : `${failed[0]}；${failed[1]}；等 ${failed.length} 个`
+  const handleStopAll = async () => {
+    if (!onStopAll) return
+    // §51 in-flight-stop-all-archive：发起时捕获 home；结果回来时已切走就丢弃
+    const homeAtStart = homeId
+    setStoppingAll(true)
+    try {
+      const outcome = await onStopAll()
+      if (homeIdRef.current !== homeAtStart) return
+      const orphanNote =
+        groups.orphan.length > 0 ? `；${groups.orphan.length} 个不受控 agent 需单独强制终止` : ''
+      // review R2-7 / F-EXEC-12 / §43 P3：全失败、无事可做、成功、部分失败分开
+      // 提示，失败带明细；outcome 携带 signaled=0 && failed>0 时也按失败处理。
+      // §39：含失败的结果进需手动关闭的 alert，其余进 5 秒的 status 区域。
+      if (outcome === null) {
+        setStopAllAlert('停止失败，请重试')
+      } else if (outcome.failed.length > 0) {
+        setStopAllAlert(
+          outcome.signaled === 0
+            ? `停止失败：${describeStopAllFailures(outcome.failed)}`
+            : `已向 ${outcome.signaled} 个 agent 发出停止信号，${outcome.failed.length} 个停止失败：${describeStopAllFailures(outcome.failed)}${orphanNote}`,
+        )
+      } else {
+        showStopAllNotice(
+          outcome.signaled === 0
+            ? '当前没有运行中的 agent'
+            : `已向 ${outcome.signaled} 个 agent 发出停止信号${orphanNote}`,
+        )
+      }
+    } finally {
+      setStoppingAll(false)
+    }
+  }
   const selected = agents.find(a => a.id === selectedAgentId) ?? null
   const selectedExec = selected ? latestExecOf(selected) : null
   const selectedStat = selectedExec?.runId ? stats[selectedExec.runId] : undefined
@@ -306,9 +598,14 @@ export function AgentsPanel({
       >
         <div className="agent-row-main">
           <span className="agent-name">{agentDisplayName(agent)}</span>
+          {/* A8：当前显示的最新 exec 的发起方（cli / mcp 才显示） */}
+          <OriginChip origin={exec?.launchedBy} />
           <span className={`chip agent-status st-${agent.status}`}>{agent.status}</span>
           {agent.attachment === 'orphan' && (
-            <span className="orphan-badge" title="重启后 pid 仍存活：只读尾随，不可受控终止">
+            <span
+              className="orphan-badge"
+              title="执行进程已丢失，harness 进程仍在运行：不会再有新输出，只能强制终止"
+            >
               不受控·只读
             </span>
           )}
@@ -325,6 +622,7 @@ export function AgentsPanel({
               onClick={event => {
                 event.stopPropagation()
                 setDeleteError(null)
+                setForceArming(false)
                 setDeleteTarget(agent)
               }}
             >
@@ -347,6 +645,13 @@ export function AgentsPanel({
           <span className="mono">{agent.harness}</span>
           {nodeTitle && <span className="node-title">· {nodeTitle}</span>}
           {stat && <span className="run-progress">完成 {stat.done} / 失败 {stat.failed}</span>}
+          {agent.status === 'failed' && exec?.failureDetail && (
+            <span className="agent-failure" title={exec.failureDetail}>
+              {/* F-EXEC-5 residue：orphan（不受控、pid 存活）不可续跑——失败
+                  说明不得承诺「可续跑」，改指路强制终止（agentUi 按此分流） */}
+              {describeFailure(exec.failureDetail, agent.attachment !== 'orphan')}
+            </span>
+          )}
           {agent.status === 'exited' && stat && claimed === 0 && (
             <span className="agent-unclaimed">未认领任何项</span>
           )}
@@ -358,19 +663,36 @@ export function AgentsPanel({
   return (
     <div className="agents-layout">
       <div className="agents-list">
-        {parseFailed && (
-          <p className="error-banner">agents.json 解析失败——已降级为空列表（损坏文件已留证 .corrupt-*）</p>
-        )}
+        {degradedBanner}
         {gcBar}
+        {onStopAll && groups.active.length > 0 && (
+          <ConfirmStopAllButton
+            running={groups.active.length}
+            claimed={activeClaimed}
+            busy={stoppingAll}
+            onConfirm={() => void handleStopAll()}
+          />
+        )}
+        {noticeRegion}
+        {stopAllAlert && (
+          <div className="error-banner" role="alert">
+            <p>{stopAllAlert}</p>
+            <button className="chip" onClick={() => setStopAllAlert(null)}>
+              知道了
+            </button>
+          </div>
+        )}
         {groups.active.length > 0 && <p className="agents-group-label">运行中</p>}
         {groups.active.map(renderRow)}
-        {groups.orphan.length > 0 && <p className="agents-group-label">不受控（重启遗留）</p>}
+        {groups.orphan.length > 0 && <p className="agents-group-label">不受控（执行进程已丢失）</p>}
         {groups.orphan.map(renderRow)}
         {groups.finished.length > 0 && <p className="agents-group-label">已结束</p>}
         {groups.finished.map(renderRow)}
       </div>
       <div className="agents-transcript">
         {resumeError && <p className="error-banner">{resumeError}</p>}
+        {/* A8：transcript 头部——当前显示的那次 exec 的发起方（cli / mcp 才显示） */}
+        {selected && selectedExec && <OriginChip origin={selectedExec.launchedBy} />}
         {selected && selectedExec ? (
           <TranscriptView
             key={selectedExec.execId}
@@ -385,15 +707,19 @@ export function AgentsPanel({
               selected.attachment !== 'orphan'
                 ? () => {
                     setDeleteError(null)
+                    setForceArming(false)
                     setDeleteTarget(selected)
                   }
                 : undefined
             }
             onResumeAgent={
               // U10：空闲（非 running/starting）且最新 exec 带 ticket 才可续跑；
+              // F-EXEC-5：orphan（不受控、pid 存活）不可续跑——服务端守卫
+              // 拒绝，UI 直接不给入口（改指路强制终止，见 TranscriptView）；
               // 结果就地报错（harness 未启用/未做知情确认/守卫拒绝等）
               selected.status !== 'running' &&
               selected.status !== 'starting' &&
+              selected.attachment !== 'orphan' &&
               selectedExec.nodeId
                 ? async () => {
                     setResumeError(null)
@@ -411,30 +737,82 @@ export function AgentsPanel({
         )}
         {gatePopup}
         {deleteTarget && (
-          // F-DEL：删除确认弹窗——红色危险态，明确不可恢复与影响面
+          // F-DEL：删除确认弹窗——红色危险态，明确不可恢复与影响面。
+          // F-EXEC-14(4)：常规删除被「待对账租约」守卫拒绝时进入第二步
+          // 「放弃租约并删除」确认；其余错误照旧就地报错。
+          // F-EXEC-16 ③（§45）：后果如实说明——服务端会先尽力释放一次，
+          // 释放失败的租约被真正放弃（daemon 不回收租约），对应 run item
+          // 可能一直显示运行中，需在 Runs 面板手动取消。
+          // §45 P3-1：第二步不自动复位；确认按钮带展示名、聚焦 +
+          // aria-describedby（见 force-delete-consequence）。
           <div className="trust-gate-popup delete-confirm" role="alertdialog" aria-label="确认删除 agent">
-            <p className="trust-gate-popup-title">
-              删除 {agentDisplayName(deleteTarget)}（{deleteTarget.harness}）？
-            </p>
-            <p className="hm-hint">
-              将移除该 agent 的记录与执行历史（transcript 文件保留在磁盘）。此操作不可恢复。
-            </p>
+            {forceArming ? (
+              <>
+                <p className="trust-gate-popup-title">该 agent 有未释放的租约。放弃租约并删除？</p>
+                <p className="hm-hint">
+                  将删除该 agent 的记录、执行历史和 transcript 文件。此操作不可恢复。
+                </p>
+                <p className="hm-hint" id="force-delete-consequence">
+                  强制删除前会先尝试释放租约；若释放失败，该 run item 可能一直显示运行中，需到
+                  Runs 面板手动取消该 run。
+                </p>
+              </>
+            ) : (
+              <>
+                <p className="trust-gate-popup-title">
+                  删除 {agentDisplayName(deleteTarget)}（{deleteTarget.harness}）？
+                </p>
+                <p className="hm-hint">将删除该 agent 的记录、执行历史和 transcript 文件。此操作不可恢复。</p>
+              </>
+            )}
             {deleteError && <p className="error-banner">{deleteError}</p>}
             <div className="chip-row">
               <button
                 className="chip active"
+                ref={forceConfirmRef}
+                aria-describedby={forceArming ? 'force-delete-consequence' : undefined}
                 disabled={deleting}
                 onClick={() => {
                   setDeleting(true)
-                  onDeleteAgent(deleteTarget)
-                    .then(() => setDeleteTarget(null))
-                    .catch(err => setDeleteError(String(err)))
+                  // F-EXEC-14(4)：第二步（放弃租约）以 force=true 重发；第一步
+                  // 保持 onDeleteAgent(agent) 的既有单参契约（store/bridge
+                  // 侧缺省按 false 走常规守卫）
+                  const attempt = forceArming
+                    ? onDeleteAgent(deleteTarget, true)
+                    : onDeleteAgent(deleteTarget)
+                  attempt
+                    .then(() => {
+                      setDeleteTarget(null)
+                      setForceArming(false)
+                    })
+                    .catch(err => {
+                      if (String(err).includes('存在待对账的租约')) {
+                        // F-EXEC-14(4)：租约守卫拒绝 → 第二步「放弃租约并删除」
+                        //（守卫原因由第二步文案说明，不重复刷原始长错误）
+                        setDeleteError(null)
+                        setForceArming(true)
+                      } else {
+                        setDeleteError(String(err))
+                      }
+                    })
                     .finally(() => setDeleting(false))
                 }}
               >
-                {deleting ? '删除中…' : '确认删除'}
+                {/* §45 P3-1：第二步按钮不再只写「确认」——动作 + agent 展示名 */}
+                {deleting
+                  ? '删除中…'
+                  : forceArming
+                    ? `放弃租约并删除 ${agentDisplayName(deleteTarget)}`
+                    : '确认删除'}
               </button>
-              <button className="chip" disabled={deleting} onClick={() => setDeleteTarget(null)}>
+              <button
+                className="chip"
+                disabled={deleting}
+                onClick={() => {
+                  setDeleteTarget(null)
+                  setForceArming(false)
+                }}
+              >
                 取消
               </button>
             </div>

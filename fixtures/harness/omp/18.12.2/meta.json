@@ -1,0 +1,10 @@
+{
+ "provider": "omp",
+ "harnessVersion": "18.12.2",
+ "omtVersion": "0.6.6",
+ "model": "kimi-coding/k3",
+ "task": "smoke-hello-dispatch",
+ "capturedAt": "2026-10-20",
+ "source": "acceptance env real dispatch (post F-PROMPT, 3-tool-call round)",
+ "normalization": "paths/sessionId/execId/pid/timestamps -> fixed placeholders (object-level; string bodies: ISO -> __TS__, mcp:<pid> -> mcp:__PID__)"
+}

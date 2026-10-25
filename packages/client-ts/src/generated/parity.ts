@@ -66,3 +66,21 @@ export interface SeedActionParityMatrix {
   ];
   [k: string]: unknown;
 }
+/**
+ * 子项目 2 本地工具（不经 daemon，KD-E4）。local_read 只读；local_exec 有副作用，受 exec/policy.json 约束。
+ */
+
+/**
+ * 子项目 2 本地工具（不经 daemon，KD-E4）。local_read 只读；local_exec 有副作用，受 exec/policy.json 约束。
+ */
+export interface LocalToolEntry {
+  tool: string;
+  classification: "local_read" | "local_exec";
+  summary: string;
+  since: string;
+}
+
+export interface LocalToolMatrix {
+  entries: LocalToolEntry[];
+  [k: string]: unknown;
+}

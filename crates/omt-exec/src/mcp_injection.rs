@@ -55,15 +55,14 @@ use std::sync::Mutex;
 
 use sha2::{Digest, Sha256};
 
-use crate::atomic_json::OpenOptionsUnix;
-use crate::daemon;
+use omt_harness::atomic_json::OpenOptionsUnix;
 
 /// 项目级 MCP 注入的 per-provider 参数。omp 的目录与条目形状是**已持久化
 /// 的兼容面**（在途 state 的 writtenSha 基线、用户机器上的 launcher 目录），
 /// 字节不得变动；pi 走独立命名空间与实测条目形状（`pi mcp add -l` 实测：
 /// 无 `type` 字段）。
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct ProjectSpec {
+pub struct ProjectSpec {
     /// `runtime/harness/<ns>-injection` 与 `runtime/harness/<ns>-launchers`
     pub ns: &'static str,
     /// workspace 配置相对路径
@@ -162,6 +161,15 @@ impl McpInjection {
 /// （single-instance + U15 后跨进程由 omt CLI 共写约定接管）。
 static PROJECT_LOCK: Mutex<()> = Mutex::new(());
 
+/// P-9：项目级注入的跨进程锁（多个 shim 进程共写同一 state.json 的引用
+/// 计数）。与进程内 PROJECT_LOCK 叠加使用：先拿进程内锁，再拿 flock。
+fn project_flock(runtime_dir: &Path, spec: ProjectSpec) -> Result<std::fs::File, String> {
+    omt_harness::atomic_json::lock_exclusive(
+        &spec.injection_root(runtime_dir).join(".project"),
+        omt_harness::atomic_json::LOCK_ACQUIRE_TIMEOUT,
+    )
+}
+
 /// F-U3-5：`DefaultHasher` 的内部算法不保证跨 Rust 版本稳定——用于
 /// **持久化**比对（workspace hash、写入内容 hash）必须用稳定算法，否则
 /// toolchain 升级后旧记录全部判"用户改过"、永不恢复。
@@ -209,8 +217,12 @@ fn single_quote(path: &str) -> String {
     format!("'{}'", path.replace('\'', "'\\''"))
 }
 
-/// 原子写：同目录 tmp + rename（F-U3-8——用户工作区文件不能半截写坏）。
+/// 原子写：同目录 tmp + fsync + rename（F-U3-8——用户工作区文件不能半截写
+/// 坏）。§39 mcp-write-atomic-fsync：rename 前 `sync_all`（F-U4a-4 同款），
+/// 断电不留 0 字节的 backup.json / state.json / 用户 mcp.json；rename 后
+/// best-effort 同步目录项。权限保持默认（用户工作区文件，不套 0600）。
 fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
+    use std::io::Write as _;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("create dir: {e}"))?;
     }
@@ -219,13 +231,26 @@ fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
         path.extension().and_then(|e| e.to_str()).unwrap_or("json"),
         std::process::id()
     ));
-    std::fs::write(&tmp, text).map_err(|e| format!("write tmp: {e}"))?;
+    let written = std::fs::File::create(&tmp).and_then(|mut file| {
+        file.write_all(text.as_bytes())?;
+        file.sync_all()
+    });
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("write tmp: {e}"));
+    }
     std::fs::rename(&tmp, path).map_err(|e| {
         // F-U3-13：rename 失败不留 tmp——否则每次失败都在用户工作区（或
         // state 目录）多一个孤儿文件。
         let _ = std::fs::remove_file(&tmp);
         format!("rename: {e}")
-    })
+    })?;
+    if let Some(dir) = path.parent() {
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+    Ok(())
 }
 
 /// 写 launcher：`omt [--actor <actor>] mcp` 的包装脚本（omp 的 mcp.json 是
@@ -373,6 +398,7 @@ fn prepare_project_with(
     let _guard = PROJECT_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _flock = project_flock(runtime_dir, spec)?;
     if persistent {
         // 固定名 launcher：跨多次派发复用，不绑定单次 exec 身份（没有意义——
         // 这条连接的目的是让用户随时手动用 omp 连上 omt，不属于任何 run）。
@@ -540,6 +566,7 @@ fn release_project(
     let _guard = PROJECT_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _flock = project_flock(runtime_dir, spec)?;
     let state_dir = state_dir(runtime_dir, workspace_root, spec);
     let mut state = omp_state(&state_dir);
     let refcount = state["refcount"].as_u64().unwrap_or(0);
@@ -551,31 +578,10 @@ fn release_project(
     finalize_release(runtime_dir, &state_dir, workspace_root, &state, spec)
 }
 
-/// 注入准备：sidecar 预检 + 按 provider 分派。任何失败=派发失败（绝不
-/// spawn 无 MCP 的 harness）。`persistent` 供 U7 设置项透传。
+/// 注入准备：sidecar 预检 + 按 provider 分派。任何失败 = 派发失败（绝不
+/// spawn 无 MCP 的 harness）。`omt_path` 是 MCP 桥二进制（桌面端 sidecar
+/// 或 shim 自身所在目录的 `omt`）；`persistent` 供 U7 设置项透传。
 pub fn prepare(
-    runtime_dir: &Path,
-    workspace_root: &Path,
-    provider_id: &str,
-    exec_id: &str,
-    persistent: bool,
-) -> Result<McpInjection, String> {
-    let omt_path = daemon::omt_sidecar_path()?;
-    prepare_with(
-        &omt_path,
-        runtime_dir,
-        workspace_root,
-        provider_id,
-        exec_id,
-        persistent,
-    )
-}
-
-/// `pub(crate)`（not just `#[cfg(test)]`) so other modules' tests can drive
-/// the real prepare path with an injectable `omt_path`, instead of hand-
-/// building a `McpInjection` that bypasses the `launchers` bookkeeping
-/// (F-U3-12) — see `executor::tests::spawn_failure_releases_mcp_injection`.
-pub(crate) fn prepare_with(
     omt_path: &Path,
     runtime_dir: &Path,
     workspace_root: &Path,
@@ -656,19 +662,40 @@ pub fn release(runtime_dir: &Path, injection: &McpInjection) -> Result<(), Strin
 /// 随后清扫真正的孤儿 launcher（F-U3-18：跳过 persistent.sh，它没有
 /// state 目录、每次正常重启都要继续用）。omp 与 pi 各自的 state/launcher
 /// 命名空间独立清扫。返回成功处理的 workspace 数。
-pub fn sweep_crash_residue(runtime_dir: &Path) -> Result<usize, String> {
+///
+/// P-9：`is_exec_live` 判定某个 exec（launcher id 即 exec id，`persistent`
+/// 除外）是否仍在运行——仍有存活 exec 的 workspace 与 launcher 一律跳过
+/// （desktop 重启时 shim 可能还在跑，清扫不能摘掉在跑 exec 的注入，由其
+/// shim 收尾时释放）。
+pub fn sweep_crash_residue(
+    runtime_dir: &Path,
+    is_exec_live: &dyn Fn(&str) -> bool,
+) -> Result<usize, String> {
     let mut swept_total = 0usize;
     for spec in [OMP_SPEC, PI_SPEC] {
-        swept_total += sweep_spec_crash_residue(runtime_dir, spec)?;
+        swept_total += sweep_spec_crash_residue(runtime_dir, spec, is_exec_live)?;
     }
     Ok(swept_total)
 }
 
-fn sweep_spec_crash_residue(runtime_dir: &Path, spec: ProjectSpec) -> Result<usize, String> {
+fn sweep_spec_crash_residue(
+    runtime_dir: &Path,
+    spec: ProjectSpec,
+    is_exec_live: &dyn Fn(&str) -> bool,
+) -> Result<usize, String> {
     let root = spec.injection_root(runtime_dir);
     let Ok(entries) = std::fs::read_dir(&root) else {
         return Ok(0);
     };
+    // §39 mcp-sweep-snapshot-race：state 快照必须在锁内读取——此前先读
+    // state.json 再拿锁，等锁期间另一个 shim 的 prepare 已把新 exec 记进
+    // launchers，清扫仍按旧快照判「无存活 exec」并 finalize_release，摘掉
+    // 正在运行的 exec 的注入。整个清扫持有进程内锁 + flock（只在启动时跑
+    // 一次；孤儿 launcher 的兜底清扫也在锁内）。
+    let _guard = PROJECT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _flock = project_flock(runtime_dir, spec)?;
     let mut swept = 0usize;
     for entry in entries.flatten() {
         if !entry.path().is_dir() {
@@ -679,9 +706,13 @@ fn sweep_spec_crash_residue(runtime_dir: &Path, spec: ProjectSpec) -> Result<usi
         if workspace.is_empty() {
             continue;
         }
-        let _guard = PROJECT_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let has_live = state["launchers"]
+            .as_array()
+            .map(|ids| ids.iter().filter_map(|v| v.as_str()).any(is_exec_live))
+            .unwrap_or(false);
+        if has_live {
+            continue; // 该 workspace 仍被存活 exec 使用，由其 shim 收尾时释放
+        }
         match finalize_release(
             runtime_dir,
             &entry.path(),
@@ -696,16 +727,21 @@ fn sweep_spec_crash_residue(runtime_dir: &Path, spec: ProjectSpec) -> Result<usi
                 entry.path().display()
             ),
         }
-        drop(_guard);
     }
     // 上面每个 workspace 的 finalize_release 已经清了自己追踪到的
     // launcher；这里只兜底真正的孤儿（例如 state 目录在记录 `workspace`
-    // 之前就整个丢失）。绝不动 persistent.sh。
+    // 之前就整个丢失）。绝不动 persistent.sh，也不动存活 exec 的 launcher
+    // （P-9）。
     if let Ok(entries) = std::fs::read_dir(spec.launchers_dir(runtime_dir)) {
         let persistent = launcher_path(runtime_dir, spec, "persistent");
         for entry in entries.flatten() {
             let path = entry.path();
-            if path != persistent {
+            let id = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_string();
+            if path != persistent && !is_exec_live(&id) {
                 let _ = std::fs::remove_file(&path);
             }
         }
@@ -757,7 +793,7 @@ mod tests {
     #[test]
     fn sidecar_missing_is_rejected_with_path() {
         let rig = rig();
-        let err = prepare_with(
+        let err = prepare(
             Path::new("/definitely/not/here/omt"),
             &rig.runtime,
             &rig.workspace,
@@ -772,7 +808,7 @@ mod tests {
     #[test]
     fn opencode_injection_is_env_only() {
         let rig = rig();
-        let injection = prepare_with(
+        let injection = prepare(
             &rig.fake_omt,
             &rig.runtime,
             &rig.workspace,
@@ -801,7 +837,7 @@ mod tests {
             r#"{ "mcpServers": { "user-server": { "type": "stdio", "command": "u" } } }"#,
         )
         .unwrap();
-        let injection = prepare_with(
+        let injection = prepare(
             &rig.fake_omt,
             &rig.runtime,
             &rig.workspace,
@@ -830,7 +866,7 @@ mod tests {
     #[test]
     fn omp_fresh_workspace_file_removed_on_release() {
         let rig = rig();
-        let injection = prepare_with(
+        let injection = prepare(
             &rig.fake_omt,
             &rig.runtime,
             &rig.workspace,
@@ -849,7 +885,7 @@ mod tests {
         let rig = rig();
         std::fs::create_dir_all(rig.workspace.join(".omp")).unwrap();
         std::fs::write(OMP_SPEC.workspace_file(&rig.workspace), "{}").unwrap();
-        let first = prepare_with(
+        let first = prepare(
             &rig.fake_omt,
             &rig.runtime,
             &rig.workspace,
@@ -858,7 +894,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let second = prepare_with(
+        let second = prepare(
             &rig.fake_omt,
             &rig.runtime,
             &rig.workspace,
@@ -895,7 +931,7 @@ mod tests {
         let rig = rig();
         std::fs::create_dir_all(rig.workspace.join(".omp")).unwrap();
         std::fs::write(OMP_SPEC.workspace_file(&rig.workspace), "{}").unwrap();
-        let first = prepare_with(
+        let first = prepare(
             &rig.fake_omt,
             &rig.runtime,
             &rig.workspace,
@@ -904,7 +940,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let _second = prepare_with(
+        let _second = prepare(
             &rig.fake_omt,
             &rig.runtime,
             &rig.workspace,
@@ -933,7 +969,7 @@ mod tests {
         let rig = rig();
         std::fs::create_dir_all(rig.workspace.join(".omp")).unwrap();
         std::fs::write(OMP_SPEC.workspace_file(&rig.workspace), "{}").unwrap();
-        let injection = prepare_with(
+        let injection = prepare(
             &rig.fake_omt,
             &rig.runtime,
             &rig.workspace,
@@ -970,7 +1006,7 @@ mod tests {
             r#"{"mcpServers":{"user-server":{"type":"stdio","command":"u"}}}"#,
         )
         .unwrap();
-        let injection = prepare_with(
+        let injection = prepare(
             &rig.fake_omt,
             &rig.runtime,
             &rig.workspace,
@@ -1002,7 +1038,7 @@ mod tests {
         let rig = rig();
         std::fs::create_dir_all(rig.workspace.join(".omp")).unwrap();
         std::fs::write(OMP_SPEC.workspace_file(&rig.workspace), "{}").unwrap();
-        let first = prepare_with(
+        let first = prepare(
             &rig.fake_omt,
             &rig.runtime,
             &rig.workspace,
@@ -1020,7 +1056,7 @@ mod tests {
             serde_json::to_string_pretty(&root).unwrap(),
         )
         .unwrap();
-        let second = prepare_with(
+        let second = prepare(
             &rig.fake_omt,
             &rig.runtime,
             &rig.workspace,
@@ -1043,7 +1079,7 @@ mod tests {
     fn omp_persistent_and_non_persistent_do_not_clobber_each_other() {
         let rig = rig();
         // 先建立 persistent 注入
-        let persistent = prepare_with(
+        let persistent = prepare(
             &rig.fake_omt,
             &rig.runtime,
             &rig.workspace,
@@ -1060,7 +1096,7 @@ mod tests {
             }
         ));
         // 再来一次非 persistent 派发（不同 exec）：会临时覆盖 omt 条目
-        let scoped = prepare_with(
+        let scoped = prepare(
             &rig.fake_omt,
             &rig.runtime,
             &rig.workspace,
@@ -1092,7 +1128,7 @@ mod tests {
         std::fs::create_dir_all(rig.workspace.join(".omp")).unwrap();
         std::fs::write(OMP_SPEC.workspace_file(&rig.workspace), "{}").unwrap();
         // prepare 后不 release（模拟 crash）
-        prepare_with(
+        prepare(
             &rig.fake_omt,
             &rig.runtime,
             &rig.workspace,
@@ -1102,7 +1138,7 @@ mod tests {
         )
         .unwrap();
         assert!(OMP_SPEC.workspace_file(&rig.workspace).is_file());
-        let swept = sweep_crash_residue(&rig.runtime).unwrap();
+        let swept = sweep_crash_residue(&rig.runtime, &|_| false).unwrap();
         assert_eq!(swept, 1);
         assert_eq!(
             std::fs::read_to_string(OMP_SPEC.workspace_file(&rig.workspace)).unwrap(),
@@ -1110,7 +1146,7 @@ mod tests {
         );
         assert_eq!(launcher_count(&rig.runtime), 0);
         // 二次清扫幂等
-        assert_eq!(sweep_crash_residue(&rig.runtime).unwrap(), 0);
+        assert_eq!(sweep_crash_residue(&rig.runtime, &|_| false).unwrap(), 0);
     }
 
     #[test]
@@ -1118,7 +1154,7 @@ mod tests {
         let rig = rig();
         std::fs::create_dir_all(rig.workspace.join(".omp")).unwrap();
         std::fs::write(OMP_SPEC.workspace_file(&rig.workspace), "{}").unwrap();
-        prepare_with(
+        prepare(
             &rig.fake_omt,
             &rig.runtime,
             &rig.workspace,
@@ -1136,7 +1172,7 @@ mod tests {
             serde_json::to_string_pretty(&root).unwrap(),
         )
         .unwrap();
-        sweep_crash_residue(&rig.runtime).unwrap();
+        sweep_crash_residue(&rig.runtime, &|_| false).unwrap();
         let after = std::fs::read_to_string(OMP_SPEC.workspace_file(&rig.workspace)).unwrap();
         let after_json: serde_json::Value = serde_json::from_str(&after).unwrap();
         assert!(after_json["mcpServers"].get("omt").is_none(), "{after}");
@@ -1172,7 +1208,7 @@ mod tests {
         )
         .unwrap();
 
-        sweep_crash_residue(&rig.runtime).unwrap();
+        sweep_crash_residue(&rig.runtime, &|_| false).unwrap();
         let after = std::fs::read_to_string(OMP_SPEC.workspace_file(&rig.workspace)).unwrap();
         let after_json: serde_json::Value = serde_json::from_str(&after).unwrap();
         assert!(after_json["mcpServers"].get("omt").is_none(), "{after}");
@@ -1198,7 +1234,7 @@ mod tests {
         )
         .unwrap();
 
-        let injection = prepare_with(
+        let injection = prepare(
             &rig.fake_omt,
             &rig.runtime,
             &rig.workspace,
@@ -1223,7 +1259,7 @@ mod tests {
     #[test]
     fn omp_persistent_mode_merges_without_state() {
         let rig = rig();
-        let injection = prepare_with(
+        let injection = prepare(
             &rig.fake_omt,
             &rig.runtime,
             &rig.workspace,
@@ -1256,7 +1292,7 @@ mod tests {
         // F-U3-18 回归测试：sweep 曾经在**每次**启动（不只 crash 后）无条件
         // 清空整个 launcher 目录，persistent.sh 一并被删。
         let rig = rig();
-        let persistent = prepare_with(
+        let persistent = prepare(
             &rig.fake_omt,
             &rig.runtime,
             &rig.workspace,
@@ -1267,7 +1303,7 @@ mod tests {
         .unwrap();
         let _ = persistent;
         assert_eq!(launcher_count(&rig.runtime), 1);
-        sweep_crash_residue(&rig.runtime).unwrap();
+        sweep_crash_residue(&rig.runtime, &|_| false).unwrap();
         assert_eq!(
             launcher_count(&rig.runtime),
             1,
@@ -1290,7 +1326,7 @@ mod tests {
     #[test]
     fn unknown_provider_rejected() {
         let rig = rig();
-        assert!(prepare_with(
+        assert!(prepare(
             &rig.fake_omt,
             &rig.runtime,
             &rig.workspace,
@@ -1307,7 +1343,7 @@ mod tests {
     #[test]
     fn pi_injection_roundtrip_shape_and_namespace() {
         let rig = rig();
-        let inject = prepare_with(
+        let inject = prepare(
             &rig.fake_omt,
             &rig.runtime,
             &rig.workspace,
@@ -1343,7 +1379,7 @@ mod tests {
             .join(workspace_hash(&rig.workspace))
             .is_dir());
         // omp 同 workspace 并行 prepare → 各自 refcount 独立
-        let _omp_inject = prepare_with(
+        let _omp_inject = prepare(
             &rig.fake_omt,
             &rig.runtime,
             &rig.workspace,
@@ -1385,7 +1421,7 @@ mod tests {
     #[test]
     fn pi_crash_residue_is_swept() {
         let rig = rig();
-        let _ = prepare_with(
+        let _ = prepare(
             &rig.fake_omt,
             &rig.runtime,
             &rig.workspace,
@@ -1395,9 +1431,104 @@ mod tests {
         )
         .unwrap();
         assert!(rig.workspace.join(".pi").join("mcp.json").exists());
-        let swept = sweep_crash_residue(&rig.runtime).unwrap();
+        let swept = sweep_crash_residue(&rig.runtime, &|_| false).unwrap();
         assert!(swept >= 1, "至少清扫 pi 一个 workspace");
         assert!(!rig.workspace.join(".pi").join("mcp.json").exists());
-        assert_eq!(sweep_crash_residue(&rig.runtime).unwrap(), 0);
+        assert_eq!(sweep_crash_residue(&rig.runtime, &|_| false).unwrap(), 0);
+    }
+
+    /// P-9：桌面端重启时 shim 可能仍在运行——清扫不得摘掉存活 exec 的注入。
+    #[test]
+    fn sweep_skips_workspaces_with_live_execs() {
+        let rig = rig();
+        let inj = prepare(
+            &rig.fake_omt,
+            &rig.runtime,
+            &rig.workspace,
+            "omp",
+            "exec-live",
+            false,
+        )
+        .unwrap();
+        let mcp = rig.workspace.join(".omp").join("mcp.json");
+        assert!(std::fs::read_to_string(&mcp).unwrap().contains("omt"));
+        let swept = sweep_crash_residue(&rig.runtime, &|id| id == "exec-live").unwrap();
+        assert_eq!(swept, 0);
+        assert!(
+            std::fs::read_to_string(&mcp).unwrap().contains("omt"),
+            "存活 exec 的注入必须保留"
+        );
+        assert_eq!(
+            launcher_count(&rig.runtime),
+            1,
+            "存活 exec 的 launcher 必须保留"
+        );
+        // exec 结束后同一清扫照常恢复
+        let swept = sweep_crash_residue(&rig.runtime, &|_| false).unwrap();
+        assert_eq!(swept, 1);
+        drop(inj);
+    }
+
+    /// §39 mcp-sweep-snapshot-race：清扫必须在锁内读 state 快照。持锁期间
+    /// 另一个 shim 的 prepare 把新 exec 记进 launchers——清扫拿到锁后必须看到
+    /// 它并跳过该 workspace；此前清扫在拿锁前读快照，按旧快照把正在运行的
+    /// exec 的注入摘掉。
+    #[test]
+    fn sweep_reads_state_under_the_lock() {
+        let rig = rig();
+        let _inj = prepare(
+            &rig.fake_omt,
+            &rig.runtime,
+            &rig.workspace,
+            "omp",
+            "exec-old",
+            false,
+        )
+        .unwrap();
+        let mcp = rig.workspace.join(".omp").join("mcp.json");
+        let state_file = state_dir(&rig.runtime, &rig.workspace, OMP_SPEC).join("state.json");
+        let held = project_flock(&rig.runtime, OMP_SPEC).unwrap();
+        let runtime = rig.runtime.clone();
+        let sweeper =
+            std::thread::spawn(move || sweep_crash_residue(&runtime, &|id| id == "exec-new"));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let mut state: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&state_file).unwrap()).unwrap();
+        state["launchers"]
+            .as_array_mut()
+            .expect("launchers 数组")
+            .push(serde_json::json!("exec-new"));
+        std::fs::write(&state_file, state.to_string()).unwrap();
+        drop(held);
+        assert_eq!(
+            sweeper.join().unwrap().unwrap(),
+            0,
+            "存活 exec 的 workspace 必须跳过"
+        );
+        assert!(
+            std::fs::read_to_string(&mcp).unwrap().contains("omt"),
+            "存活 exec 的注入必须保留"
+        );
+    }
+
+    /// P-9：跨进程锁——持锁期间另一个 prepare 必须等待而不是并发改写 state。
+    #[test]
+    fn project_ops_take_the_cross_process_lock() {
+        let rig = rig();
+        let held = project_flock(&rig.runtime, OMP_SPEC).unwrap();
+        let runtime = rig.runtime.clone();
+        let workspace = rig.workspace.clone();
+        let omt = rig.fake_omt.clone();
+        let started = std::time::Instant::now();
+        let t = std::thread::spawn(move || {
+            prepare(&omt, &runtime, &workspace, "omp", "exec-2", false).map(|_| started.elapsed())
+        });
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        drop(held);
+        let waited = t.join().unwrap().unwrap();
+        assert!(
+            waited >= std::time::Duration::from_millis(350),
+            "{waited:?}"
+        );
     }
 }

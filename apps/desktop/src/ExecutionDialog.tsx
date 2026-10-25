@@ -340,7 +340,12 @@ export function ExecutionDialog({
     }
   }
 
-  const idleAgents = agents.filter(a => a.status !== 'running' && a.status !== 'starting')
+  // F-EXEC-5 residue（§41）：「空闲」判定必须剔除 orphan（不受控、pid 仍
+  // 存活）——服务端 append_exec 对 orphan 一律拒绝（续跑会把 attachment 覆盖
+  // 回 Live、丢失 orphan 追踪），optgroup 的「续跑」承诺与之直接矛盾。
+  const idleAgents = agents.filter(
+    a => a.status !== 'running' && a.status !== 'starting' && a.attachment !== 'orphan',
+  )
 
   return (
     <div className="modal-overlay" onClick={onClose}>

@@ -550,3 +550,40 @@ body {
   background: var(--panel-raised); color: var(--accent); font-size: 12px; cursor: pointer;
 }
 .idle-hint { color: #d29922; font-size: 12px; margin: 6px 0 0; }
+
+/* P-10 / review F7/F14：「停止全部」按钮与结果提示 */
+.agents-stop-all {
+  margin: 4px 8px;
+  align-self: flex-start;
+}
+/* review R2-10：确认文案 + 两个按钮超过 340px 列宽时换行，确认按钮不被裁掉 */
+.confirm-stop.agents-stop-all {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+.agents-notice {
+  margin: 0 8px 4px;
+  font-size: 12px;
+  opacity: 0.8;
+}
+/* review F8（P-10）：失败说明（describeFailure 的展示文案）用危险色 */
+.agent-failure {
+  color: var(--danger, #cf222e);
+}
+
+/* §41：归档失败就地提示（降级横幅内、按钮旁） */
+.degraded-banner .archive-error {
+  margin-left: 8px;
+  font-weight: 600;
+}
+/* §39：常驻的停止全部结果区域——无文字时不占位（仍挂载，live region 有效） */
+.agents-notice:empty {
+  margin: 0;
+  padding: 0;
+}
+/* §47：应用级的被放弃租约通知 */
+.lease-notices .lease-notice + .lease-notice {
+  margin-top: 8px;
+}

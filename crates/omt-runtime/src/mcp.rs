@@ -18,6 +18,11 @@
 //! tool's `inputSchema` is projected from `schema/commands.schema.json`
 //! (F-ACC-10: an empty schema once left the model with no way to pass
 //! `runId`), so tools/list can never drift from the protocol contract.
+//!
+//! 子项目 2（A6 / Q-5）：顶层会话在 daemon 工具之外**始终列出全部本地工具**
+//! （`local_tools::LOCAL_TOOLS`——harness / exec 族）；`exec__start` 的 policy
+//! 在调用时检查。注入桥（`--actor exec:*`）与带 `OMT_EXEC_ID` 的进程（被
+//! 派发的 harness 自己起的 `omt mcp`）不暴露任何本地工具（Q-12 权限放大闸门）。
 
 use std::io::{BufRead, BufReader, Write};
 
@@ -63,10 +68,53 @@ fn action_of(wire: &str) -> Option<&'static str> {
     MCP_TOOLS.iter().copied().find(|a| wire_name(a) == wire)
 }
 
+/// A6 / Q-5：本地工具的 tools/list 描述符。顶层会话始终列出全部本地工具
+/// （`omt mcp` 不声明 listChanged，按 policy 隐藏会让中途开启派发后主控
+/// 仍看不到 `exec__start`，必须重启 MCP）；policy 在调用时检查。
+fn local_descriptors(local: Option<&dyn crate::local_tools::LocalTools>) -> Vec<serde_json::Value> {
+    if local.is_none() {
+        return Vec::new();
+    }
+    crate::local_tools::LOCAL_TOOLS
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "name": wire_name(t.action),
+                "description": t.description,
+                "inputSchema": (t.input_schema)(),
+            })
+        })
+        .collect()
+}
+
+/// daemon 工具 ∪ 本地工具（按注入身份过滤后的全集）。
+fn all_tool_descriptors(
+    local: Option<&dyn crate::local_tools::LocalTools>,
+) -> Vec<serde_json::Value> {
+    let mut tools = tool_descriptors();
+    tools.extend(local_descriptors(local));
+    tools
+}
+
+/// MCP wire 名（`exec__start`）→ 本地工具 action（`exec/start`）。
+fn local_action_of(wire: &str) -> Option<&'static str> {
+    crate::local_tools::LOCAL_TOOLS
+        .iter()
+        .map(|t| t.action)
+        .find(|a| wire_name(a) == wire)
+}
+
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
 /// Run the stdio MCP server loop until stdin closes.
-pub fn serve(globals: &GlobalArgs) -> Result<i32, Problem> {
+///
+/// `local`（子项目 2 A5 引入的形参）：本地工具族实现，A6 起按 Q-5 暴露与
+/// 路由；`omt` 二进制传入 `LocalImpl`，lib 侧调用方（如有）传 None。
+/// 注入桥（actor `exec:*`）与带 `OMT_EXEC_ID` 的进程拿不到本地工具（Q-12）。
+pub fn serve(
+    globals: &GlobalArgs,
+    local: Option<&dyn crate::local_tools::LocalTools>,
+) -> Result<i32, Problem> {
     let runtime_dir = crate::paths::resolve(globals.runtime_dir.as_deref());
     // Bounded readiness wait: harnesses legitimately launch the mcp
     // process immediately after daemon-start, while the winner may still
@@ -120,73 +168,153 @@ pub fn serve(globals: &GlobalArgs) -> Result<i32, Problem> {
         log_line("warning: daemon granted a narrower actor namespace than requested (see auth.rs Registry::issue)");
     }
 
+    // Q-5 / Q-12：注入给 harness 的桥（actor exec:*），或被派发 harness 自己起的
+    // omt mcp（进程环境带 OMT_EXEC_ID）都不暴露本地工具——被派发的 agent 不能再派发
+    let nested = globals
+        .actor
+        .as_deref()
+        .is_some_and(|a| a.starts_with("exec:"))
+        || std::env::var("OMT_EXEC_ID").is_ok_and(|v| !v.is_empty());
+    let local = local.filter(|_| !nested);
+
     log_line("mcp server ready (scoped grant: node/run/events)");
 
-    let stdin = std::io::stdin();
-    let mut reader = BufReader::new(stdin.lock());
-    let stdout = std::io::stdout();
-    let mut writer = stdout.lock();
+    // §49 mcp-stdio-worker：本地工具调用（exec__start 最长 60s 锁等待 + 30s
+    // 就绪握手、harness__list ~14s 探测）放到**单个工作线程**上顺序执行——
+    // serve 循环保持响应（ping / tools/list 立即应答），客户端超时放弃后仍
+    // 可用 exec__list 凭 id 找回 execId。并发上界 = 1（本地工具共享同一把
+    // 跨进程派发锁，并发跑也只会排队；daemon 工具仍在 serve 线程内联执行
+    // ——它们只是 socket 往返）。本地调用的响应由工作线程乱序写出：JSON-RPC
+    // 按 id 配对，乱序合法。`thread::scope` 让工作线程借用非 'static 的
+    // `&dyn LocalTools`，serve 返回前 join（在途调用收尾完才退出，与旧实现
+    // 的内联阻塞等价）。
+    std::thread::scope(|scope| -> Result<i32, Problem> {
+        let local_worker = local.map(|local| {
+            let (tx, rx) = std::sync::mpsc::channel::<LocalCall>();
+            scope.spawn(move || {
+                for call in rx {
+                    // §51 P3：通知形式（无 id）的 tools/call 不回包——JSON-RPC
+                    // 通知没有响应；旧实现无条件写出 {"id":null,…} 违反协议。
+                    if call.is_notification {
+                        continue;
+                    }
+                    let response = call_local_tool(local, call.action, call.arguments, &call.id);
+                    // 写失败（stdout 已关）时继续排空队列后退出
+                    let _ = write_stdout_line(&response.to_string());
+                }
+            });
+            tx
+        });
 
-    while let Some(message) = read_frame(&mut reader)? {
-        let Ok(request) = serde_json::from_str::<serde_json::Value>(&message) else {
-            continue;
-        };
-        let method = request["method"].as_str().unwrap_or_default();
-        let id = request["id"].clone();
+        let stdin = std::io::stdin();
+        let mut reader = BufReader::new(stdin.lock());
 
-        // Notifications (no id) need no response.
-        let is_notification = id.is_null();
+        while let Some(message) = read_frame(&mut reader)? {
+            let Ok(request) = serde_json::from_str::<serde_json::Value>(&message) else {
+                continue;
+            };
+            let method = request["method"].as_str().unwrap_or_default();
+            let id = request["id"].clone();
 
-        let response = match method {
-            "initialize" => Some(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": {
-                    "protocolVersion": PROTOCOL_VERSION,
-                    "capabilities": { "tools": {} },
-                    "serverInfo": {
-                        "name": "omt-mcp",
-                        "version": env!("CARGO_PKG_VERSION"),
+            // Notifications (no id) need no response.
+            let is_notification = id.is_null();
+
+            let response = match method {
+                "initialize" => Some(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "protocolVersion": PROTOCOL_VERSION,
+                        "capabilities": { "tools": {} },
+                        "serverInfo": {
+                            "name": "omt-mcp",
+                            "version": env!("CARGO_PKG_VERSION"),
+                        },
                     },
-                },
-            })),
-            "notifications/initialized" | "notifications/cancelled" => None,
-            "ping" => Some(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {} })),
-            "tools/list" => Some(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": { "tools": tool_descriptors() },
-            })),
-            "tools/call" => {
-                let name = request["params"]["name"].as_str().unwrap_or_default();
-                let arguments = request["params"]["arguments"].clone();
-                Some(match action_of(name) {
-                    None => error_reply(&id, -32602, &format!("unknown tool: {name}")),
-                    Some(action) => call_tool(&mut enrollment.client, action, arguments, &id),
-                })
-            }
-            _ => {
-                if is_notification {
-                    None
-                } else {
-                    Some(error_reply(
-                        &id,
-                        -32601,
-                        &format!("method not found: {method}"),
-                    ))
+                })),
+                "notifications/initialized" | "notifications/cancelled" => None,
+                "ping" => Some(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {} })),
+                "tools/list" => Some(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": { "tools": all_tool_descriptors(local) },
+                })),
+                "tools/call" => {
+                    let name = request["params"]["name"].as_str().unwrap_or_default();
+                    let arguments = request["params"]["arguments"].clone();
+                    match action_of(name) {
+                        Some(action) => {
+                            Some(call_tool(&mut enrollment.client, action, arguments, &id))
+                        }
+                        None => match (&local_worker, local_action_of(name)) {
+                            // §49：派给工作线程——本线程立刻回到读循环（ping
+                            // 不被本地调用阻塞）；响应由工作线程按 id 写出。
+                            // §51 P3：通知（无 id）不回包——is_notification
+                            // 随派发传递，工作线程据此抑制响应写出。
+                            (Some(tx), Some(action)) => {
+                                match tx.send(LocalCall {
+                                    action,
+                                    arguments,
+                                    id: id.clone(),
+                                    is_notification,
+                                }) {
+                                    Ok(()) => None,
+                                    Err(_) if is_notification => None,
+                                    Err(_) => Some(error_reply(
+                                        &id,
+                                        -32603,
+                                        "local tool worker unavailable",
+                                    )),
+                                }
+                            }
+                            _ => Some(error_reply(&id, -32602, &format!("unknown tool: {name}"))),
+                        },
+                    }
+                }
+                _ => {
+                    if is_notification {
+                        None
+                    } else {
+                        Some(error_reply(
+                            &id,
+                            -32601,
+                            &format!("method not found: {method}"),
+                        ))
+                    }
+                }
+            };
+
+            if let Some(response) = response {
+                if !is_notification {
+                    write_stdout_line(&response.to_string())
+                        .map_err(|err| Problem::new("IO", format!("stdout write: {err}")))?;
                 }
             }
-        };
-
-        if let Some(response) = response {
-            if !is_notification {
-                write_frame(&mut writer, &response.to_string())
-                    .map_err(|err| Problem::new("IO", format!("stdout write: {err}")))?;
-            }
         }
-    }
+        Ok(0)
+    })?;
     log_line("mcp server exiting (stdin closed)");
     Ok(0)
+}
+
+/// §49 mcp-stdio-worker：本地工具调用的一次派发（serve 线程 → 工作线程）。
+/// §51 P3：`is_notification` = 请求无 id——JSON-RPC 通知不得有响应，工作
+/// 线程据此跳过写出（此前无条件回包，输出 `{"id":null,…}`）。
+struct LocalCall {
+    action: &'static str,
+    arguments: serde_json::Value,
+    id: serde_json::Value,
+    is_notification: bool,
+}
+
+/// 单行写 stdout 并 flush——serve 线程与本地工具工作线程共用（各自的锁在
+/// write 期间互斥；锁随写结束释放，读 stdin 期间不持锁，工作线程不会被
+/// 挡死）。
+fn write_stdout_line(body: &str) -> std::io::Result<()> {
+    let stdout = std::io::stdout();
+    let mut writer = stdout.lock();
+    writeln!(writer, "{body}")?;
+    writer.flush()
 }
 
 /// tools/list descriptors: one MCP tool per exposed action, named with
@@ -352,6 +480,43 @@ fn error_reply(id: &serde_json::Value, code: i64, message: &str) -> serde_json::
     })
 }
 
+/// 本地工具调用：Problem → isError（与 daemon 工具同一映射）。policy（含
+/// `allowFromMcp` 未开启）由 LocalImpl / omt_exec::local 在调用时检查。
+fn call_local_tool(
+    local: &dyn crate::local_tools::LocalTools,
+    action: &str,
+    arguments: serde_json::Value,
+    id: &serde_json::Value,
+) -> serde_json::Value {
+    let args = if arguments.is_object() {
+        arguments
+    } else {
+        serde_json::json!({})
+    };
+    let outcome = local.call(crate::local_tools::LocalCaller::Mcp, action, args);
+    match outcome {
+        Ok(result) => serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
+                "isError": false,
+            },
+        }),
+        Err(problem) => serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": format!("{}: {}", problem.code, problem.message),
+                }],
+                "isError": true,
+            },
+        }),
+    }
+}
+
 /// stderr lifecycle line — secrets hygiene: never log anything beyond
 /// static text (no params, no tokens, no paths with user data).
 fn log_line(text: &str) {
@@ -380,13 +545,6 @@ fn read_frame(reader: &mut impl BufRead) -> Result<Option<String>, Problem> {
         }
         return Ok(Some(trimmed.to_string()));
     }
-}
-
-fn write_frame(writer: &mut impl Write, body: &str) -> std::io::Result<()> {
-    // Responses are compact single-line JSON (serde_json::to_string) —
-    // writeln supplies the delimiter the client reads on.
-    writeln!(writer, "{body}")?;
-    writer.flush()
 }
 
 /// U3: enrollment 身份——desktop 派发时经 `--actor exec:<execId>` 指定执行者
@@ -465,6 +623,50 @@ mod tests {
         assert!(!identity_downgraded("mcp:1/exec:e1", Some("mcp:1/exec:e1")));
         assert!(identity_downgraded("mcp:1/exec:e1", Some("mcp:1")));
         assert!(identity_downgraded("mcp:1/exec:e1", None));
+    }
+
+    /// A6 / Q-5：本地工具以 `__` 映射名进入 tools/list，name↔action 双向
+    /// 对得上；未注入实现（或注入桥）时一个都不列。
+    #[test]
+    fn local_tool_descriptors_cover_the_family_and_map_back() {
+        struct Noop;
+        impl crate::local_tools::LocalTools for Noop {
+            fn call(
+                &self,
+                _caller: crate::local_tools::LocalCaller,
+                _tool: &str,
+                _args: serde_json::Value,
+            ) -> Result<serde_json::Value, omt_storage::Problem> {
+                Ok(serde_json::json!({}))
+            }
+        }
+        assert!(local_descriptors(None).is_empty(), "未注入 → 不暴露");
+
+        let tools = local_descriptors(Some(&Noop));
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        let expected: Vec<String> = crate::local_tools::LOCAL_TOOLS
+            .iter()
+            .map(|t| wire_name(t.action))
+            .collect();
+        assert_eq!(
+            names,
+            expected.iter().map(String::as_str).collect::<Vec<_>>(),
+            "全部 8 个本地工具都列出"
+        );
+        for tool in &tools {
+            assert!(tool["description"].as_str().is_some_and(|d| !d.is_empty()));
+            assert_eq!(tool["inputSchema"]["type"], "object", "{tool}");
+            assert!(
+                tool["inputSchema"]["properties"]
+                    .as_object()
+                    .is_some_and(|p| !p.is_empty()),
+                "{tool}"
+            );
+        }
+        for action in crate::local_tools::LOCAL_TOOLS.iter().map(|t| t.action) {
+            assert_eq!(local_action_of(&wire_name(action)), Some(action));
+        }
+        assert_eq!(local_action_of("node__list"), None, "daemon 工具不在此表");
     }
 
     /// F-ACC-10 回归：每个 MCP 工具的 inputSchema 必须从

@@ -6,8 +6,8 @@
  */
 import { Channel, invoke } from '@tauri-apps/api/core'
 import { getVersion } from '@tauri-apps/api/app'
-import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-import type { AgentsListResult, BindingsGcResult, BindingsResult } from './types'
+import { emit, listen, type UnlistenFn } from '@tauri-apps/api/event'
+import type { AgentsListResult, BindingsGcResult, BindingsResult, ExecPolicy, ExecPolicyView } from './types'
 
 export interface DaemonStatus {
   running: boolean
@@ -17,8 +17,76 @@ export interface DaemonStatus {
   spawned_by_us: boolean
 }
 
+/**
+ * §57 F-SP2-11 / §59 P3-1：Rust 超时文案（daemon.rs `DAEMON_TIMEOUT_MESSAGE`）
+ * 的机器前缀——跨语言锁定（vitest 直接读 daemon.rs 源码断言
+ * DAEMON_TIMEOUT_MESSAGE 以本常量开头、Rust 侧 `DAEMON_TIMEOUT_MARKER`
+ * 与之同值；Rust 改前缀会让测试红，而不是前端静默退回普通 error）。
+ */
+export const DAEMON_TIMEOUT_MARKER = '[daemon-timeout]'
+
+/**
+ * §59 F-SP2-12：daemon 写路径超时的类型化错误——bridge 出口（omtCall /
+ * execStart）把 Rust `DAEMON_TIMEOUT_MESSAGE`（`[daemon-timeout] ` 机器前缀）
+ * 转成本类后上抛：
+ * - `text` 为剥前缀后的展示文案（Rust 常量仍是文案唯一来源），
+ *   `daemonTimeout = true` 供 store 按类型分流到粘性 timeoutNotice
+ *   （不再靠字符串回判——此前前缀只在 presentErrorWithKind 的调用点剥掉，
+ *   组件层 `String(err)` 的展示面全在覆盖之外）；
+ * - `toString()` 返回剥前缀文案——TreePanel / ExecutionDialog / RunsPanel /
+ *   DetailPanel / AgentsPanel 的就地错误态（`String(err)`）自动拿到干净
+ *   文案，无需逐点替换。
+ */
+export class DaemonTimeoutError extends Error {
+  readonly daemonTimeout = true
+
+  constructor(
+    /** 剥掉机器前缀后的展示文案 */
+    readonly text: string,
+  ) {
+    super(text)
+    this.name = 'DaemonTimeoutError'
+  }
+
+  override toString(): string {
+    return this.text
+  }
+}
+
+/**
+ * §59 F-SP2-12：类型化超时错误的读取缝——是 bridge 出口整形过的 daemon
+ * 超时则返回剥前缀文案，否则 null（store 据此分流，不 import 类本体）。
+ */
+export function daemonTimeoutText(error: unknown): string | null {
+  return error instanceof DaemonTimeoutError ? error.text : null
+}
+
+/**
+ * §59 F-SP2-12：bridge 出口的统一错误整形——超时类（机器前缀命中）转
+ * {@link DaemonTimeoutError}（剥前缀 + 类型分流），其余原样上抛（既有
+ * 文案语义不变）。
+ *
+ * §61 P3：超时整形同时 emit `omt:daemon-timeout`（携带去前缀文案）——
+ * store 订阅后落粘性提示，一处覆盖**全部**经 omtCall / execStart 的写
+ * 路径（组件本地直接 await omtCall 的 run/control、node/update 等不必
+ * 逐个接 noteTimeout）。
+ */
+function presentInvokeError(error: unknown): never {
+  const raw = String(error).replace(/^Error:\s*/, '')
+  if (raw.startsWith(DAEMON_TIMEOUT_MARKER)) {
+    const text = raw.slice(DAEMON_TIMEOUT_MARKER.length).trim()
+    void emit('omt:daemon-timeout', { text })
+    throw new DaemonTimeoutError(text)
+  }
+  throw error
+}
+
 export async function omtCall<T = unknown>(method: string, params: Record<string, unknown> = {}): Promise<T> {
-  return invoke<T>('omt_call', { method, params })
+  try {
+    return await invoke<T>('omt_call', { method, params })
+  } catch (error) {
+    presentInvokeError(error)
+  }
 }
 
 export async function daemonStatus(): Promise<DaemonStatus> {
@@ -202,6 +270,12 @@ export async function agentsList(homeId: string): Promise<AgentsListResult> {
   return invoke<AgentsListResult>('agents_list', { homeId })
 }
 
+/** §41：「确认并归档」未能迁移的旧版 agents.json（移入 `<home>/.recovered/`，
+ * 解除绑定清理冻结）。旧文件可解析时 Rust 侧拒绝（由启动迁移处理）。 */
+export async function agentsArchiveLegacy(homeId: string): Promise<{ archived: string[] }> {
+  return invoke<{ archived: string[] }>('agents_archive_legacy', { homeId })
+}
+
 // ── U9 绑定（R-C）─────────────────────────────────────────────────────────
 
 /**
@@ -231,6 +305,38 @@ export async function execStop(execId: string): Promise<void> {
 /** Orphan 强制 kill：Rust 侧从持久化 agent/exec 身份解析并验证 pid。 */
 export async function execKillOrphan(homeId: string, agentId: string, execId: string): Promise<void> {
   return invoke<void>('exec_kill_orphan', { homeId, agentId, execId })
+}
+
+/** P-10 / F-EXEC-12：exec_stop_all 的返回形状——失败明细以**数据**携带
+ * （此前只回 signaled 计数、失败仅进 stderr，UI 把部分失败当成功提示）。
+ * - `signaled`：实际发出停止信号的 exec 数（ESRCH 竞态计入；shim 已死走
+ *   对账收尾的不计）。
+ * - `failed`：逐 agent/exec 收集的失败明细，空数组 = 全部成功。 */
+export interface StopAllOutcome {
+  signaled: number
+  failed: string[]
+}
+
+/** P-10：停止当前 home 的全部运行中 exec（设计 §3.4：替代「桌面退出即终止」）。
+ * 返回发出停止信号的数量与失败明细（F-EXEC-12）。 */
+export async function execStopAll(homeId: string): Promise<StopAllOutcome> {
+  return invoke<StopAllOutcome>('exec_stop_all', { homeId })
+}
+
+/** P-10：重新接上仍在运行的 exec 的实时 transcript（桌面重启后 shim 仍在跑）。
+ * `afterSeq` = 已有的最后一个事件 seq（无则 null，从头推）。 */
+export async function execAttach(options: {
+  homeId: string
+  execId: string
+  afterSeq: number | null
+  channel: Channel<TranscriptEvent>
+}): Promise<void> {
+  return invoke<void>('exec_attach', {
+    homeId: options.homeId,
+    execId: options.execId,
+    afterSeq: options.afterSeq,
+    channel: options.channel,
+  })
 }
 
 // ── U6 执行派发（R-B）─────────────────────────────────────────────────────
@@ -264,17 +370,23 @@ export async function execStart(options: {
   agentId?: string | null
   channel: Channel<TranscriptEvent>
 }): Promise<ExecStartOutcome> {
-  return invoke<ExecStartOutcome>('exec_start', {
-    homeId: options.homeId,
-    homePath: options.homePath,
-    nodeId: options.nodeId,
-    harness: options.harness,
-    unattended: options.unattended,
-    model: options.model ?? null,
-    resumeSession: options.resumeSession ?? null,
-    agentId: options.agentId ?? null,
-    channel: options.channel,
-  })
+  try {
+    return await invoke<ExecStartOutcome>('exec_start', {
+      homeId: options.homeId,
+      homePath: options.homePath,
+      nodeId: options.nodeId,
+      harness: options.harness,
+      unattended: options.unattended,
+      model: options.model ?? null,
+      resumeSession: options.resumeSession ?? null,
+      agentId: options.agentId ?? null,
+      channel: options.channel,
+    })
+  } catch (error) {
+    // §59 F-SP2-12：exec_start 经 rpc_of → launch::start 同样上抛
+    // DAEMON_TIMEOUT_MESSAGE（无 commandId 的写）——出口统一整形
+    presentInvokeError(error)
+  }
 }
 
 /**
@@ -292,9 +404,29 @@ export async function harnessLaunchPreview(harness: string): Promise<HarnessLaun
   return invoke<HarnessLaunchPreview>('harness_launch_preview', { harness })
 }
 
-/** F-DEL：删除 agent（终态；运行中/不受控会被服务端拒绝并给可读理由） */
-export async function agentsDelete(homeId: string, agentId: string): Promise<void> {
-  await invoke<void>('agents_delete', { homeId, agentId })
+/** F-EXEC-16 ①（§45）：`agents_delete`（force=true）的响应——尽力释放的
+ * 结果如实上报（`deleted` 为既有字段，保持兼容）。 */
+export interface AgentsDeleteResult {
+  deleted: string
+  /** 成功释放并标记 reconciled 的租约数（force 分支先行尽力释放）。 */
+  leasesReleased: number
+  /** 释放失败的明细（逐 exec）——这些租约被真正放弃，对应 run item 可能
+   * 一直显示运行中，需在 Runs 面板手动取消该 run。 */
+  leaseReleaseFailures: string[]
+}
+
+/** F-DEL / F-EXEC-14(4)：删除 agent（终态守卫在服务端）。`force=true` =
+ * 「放弃租约并删除」——只绕过待对账租约守卫；服务端会**先尽力释放一次**
+ * 该 agent 待对账的租约（结果见 AgentsDeleteResult），释放失败的租约被
+ * 真正放弃——daemon 不回收租约，run item 可能一直显示运行中，需到 Runs
+ * 面板手动取消该 run。Starting/Running 与 Orphan 守卫不受 force 影响；
+ * 缺省 false 走常规守卫（不做释放）。 */
+export async function agentsDelete(
+  homeId: string,
+  agentId: string,
+  force: boolean = false,
+): Promise<AgentsDeleteResult> {
+  return invoke<AgentsDeleteResult>('agents_delete', { homeId, agentId, force })
 }
 
 /** 历史 transcript 尾部（F-PI-3）：raw.log 尾部重建的展示事件——
@@ -324,4 +456,18 @@ export async function harnessListModels(harness: string): Promise<HarnessModelEn
  * 的全局存储，OMT 不经手。 */
 export async function harnessOpenLogin(harness: string): Promise<void> {
   await invoke<void>('harness_open_login', { harness })
+}
+
+// ── A8 派发策略（设置页「派发策略」；只约束 CLI / MCP 发起的派发）─────────
+
+/** 读当前策略视图：文件缺失 = 默认值（source: 'default'）；文件无效时
+ * `policy` 缺席、`error` 携带 `POLICY_INVALID: <原因>`——界面据此提示
+ * fail-closed 并预填文档默认值，不把错误伪装成文件内容。 */
+export async function execPolicyGet(): Promise<ExecPolicyView> {
+  return invoke<ExecPolicyView>('exec_policy_get')
+}
+
+/** 保存策略（Rust 侧校验 + 原子落盘），返回保存后的 exec_policy_get 结果。 */
+export async function execPolicySet(policy: ExecPolicy): Promise<ExecPolicyView> {
+  return invoke<ExecPolicyView>('exec_policy_set', { policy })
 }

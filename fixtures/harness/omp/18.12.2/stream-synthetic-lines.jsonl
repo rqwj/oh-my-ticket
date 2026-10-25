@@ -1,0 +1,10 @@
+{"type":"session","version":3,"id":"__SESSION__","timestamp":"__TS__","cwd":"__PATH__"}
+{"type":"agent_start"}
+{"type":"turn_start"}
+{"type":"message_update","assistantMessageEvent":{"type":"thinking_start","contentIndex":0}}
+{"type":"message_update","usage":{"input":6979,"totalTokens":6979,"cost":{"total":0.020937}},"assistantMessageEvent":{"type":"thinking_end","contentIndex":0,"content":"Let me run the probe."}}
+{"type":"message_update","assistantMessageEvent":{"type":"toolcall_end","contentIndex":1,"toolCall":{"type":"toolCall","id":"tool_1","name":"bash","arguments":{"command":"echo TOOLPROBE"}}}}
+{"type":"tool_execution_end","toolCallId":"tool_1","toolName":"bash","result":{"content":[{"type":"text","text":"TOOLPROBE\n"}],"structuredContent":{"output":"TOOLPROBE\n","exit_code":0}},"isError":false}
+{"type":"message_update","usage":{"input":7000,"totalTokens":7100,"cost":{"total":0.021}},"assistantMessageEvent":{"type":"text_end","contentIndex":0,"content":"DONE"}}
+{"type":"agent_end","messages":[]}
+{"type":"agent_settled"}
