@@ -1914,20 +1914,25 @@ F-BENCH-13 查证结论：4e960a2 提交说明声称的探针/capture/lib 改动
 
 | # | 场景 | 期望 | 结果 |
 |---|---|---|---|
-| 1 | 设置页「派发策略」：默认显示 MCP 关闭；打开并保存 | `exec/policy.json` 写出；`omt exec policy` 显示 `source: file`、`allowFromMcp: true` | 待验收 |
-| 2 | 主控（Claude Code 配置 `omt mcp`）调用 `harness__list`、`harness__models pi` | 返回已启用 harness 与 pi 的模型列表 | 待验收 |
-| 3 | 主控 `exec__start {homeId, harness: "pi", model: "kimi-coding/k3", nodeId: <快速 ticket>}`（ticket 在 workspace 内的 `.omt` 里） | 立即返回 `{agentId, execId, runId}`；**5 秒内**桌面端 Agents 面板出现新 agent，带 `MCP` 标签；选中它后实时 transcript 可见；跑完 run completed | 待验收 |
-| 4 | 主控 `exec__tail` 循环直到 `done` | 能拿到完整事件，末尾是 exit | 待验收 |
-| 5 | 设置页关闭 MCP 派发后，主控再 `exec__start`（不重启 MCP 会话）；再在设置页重新开启并再调一次 | 关闭时 `POLICY_DENIED`（field `allowFromMcp`）、`exec__start` 仍在 tools/list 中；重新开启后无需重启会话即可派发成功 | 待验收 |
-| 6 | 被派发的 harness 自己的 MCP 工具列表 | 不含任何 `harness__*` / `exec__*` | 待验收 |
-| 7 | `maxConcurrent: 1` 时连续两次 `omt exec start` | 第二次 `POLICY_DENIED`（field `maxConcurrent`） | 待验收 |
-| 8 | `omt exec stop <execId>` | 3 秒内 `killed`，item 回 pending | 待验收 |
-| 9 | 桌面端派发（任一 harness） | 与子项目 1 完全一致，不受 policy 影响 | 待验收 |
-| 10 | 故意写坏 `exec/policy.json` | 设置页显示「策略文件无效」并预填默认值；CLI/MCP 派发 `POLICY_INVALID`；`omt exec stop` 仍可用；桌面端派发不受影响 | 待验收 |
-| 11 | 被派发的 harness 在自己的 shell 里执行 `omt exec start …` 与 `omt exec stop …`（可让测试 ticket 要求它这样做） | 均 `POLICY_DENIED`（field `nestedDispatch`）；它的 MCP 工具列表里没有任何 `harness__*` / `exec__*` | 待验收 |
-| 12 | 设置页关闭 CLI 派发后，在终端执行 `omt exec start --harness pi --node <ticket>` | `POLICY_DENIED`（field `allowFromCli`）——同时证明关 MCP 不等于关掉 agent 经 shell 的派发 | 待验收 |
-| 13 | 对全局 home（`~/.omt`）里的 ticket 执行 `omt --home ~/.omt exec start …` | `POLICY_DENIED`（field `workspaces`），没有在用户主目录下拉起 harness | 待验收 |
-| 14 | 主控 `harness__list` | 返回的条目只有 `envKeys`（键名），看不到任何 env 值；`extraArgs` 已脱敏 | 待验收 |
+| 1 | 设置页「派发策略」：默认显示 MCP 关闭；打开并保存 | `exec/policy.json` 写出；`omt exec policy` 显示 `source: file`、`allowFromMcp: true` | ✔（2026-10-25）：默认 `source: default`、`allowFromMcp: false`；设置页打开 MCP 派发并保存后写出 `exec/policy.json`（权限 0600），`omt exec policy` 显示 `source: file`、`allowFromMcp: true` |
+| 2 | 主控（Claude Code 配置 `omt mcp`）调用 `harness__list`、`harness__models pi` | 返回已启用 harness 与 pi 的模型列表 | ✔（2026-10-25）：协议层（stdio 驱动 `omt mcp`）与真实 Claude Code（`claude mcp add` 配置 `omt mcp`）均正常返回；真 pi 模型 61 个含 `kimi-coding/k3` |
+| 3 | 主控 `exec__start {homeId, harness: "pi", model: "kimi-coding/k3", nodeId: <快速 ticket>}`（ticket 在 workspace 内的 `.omt` 里） | 立即返回 `{agentId, execId, runId}`；**5 秒内**桌面端 Agents 面板出现新 agent，带 `MCP` 标签；选中它后实时 transcript 可见；跑完 run completed | ✔（2026-10-25，真实 Claude Code + 真 pi）：派发 TICKET-0005 立即返回；用户确认桌面端 Agents 面板出现带 `MCP` 标签的 agent、实时 transcript 可见；CLI 侧 `exec-18607-1` `launchedBy: mcp`、exit 0、RUN-0005 completed、ticket done，`hello.txt` 已写出 |
+| 4 | 主控 `exec__tail` 循环直到 `done` | 能拿到完整事件，末尾是 exit | ✔（2026-10-25，MCP 协议层）：`done: true`，事件 `session_start / raw / exit`，末条 exit code 0 |
+| 5 | 设置页关闭 MCP 派发后，主控再 `exec__start`（不重启 MCP 会话）；再在设置页重新开启并再调一次 | 关闭时 `POLICY_DENIED`（field `allowFromMcp`）、`exec__start` 仍在 tools/list 中；重新开启后无需重启会话即可派发成功 | ✔（2026-10-25，协议层 + 真实 Claude Code）：设置页关闭后 `exec__start` 返回 `POLICY_DENIED`（文案点名 `allowFromMcp`）且仍在 tools/list，只读工具（`harness__list` 等）照常可用（设计如此，Q-4 只约束派发）；重新开启后同一 MCP 进程（pid 18607）派发 TICKET-0002 成功（`exec-18607-3`，exit 0）；被拒调用只占一个序号，不留 agent / exec 记录 |
+| 6 | 被派发的 harness 自己的 MCP 工具列表 | 不含任何 `harness__*` / `exec__*` | ✔（2026-10-25，真实派发环境）：假 pi 在 exec 内经 shim 生成的启动器（`omt --actor exec:<execId> mcp`）列工具，无任何 `harness__*` / `exec__*` |
+| 7 | `maxConcurrent: 1` 时连续两次 `omt exec start` | 第二次 `POLICY_DENIED`（field `maxConcurrent`） | ✔（2026-10-25，CLI）：第二次 `POLICY_DENIED`（field `maxConcurrent`），exit 3 |
+| 8 | `omt exec stop <execId>` | 3 秒内 `killed`，item 回 pending | ✔（2026-10-25，CLI）：0.31 s 变 `killed`（`killReason: user`），item 回 `pending`（假 pi 未认领；认领后停止的路径随第 3 行真 pi 复核） |
+| 9 | 桌面端派发（任一 harness） | 与子项目 1 完全一致，不受 policy 影响 | ✔（2026-10-25，用户在桌面端操作）：真 pi（kimi-coding/k3）派发 TICKET-0006，`launchedBy: desktop`、exit 0、RUN-0004 completed、ticket done，`desk.txt` 已写出 |
+| 10 | 故意写坏 `exec/policy.json` | 设置页显示「策略文件无效」并预填默认值；CLI/MCP 派发 `POLICY_INVALID`；`omt exec stop` 仍可用；桌面端派发不受影响 | ✔（2026-10-25）：CLI `exec policy` 与 `exec start` 均 `POLICY_INVALID`；写坏前已启动的 exec 仍可 `exec stop`（killed）；设置页显示「策略文件无效：POLICY_INVALID …」并预填默认值（CLI 开、MCP 关、pi/omp/opencode、并发 4、1800 秒）；文件仍坏时桌面端派发正常完成（`exec-88716-4`，RUN-0006 completed） |
+| 11 | 被派发的 harness 在自己的 shell 里执行 `omt exec start …` 与 `omt exec stop …`（可让测试 ticket 要求它这样做） | 均 `POLICY_DENIED`（field `nestedDispatch`）；它的 MCP 工具列表里没有任何 `harness__*` / `exec__*` | ✔（2026-10-25，真实派发环境）：exec 内 `omt exec start` / `exec stop` 均 `POLICY_DENIED`（field `nestedDispatch`），`allowFromMcp` 打开时同样被拒；MCP 工具列表同第 6 行 |
+| 12 | 设置页关闭 CLI 派发后，在终端执行 `omt exec start --harness pi --node <ticket>` | `POLICY_DENIED`（field `allowFromCli`）——同时证明关 MCP 不等于关掉 agent 经 shell 的派发 | ✔（2026-10-25，CLI）：`POLICY_DENIED`（field `allowFromCli`），exit 3 |
+| 13 | 对全局 home（`~/.omt`）里的 ticket 执行 `omt --home ~/.omt exec start …` | `POLICY_DENIED`（field `workspaces`），没有在用户主目录下拉起 harness | ✔（2026-10-25，CLI）：`POLICY_DENIED`（field `workspaces`），全局 home 下无 agent、无 harness 进程（其 `omt.db` 为 daemon 启动时默认打开全局 home 所建，时间戳与 daemon 启动一致） |
+| 14 | 主控 `harness__list` | 返回的条目只有 `envKeys`（键名），看不到任何 env 值；`extraArgs` 已脱敏 | ✔（2026-10-25，CLI + MCP 协议层）：pi 只返回 `envKeys`（键名），`extraArgs` 为 `--api-key= ***`；两路输出中均搜不到密钥值 |
+
+
+**2026-10-25 验收环境**：`~/omt-accept/sp2/`（`rt` 为 runtime dir、`globalhome` 为全局 home、`ws/.omt` 为工作区 home、`env.sh` 为环境变量；daemon 由 `omt --home ws/.omt daemon-start` 拉起，二进制为 `feat/harness-benchmark` HEAD `9765218` 的 `target/debug`）。CLI 与 MCP 协议层的行由主控执行；第 1、3、9 行与第 10 行的界面部分需桌面端（同一 runtime dir 下 `pnpm tauri:dev`），第 2、3、5 行的 Claude Code 冒烟需真实客户端。
+
+**2026-10-25 验收结论**：14 行全部通过。验收中发现 1 条 P3：`apps/desktop/src/ExecPolicySection.tsx:95` 文案「无人值守运行（pi `--auto`、omp `--approval-mode=yolo` 等）」有误——`--auto` 是 opencode 的放行参数（`harness.rs:212`），pi 没有无人值守参数（`harness.rs:247` `unattended_flag: &[]`，本身无审批层）；已随验收收口提交改为「opencode `--auto`、omp `--approval-mode=yolo`；pi 本身没有审批层」。另记两条观察（不影响结论）：同一 exec 的 extraArgs 在 tail 事件里为 `--api-key=***`、在 status 里为 `--api-key= ***`（两条脱敏路径输出格式不一致）；第 8 行假 pi 未认领 item，「认领后停止 → item 回 pending」未单独覆盖（F-ACC-12 历史验收覆盖过同路径）。
 
 **自动化旁证**（不替代手工验收）：第 4 项的分页 tail 与 exit 收尾 = A9 e2e（CLI 路径）+ A4 `transcript_page` 单测；第 7 项 = A3 `check_capacity` 单测与跨进程锁测试；第 11 项 = `nested_dispatch_marker_denies_start_and_stop`（CLI）+ A6 mcp_spec 的注入桥不暴露断言；第 12 项 = `exec_start_denied_by_policy_exits_3_with_structured_problem` 与 `~/omt-accept/` 实测；第 13 项 = A4 `workspace_scope_denial` 单测（Q-13）；第 14 项 = A4 `list_value` 投影单测 + `~/omt-accept/` 实测输出。第 3/5 项的「tools/list 始终列出 8 个本地工具」由 A7 契约测试与 A6 mcp_spec 钉住。
 
@@ -2356,3 +2361,34 @@ F-BENCH-13 查证结论：4e960a2 提交说明声称的探针/capture/lib 改动
 - 过程记录：变异 2 首测用了作用域外的 `handle.exit(1)`——编译失败被 grep 漏看，误判「存活」；换作用域内的 `app.exit(1)` 重测确认**被抓**。§62 如实记录。
 
 **验证**：workspace 519 全绿、桌面 lib 25 全绿；前端 225（+2）、tsc 干净；clippy/fmt 干净；nm daemon 双零。
+
+### §63. §62 修复复审（2026-10-25，9765218）
+
+**范围**：`9765218`（§61 两条 P3）。改动小，主控直接复审 + 变异实测。未跟踪的 `docs/plans/2026-10-25-0113-feat-desktop-embedded-terminal-plan.md` 属终端调研，不在本审范围。
+
+**验证**：workspace 519 ×3——第 2 轮 `election_race` 超时一次（401/1 早停；当时主控的 vitest 变异在并发跑，已知的负载敏感用例），低负载单独复跑 3 次全绿，另两轮 519 全绿；clippy/fmt 干净；nm daemon 0；`pnpm gen` 无差异；根 tsc 干净、根 vitest 447；桌面 vitest 225（19 个文件）。
+
+**结论**：两条 P3 都按建议修了，行为正确；无新增 P1/P2。留一个测试缺口（P3）。
+
+#### 已核实正确
+
+- **事件化粘性提示**：`presentInvokeError` 整形超时时 `emit('omt:daemon-timeout', {text})`，store 挂载期订阅并设 `timeoutNotice`；dispose 后到达的 unlisten 立即调用，订阅失败被吞、不影响主流程。`capabilities/default.json` 有 `core:default`（含 `core:event:default` → allow-emit / allow-listen），前端 `emit` 有权限。与 `applyError` / `noteTimeout` 重复置位的是同一文案，无害。
+- **退出断言**（主控变异重跑，均为断言失败、非编译错误，改完即还原）：
+
+| 变异 | 结果 |
+|---|---|
+| ExitRequested 的 match 之后加回共享尾部 | 抓住（`lib.rs:834`） |
+| CloseRequested 的 Keep 加 store + exit | 抓住（`lib.rs:809`） |
+| ExitRequested 的 Cancel 加 `std::process::exit(0)`（§61 存活项） | **抓住**（`lib.rs:833`） |
+
+#### P3
+
+- **事件的发出端没有测试**（变异实测）：删掉 `bridge.ts` 里的 `void emit('omt:daemon-timeout', { text })`，桌面 vitest 225 条全绿。新增的两条用例只覆盖接收端（直接调用 store 的监听函数）；p59 的 `emitMock` 只 `mockReset`，从未断言被调用。§62「全部写路径一处覆盖」在行为上成立，但没被测试锁住——有人删掉这行，组件本地写路径的粘性提示会静默消失。建议在 §59 的 bridge 用例里补一条：`omtCall` 超时拒绝后 `expect(emitMock).toHaveBeenCalledWith('omt:daemon-timeout', { text: <去前缀文案> })`，非超时拒绝断言未调用。
+- 小项（不必单独修）：
+  - 读超时现在也一律落「可能已生效」粘性提示（`node/get`、`run/get` 等经 `omtCall` 的读都会触发）——是 §59 已记、§60 留待桌面专项的「读超时误导」的范围扩大，不是新问题，届时一并按写 / 读区分即可。
+  - `void emit(...)` 若被拒绝会成为未处理的 Promise 拒绝（控制台噪声）；也可以改用同步的 DOM `CustomEvent`（`window.dispatchEvent`），不经 IPC 往返、测试也不必 mock `emit`。
+  - Stop 改成末分支、且 match 之后只加 `exit(`（不碰 `QUIT_CONFIRMED`）时，尾部被并入 Stop 区域而 Stop 不做 exit 断言——需要同时重排分支和加尾部，属构造性改法，记录即可。
+
+**建议**：可以收口。发出端测试是一行断言，随下次触及这些文件时补上即可。
+
+**去向（2026-10-25）**：§57–§63 遗留的桌面端 P3 已转入 `docs/plans/2026-10-25-0113-feat-desktop-embedded-terminal-plan.md` 的「遗留评审发现」（CF1–CF8），随 U1 / U2 / U3 / U6 / U10 关闭：CF1 `refreshNodes` 活动 home 守卫、CF2 timeoutNotice 绑定 home / 序号与读写区分、CF3 事件泵失败状态、CF4 超时事件发出端测试、CF5 async 命令 `spawn_blocking`、CF6 会话锁结构性保证（替代 `command_spans` 源码扫描）、CF7 `runtime_dir` 与 config.md 对齐、CF8 退出确认框动作函数化（替代源码文本断言）。脱敏剩余泄漏形态不转入，留给单独的脱敏专项。
