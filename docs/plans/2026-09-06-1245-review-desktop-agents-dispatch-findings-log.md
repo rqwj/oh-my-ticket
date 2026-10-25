@@ -59,7 +59,7 @@ branch: feat/desktop-agents-dispatch
 | F-TERM-9 | P3 | gated_auto | 桌面/U1 | `workspaceList.ts:171-183` `addCandidates` | 只按路径去重：known-homes 报规范路径、daemon 报首个声明者的原始路径，`/tmp` 与 `/private/tmp` 同一 home 出现两行（仅显示问题，添加后两行都消失） | fixed(97614e3) | — |
 | F-TERM-10 | P3 | gated_auto | 桌面/U1 | `store.ts:1422-1434`、`1533-1550` | F-TERM-3 残留：启动时 `daemon_homes` 失败后、首次成功刷新前用户先「＋ 添加工作区」，`updateWorkspaces` 在未初始化时存下 `[picked]`，其他已打开 home 的迁移永久不再执行（可经添加弹窗手动补回） | fixed(97614e3) | — |
 | F-TERM-11 | P3 | testing-gap | 桌面/U1 | `store.ts` 多处（6c3cbb2） | 变异存活：`selectHome` 写入保护、focus 路径的成功门、`selectWorkspace` 按声明 homeId 查找、对齐 effect 吸附到 `list[0]`、「已打开」分支 homeId 回写（被对齐 effect 的回写掩盖）。行为按代码阅读正确，只是缺覆盖；agent「每条修复都有修复前会失败的测试」的说法因此不完全成立 | fixed(97614e3) | — |
-| F-TERM-12 | P2 | gated_auto | 桌面/U1 | `App.tsx:130-146` `isMissingWorkspace`、`store.ts:1561-1563`（97614e3） | 失效探测改成 path 或 homeId 双键后，项目目录被移动 / 改名会被误判失效：homeId 存在 home 自己的库里、移动后不变，known-homes 的旧路径条目永久 missing 且按首次出现排在前面——新路径的图标即使已打开也被置灰；daemon 不再持有该 home 后点击报「目录已不存在」、从不声明有效路径（临时测试复现；改动前只按路径匹配无此问题）。修法：路径精确匹配优先，无同路径条目时才回退 homeId，且只有该 homeId 的所有条目都 missing 才算失效 | open | — |
+| F-TERM-12 | P2 | gated_auto | 桌面/U1 | `App.tsx:130-146` `isMissingWorkspace`、`store.ts:1561-1563`（97614e3） | 失效探测改成 path 或 homeId 双键后，项目目录被移动 / 改名会被误判失效：homeId 存在 home 自己的库里、移动后不变，known-homes 的旧路径条目永久 missing 且按首次出现排在前面——新路径的图标即使已打开也被置灰；daemon 不再持有该 home 后点击报「目录已不存在」、从不声明有效路径（临时测试复现；改动前只按路径匹配无此问题）。修法：路径精确匹配优先，无同路径条目时才回退 homeId，且只有该 homeId 的所有条目都 missing 才算失效 | fixed（主控，见 §68） | — |
 | F-TERM-13 | P3 | gated_auto | 桌面/CF3 | `store.ts` ~1733-1748、`store.ts:1390` | events-status 监听不看 `payload.homeId`：切到 B 前一刻 A 的「失败」事件会把横幅挂到 B，之后恢复时 B 不会再发事件（latch 已重置），横幅卡住；`selectHome` 重点当前图标会清掉横幅而订阅 effect 不重跑，事件仍坏时横幅再也不回来。修法：按 homeId 过滤，只在 homeId 变化时清 | open | — |
 | F-TERM-14 | P3 | advisory | 桌面/CF2 | `bridge.ts:46-60` `DAEMON_WRITE_METHODS`；`store.ts:1263` | 幂等的后台写 `ui/filters-set` / `ui/recent-set` 在写集合里，超时会挂上「可能已生效、避免重复提交」的粘性提示（可能绑定到非活动 home、只能手动关）；读超时进 `error` 后文案仍是「结果未知、可能已生效」；`refreshNodes` 失败分支无活动 home 守卫，A 迟到的失败横幅显示在 B | open | — |
 | F-TERM-15 | P3 | testing-gap | 桌面/CF2·CF3 | 测试（97614e3） | 变异存活：组件写方法（如 run/control）退出写集合、通知绑定到写操作自己的 homeId（而非活动 home，CF2 的核心场景）、App 的 `openRunsOfHome` 接线；Rust 事件泵只有统计子串的源码扫描测试，「每次成功都发 ok」「事件名改错」「恢复时 homeId 为空」「只在非空页计成功」四个变异存活——与计划 CF6/CF8「源码扫描改结构性测试」的方向相反，建议给 `subscription_pump` 注入连接 / descriptor 闭包后直接测 | open | — |
@@ -2489,3 +2489,11 @@ F-BENCH-13 查证结论：4e960a2 提交说明声称的探针/capture/lib 改动
 - 三轮共约 109 分钟、$13.87；ticket 粒度越大，单轮成本越高（本轮 54.7 分钟、$7.70），但一次交付了 9 项、只留 1 条 P2。
 - agent 的自测质量在提升：本轮按要求做了回退验证，声明属实；遗漏集中在「跨 home 的边界」（移动的项目、切换瞬间的事件归属）与 Rust 侧只有源码扫描测试。
 - F-SELF-1 修好后，长任务不再需要人工收口，流程上已可持续串行推进。
+
+
+### §68. F-TERM-12 修复（2026-10-25，主控直接修）
+
+- **修法**：新增纯函数 `workspaceList.ts::isWorkspaceMissing`——known-homes 有同路径条目时只看这些条目；没有同路径条目（写法不一致：条目记 `/tmp`、known-homes 报 `/private/tmp`）才按 homeId（`lastHomeId`）回退，且该 homeId 的条目全部 missing 才算失效。`App.tsx` 的图标置灰与 `store.ts::selectWorkspace` 的点击拦截改为共用它（此前两处各写一份双键匹配）。
+- **测试**：`workspace-list.spec.ts` 新增 3 条（移动过的项目不判失效且旧路径仍判失效、写法不一致时按 homeId 回退且全部 missing 才算、无对应条目或 homeId 为空不判失效）；`workspace-rail.spec.tsx` 新增 App 级用例（旧路径 missing + 新路径同 homeId：新图标不置灰、点击声明新路径、无「目录已不存在」）。变异：把判定改回旧的双键 `some(missing && (path || homeId))`，3 条新测试变红。
+- **验证**：桌面 vitest 22 文件 283 通过（+4）、tsc 干净、`pnpm build` 通过。
+- F-TERM-13..15 与 F-SELF-3（P3）按用户决定留到 U2 一起处理。

@@ -180,6 +180,42 @@ describe('U1 路径失效（KTD14）', () => {
   })
 })
 
+describe('F-TERM-12 移动过的项目', () => {
+  it('旧路径 missing、新路径同 homeId：新路径图标不置灰，点击声明新路径', async () => {
+    // homeId 存在 home 自己的库里，移动后不变；known-homes 的旧路径条目
+    // 永久 missing 且排在前面——按 homeId 命中就判失效会让新路径永远打不开
+    window.localStorage.setItem(STORED_KEY, JSON.stringify([
+      { path: '/tmp/ws1/.omt', homeId: 'h_a', name: 'ws1' },
+      { path: '/tmp/ws2-moved/.omt', homeId: 'h_b', name: 'ws2-moved' },
+    ]))
+    const known = [
+      { path: '/tmp/ws2/.omt', name: '.omt', kind: 'workspace', open: false, missing: true, lastHomeId: 'h_b' },
+      { path: '/tmp/ws2-moved/.omt', name: '.omt', kind: 'workspace', open: false, missing: false, lastHomeId: 'h_b' },
+    ]
+    const declared: string[] = []
+    mockDaemon([homeA], known)
+    invokeMock.mockImplementation((cmd: string, args?: { method?: string; params?: { path?: string } }) => {
+      if (cmd === 'daemon_homes') return Promise.resolve({ homes: [homeA], homeDir: '/Users/test' })
+      if (cmd === 'daemon_reconnect') return Promise.resolve({})
+      if (cmd === 'omt_call' && args?.method === 'home/list-known') return Promise.resolve({ homes: known })
+      if (cmd === 'omt_call' && args?.method === 'home/declare') {
+        declared.push(args.params?.path!)
+        return Promise.resolve({ homeId: 'h_b' })
+      }
+      return Promise.resolve({})
+    })
+    const { App } = await import('../src/App')
+    render(<App />)
+    await waitFor(() => expect(railIcons().length).toBe(2))
+    const moved = railIcons()[1]
+    expect(moved.className).not.toContain('missing')
+
+    fireEvent.click(moved)
+    await waitFor(() => expect(declared).toEqual(['/tmp/ws2-moved/.omt']))
+    expect(screen.queryByText(/目录已不存在/)).toBeNull()
+  })
+})
+
 describe('U1 懒声明失败（QUOTA_EXCEEDED）', () => {
   it('声明被配额拒绝：图标错误态，提示文案点名配额；当前选中不变', async () => {
     window.localStorage.setItem(STORED_KEY, JSON.stringify([

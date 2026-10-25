@@ -9,10 +9,10 @@
  * 点自动切详情。U9：树 badge 的绑定数据（bindingsByHome/agents）与 Agents
  * 面一键清理接线；派发成功后 refreshBindings（R-C）。
  */
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { WorkspaceRail } from './WorkspaceRail'
 import { workspaceRootOf } from './homePath'
-import { workspaceNameOf } from './workspaceList'
+import { isWorkspaceMissing, workspaceNameOf } from './workspaceList'
 import { useTreeStore } from './store'
 import { TreePanel } from './TreePanel'
 import { DetailPanel } from './DetailPanel'
@@ -128,22 +128,11 @@ export function App() {
     window.addEventListener('pointerup', onUp)
   }, [treeWidth])
 
-  // KTD14：known-homes 的 missing 探测 → 图标置灰带警告。§64 遗留：
-  // known-homes 报规范路径、图标栏条目记原始写法（/tmp 与 /private/tmp）
-  // ——按 path 与 homeId（lastHomeId）双键匹配，路径写法不一致也命中
-  const missingKeys = useMemo(() => {
-    const keys = new Set<string>()
-    for (const k of state.knownHomes) {
-      if (!k.missing) continue
-      keys.add(`path:${k.path}`)
-      if (k.lastHomeId) keys.add(`home:${k.lastHomeId}`)
-    }
-    return keys
-  }, [state.knownHomes])
+  // KTD14：known-homes 的 missing 探测 → 图标置灰带警告。F-TERM-12：路径
+  // 精确匹配优先、homeId 仅作写法不一致时的回退（见 isWorkspaceMissing）
   const isMissingWorkspace = useCallback(
-    (ws: { path: string; homeId: string }) =>
-      missingKeys.has(`path:${ws.path}`) || missingKeys.has(`home:${ws.homeId}`),
-    [missingKeys],
+    (ws: { path: string; homeId: string }) => isWorkspaceMissing(ws, state.knownHomes),
+    [state.knownHomes],
   )
   const workspaceErrorText = Object.keys(state.workspaceErrors).length > 0
     ? Object.values(state.workspaceErrors).join('；')

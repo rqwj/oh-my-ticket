@@ -10,6 +10,7 @@ import {
   abbreviationOf,
   appendWorkspace,
   hueOf,
+  isWorkspaceMissing,
   migrateWorkspaces,
   parentDirOf,
   readStoredWorkspaces,
@@ -174,6 +175,36 @@ describe('添加弹窗候选（F-TERM-5）', () => {
       [],
     )
     expect(candidates.map(c => c.path)).toEqual(['/tmp/ws2/.omt'])
+  })
+})
+
+describe('失效判定（F-TERM-12）', () => {
+  const k = (path: string, missing: boolean, lastHomeId?: string) => ({ path, missing, lastHomeId })
+
+  it('同路径条目存在时只看同路径：移动过的项目（旧路径 missing、同 homeId）不判失效', () => {
+    const known = [k('/tmp/ws2/.omt', true, 'h_b'), k('/tmp/ws2-moved/.omt', false, 'h_b')]
+    expect(isWorkspaceMissing({ path: '/tmp/ws2-moved/.omt', homeId: 'h_b' }, known)).toBe(false)
+    // 旧路径本身仍判失效
+    expect(isWorkspaceMissing({ path: '/tmp/ws2/.omt', homeId: 'h_b' }, known)).toBe(true)
+  })
+
+  it('无同路径条目（写法不一致）才按 homeId 回退：全部 missing 才算失效', () => {
+    // 条目记原始写法 /tmp，known-homes 报规范路径 /private/tmp
+    expect(
+      isWorkspaceMissing({ path: '/tmp/ws2/.omt', homeId: 'h_b' }, [k('/private/tmp/ws2/.omt', true, 'h_b')]),
+    ).toBe(true)
+    // 同 homeId 有一条仍在 → 不判失效
+    expect(
+      isWorkspaceMissing({ path: '/tmp/ws2/.omt', homeId: 'h_b' }, [
+        k('/private/tmp/ws2-old/.omt', true, 'h_b'),
+        k('/private/tmp/ws2/.omt', false, 'h_b'),
+      ]),
+    ).toBe(false)
+  })
+
+  it('known-homes 里没有任何对应条目、或条目 homeId 为空 → 不判失效', () => {
+    expect(isWorkspaceMissing({ path: '/tmp/ws9/.omt', homeId: 'h_z' }, [k('/tmp/ws2/.omt', true, 'h_b')])).toBe(false)
+    expect(isWorkspaceMissing({ path: '/tmp/ws9/.omt', homeId: '' }, [k('/tmp/ws2/.omt', true)])).toBe(false)
   })
 })
 

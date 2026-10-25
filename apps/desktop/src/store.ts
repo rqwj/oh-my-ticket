@@ -77,6 +77,7 @@ import type {
 } from './types'
 import {
   appendWorkspace,
+  isWorkspaceMissing,
   migrateWorkspaces,
   readStoredWorkspaces,
   saveStoredWorkspaces,
@@ -1556,12 +1557,9 @@ export function useTreeStore() {
         void selectHome(open)
         return
       }
-      // §64 遗留：known-homes 报规范路径、条目记原始写法（/tmp vs
-      // /private/tmp）——失效探测按 path 或 homeId（lastHomeId）双键匹配
-      const known = knownHomesRef.current.find(
-        k => k.path === ws.path || (k.lastHomeId !== undefined && k.lastHomeId === ws.homeId),
-      )
-      if (known?.missing) {
+      // F-TERM-12：路径精确匹配优先、homeId 仅作写法不一致时的回退——
+      // 移动过的项目（homeId 不变、旧路径条目永久 missing）不得误判失效
+      if (isWorkspaceMissing(ws, knownHomesRef.current)) {
         setWorkspaceError(ws.homeId, '目录已不存在（被移动/删除），无法切换到该工作区。')
         return
       }

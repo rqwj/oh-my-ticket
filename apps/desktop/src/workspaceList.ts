@@ -143,6 +143,26 @@ export function saveStoredWorkspaces(list: WorkspaceEntry[]): void {
   window.localStorage.setItem(WORKSPACES_KEY, JSON.stringify(list))
 }
 
+/**
+ * F-TERM-12：图标栏条目是否已失效（KTD14 置灰带警告、点击不声明）。
+ * 路径精确匹配优先：known-homes 有同路径条目时只看这些条目。没有同路径
+ * 条目（条目记原始写法、known-homes 报规范路径：/tmp vs /private/tmp）才按
+ * homeId（lastHomeId）回退，且该 homeId 的条目**全部**失效才算失效。
+ * homeId 存在 home 自己的库里，项目目录被移动 / 改名后不变，而 known-homes
+ * 的旧路径条目永久 missing——只要一条 missing 就判失效，会把移动后的项目
+ * 误判为失效、从不声明有效路径。
+ */
+export function isWorkspaceMissing(
+  ws: { path: string; homeId: string },
+  knownHomes: ReadonlyArray<{ path: string; missing: boolean; lastHomeId?: string }>,
+): boolean {
+  const byPath = knownHomes.filter(k => k.path === ws.path)
+  if (byPath.length > 0) return byPath.every(k => k.missing)
+  if (ws.homeId === '') return false
+  const byHomeId = knownHomes.filter(k => k.lastHomeId === ws.homeId)
+  return byHomeId.length > 0 && byHomeId.every(k => k.missing)
+}
+
 /** 添加弹窗的候选项（F-TERM-5）。来源：daemon 已打开的 home + known-homes
  *  条目；已在图标栏里的（path 或 homeId 命中）不列——已在列表中的不应再
  * 显示为「已知未开」，由 DSH/CLI 打开的 home 也不应凭空消失。 */
