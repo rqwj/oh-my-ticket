@@ -63,6 +63,10 @@ branch: feat/desktop-agents-dispatch
 | F-TERM-13 | P3 | gated_auto | 桌面/CF3 | `store.ts` ~1733-1748、`store.ts:1390` | events-status 监听不看 `payload.homeId`：切到 B 前一刻 A 的「失败」事件会把横幅挂到 B，之后恢复时 B 不会再发事件（latch 已重置），横幅卡住；`selectHome` 重点当前图标会清掉横幅而订阅 effect 不重跑，事件仍坏时横幅再也不回来。修法：按 homeId 过滤，只在 homeId 变化时清 | open | — |
 | F-TERM-14 | P3 | advisory | 桌面/CF2 | `bridge.ts:46-60` `DAEMON_WRITE_METHODS`；`store.ts:1263` | 幂等的后台写 `ui/filters-set` / `ui/recent-set` 在写集合里，超时会挂上「可能已生效、避免重复提交」的粘性提示（可能绑定到非活动 home、只能手动关）；读超时进 `error` 后文案仍是「结果未知、可能已生效」；`refreshNodes` 失败分支无活动 home 守卫，A 迟到的失败横幅显示在 B | open | — |
 | F-TERM-15 | P3 | testing-gap | 桌面/CF2·CF3 | 测试（97614e3） | 变异存活：组件写方法（如 run/control）退出写集合、通知绑定到写操作自己的 homeId（而非活动 home，CF2 的核心场景）、App 的 `openRunsOfHome` 接线；Rust 事件泵只有统计子串的源码扫描测试，「每次成功都发 ok」「事件名改错」「恢复时 homeId 为空」「只在非空页计成功」四个变异存活——与计划 CF6/CF8「源码扫描改结构性测试」的方向相反，建议给 `subscription_pump` 注入连接 / descriptor 闭包后直接测 | open | — |
+| F-TERM-16 | P2 | gated_auto | 桌面/CF6 | `state.rs:234` `BlockingScope::rpc`（f7c3e2e） | `rpc()` 返回 `'static` 的 `RpcFn`（`Arc<dyn Fn + Send + Sync>`），`in_blocking_scope` 只要求 `R: Send + 'static`——`in_blocking_scope(\|s\| Ok(s.rpc()))` 能把拿锁能力带出令牌作用域，之后同步命令或 tokio worker 上都能直接锁会话。变异：`exec_start` 改为取出 rpc 后在 worker 上跑 `launch::start`（完整的 CF5 回归）编译通过、全部测试通过。U6 的 `terminal_open` 正是这个模式。修法：`rpc(&self)` 返回借用 scope 的闭包（`launch::start` 本就接受 `DaemonRpc<'_>`），后台对账线程把 scope 移进线程；补 `compile_fail` doctest | fixed(f0ddf82) | — |
+| F-TERM-17 | P3 | gated_auto | 桌面/CF6 | 同步命令（如 `rpc_bridge.rs:477` `events_subscribe`） | 没有任何东西阻止同步命令 `tauri::async_runtime::block_on(shared.with_session_async(...))`——主线程照样在锁上等最长 30 s（变异存活）。修法：`clippy.toml` 的 `disallowed-methods` 禁 `block_on` 一类（CI 的 `-D warnings` 兜住），或在锁路径 debug 断言不在主线程 | fixed(f0ddf82) | — |
+| F-TERM-18 | P3 | testing-gap | 桌面/CF6 | `state.rs:274/285` compile_fail doctest | doctest 从 crate 外部检查，看不到 `pub(crate)`：字段改 `pub(crate)`、`BlockingScope` 加 `pub fn new` / `pub(crate)` 字段、新增 pub 同步锁访问器等变异全部存活——`state.rs` 实际靠代码评审守边界；稳定版 rustdoc 不校验错误码（注释称 E0603，实际 E0451）。修法：把锁与令牌内核拆成独立小 crate，或明确声明 `state.rs` 是信任边界并收回 `pub mod state` | addressed(f0ddf82，信任边界写入 state.rs 模块文档，未拆 crate) | — |
+| F-TERM-19 | P3 | testing-gap | 桌面/CF5 | `state.rs:353` 饿死测试 | `async_entry_points_do_not_starve_while_session_lock_is_held` 的探针既不争锁也不争 tokio worker，`<400ms` 断言恒成立：去掉持锁、把 `spawn_blocking` 换成 `async_runtime::spawn`（真正的 CF5 回归）都存活；只有线程 id 断言抓住「内联执行」。修法：在被占住的锁上排队多于 worker 数的 `with_session_async`，再断言无关的 `spawn` 任务能很快完成 | fixed(f0ddf82) | — |
 | F-SELF-3 | P3 | advisory | 执行面/注入 | `mcp_injection.rs`（pi 项目注入释放） | 注入释放删除了 `.pi/mcp.json` 但留下空的 `.pi/` 目录（该目录由注入创建）；git 不显示空目录，但会残留在用户项目里 | open | — |
 | F-SELF-1 | P2 | gated_auto | 执行面/run | `dispatch.rs:1537-1539` `LEASE_TTL_MS`、`runs.rs:174` | 认领租约固定 15 分钟且**从未接上续期**（注释称随 U5b janitor 落地，未实现）；CLI/MCP 默认时长上限 30 分钟、桌面端 120 分钟——任何超过 15 分钟的派发都必然 `run__report` 被拒（`lease-stale: the claiming lease has expired`），工作已完成但 run 状态无法记录，exec 退出后 item 回到 pending、可能被重复派发。自托管试点 U1 首次真实单元即触发（29.6 分钟） | fixed(9cfa834，PR #11) | — |
 | F-SELF-2 | P3 | advisory | 执行面/注入 | `mcp_injection.rs`（pi 项目注入） | omt 为 pi 写入工作区的 `.pi/mcp.json` 在 exec 期间是未跟踪、未忽略的文件；被派发的 agent 若用 `git add -A` 提交会把指向本次启动器的临时注入带进仓库。本次 agent 未提交、退出后注入已清理 | open | — |
@@ -2497,3 +2501,34 @@ F-BENCH-13 查证结论：4e960a2 提交说明声称的探针/capture/lib 改动
 - **测试**：`workspace-list.spec.ts` 新增 3 条（移动过的项目不判失效且旧路径仍判失效、写法不一致时按 homeId 回退且全部 missing 才算、无对应条目或 homeId 为空不判失效）；`workspace-rail.spec.tsx` 新增 App 级用例（旧路径 missing + 新路径同 homeId：新图标不置灰、点击声明新路径、无「目录已不存在」）。变异：把判定改回旧的双键 `some(missing && (path || homeId))`，3 条新测试变红。
 - **验证**：桌面 vitest 22 文件 283 通过（+4）、tsc 干净、`pnpm build` 通过。
 - F-TERM-13..15 与 F-SELF-3（P3）按用户决定留到 U2 一起处理。
+
+
+### §69. 自托管试点 · U2-1 复审（2026-10-25，f7c3e2e）
+
+**运行**：TICKET-0140（CF5/CF6）派给 pi + `zai/glm-5.3`，`exec-19622-1` 14.0 分钟、exit 0、42 轮模型调用、$1.04；`run__report` 成功、RUN-0008 completed。一次提交 `f7c3e2e`，只改桌面端 Rust 5 个文件。注入释放再次留下空 `.pi/`（F-SELF-3 复现），主控已删除。派发前稳定版 daemon 已因空闲退出、CLI 不会自动拉起，需先 `daemon-start`（自托管流程摩擦，见下）。
+
+**验证**：desktop crate 30 单测 + 2 doctest、clippy `-D warnings`、fmt、桌面 vitest 283 全部通过（评审代理复跑）。
+
+**结论：基本可以接受；F-TERM-16（P2）应在 U2-2 建 `workspace.rs` / 之后 `terminal.rs` 之前修掉。**
+- CF5 完成且行为不变：`omt_call`、`daemon_homes`、`daemon_ensure`、`exec_start`（整个 `launch::start`）与 `daemon_reconnect` 的阻塞工作都在 `spawn_blocking`；`DaemonSession::call` / `handshake_homes` 未改，`DAEMON_TIMEOUT_MESSAGE` 透传、超时不重放、超时丢连接惰性重建、daemon 消失单次重放、`homes_payload` 的 `?`、中毒处理均与原实现一致；std 锁只在阻塞线程上取、从不跨 `.await`；`events_subscribe` 仍同步，F-SP2-10 到达顺序保持。
+- CF6 对已测形态成立：crate 外 `.0.lock()`（E0616）与结构体字面量构造 `BlockingScope`（E0451）都编译失败；但 F-TERM-16 的 `RpcFn` 逃逸、F-TERM-17 的 `block_on`、F-TERM-18 的 `pub(crate)` 盲区让保证有实际漏洞。
+- 测试：F-TERM-19 的饿死测试是空跑；命令级胶水（`daemon_ensure` 不建会话）无测试，属既有缺口。
+
+**变异（评审代理）**：14 项，4 被抓、10 存活（存活集中在 F-TERM-16..19）。agent 汇报的回退验证（字段改 pub → doctest 红、去掉 `spawn_blocking` → 两个 CF5 测试红）属实，但只覆盖了最直接的两种回退。
+
+**自托管流程摩擦**：稳定版 daemon 空闲 30 分钟自动退出，CLI 在线命令不会拉起，两次派发之间若间隔较长需先手动 `daemon-start`。
+
+**建议**：F-TERM-16（借用式 rpc）+ F-TERM-19（真正的饿死测试）+ F-TERM-17（clippy 禁 `block_on`）合成一个小 ticket 先派，再派 U2-2；F-TERM-18 记录信任边界即可，暂不拆 crate。
+
+
+### §70. 自托管试点 · U2-1b 复审（2026-10-25，f0ddf82）
+
+**运行**：TICKET-0142（F-TERM-16/17/19 + F-TERM-18 文档）派给 pi + `zai/glm-5.3`，`exec-63073-1` 约 13 分钟、exit 0，`run__report` 成功、RUN-0009 completed。一次提交 `f0ddf82`：`state.rs`、`executor.rs`、新建根目录 `clippy.toml`；未碰 `crates/`。改动小，主控直接复审。
+
+**改法**：`BlockingScope::rpc(&self)` 返回借用 scope 的 `impl Fn … + '_`（`exec_start` 直接把 `&rpc` 传给 `launch::start`；后台对账线程把 scope 移进线程后借用，改用 `reconcile_interrupted_execs_with`）；新增 `compile_fail` doctest `in_blocking_scope(|scope| Ok(scope.rpc()))`；`clippy.toml` 以 `disallowed-methods` 禁 `tauri::async_runtime::block_on` 与 tokio `Runtime::block_on` / `Handle::block_on`（测试中合理用途加 allow 并注明）；饿死测试改为在长占（2 s）的锁上排队 `available_parallelism() + 1` 个 `with_session_async`，断言无关 `spawn` 任务 400 ms 内完成（使用预置占位会话 + 临时目录，不会惰性建立真实会话）；`state.rs` 模块文档写明本模块是会话锁的信任边界，doctest 错误码注释改为 E0451。
+
+**验证**（主控，`OMT_RUNTIME_DIR` 指向空目录，跑完仍为空）：desktop crate 30 单测 + 3 doctest、`cargo clippy --workspace --all-targets -D warnings`、fmt、桌面 vitest 283 全部通过。
+
+**回退验证（主控复做，三项全部被抓）**：(a) `rpc()` 改回 `'static` 闭包 → 新 doctest 失败；(b) `spawn_blocking` 换成 `async_runtime::spawn` → 饿死测试失败；(c) 同步命令 `events_subscribe` 加 `block_on` → clippy `disallowed method`。agent 的回退验证声明属实。
+
+**结论：通过。** 台账 F-TERM-16/17/19 翻 fixed(f0ddf82)，F-TERM-18 以文档方式处理。会话锁的结构性保证（U2-1 + U2-1b）可以作为 U2-2 `workspace.rs` 与之后 `terminal.rs` 的基础。
