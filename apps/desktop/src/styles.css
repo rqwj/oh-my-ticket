@@ -14,6 +14,16 @@
 
 * { box-sizing: border-box; }
 
+/* 全局细滚动条（WebKit / WKWebView）：透明轨道 + 半透明圆角滑块，悬停
+   提亮——取代系统的宽滚动条（树、Agents 列表等各面板统一）。图标栏在
+   下方单独收窄为 4px 并常驻占位。 */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track, ::-webkit-scrollbar-corner { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.16); border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.32); }
+
 body {
   margin: 0;
   background: var(--bg);
@@ -37,12 +47,9 @@ body {
   display: flex; flex-direction: column; gap: 8px; align-items: center;
   padding: 12px 0 12px 4px;
 }
+/* 轨道 / 滑块颜色沿用全局细滚动条，这里只收窄 */
 .rail-icons::-webkit-scrollbar { width: 4px; }
-.rail-icons::-webkit-scrollbar-track { background: transparent; }
-.rail-icons::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.16); border-radius: 2px;
-}
-.rail-icons::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.32); }
+.rail-icons::-webkit-scrollbar-thumb { border-radius: 2px; }
 .rail-icon {
   position: relative; width: 36px; height: 36px; border-radius: 9px;
   border: 1px solid rgba(255, 255, 255, 0.12);
