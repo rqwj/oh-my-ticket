@@ -1,0 +1,14 @@
+# F-TERM-17（§69 评审）：会话锁的 async 入口（state.rs 的
+# with_session_async / in_blocking_scope）把阻塞工作放进
+# tauri::async_runtime::spawn_blocking 的阻塞线程池（CF5）。任何代码若用
+# block_on 在 tokio worker / 主线程上等这些 future，就把阻塞工作重新拉回
+# worker（或冻住主线程最长 30s）——CF5 回归。CI 的
+# `cargo clippy --workspace --all-targets -- -D warnings` 兜住：workspace 内
+# 禁止一切 block_on 一类的方法调用；确有合理用途的地方（目前仅 state.rs
+# 测试：用 block_on 从普通 std 线程驱动 spawn_blocking 承载的 async 入口，
+# 不占 tokio worker）必须 `#[allow(clippy::disallowed_methods)]` 并写明原因。
+disallowed-methods = [
+  { path = "tauri::async_runtime::block_on", reason = "阻塞等待 async future 会把阻塞工作拉回调用线程（CF5 回归）；会话入口在 async 上下文用 .await，测试驱动见各处 allow 注释" },
+  { path = "tokio::runtime::Runtime::block_on", reason = "同 tauri::async_runtime::block_on：禁止在工作线程/主线程上阻塞等待 future" },
+  { path = "tokio::runtime::Handle::block_on", reason = "同 tauri::async_runtime::block_on：禁止在工作线程/主线程上阻塞等待 future" },
+]

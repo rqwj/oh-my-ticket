@@ -14,6 +14,16 @@
 
 * { box-sizing: border-box; }
 
+/* 全局细滚动条（WebKit / WKWebView）：透明轨道 + 半透明圆角滑块，悬停
+   提亮——取代系统的宽滚动条（树、Agents 列表等各面板统一）。图标栏在
+   下方单独收窄为 4px 并常驻占位。 */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track, ::-webkit-scrollbar-corner { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.16); border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.32); }
+
 body {
   margin: 0;
   background: var(--bg);
@@ -22,28 +32,81 @@ body {
   font-size: 14px;
 }
 
-.app-shell { display: flex; flex-direction: column; height: 100vh; }
+.app-shell { display: flex; flex-direction: row; height: 100vh; }
+.app-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 
-/* 顶部标签条（Tickets | Runs 形态） */
-.top-bar {
-  display: flex; align-items: center; gap: 16px;
-  padding: 0 16px; border-bottom: 1px solid var(--border);
-  background: var(--bg);
+/* ── U1：工作区图标栏（KTD14）─────────────────────────────────── */
+.workspace-rail {
+  width: 56px; flex-shrink: 0; display: flex; flex-direction: column;
+  border-right: 1px solid var(--border); background: var(--panel);
 }
-.tab-strip { display: flex; gap: 18px; }
-.tab {
-  padding: 12px 2px 10px; border: none; background: transparent;
-  color: var(--muted); font-size: 14px; font-weight: 600; cursor: pointer;
-  border-bottom: 2px solid transparent;
+.rail-icons {
+  /* 溢出滚动（KTD14）。滚动条位置常驻（overflow-y: scroll + 透明轨道）：
+     溢出出现 / 消失时图标不再左右跳动；左侧补同宽内边距保持图标居中 */
+  flex: 1; min-height: 0; overflow-y: scroll;
+  display: flex; flex-direction: column; gap: 8px; align-items: center;
+  padding: 12px 0 12px 4px;
 }
-.tab.active { color: var(--text); border-bottom-color: var(--text); }
-.home-name { margin-left: auto; color: var(--muted); font-size: 12px; }
+/* 轨道 / 滑块颜色沿用全局细滚动条，这里只收窄 */
+.rail-icons::-webkit-scrollbar { width: 4px; }
+.rail-icons::-webkit-scrollbar-thumb { border-radius: 2px; }
+.rail-icon {
+  position: relative; width: 36px; height: 36px; border-radius: 9px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  color: #fff; font-size: 13px; font-weight: 700; cursor: pointer;
+  display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+}
+/* 当前工作区左侧的指示条（KTD14） */
+.rail-icon.active::before {
+  content: ''; position: absolute; left: -11px; top: 6px; bottom: 6px;
+  width: 3px; border-radius: 2px; background: var(--accent);
+}
+.rail-abbr { pointer-events: none; }
+/* 路径失效：置灰带警告，仍可点击（KTD14） */
+.rail-icon.missing { opacity: 0.45; }
+.rail-icon.error { border-color: var(--danger); }
+/* 键盘可达性：图标聚焦时可见的焦点环（不依赖鼠标 hover 样式） */
+.rail-icon:focus-visible, .rail-action:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 2px;
+}
+.rail-warn {
+  position: absolute; right: -4px; top: -4px; font-size: 11px;
+  color: #d29922;
+}
+.rail-footer {
+  display: flex; flex-direction: column; align-items: center; gap: 4px;
+  padding: 8px 0 12px; border-top: 1px solid var(--border);
+}
+.rail-action {
+  width: 32px; height: 32px; border-radius: 8px; border: none;
+  background: transparent; color: var(--muted); font-size: 15px; cursor: pointer;
+}
+.rail-action:hover { background: var(--panel-raised); color: var(--text); }
+.rail-action.active { background: var(--panel-raised); color: var(--text); }
+
+/* 通知堆叠区（U1：顶栏移除后错误/提示条收入内容列顶部） */
+.notice-stack { display: flex; flex-direction: column; gap: 8px; padding: 8px 12px 0; }
+.workspace-error-banner { display: flex; align-items: center; gap: 8px; }
+.workspace-error-banner .workspace-error-text { flex: 1; }
+/* §67 nit：`.timeout-notice` 的关闭按钮此前没有 flex 布局（规则只写在
+   .workspace-error-banner 上），长文案时 ✕ 换行 / 不对齐——同一形态的横幅
+   共用同一套行内布局 */
+.timeout-notice { display: flex; align-items: center; gap: 8px; }
+.timeout-notice .workspace-error-text { flex: 1; }
+.banner-close {
+  border: none; background: transparent; color: inherit; cursor: pointer;
+  font-size: 12px; padding: 2px 6px; border-radius: 4px; flex-shrink: 0;
+}
+.banner-close:hover { background: rgba(248, 81, 73, 0.2); }
 
 .content { display: flex; flex: 1; min-height: 0; }
 
-.tree-wrap { flex-shrink: 0; min-width: 0; display: flex; }
+.tree-wrap { flex-shrink: 0; min-width: 0; display: flex; flex-direction: column; }
 .tree-panel {
   width: 100%;
+  /* F-TERM-1：tree-wrap 纵向 flex 里必须自己占满剩余高度并允许收缩，
+     .tree-scroll 的 overflow-y 才有有界高度（否则整页滚动） */
+  flex: 1; min-height: 0;
   display: flex; flex-direction: column; background: var(--bg);
 }
 .splitter {
@@ -156,32 +219,64 @@ body {
 .status-grid { display: grid; grid-template-columns: 90px 1fr; gap: 6px 12px; }
 .status-grid dt { color: var(--muted); }
 .mono { font-family: ui-monospace, monospace; font-size: 12px; }
-.home-list { display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; }
 .home-row {
   display: flex; flex-direction: column; gap: 6px; align-items: stretch;
   padding: 8px 12px;
   border: 1px solid var(--border); border-radius: 6px;
   background: var(--panel); color: var(--text); cursor: pointer; text-align: left;
 }
-.home-row-main { display: flex; gap: 10px; align-items: center; }
-.home-path { text-align: left; word-break: break-all; }
-.home-row-sub { display: flex; padding-left: 2px; }
 .home-row:hover { background: var(--panel-raised); border-color: var(--muted); }
-.home-row.selected { border-color: var(--accent); background: rgba(88, 166, 255, 0.08); }
-.row-check { margin-left: auto; color: var(--accent); font-weight: 700; font-size: 14px; }
 .home-row:disabled { opacity: 0.45; cursor: not-allowed; }
 .known-section { margin-bottom: 12px; }
 .known-section h4 { margin: 0 0 6px; font-size: 12px; color: var(--muted); font-weight: 500; }
 .known-section .home-row { margin-bottom: 4px; }
-.declare-form { display: flex; gap: 8px; }
 
-/* Workspace 切换弹窗 */
-.home-switch-btn {
-  border: none; background: transparent; color: var(--muted);
-  font-size: 12px; cursor: pointer; padding: 4px 8px; border-radius: 6px;
-  font-family: ui-monospace, monospace;
+/* ── U1：ticket 栏顶部的工作区标题（R5）────────────────────────── */
+.workspace-header {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 10px; border-bottom: 1px solid var(--border); flex-shrink: 0;
 }
-.home-switch-btn:hover { background: var(--panel-raised); color: var(--text); }
+.workspace-title { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.workspace-name {
+  font-weight: 600; font-size: 13px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.workspace-path {
+  color: var(--muted); font-size: 11px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.icon-btn {
+  border: none; background: transparent; color: var(--muted); cursor: pointer;
+  font-size: 14px; padding: 4px 6px; border-radius: 6px; flex-shrink: 0;
+}
+.icon-btn:hover { background: var(--panel-raised); color: var(--text); }
+.workspace-empty {
+  flex: 1; display: flex; flex-direction: column; gap: 12px;
+  align-items: center; justify-content: center;
+}
+.workspace-settings-page h2 { margin: 0 0 12px; font-size: 18px; }
+.workspace-settings-page { padding: 16px; overflow-y: auto; }
+.ws-settings-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 16px; }
+
+/* ── U2：工作区右键菜单（R4）与移除确认（R32）───────────────── */
+.context-overlay { position: fixed; inset: 0; z-index: 90; }
+.ws-context-menu {
+  position: fixed; z-index: 91; min-width: 200px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+  padding: 4px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+}
+.ws-menu-item {
+  display: block; width: 100%; text-align: left;
+  border: none; background: transparent; color: var(--text);
+  padding: 6px 10px; border-radius: 6px; cursor: pointer; font-size: 13px;
+}
+.ws-menu-item:hover { background: var(--panel-raised); }
+.ws-menu-sep { height: 1px; background: var(--border); margin: 4px 2px; }
+.ws-menu-danger { color: var(--danger); }
+.ws-remove-confirm { padding: 8px 10px; max-width: 300px; }
+.ws-remove-text { margin: 0 0 10px; font-size: 13px; line-height: 1.5; }
+
+/* 添加工作区弹窗（图标栏「＋」）沿用 modal 形态 */
 .modal-overlay {
   position: fixed; inset: 0; background: rgba(0, 0, 0, 0.5);
   display: flex; align-items: flex-start; justify-content: center;
@@ -272,9 +367,8 @@ body {
 }
 .md-link { color: var(--accent); cursor: default; }
 
-/* U1b：旧 dsh harness 条目的迁移提示（设置页 home 行；旧选择器已退役） */
+/* row-spacer：行内把尾部操作推到右侧（AgentsPanel / TranscriptView） */
 .row-spacer { flex: 1; }
-.harness-notice { color: var(--muted); font-size: 11px; }
 
 /* ── U7：设置页 Harnesses 管理面（R-A：左类型列表右详情）──────────────── */
 .harness-manager { margin-bottom: 24px; }

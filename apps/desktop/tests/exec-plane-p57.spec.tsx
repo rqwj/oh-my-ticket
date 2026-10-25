@@ -211,9 +211,10 @@ describe('§57 超时提示独立字段（F-SP2-11）', () => {
     vi.useFakeTimers()
   })
 
-  it('超时类失败 → 粘性 timeoutNotice（剥机器前缀）；refreshAgents/refreshHomes 不清；refreshNodes 成功才清', async () => {
+  it('读超时（node/tree）→ 普通 error（CF2）；写超时 → 结构化粘性 timeoutNotice；refreshAgents/refreshHomes 不清；同 home 超时后发出的 refreshNodes 成功才清', async () => {
     const { result } = await bootStore()
-    // node/tree 拉取超时：Rust 原文（带机器前缀）上抛
+    // node/tree 拉取超时：Rust 原文（带机器前缀）上抛——它是**读**，CF2 起
+    // 不再进粘性提示（对读请求「可能已生效」是误导），照常进普通 error
     invokeMock.mockImplementation((cmd: string, args?: { method?: string }) => {
       if (cmd === 'omt_call' && args?.method === 'node/tree') {
         return Promise.reject(new Error(RUST_TIMEOUT_MESSAGE))
@@ -226,21 +227,33 @@ describe('§57 超时提示独立字段（F-SP2-11）', () => {
     await act(async () => {
       await result.current.refreshNodes(result.current.state.activeHome!)
     })
-    expect(result.current.state.timeoutNotice).toContain('结果未知')
-    expect(result.current.state.timeoutNotice, '机器前缀是分流契约，不得展示给用户').not.toContain(
+    // F-TERM-14：读超时用读路径自己的文案（可安全重试，无「可能已生效」）
+    expect(result.current.state.error).toContain('可安全重试')
+    expect(result.current.state.error, '读文案不得带写路径的「可能已生效」').not.toContain('可能已生效')
+    expect(result.current.state.error, '机器前缀是分流契约，不得展示给用户').not.toContain(
       '[daemon-timeout]',
     )
-    expect(
-      result.current.state.error,
-      '超时类只进粘性 timeoutNotice——error 会被常规刷新的 error:null 抹掉',
-    ).toBeNull()
+    expect(result.current.state.timeoutNotice, 'CF2：读超时不进粘性提示').toBeNull()
+    // 写超时（bridge 出口事件，CF2 起结构化 {homeId, text, minNodesSeq}）
     // F-SP2-11 的触发点：窗口聚焦路径的非静默 refreshAgents()（agents_list
-    // 只读本地文件，daemon 卡死时也成功）
+    // 只读本地文件，daemon 卡死时也成功）不得清它
+    await act(async () => {
+      window.dispatchEvent(
+        new CustomEvent('omt:daemon-timeout', {
+          detail: { text: RUST_TIMEOUT_MESSAGE.replace(/^\[daemon-timeout\] /, ''), homeId: 'h_a' },
+        }),
+      )
+    })
+    expect(result.current.state.timeoutNotice?.text).toContain('结果未知')
+    expect(result.current.state.timeoutNotice?.text, '机器前缀是分流契约，不得展示给用户').not.toContain(
+      '[daemon-timeout]',
+    )
+    expect(result.current.state.error, 'error 与粘性提示互不干扰').toContain('可安全重试')
     await act(async () => {
       await result.current.refreshAgents()
     })
     expect(
-      result.current.state.timeoutNotice,
+      result.current.state.timeoutNotice?.text,
       'F-SP2-11：非静默 refreshAgents 成功不得抹掉超时提示',
     ).toContain('结果未知')
     // homes 刷新成功同样不清
@@ -248,15 +261,15 @@ describe('§57 超时提示独立字段（F-SP2-11）', () => {
       await result.current.refreshHomes()
     })
     expect(
-      result.current.state.timeoutNotice,
+      result.current.state.timeoutNotice?.text,
       'homes 拉回来了不等于节点树刷新过——用户还没确认上次写入是否生效',
     ).toContain('结果未知')
-    // 成功的节点拉取（用户确认过实际状态）才清
+    // 成功的节点拉取（同 home、超时之后发出——用户确认过实际状态）才清
     invokeMock.mockImplementation(() => Promise.resolve({}))
     await act(async () => {
       await result.current.refreshNodes(result.current.state.activeHome!)
     })
-    expect(result.current.state.timeoutNotice, '成功的节点拉取清除粘性提示').toBeNull()
+    expect(result.current.state.timeoutNotice, '同 home 超时后发出的成功节点拉取清除粘性提示').toBeNull()
     expect(result.current.state.error).toBeNull()
   })
 

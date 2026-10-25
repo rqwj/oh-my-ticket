@@ -867,6 +867,9 @@ describe('U6 App 全局门控', () => {
 describe('U6 App 派发警告条随 workspace 切换清除', () => {
   it('派发产生 warnings 后切换 workspace → 警告条消失', async () => {
     window.localStorage.setItem('omt-desktop-last-home', 'h1')
+    // 同文件前一个 App 用例的迁移结果会留在 localStorage——清掉让本次重新
+    // 迁移出两个图标（h1/h2）
+    window.localStorage.removeItem('omt-desktop-workspaces')
     const { App } = await import('../src/App')
     invokeMock.mockImplementation(async (cmd: string, args?: { method: string; params: Record<string, unknown> }) => {
       if (cmd === 'daemon_homes') return { homes: [homeOf('h1'), homeOf('h2')], homeDir: '/tmp' }
@@ -898,11 +901,10 @@ describe('U6 App 派发警告条随 workspace 切换清除', () => {
     clickCheckboxIn(screen.getByText(/我已知悉/))
     fireEvent.click(screen.getByRole('button', { name: '派发' }))
     await waitFor(() => expect(screen.getByText(/绑定写入失败：boom/)).toBeTruthy())
-    // 设置页选第二个 workspace（h2）→ activeHome 变化 → 警告条清除
-    fireEvent.click(screen.getByText('设置'))
-    await waitFor(() => expect(document.querySelectorAll('.home-row').length).toBe(2))
+    // 图标栏点第二个 workspace（h2）→ activeHome 变化 → 警告条清除
+    // （U1：设置页的 Workspaces 列表已移入图标栏）
     await act(async () => {
-      fireEvent.click(document.querySelectorAll('.home-row')[1])
+      fireEvent.click(screen.getByTitle('h2（~）'))
       await Promise.resolve()
     })
     await waitFor(() => expect(screen.queryByText(/绑定写入失败：boom/)).toBeNull())

@@ -23,6 +23,14 @@
  * U9 增量：bindings 切片——bindingsByHome（bindings_get pull，契约对齐
  * agents）+ 子树继承解析纯函数（resolveBindingForNode / bindingViewsForNodes
  * / danglingBindingsOf，R-C）+ gcBindings（一键清理，Rust 侧降级冻结）。
+ *
+ * U1（嵌入式终端计划）增量：工作区列表切片（KTD14）——桌面端自管清单
+ * 存 localStorage `omt-desktop-workspaces`（workspaceList.ts），首次运行从
+ * daemon 已开 home + known-homes 的 open 条目迁移；切换未开的工作区时懒
+ * 声明（selectWorkspace），失败记图标错误态（workspaceErrors）。homes /
+ * knownHomes / homeDir 的 ref 镜像在写入 setState 前同步更新——await 之后的
+ * 回调（addWorkspace/selectWorkspace 找回新声明的 home）不能依赖 React 的
+ * 异步渲染时序。
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
@@ -37,7 +45,9 @@ import {
   agentsList,
   bindingsGet,
   bindingsGc,
+  DAEMON_TIMEOUT_EVENT,
   daemonTimeoutText,
+  daemonTimeoutIsWrite,
   DAEMON_TIMEOUT_MARKER,
   execAttach,
   execKillOrphan,
@@ -65,6 +75,16 @@ import type {
   RunSummary,
   SavedFilters,
 } from './types'
+import {
+  appendWorkspace,
+  isWorkspaceMissing,
+  migrateWorkspaces,
+  readStoredWorkspaces,
+  removeWorkspace as removeWorkspaceEntry,
+  saveStoredWorkspaces,
+  workspaceNameOf,
+  type WorkspaceEntry,
+} from './workspaceList'
 
 const FILTERS_KEY = 'tauri:ui' // KD3: surface-prefixed bag key
 const LAST_HOME_KEY = 'omt-desktop-last-home' // 启动恢复：最后选择的 workspace homeId
@@ -356,6 +376,32 @@ export interface KnownHome {
   kind: string
   open: boolean
   missing: boolean
+  /** 声明前唯一可得的历史 id（信息性，代际间会轮换）——首次迁移收录已知未开条目用 */
+  lastHomeId?: string
+}
+
+/**
+ * CF2（§59 / §63）：超时粘性提示的结构化形态——绑定写入的 home 与落置
+ * 时的 refreshNodes 序号：只有**同 home 且在超时之后发出**的 refreshNodes
+ * 成功才清除（切到 B 的刷新不得清掉关于 A 的写提示；写入前已发出、
+ * 超时后才返回的读也不清）。homeId = null 表示无处归属（如零 home 下
+ * home/declare 超时）——不会被自动清除，只能手动关闭。
+ */
+export interface TimeoutNotice {
+  homeId: string | null
+  text: string
+  /** 落置时的 refreshNodes 发出序号；清除门槛 = 同 home 且序号更大 */
+  minNodesSeq: number
+}
+
+/**
+ * CF3（§59 P3）：事件泵健康状态——Rust subscription_pump 连续失败达阈值
+ * 后经 `omt://events-status` 上报；外部 CLI 改动因此不再自动刷新，界面
+ * 必须可见。ok 恢复事件会把本字段清回 null（提示消失）。
+ */
+export interface EventsStatusNotice {
+  homeId: string | null
+  error: string | null
 }
 
 export interface TreeState {
@@ -387,18 +433,24 @@ export interface TreeState {
   bindingsByHome: Record<string, Record<string, string>>
   /** 当前 home 绑定数据降级（bindings_get parseFailed，粘性）——悬空判定冻结 */
   bindingsParseFailed: boolean
+  /** U1：桌面端自管的工作区列表（KTD14：localStorage 持久化，按加入顺序） */
+  workspaces: WorkspaceEntry[]
+  /** U1：图标错误态（homeId → 原因；懒声明失败 / 路径失效） */
+  workspaceErrors: Record<string, string>
   /** 尾窗渲染信号：一次 raw 合并 flush 递增 1（高频事件不逐条渲染） */
   transcriptVersion: number
   loading: boolean
   error: string | null
   /**
-   * §57 F-SP2-11：daemon 超时类失败（结果未知、可能已生效）的**粘性**
-   * 提示——独立于 error：refreshAgents / refreshHomes 的成功路径清 error
-   * 不清它（agents_list 只读本地文件、daemon 卡死时也成功；home 列表拉回
-   * 来了不等于节点树刷新过，用户还没确认上次写入是否生效）。只有
-   * refreshNodes **成功**才清（确认过实际状态后回到正常）。
+   * §57 F-SP2-11 / CF2：daemon **写**超时（结果未知、可能已生效）的粘性
+   * 提示（结构化：见 {@link TimeoutNotice}）——独立于 error：
+   * refreshAgents / refreshHomes 的成功路径清 error 不清它。只有同 home、
+   * 超时之后发出的 refreshNodes **成功**才清（确认过实际状态后回到正常）。
+   * 只有写超时会进提示（CF2：读超时无「可能已生效」语义，照常进 error）。
    */
-  timeoutNotice: string | null
+  timeoutNotice: TimeoutNotice | null
+  /** CF3：事件泵连续失败的上报（外部改动不会自动刷新）；恢复后清回 null */
+  eventsStatus: EventsStatusNotice | null
 }
 
 const INITIAL: TreeState = {
@@ -420,10 +472,13 @@ const INITIAL: TreeState = {
   unviewedFailedIds: [],
   bindingsByHome: {},
   bindingsParseFailed: false,
+  workspaces: [],
+  workspaceErrors: {},
   transcriptVersion: 0,
   loading: true,
   error: null,
   timeoutNotice: null,
+  eventsStatus: null,
 }
 
 /**
@@ -436,11 +491,23 @@ const INITIAL: TreeState = {
  * 时前缀已剥，字符串匹配不再命中）；字符串回判保留为不经 bridge 出口的
  * 防御路径。
  */
+/**
+ * F-TERM-14（§67）：非写方法（读 + 幂等后台写 ui/*-set）超时的专用文案——
+ * 无「结果未知、可能已生效、避免重复提交」语义（重试无重复提交风险），
+ * 照常进可被常规刷新清除的 error。文案不复制 Rust 的写路径句子。
+ */
+const DAEMON_RETRYABLE_TIMEOUT_TEXT =
+  'daemon 无响应（30s）：请求超时（无重复提交风险，可安全重试）——请稍后重试或刷新确认。'
+
 export function presentErrorWithKind(error: unknown): { text: string; daemonTimeout: boolean } {
   // §59 F-SP2-12：类型化路径——bridge 出口的 DaemonTimeoutError
   const typed = daemonTimeoutText(error)
   if (typed !== null) {
-    return { text: typed, daemonTimeout: true }
+    // CF2：只有**写**超时进粘性提示；读超时（node/tree、node/get…）照常
+    // 进可被常规刷新清除的 error（对读请求「可能已生效」是误导）。
+    // F-TERM-14：读/幂等写超时用读路径自己的文案，不复用写文案
+    const write = daemonTimeoutIsWrite(error)
+    return { text: write ? typed : DAEMON_RETRYABLE_TIMEOUT_TEXT, daemonTimeout: write }
   }
   const text = String(error)
   // §57 F-SP2-11（防御路径）：不经 bridge 出口整形的 Rust 超时原文（tauri
@@ -551,16 +618,37 @@ export function useTreeStore() {
   const activeHomeRef = useRef<HomeInfo | null>(null)
   // U16：agents 镜像——通知等异步回调读最新列表（避免闭包过期）
   const agentsRef = useRef<AgentRecord[]>([])
+  // U1：homes / knownHomes / homeDir 镜像——在写入 setState 前同步更新，
+  // await declareHome 之后的回调（selectWorkspace / addWorkspace 找回新声明
+  // 的 home）读「最新」列表，不依赖 React 渲染时序
+  const homesRef = useRef<HomeInfo[]>([])
+  const knownHomesRef = useRef<KnownHome[]>([])
+  const homeDirRef = useRef<string | undefined>(undefined)
+  // U1：工作区列表镜像——openRunsOfHome 等命令式回调读最新列表
+  const workspacesRef = useRef<WorkspaceEntry[]>([])
+  // §67 nit：旧 timeoutNoticeRef 只写不读（清除门槛实际读 setState updater 里的
+  // 最新 state）——删除，避免「同步镜像」的假象
+  // U1：localStorage 不可用（隐私模式/配额/损坏抛错）→ 退回 daemon homes 实时投影
+  const storageBrokenRef = useRef(false)
+  // U1：已从存量读取或完成首次迁移（空数组也是有效存量：用户清空过列表）
+  const workspacesInitRef = useRef(false)
+  // F-TERM-6：图标点击的选择序号——selectWorkspace 的慢声明完成后若用户
+  // 已改选别的图标，过期结果直接丢弃（先点慢的 B、再点快的 C，最终停在 C）
+  const workspaceSelectSeqRef = useRef(0)
   // Pulls may resolve out of order while the user switches homes (or when a
   // focus/dispatch refresh overlaps another refresh). Only the newest request
   // for the still-active home may update current-home state.
   const agentsRequestSeqRef = useRef(0)
   const bindingsRequestSeqRef = useRef(0)
+  // CF1/CF2：refreshNodes 发出序号——迟到的旧结果不得写入（CF1），粘性
+  // 提示只被「超时之后发出」的同 home 成功拉取清除（CF2）
+  const nodesRequestSeqRef = useRef(0)
   useEffect(() => {
     filtersRef.current = state.filters
     activeHomeRef.current = state.activeHome
     agentsRef.current = state.agents
-  }, [state.filters, state.activeHome, state.agents])
+    workspacesRef.current = state.workspaces
+  }, [state.filters, state.activeHome, state.agents, state.workspaces])
 
   // ── U5：executions/agents 切片 ──────────────────────────────────────────
   // 尾窗与 pending buffer 留在 ref：高频 raw 事件不进 React 调度，
@@ -607,24 +695,22 @@ export function useTreeStore() {
    */
   const applyError = useCallback((error: unknown, extra?: Partial<TreeState>) => {
     const { text, daemonTimeout } = presentErrorWithKind(error)
-    setState(s => ({
-      ...s,
-      ...extra,
-      ...(daemonTimeout ? { timeoutNotice: text } : { error: text }),
-    }))
+    if (daemonTimeout) {
+      // CF2：写超时落结构化粘性提示（{homeId, seq}，见 TimeoutNotice）
+      const notice: TimeoutNotice = {
+        homeId: activeHomeRef.current?.homeId ?? null,
+        text,
+        minNodesSeq: nodesRequestSeqRef.current,
+      }
+      setState(s => ({ ...s, ...extra, timeoutNotice: notice }))
+      return
+    }
+    setState(s => ({ ...s, ...extra, error: text }))
   }, [])
 
-  /**
-   * §59 F-SP2-12：**写路径**超时 → 粘性提示的统一落点。createNode /
-   * startDispatch 这类把拒绝值抛给组件就地展示（`String(err)`）的写路径，
-   * 此前从不进 timeoutNotice——错误留在组件本地状态里，结果未知、可能已
-   * 生效的语义丢失。出口（omtCall / execStart）已把超时整形为类型化错误
-   * （daemonTimeout flag），这里按类型路由：超时 → 粘性提示（只有
-   * refreshNodes 成功才清）；非超时静默（就地错误已是全部语义）。
-   */
-  const noteTimeout = useCallback((error: unknown) => {
-    const typed = daemonTimeoutText(error)
-    if (typed !== null) setState(s => ({ ...s, timeoutNotice: typed }))
+  /** CF2：手动关闭粘性超时提示（无自动清除路径可达时的出口）。 */
+  const dismissTimeoutNotice = useCallback(() => {
+    setState(s => (s.timeoutNotice === null ? s : { ...s, timeoutNotice: null }))
   }, [])
 
   const flushPendingRaw = useCallback(() => {
@@ -942,8 +1028,8 @@ export function useTreeStore() {
         dispatchingRef.current -= 1
         flushDeferredAttach()
         // §59 F-SP2-12：exec_start 是不带 commandId 的写——超时 = 结果未知、
-        // 可能已生效，拒绝值抛给弹窗就地展示的同时落粘性提示
-        noteTimeout(error)
+        // 可能已生效；bridge 出口已派发 omt:daemon-timeout 落粘性提示，
+        // 拒绝值照常抛给弹窗就地展示
         throw error
       }
       dispatchingRef.current -= 1
@@ -956,7 +1042,7 @@ export function useTreeStore() {
       scheduleAgentsRepull()
       return outcome
     },
-    [ingestTranscriptEvent, scheduleAgentsRepull, flushDeferredAttach, noteTimeout],
+    [ingestTranscriptEvent, scheduleAgentsRepull, flushDeferredAttach],
   )
 
   const selectAgent = useCallback((agentId: string) => {
@@ -1092,22 +1178,31 @@ export function useTreeStore() {
     [scheduleAgentsRepull, applyError],
   )
 
-  const refreshHomes = useCallback(async () => {
+  const refreshHomes = useCallback(async (): Promise<boolean> => {
     try {
       // Handshake projection of open homes (pull-based freshness, v1).
       const result = await invoke<{ homes?: HomeInfo[]; homeDir?: string }>('daemon_homes')
       const homes = result.homes ?? []
+      homesRef.current = homes
+      if (result.homeDir !== undefined) homeDirRef.current = result.homeDir
       void loadKnownHomes()
       // U1b：每个 home 拉到后顺带执行 bag v2 迁移（幂等，旧键清理后为 no-op）
       for (const home of homes) void migrateHarnessBag(home.homeId)
       if (result.homeDir !== undefined) setState(s => ({ ...s, homeDir: result.homeDir }))
+      // F-TERM-2：localStorage 抛错（隐私模式/配额/损坏）不得让应用崩溃——
+      // 记忆恢复降级为「没有记忆值」；读取移出 setState updater（保持纯函数）
+      let remembered: string | null = null
+      try {
+        remembered = window.localStorage.getItem(LAST_HOME_KEY)
+      } catch {
+        /* localStorage 不可用：跳过记忆恢复 */
+      }
       setState(s => {
         // A homes refresh must NEVER unset an existing selection — a
         // transiently incomplete list (in-flight boot, declare still
         // landing) would otherwise wipe the user's active home. Only
         // auto-pick when nothing is selected yet; the boot pick prefers
         // the LAST-USED workspace (localStorage) over the first home.
-        const remembered = window.localStorage.getItem(LAST_HOME_KEY)
         const next = s.activeHome
           ?? (remembered ? homes.find(h => h.homeId === remembered) : undefined)
           ?? homes[0]
@@ -1130,13 +1225,17 @@ export function useTreeStore() {
           error: null,
         }
       })
+      return true
     } catch (error) {
       applyError(error, { loading: false })
+      // F-TERM-3：失败时告知调用方——首次迁移不得在 daemon 不可达时持久化空列表
+      return false
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   const refreshNodes = useCallback(async (home: HomeInfo) => {
+    const seq = ++nodesRequestSeqRef.current
     try {
       const result = await omtCall<{ trees?: OmtNode[] }>('node/tree', { homeId: home.homeId })
       // Wire TreeNode uses `nodeId` (generated common.ts); the desktop's
@@ -1150,10 +1249,29 @@ export function useTreeStore() {
           normalize(child as OmtNode & { nodeId?: string }),
         ),
       })
-      // §57 F-SP2-11：成功的节点拉取 = 用户确认过实际状态——同时清普通
-      // error 与粘性 timeoutNotice
-      setState(s => ({ ...s, nodes: (result.trees ?? []).map(normalize), error: null, timeoutNotice: null }))
+      // CF1（§59 P3）：活动 home 守卫——快速从 A 切到 B 时，A 迟到的
+      // node/tree 结果不得覆盖 B 的 nodes（对照 activeHomeRef，不一致丢弃）
+      if (activeHomeRef.current?.homeId !== home.homeId) return
+      const trees = (result.trees ?? []).map(normalize)
+      setState(s => ({
+        ...s,
+        nodes: trees,
+        error: null,
+        // §57 F-SP2-11 / CF2：成功的节点拉取 = 用户确认过实际状态——清普通
+        // error；粘性 timeoutNotice 只在「同 home 且本次拉取是在超时之后
+        // 发出的」（seq > 落置序号）时清除：切到 B 的成功刷新不得清掉关于
+        // A 的写提示，写入前已发出、超时后才返回的读也不清
+        ...(s.timeoutNotice !== null
+          && s.timeoutNotice.homeId === home.homeId
+          && seq > s.timeoutNotice.minNodesSeq
+          ? { timeoutNotice: null }
+          : {}),
+      }))
     } catch (error) {
+      // CF2：node/tree 是读——超时经 presentErrorWithKind 分流为普通 error。
+      // F-TERM-14：活动 home 守卫同样盖住失败分支——A 迟到的失败横幅不得
+      // 挂到 B（成功分支 CF1 已守）
+      if (activeHomeRef.current?.homeId !== home.homeId) return
       applyError(error)
     }
   }, [applyError])
@@ -1196,10 +1314,12 @@ export function useTreeStore() {
   const loadKnownHomes = useCallback(async () => {
     try {
       const result = await omtCall<{ homes?: KnownHome[] }>('home/list-known', {})
+      knownHomesRef.current = result.homes ?? []
       setState(s => ({ ...s, knownHomes: result.homes ?? [] }))
     } catch {
       // Pre-list-known daemon (method NOT_FOUND) degrades to an empty
       // known list — the picker keeps working with open homes only.
+      knownHomesRef.current = []
       setState(s => ({ ...s, knownHomes: [] }))
     }
   }, [])
@@ -1256,6 +1376,11 @@ export function useTreeStore() {
 
   const selectHome = useCallback(
     async (home: HomeInfo) => {
+      // F-TERM-8：选择序号守卫统一入口——任何直接 selectHome 的路径
+      // （addWorkspace、openRunsOfHome、对齐 effect 等）都使先前挂起的
+      // 慢声明（selectWorkspace 的 await 之后）过期，先点慢的 B、再添加
+      // D，最终停在 D
+      workspaceSelectSeqRef.current += 1
       setState(s => ({
         ...s,
         activeHome: home,
@@ -1272,6 +1397,11 @@ export function useTreeStore() {
         unviewedFailedIds: [],
         // U9：绑定降级标志随 home 切换重置（表按 home 键保留）
         bindingsParseFailed: false,
+        // CF3：泵健康上报随 home 切换重置——新目标的订阅是新起点，旧 home
+        // 的失败提示不再适用（持续失败会在阈值后重新上报）。
+        // F-TERM-13：只在 homeId **真正变化**时清——重选当前图标不清（泵的
+        // down 已锁存不会重报，清了横幅就永远回不来）
+        ...(s.activeHome?.homeId === home.homeId ? {} : { eventsStatus: null }),
       }))
       viewedFailedRef.current.clear()
       filtersRef.current = {}
@@ -1279,7 +1409,12 @@ export function useTreeStore() {
       // silent 轮询结果被误判为「结构未变」而跳过落账（空列表签名尤其常见）
       agentsSigRef.current = null
       activeHomeRef.current = home
-      window.localStorage.setItem(LAST_HOME_KEY, home.homeId)
+      // F-TERM-2：localStorage 抛错时跳过记忆持久化，不影响切换本身
+      try {
+        window.localStorage.setItem(LAST_HOME_KEY, home.homeId)
+      } catch {
+        /* localStorage 不可用：本次会话不记忆 */
+      }
       // U1b：切 home 装载 per-home 数据时顺带执行 bag v2 迁移（幂等）
       await Promise.all([refreshNodes(home), refreshRuns(home), loadFilters(home), refreshAgents(), refreshBindings(), migrateHarnessBag(home.homeId)])
     },
@@ -1288,59 +1423,293 @@ export function useTreeStore() {
 
   /** 新建节点（树面板入口）：node/create → 刷新树 → 选中新节点。
    * §59 F-SP2-12：node/create 不带 commandId——超时 = 结果未知、可能已生效
-   * （state.rs 点名的重复提交风险路径），拒绝值抛给表单就地展示的同时经
-   * noteTimeout 落粘性提示。 */
+   * （state.rs 点名的重复提交风险路径），拒绝值抛给表单就地展示；粘性
+   * 提示由 bridge 出口派发的 omt:daemon-timeout 事件统一落（CF2）。 */
   const createNode = useCallback(
     async (input: { type: string; title: string; body?: string; parentId: string | null }) => {
       const home = activeHomeRef.current
       if (!home) throw new Error('无活动 workspace')
-      let result: { node?: { nodeId?: string } }
-      try {
-        result = await omtCall<{ node?: { nodeId?: string } }>('node/create', {
-          homeId: home.homeId,
-          type: input.type,
-          title: input.title,
-          ...(input.parentId ? { parentId: input.parentId } : {}),
-          ...(input.body !== undefined ? { body: input.body } : {}),
-        })
-      } catch (error) {
-        noteTimeout(error)
-        throw error
-      }
+      const result = await omtCall<{ node?: { nodeId?: string } }>('node/create', {
+        homeId: home.homeId,
+        type: input.type,
+        title: input.title,
+        ...(input.parentId ? { parentId: input.parentId } : {}),
+        ...(input.body !== undefined ? { body: input.body } : {}),
+      })
       await refreshNodes(home)
       const newId = result.node?.nodeId
       if (newId) selectNode(newId)
       return newId ?? ''
     },
-    [refreshNodes, noteTimeout],
+    [refreshNodes],
   )
 
   // Declare flow (U5 consumer): register an unregistered home directory,
   // then re-pull the home list. Pre-U5 daemons surface the feature gap
-  // as a readable fallback message.
+  // as a readable fallback message. F-TERM-4：把 home/declare 返回的
+  // homeId 透传给调用方——daemon 回报的 path 可能与声明写法不同（符号
+  // 链接 / 首个声明者的原始路径），按路径字符串找回会误报「没有找到」。
   const declareHome = useCallback(
-    async (path: string) => {
+    async (path: string): Promise<{ homeId: string | null; error: string | null }> => {
       try {
-        await omtCall('home/declare', { path })
+        const result = await omtCall<{ homeId?: string }>('home/declare', { path })
         // requiresRehandshake: a fresh session folds the new home into the
         // credential's scoped grant before we re-list.
         await invoke('daemon_reconnect')
         await refreshHomes()
         await loadKnownHomes()
-        return null
+        return { homeId: result.homeId ?? null, error: null }
       } catch (error) {
         const text = String(error)
         if (text.includes('NOT_FOUND') || text.includes('method')) {
-          return '当前 daemon 版本不支持动态收录 home（缺少 homeDeclare 能力位）— 请升级 daemon 后重试。'
+          return { homeId: null, error: '当前 daemon 版本不支持动态收录 home（缺少 homeDeclare 能力位）— 请升级 daemon 后重试。' }
         }
         // §57 F-SP2-11：home/declare 超时同样结果未知——返回给切换器就地
-        // 展示，并落粘性 timeoutNotice
-        const presented = presentErrorWithKind(error)
-        if (presented.daemonTimeout) setState(s => ({ ...s, timeoutNotice: presented.text }))
-        return presented.text
+        // 展示；粘性提示由 bridge 出口事件统一落（home/declare 属写方法）
+        return { homeId: null, error: presentErrorWithKind(error).text }
       }
     },
     [refreshHomes],
+  )
+
+  // ── U1：工作区列表切片（KTD14）─────────────────────────────────────
+
+  /** 图标错误态写入点：text=null 清除对应 home 的错误。 */
+  const setWorkspaceError = useCallback((homeId: string, text: string | null) => {
+    setState(s => {
+      if (text === null && !(homeId in s.workspaceErrors)) return s
+      const workspaceErrors = { ...s.workspaceErrors }
+      if (text === null) delete workspaceErrors[homeId]
+      else workspaceErrors[homeId] = text
+      return { ...s, workspaceErrors }
+    })
+  }, [])
+
+  const clearWorkspaceErrors = useCallback(() => {
+    setState(s => (Object.keys(s.workspaceErrors).length === 0 ? s : { ...s, workspaceErrors: {} }))
+  }, [])
+
+  /**
+   * U1（KTD14）初始化：localStorage 有存量 → 直接采用（空数组也是有效状
+   * 态：用户清空过列表）；无存量 → 首次迁移（daemon 已开 home + known-homes
+   * 的 open 条目）并落盘。localStorage 不可用（抛错）→ 退回 daemon homes 的
+   * 实时投影，不落盘、每次 homes 刷新重算。已初始化且存储可用时为 no-op
+   * （列表只由用户增删驱动，不随 daemon 的开合抖动）。
+   */
+  const initializeWorkspaces = useCallback(() => {
+    const derive = () => migrateWorkspaces(homesRef.current, knownHomesRef.current, homeDirRef.current)
+    if (!storageBrokenRef.current) {
+      try {
+        if (!workspacesInitRef.current) {
+          const stored = readStoredWorkspaces()
+          if (stored === null) {
+            const migrated = derive()
+            saveStoredWorkspaces(migrated)
+            workspacesInitRef.current = true
+            setState(s => ({ ...s, workspaces: migrated }))
+          } else {
+            workspacesInitRef.current = true
+            setState(s => ({ ...s, workspaces: stored }))
+          }
+        }
+        return
+      } catch {
+        storageBrokenRef.current = true
+      }
+    }
+    setState(s => ({ ...s, workspaces: derive() }))
+  }, [])
+
+  /** 列表变更统一落点：更新 state 同时落盘（localStorage 抛错 → 降级为不持久化）。
+   * F-TERM-10：未初始化时的首个变更先补初始化（迁移）——首次成功刷新前
+   * 用户先「＋ 添加工作区」不得因此把存量列表顶掉而永久跳过迁移：此时
+   * daemon 已恢复（declareHome 成功过、homesRef 已刷新），迁移能拿到全部
+   * 已开 home；之后再应用变更（appendWorkspace 按 path/homeId 去重，迁移
+   * 已收录的不会重复）。 */
+  const updateWorkspaces = useCallback(
+    (update: (list: WorkspaceEntry[]) => WorkspaceEntry[]) => {
+      if (!workspacesInitRef.current) initializeWorkspaces()
+      setState(s => {
+        const list = update(s.workspaces)
+        if (list === s.workspaces) return s
+        if (!storageBrokenRef.current) {
+          try {
+            saveStoredWorkspaces(list)
+          } catch {
+            storageBrokenRef.current = true
+          }
+        }
+        return { ...s, workspaces: list }
+      })
+    },
+    [initializeWorkspaces],
+  )
+
+  /**
+   * U1：图标栏点击切换（KTD14 懒声明）。已开（homeId/路径命中 daemon 的
+   * home）→ 直接 selectHome；未开且路径已失效（known-homes 探测）→ 图标
+   * 错误态 + 原因，不清空当前选中；否则 declareHome 后按声明返回的
+   * homeId 找回 home 再选中（known-homes 的 lastHomeId 只是历史值，轮换
+   * 时回写列表）。声明失败（配额/路径缺失/home 锁/超时）→ 图标错误态 +
+   * 全局提示。F-TERM-6：选择序号守卫——慢声明完成后若用户已改选别的
+   * 图标（先点慢的 B 再点快的 C），过期结果直接丢弃，最终停在 C。
+   * F-TERM-21：返回选择是否落定（失效 / 声明失败 / 被后来的选择取代 →
+   * false）——依赖「已切到该工作区」的后续动作（如打开它的设置标签）据此
+   * 决定是否继续，不得在切换失败时作用到当前工作区上。
+   */
+  const selectWorkspace = useCallback(
+    async (ws: WorkspaceEntry): Promise<boolean> => {
+      const seq = ++workspaceSelectSeqRef.current
+      // daemon 已持有该 home（homeId 命中，或路径命中）→ 直接选中——
+      // open 是权威状态，优先于 known-homes 可能过期的 missing 标记。
+      // P3（§64）homeId 轮换的回写由对齐 effect 兜底（按 path 定位到本条，
+      // 不会波及同 homeId 的其他条目）——「已打开」分支不再就地重写（
+      // F-TERM-11：那份重写被 effect 完全掩盖、无法单独测试，且按 homeId
+      // 匹配会把共享陈旧 id 的其他条目一并改写）
+      const open = homesRef.current.find(h => h.homeId === ws.homeId || h.path === ws.path)
+      if (open) {
+        setWorkspaceError(ws.homeId, null)
+        setWorkspaceError(open.homeId, null)
+        void selectHome(open)
+        return true
+      }
+      // F-TERM-12：路径精确匹配优先、homeId 仅作写法不一致时的回退——
+      // 移动过的项目（homeId 不变、旧路径条目永久 missing）不得误判失效
+      if (isWorkspaceMissing(ws, knownHomesRef.current)) {
+        setWorkspaceError(ws.homeId, '目录已不存在（被移动/删除），无法切换到该工作区。')
+        return false
+      }
+      const declared = await declareHome(ws.path)
+      if (seq !== workspaceSelectSeqRef.current) return false // 过期的慢声明：用户已改选
+      if (declared.error !== null) {
+        setWorkspaceError(ws.homeId, declared.error)
+        return false
+      }
+      // F-TERM-4：优先按声明返回的 homeId 找回（路径写法不一致时兜底旧值/路径）
+      const fresh =
+        (declared.homeId !== null ? homesRef.current.find(h => h.homeId === declared.homeId) : undefined)
+        ?? homesRef.current.find(h => h.homeId === ws.homeId)
+        ?? homesRef.current.find(h => h.path === ws.path)
+      if (!fresh) {
+        setWorkspaceError(ws.homeId, '工作区已声明，但 home 列表中没有找到它——请重试。')
+        return false
+      }
+      setWorkspaceError(ws.homeId, null)
+      setWorkspaceError(fresh.homeId, null)
+      if (fresh.homeId !== ws.homeId) {
+        // homeId 轮换（lastHomeId 只是历史值）——按 path 回写本条（不波及
+        // 其他条目），后续点击直接命中
+        updateWorkspaces(list => list.map(w => (w.path === ws.path ? { ...w, homeId: fresh.homeId } : w)))
+      }
+      void selectHome(fresh)
+      return true
+    },
+    [declareHome, selectHome, setWorkspaceError, updateWorkspaces],
+  )
+
+  /**
+   * U1：＋添加工作区（R3，目录选择 / 已知未开共用）——声明成功后按
+   * home/declare 返回的 homeId（F-TERM-4）从刷新的 home 列表找回并收录
+   * （声明前不可知，KTD14）再切换过去；失败把原因返回给调用方在弹窗就地
+   * 展示，不收录。
+   */
+  const addWorkspace = useCallback(
+    async (homePath: string): Promise<string | null> => {
+      const declared = await declareHome(homePath)
+      if (declared.error !== null) return declared.error
+      const home =
+        (declared.homeId !== null ? homesRef.current.find(h => h.homeId === declared.homeId) : undefined)
+        ?? homesRef.current.find(h => h.path === homePath)
+      if (!home) return '工作区已声明，但 home 列表中没有找到它——请重试。'
+      updateWorkspaces(list => appendWorkspace(list, {
+        path: homePath,
+        homeId: home.homeId,
+        name: workspaceNameOf(homePath, homeDirRef.current),
+      }))
+      setWorkspaceError(home.homeId, null)
+      // F-TERM-8：addWorkspace 也走 selectHome——selectHome 入口的选择序号
+      // 递增使先前挂起的慢声明（selectWorkspace B）过期，最终停在本工作区
+      void selectHome(home)
+      return null
+    },
+    [declareHome, selectHome, setWorkspaceError, updateWorkspaces],
+  )
+
+  /**
+   * U2 / R9 / R32：「从列表移除」——只把工作区从桌面端的已打开列表移除，
+   * 不删除 `.omt` 目录（前端没有任何删除路径；known-homes 条目不动）。
+   * `stopSessions: true` = 「停止会话并移除」（先对该 home 的活动 exec 发
+   * 停止信号；失败如实上抛、**不移除**——调用方就地展示，用户可改选
+   * 「移除但保留运行」）；移除当前工作区时按 KTD14 选中规则切到上一个
+   * （没有就下一个），移除最后一个 → 空状态（activeHome 清空 + 记忆键
+   * 移除）。退出确认的会话统计（R32）不受影响：Rust 侧按 runtime 目录
+   * 遍历全部 home，与图标栏无关。
+   */
+  const removeWorkspace = useCallback(
+    async (ws: WorkspaceEntry, opts: { stopSessions?: boolean } = {}) => {
+      if (opts.stopSessions) {
+        // 失败如实上抛（调用方就地展示）；部分失败（signaled>0）照常继续移除
+        await execStopAll(ws.homeId)
+      }
+      const current = activeHomeRef.current
+        ? { homeId: activeHomeRef.current.homeId, path: activeHomeRef.current.path ?? null }
+        : null
+      const outcome = removeWorkspaceEntry(workspacesRef.current, ws, current)
+      if (outcome.list === workspacesRef.current) return // 已不在列表（重复点击）
+      updateWorkspaces(() => outcome.list)
+      setWorkspaceError(ws.homeId, null)
+      if (!outcome.removedCurrent) return // 移除的不是当前（或无活动 home）
+      if (outcome.next === null) {
+        // 移除最后一个：空状态——activeHome 清空，per-home 视图态一并重置
+        activeHomeRef.current = null
+        filtersRef.current = {}
+        viewedFailedRef.current.clear()
+        setState(s => ({
+          ...s,
+          activeHome: null,
+          nodes: [],
+          runs: [],
+          agents: [],
+          selectedId: null,
+          selectedAgentId: null,
+          unviewedFailedIds: [],
+          filters: {},
+          parseFailed: false,
+          legacyUnmigrated: null,
+          corruptAgents: [],
+        }))
+        try {
+          window.localStorage.removeItem(LAST_HOME_KEY)
+        } catch {
+          /* localStorage 不可用：跳过记忆清除 */
+        }
+        return
+      }
+      void selectWorkspace(outcome.next)
+    },
+    [updateWorkspaces, selectWorkspace, setWorkspaceError],
+  )
+
+  /**
+   * §64 遗留：跳转到某 home 的 Runs（租约通知的「前往 Runs」入口）。
+   * home 不在图标栏里时不直接选中（对齐 effect 会把它弹回首项）——先收
+   * 进列表（「先加入列表」）；daemon 未开该 home → 不动 home，仅切视图。
+   * F-TERM-8：selectHome 入口的选择序号递增同样使挂起的慢声明过期。
+   */
+  const openRunsOfHome = useCallback(
+    (homeId: string) => {
+      const target = homesRef.current.find(h => h.homeId === homeId)
+      if (!target || activeHomeRef.current?.homeId === homeId) return
+      if (!workspacesRef.current.some(w => w.homeId === homeId || w.path === target.path)) {
+        updateWorkspaces(list => appendWorkspace(list, {
+          path: target.path ?? '',
+          homeId: target.homeId,
+          name: workspaceNameOf(target.path ?? '', homeDirRef.current),
+        }))
+      }
+      void selectHome(target)
+    },
+    [updateWorkspaces, selectHome],
   )
 
   const selectNode = useCallback(
@@ -1396,22 +1765,68 @@ export function useTreeStore() {
 
   // Boot + pull-based home freshness on window focus (v1 contract).
   // U5：agents_list 同享 focus 重拉；U9：bindings_get 同（§四 pull 契约）。
-  // §61 P3：bridge 出口 emit 的 `omt:daemon-timeout` 落粘性提示——一处
-  // 覆盖全部经 omtCall / execStart 的写路径（组件本地直接 await 的
-  // run/control、node/update 等也计入），不再依赖各调用点逐个接 noteTimeout。
+  // §61 P3 → CF2/CF4：bridge 出口（omtCall / execStart）超时整形时同步派
+  // 发的 `omt:daemon-timeout`（DOM CustomEvent，§63 P3：免 IPC 往返与 emit
+  // mock）落**结构化**粘性提示——一处覆盖全部写路径（组件本地直接 await
+  // 的 run/control、node/update 等也计入）。只有写超时会派发（CF2）；提示
+  // 绑定 {homeId, minNodesSeq}：只有同 home、在超时之后发出的 refreshNodes
+  // 成功才清除（B 的成功刷新不得清掉关于 A 的写提示）。
+  useEffect(() => {
+    const onDaemonTimeout = (event: Event) => {
+      const detail = (event as CustomEvent<{ text?: unknown; homeId?: unknown }>).detail
+      if (!detail || typeof detail.text !== 'string' || detail.text.length === 0) return
+      const homeId =
+        typeof detail.homeId === 'string' && detail.homeId !== ''
+          ? detail.homeId
+          : activeHomeRef.current?.homeId ?? null
+      const notice: TimeoutNotice = {
+        homeId,
+        text: detail.text,
+        minNodesSeq: nodesRequestSeqRef.current,
+      }
+      setState(s => ({ ...s, timeoutNotice: notice }))
+    }
+    window.addEventListener(DAEMON_TIMEOUT_EVENT, onDaemonTimeout)
+    return () => window.removeEventListener(DAEMON_TIMEOUT_EVENT, onDaemonTimeout)
+  }, [])
+
+  // CF3（§59 P3）：Rust subscription_pump 连续失败达阈值后的健康上报——
+  // 外部 CLI 改动不再自动刷新（events_subscribe 恒 Ok，真实失败原本只在
+  // 泵里静默无限重试），界面必须可见；恢复（ok:true）后提示消失。最新
+  // 者胜（全 app 一条泵，只服务当前目标 home）。
+  // F-TERM-13（§67）：上报按 `payload.homeId` 过滤——切到 B 前一刻 A 的
+  // 「失败」不得把横幅挂到 B（B 之后不会再发恢复事件，横幅会卡死）；
+  // 配套地 selectHome 只在 homeId 真正变化时清横幅（重点当前图标不清：
+  // 泵的 down 已锁存、不会重报，清了就永远回不来）。
   useEffect(() => {
     let disposed = false
     let unlisten: (() => void) | undefined
-    void tauriListen<{ text: string }>('omt:daemon-timeout', event => {
-      if (disposed) return
-      const text = event.payload?.text
-      if (typeof text === 'string' && text.length > 0) {
-        setState(s => ({ ...s, timeoutNotice: text }))
-      }
-    }).then(fn => {
+    void tauriListen<{ homeId?: string; ok?: boolean; error?: string | null }>(
+      'omt://events-status',
+      event => {
+        if (disposed) return
+        const payload = event.payload ?? {}
+        // F-TERM-13：只接受**当前活动 home** 的上报（泵只服务一个目标，
+        // homeId 就是那个目标的 id；其它 homeId 一律是切走前夜的旧事件）
+        if (typeof payload.homeId !== 'string' || payload.homeId !== activeHomeRef.current?.homeId) {
+          return
+        }
+        const homeId = payload.homeId
+        setState(s => ({
+          ...s,
+          eventsStatus:
+            payload.ok === true
+              ? null
+              : {
+                  homeId,
+                  error: typeof payload.error === 'string' ? payload.error : null,
+                },
+        }))
+      },
+    ).then(fn => {
       if (disposed) fn()
       else unlisten = fn
-    }).catch(() => {/* 事件订阅失败不影响主流程（超时错误仍走类型化路径） */})
+    }).catch(() => {/* 健康上报是增强——订阅失败不影响主流程 */})
     return () => {
       disposed = true
       unlisten?.()
@@ -1419,17 +1834,25 @@ export function useTreeStore() {
   }, [])
 
   useEffect(() => {
-    void refreshHomes()
-    void loadKnownHomes()
+    // U1：homes + known-homes 都落定后再初始化工作区列表（迁移需要两者）；
+    // F-TERM-3：daemon_homes 拉取失败时不迁移、不落盘——否则首启 daemon
+    // 不可达会把「空列表」当作用户清空过的状态持久化，图标栏永久为空
+    void (async () => {
+      const ok = await refreshHomes()
+      await loadKnownHomes()
+      if (ok) initializeWorkspaces()
+    })()
     void loadRecent()
     const onFocus = () => {
-      void refreshHomes()
+      void refreshHomes().then(ok => {
+        if (ok) initializeWorkspaces() // localStorage 降级时每次重算；正常时 no-op
+      })
       void refreshAgents()
       void refreshBindings()
     }
     window.addEventListener('focus', onFocus)
     return () => window.removeEventListener('focus', onFocus)
-  }, [refreshHomes, loadRecent, refreshAgents, refreshBindings])
+  }, [refreshHomes, loadKnownHomes, initializeWorkspaces, loadRecent, refreshAgents, refreshBindings])
 
   // Q-10：CLI / MCP 发起的执行在桌面端无需切换焦点即可见——窗口可见时每 5s
   // 静默重拉 agents（不清除全局错误）。外部 agent 由此出现在列表中；选中后由
@@ -1446,6 +1869,30 @@ export function useTreeStore() {
     if (state.activeHome) void selectHome(state.activeHome)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.activeHome?.homeId])
+
+  // U1：图标栏是切换的唯一入口——当前选中不在桌面端列表时对齐到首项（懒
+  // 声明由 selectWorkspace 处理）。P3（§64）：boot 的自动选中
+  // （refreshHomes 的 homes[0]/记忆值）不触发对齐——与注释「boot 不主动
+  // 开 home」一致，等用户点击；homeId 轮换（声明侧回写遗漏时）在此兜底
+  // 回写，避免选中被弹回首项。
+  const prevActiveHomeIdRef = useRef<string | undefined>(undefined)
+  useEffect(() => {
+    const list = state.workspaces
+    const active = state.activeHome
+    if (list.length === 0 || !active) return
+    const firstActivation = prevActiveHomeIdRef.current === undefined
+    prevActiveHomeIdRef.current = active.homeId
+    const entry = list.find(w => w.homeId === active.homeId || w.path === active.path)
+    if (entry) {
+      // homeId 轮换兜底回写（daemon 侧重新开过，列表里的历史 id 过期）
+      if (entry.homeId !== active.homeId) {
+        updateWorkspaces(items => items.map(w => (w.path === entry.path ? { ...w, homeId: active.homeId } : w)))
+      }
+      return
+    }
+    if (firstActivation) return
+    void selectWorkspace(list[0])
+  }, [state.workspaces, state.activeHome, selectWorkspace, updateWorkspaces])
 
   // 稳定标识（[] deps，只读 activeHomeRef）：消费方把 fetchRun 放进 effect
   // 依赖时，raw flush 引起的重渲染不得反复 teardown 请求（U7 评审修复）。
@@ -1467,6 +1914,16 @@ export function useTreeStore() {
     selectNode,
     saveFilters,
     declareHome,
+    // ── U1：工作区列表切片（KTD14）──────────────────────────────────
+    initializeWorkspaces,
+    selectWorkspace,
+    addWorkspace,
+    /** U2/R9/R32：「从列表移除」*/
+    removeWorkspace,
+    openRunsOfHome,
+    clearWorkspaceErrors,
+    /** CF2：手动关闭粘性超时提示 */
+    dismissTimeoutNotice,
     refreshHomes,
     refreshNodes,
     // ── U5：agents / transcript 切片 ─────────────────────────────────────
@@ -1507,12 +1964,9 @@ export function useTreeStore() {
         return null
       } catch (error) {
         // §57 F-SP2-11：node/update 不带 commandId——超时 = 结果未知、可能
-        // 已生效（重复提交风险最高的路径）。除返回给调用方就地展示外，
-        // 还要落粘性 timeoutNotice（focus 的 refreshAgents 成功清 error
-        // 不得抹掉它）
-        const { text, daemonTimeout } = presentErrorWithKind(error)
-        if (daemonTimeout) setState(s => ({ ...s, timeoutNotice: text }))
-        return text
+        // 已生效（重复提交风险最高的路径）；粘性提示由 bridge 出口事件统一
+        // 落（CF2），这里只把文案返回给调用方就地展示
+        return presentErrorWithKind(error).text
       }
     },
   }

@@ -43,12 +43,9 @@ import { SettingsPanel } from '../src/SettingsPanel'
 
 const baseProps = {
   homes: [] as never[],
-  knownHomes: [] as never[],
-  // U1b：旧 HarnessSelect 退役，设置页只保留 legacy dsh 迁移提示态
+  // U1：Workspaces 列表已移入图标栏，设置页只保留 legacy dsh 迁移提示态
   legacyDshByHome: {} as Record<string, boolean>,
   activeHome: null,
-  onSelectHome: vi.fn(),
-  onDeclare: vi.fn().mockResolvedValue(null),
 }
 
 const baseInvokeEnvironment = () => {

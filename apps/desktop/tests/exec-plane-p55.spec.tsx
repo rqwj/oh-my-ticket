@@ -158,8 +158,9 @@ describe('§55 daemon_homes 拒绝 / 超时错误条', () => {
     ).toBeNull()
     expect(result.current.state.timeoutNotice).toBeNull()
     // ③ 真正的超时写提示（Rust DAEMON_TIMEOUT_MESSAGE 原文，带机器前缀；
-    // §59 P3-1 起从 daemon.rs 源码抽取，不再手抄整句）→ 独立粘性字段；
-    // refreshHomes / 非静默 refreshAgents 的成功路径都不清
+    // §59 P3-1 起从 daemon.rs 源码抽取，不再手抄句）→ 独立粘性字段；
+    // refreshHomes / 非静默 refreshAgents 的成功路径都不清。
+    // CF2：node/tree 是读——读超时照常进普通 error，不进粘性提示
     invokeMock.mockImplementation((cmd: string, args?: { method?: string }) => {
       if (cmd === 'omt_call' && args?.method === 'node/tree') {
         return Promise.reject(new Error(extractDaemonTimeoutMessage()))
@@ -170,19 +171,32 @@ describe('§55 daemon_homes 拒绝 / 超时错误条', () => {
     await act(async () => {
       await result.current.refreshNodes(result.current.state.activeHome!)
     })
-    expect(result.current.state.timeoutNotice).toContain('结果未知')
+    // F-TERM-14：读超时用读路径自己的文案（可安全重试），不再复用写路径的
+    // 「结果未知、可能已生效、避免重复提交」——对读是误导
+    expect(result.current.state.error, '读超时照常进普通 error').toContain('可安全重试')
+    expect(result.current.state.error, '读文案不得带写路径的「可能已生效」').not.toContain('可能已生效')
+    expect(result.current.state.timeoutNotice, 'CF2：读超时不进粘性提示').toBeNull()
+    // 写超时（bridge 出口事件）→ 结构化粘性提示
+    await act(async () => {
+      window.dispatchEvent(
+        new CustomEvent('omt:daemon-timeout', {
+          detail: { text: 'daemon 无响应（30s）：结果未知、可能已生效', homeId: 'h_a' },
+        }),
+      )
+    })
+    expect(result.current.state.timeoutNotice?.text).toContain('结果未知')
     await act(async () => {
       await result.current.refreshHomes()
     })
     expect(
-      result.current.state.timeoutNotice,
+      result.current.state.timeoutNotice?.text,
       '§55→§57：refreshHomes 成功不得抹掉超时提示——树并未随之刷新',
     ).toContain('结果未知')
     await act(async () => {
       await result.current.refreshAgents()
     })
     expect(
-      result.current.state.timeoutNotice,
+      result.current.state.timeoutNotice?.text,
       '§57 F-SP2-11：非静默 refreshAgents（agents_list 只读本地文件）成功不得抹掉超时提示',
     ).toContain('结果未知')
     // ④ 成功的节点拉取清掉粘性提示（确认过实际状态后回到正常）

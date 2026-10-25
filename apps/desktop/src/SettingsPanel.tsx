@@ -1,12 +1,12 @@
 /**
- * U10 settings panel: daemon status projection + home selector/declare
- * flow. Admin-only actions render ONLY when the credential's operations
- * include the admin family (AE12: no grant → no render).
+ * U1 全局设置面板（R8）：Daemon、DSH 集成、Harnesses（U7）、派发策略（A8）。
+ * 原设置页里的 Workspaces 列表已移到左侧工作区图标栏（R1/R3）；全局设置作
+ * 为内容区整页由图标栏底部的 ⚙ 打开。Admin-only actions render ONLY when
+ * the credential's operations include the admin family (AE12: no grant →
+ * no render).
  *
- * U7：内层分段「通用 | Harnesses」——R-A 的 Harnesses 完整管理面
- * （左类型列表右详情）在 HarnessManagerTab，挂载即拉 harness_list。
- * A8：分段加「派发策略」——ExecPolicySection（exec/policy.json 的界面
- * 编辑入口，只约束 CLI / MCP 发起的派发）。
+ * U1b：旧 dsh harness 条目的 per-home 提示（迁移不静默丢弃）保留。§64
+ * 遗留：按 home 逐条提示（不只看当前 home）——只要该 home 还开着就可见。
  */
 import { useEffect, useState } from 'react'
 import { ask, open as openDialog } from '@tauri-apps/plugin-dialog'
@@ -20,9 +20,7 @@ import {
   type DaemonStatus,
 } from './bridge'
 import type { HomeInfo } from './types'
-import type { KnownHome } from './store'
-import { NOT_A_WORKSPACE_HINT, resolveHomeFromPickedDir } from './workspacePath'
-import { workspaceRootOf } from './homePath'
+import { workspaceNameOf } from './workspaceList'
 import { HarnessManagerTab } from './HarnessManagerTab'
 import { ExecPolicySection } from './ExecPolicySection'
 
@@ -30,21 +28,18 @@ import { ExecPolicySection } from './ExecPolicySection'
 type SettingsSection = 'general' | 'harnesses' | 'policy'
 
 interface Props {
+  /** HarnessManagerTab 跨 home 汇总 agent 数据用 */
   homes: HomeInfo[]
-  knownHomes: KnownHome[]
-  homeDir?: string
-  /** U1b：legacy dsh harness 条目的 home 集合（迁移不静默丢弃，逐行提示） */
+  /** U1b：旧 dsh harness 条目的 home 集合（迁移不静默丢弃，提示条） */
   legacyDshByHome: Record<string, boolean>
   activeHome: HomeInfo | null
-  onSelectHome: (home: HomeInfo) => void
-  onDeclare: (path: string) => Promise<string | null>
+  /** §67 nit：legacy dsh 提示的显示名要压缩 homeDir 前缀（全局 home → ~） */
+  homeDir?: string
 }
 
-export function SettingsPanel({ homes, knownHomes, homeDir, legacyDshByHome, activeHome, onSelectHome, onDeclare }: Props) {
+export function SettingsPanel({ homes, legacyDshByHome, activeHome, homeDir }: Props) {
   const [status, setStatus] = useState<DaemonStatus | null>(null)
-  const [declareMessage, setDeclareMessage] = useState<string | null>(null)
   const [isAdmin, setIsAdmin] = useState(false)
-  const [picking, setPicking] = useState(false)
   const [installing, setInstalling] = useState(false)
   const [installMessage, setInstallMessage] = useState<string | null>(null)
   const [section, setSection] = useState<SettingsSection>('general')
@@ -57,26 +52,6 @@ export function SettingsPanel({ homes, knownHomes, homeDir, legacyDshByHome, act
       .then(() => setIsAdmin(true))
       .catch(error => setIsAdmin(!String(error).includes('FORBIDDEN')))
   }, [activeHome?.homeId])
-
-  const declare = async (homePath: string) => {
-    const error = await onDeclare(homePath)
-    if (error !== null && (error.includes('不存在') || error.includes('unreadable') || error.includes('not a directory') || error.includes('INVALID_INPUT'))) {
-      setDeclareMessage(NOT_A_WORKSPACE_HINT)
-      return
-    }
-    setDeclareMessage(error ?? `已添加 ${homePath}`)
-  }
-
-  const pickWorkspace = async () => {
-    setPicking(true)
-    try {
-      const picked = await openDialog({ directory: true, multiple: false, title: '选择要添加的 workspace 目录' })
-      if (typeof picked !== 'string') return // 用户取消
-      await declare(resolveHomeFromPickedDir(picked))
-    } finally {
-      setPicking(false)
-    }
-  }
 
   /**
    * 「安装 DSH 插件」流程：先探测全局 dsh；未装则弹窗问是否走 dsh 开发
@@ -169,54 +144,15 @@ export function SettingsPanel({ homes, knownHomes, homeDir, legacyDshByHome, act
             </p>
             {installMessage && <p className="info-banner">{installMessage}</p>}
           </section>
-          <section>
-            <div className="section-header">
-              <h3>Workspaces</h3>
-              <button className="chip active" disabled={picking} onClick={() => void pickWorkspace()}>
-                {picking ? '选择中…' : '＋ 添加 workspace…'}
-              </button>
-            </div>
-            <div className="home-list">
-              {homes.map(home => (
-                <button
-                  key={home.homeId}
-                  className={`home-row${activeHome?.homeId === home.homeId ? ' selected' : ''}`}
-                  onClick={() => onSelectHome(home)}
-                >
-                  <span className="home-row-main">
-                    <span className="chip">{home.kind ?? 'workspace'}</span>
-                    <span className="mono home-path">{workspaceRootOf(home.path, homeDir, home.name ?? home.homeId)}</span>
-                    {activeHome?.homeId === home.homeId && <span className="row-check">✓</span>}
-                  </span>
-                  {legacyDshByHome[home.homeId] && (
-                    <span className="home-row-sub">
-                      {/* U1b：旧 dsh harness 条目保留在 bag，不静默丢弃（dsh 接入属后续版本） */}
-                      <span className="harness-notice">dsh harness 后续版本支持，当前配置已保留</span>
-                    </span>
-                  )}
-                </button>
-              ))}
-            </div>
-            {knownHomes.filter(k => !k.open).length > 0 && (
-              <div className="known-section">
-                <h4>已知未开（点击即添加）</h4>
-                {knownHomes.filter(k => !k.open).map(known => (
-                  <button
-                    key={known.path}
-                    className="home-row"
-                    disabled={known.missing}
-                    title={known.missing ? '目录已不存在（被移动/删除）' : known.path}
-                    onClick={() => void onDeclare(known.path).then(err => setDeclareMessage(err ?? `已收录 ${known.name}`))}
-                  >
-                    <span className="chip">{known.kind}</span>
-                    <span className="mono">{workspaceRootOf(known.path, homeDir, known.name)}</span>
-                    {known.missing && <span className="chip">已缺失</span>}
-                  </button>
-                ))}
-              </div>
-            )}
-            {declareMessage && <p className="info-banner">{declareMessage}</p>}
-          </section>
+          {/* U1b / §64 遗留：旧 dsh harness 条目保留在 bag，不静默丢弃
+              （dsh 接入属后续版本）——按 home 逐条提示，不只看当前 home */}
+          {homes
+            .filter(h => legacyDshByHome[h.homeId])
+            .map(h => (
+              <p key={h.homeId} className="info-banner">
+                「{workspaceNameOf(h.path ?? '', homeDir)}」：dsh harness 后续版本支持，当前配置已保留
+              </p>
+            ))}
           {isAdmin && (
             <section>
               <h3>Admin</h3>

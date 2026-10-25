@@ -76,11 +76,8 @@ const agentWire = (over: Record<string, unknown> = {}) => ({
 
 const baseProps = {
   homes: [{ homeId: 'h1', name: 'demo', kind: 'workspace', path: '/tmp/demo/.omt' }] as never[],
-  knownHomes: [] as never[],
   legacyDshByHome: {} as Record<string, boolean>,
   activeHome: null,
-  onSelectHome: vi.fn(),
-  onDeclare: vi.fn().mockResolvedValue(null),
 }
 
 /** 设置页默认 tab 是「通用」：先点进 Harnesses 内层 tab 再断言。 */
