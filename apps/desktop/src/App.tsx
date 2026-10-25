@@ -32,8 +32,14 @@ const EMPTY_BINDINGS: Record<string, string> = {}
 const clampWidth = (px: number) => Math.min(720, Math.max(240, Math.round(px)))
 
 function initialTreeWidth(): number {
-  const stored = Number(window.localStorage.getItem(TREE_WIDTH_KEY))
-  return Number.isFinite(stored) && stored > 0 ? clampWidth(stored) : 380
+  // F-TERM-2：localStorage 读取抛错（隐私模式/配额/损坏）时用默认宽度，
+  // 页面照常渲染
+  try {
+    const stored = Number(window.localStorage.getItem(TREE_WIDTH_KEY))
+    return Number.isFinite(stored) && stored > 0 ? clampWidth(stored) : 380
+  } catch {
+    return 380
+  }
 }
 
 export function App() {
@@ -111,7 +117,12 @@ export function App() {
     }
     const onUp = (up: PointerEvent) => {
       const finalWidth = clampWidth(startWidth + (up.clientX - startX))
-      window.localStorage.setItem(TREE_WIDTH_KEY, String(finalWidth))
+      // F-TERM-2：持久化不可用时仅本次会话生效
+      try {
+        window.localStorage.setItem(TREE_WIDTH_KEY, String(finalWidth))
+      } catch {
+        /* localStorage 不可用：跳过持久化 */
+      }
       window.removeEventListener('pointermove', onMove)
       window.removeEventListener('pointerup', onUp)
     }
@@ -139,6 +150,7 @@ export function App() {
       <WorkspaceRail
         workspaces={state.workspaces}
         knownHomes={state.knownHomes}
+        homes={state.homes}
         activeHomeId={state.activeHome?.homeId ?? null}
         homeDir={state.homeDir}
         errors={state.workspaceErrors}
@@ -206,8 +218,16 @@ export function App() {
                 </>
               ) : (
                 <div className="workspace-empty">
-                  <p className="empty-hint">还没有打开的工作区</p>
-                  <button className="chip active" onClick={() => setAddOpen(true)}>＋ 添加工作区</button>
+                  {/* P3（§64）：图标栏有工作区时只提示去点图标，「还没有打开
+                      的工作区」的空态（含添加按钮）只在图标栏也为空时显示 */}
+                  {state.workspaces.length > 0 ? (
+                    <p className="empty-hint">从左侧图标栏选择一个工作区</p>
+                  ) : (
+                    <>
+                      <p className="empty-hint">还没有打开的工作区</p>
+                      <button className="chip active" onClick={() => setAddOpen(true)}>＋ 添加工作区</button>
+                    </>
+                  )}
                 </div>
               )}
             </div>

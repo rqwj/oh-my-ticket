@@ -50,6 +50,10 @@ body {
 /* 路径失效：置灰带警告，仍可点击（KTD14） */
 .rail-icon.missing { opacity: 0.45; }
 .rail-icon.error { border-color: var(--danger); }
+/* 键盘可达性：图标聚焦时可见的焦点环（不依赖鼠标 hover 样式） */
+.rail-icon:focus-visible, .rail-action:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 2px;
+}
 .rail-warn {
   position: absolute; right: -4px; top: -4px; font-size: 11px;
   color: #d29922;
@@ -80,6 +84,9 @@ body {
 .tree-wrap { flex-shrink: 0; min-width: 0; display: flex; flex-direction: column; }
 .tree-panel {
   width: 100%;
+  /* F-TERM-1：tree-wrap 纵向 flex 里必须自己占满剩余高度并允许收缩，
+     .tree-scroll 的 overflow-y 才有有界高度（否则整页滚动） */
+  flex: 1; min-height: 0;
   display: flex; flex-direction: column; background: var(--bg);
 }
 .splitter {
@@ -198,17 +205,11 @@ body {
   border: 1px solid var(--border); border-radius: 6px;
   background: var(--panel); color: var(--text); cursor: pointer; text-align: left;
 }
-.home-row-main { display: flex; gap: 10px; align-items: center; }
-.home-path { text-align: left; word-break: break-all; }
-.home-row-sub { display: flex; padding-left: 2px; }
 .home-row:hover { background: var(--panel-raised); border-color: var(--muted); }
-.home-row.selected { border-color: var(--accent); background: rgba(88, 166, 255, 0.08); }
-.row-check { margin-left: auto; color: var(--accent); font-weight: 700; font-size: 14px; }
 .home-row:disabled { opacity: 0.45; cursor: not-allowed; }
 .known-section { margin-bottom: 12px; }
 .known-section h4 { margin: 0 0 6px; font-size: 12px; color: var(--muted); font-weight: 500; }
 .known-section .home-row { margin-bottom: 4px; }
-.declare-form { display: flex; gap: 8px; }
 
 /* ── U1：ticket 栏顶部的工作区标题（R5）────────────────────────── */
 .workspace-header {
@@ -326,7 +327,7 @@ body {
 }
 .md-link { color: var(--accent); cursor: default; }
 
-/* row-spacer：行内把尾郡操作推到右侧（AgentsPanel / TranscriptView） */
+/* row-spacer：行内把尾部操作推到右侧（AgentsPanel / TranscriptView） */
 .row-spacer { flex: 1; }
 
 /* ── U7：设置页 Harnesses 管理面（R-A：左类型列表右详情）──────────────── */

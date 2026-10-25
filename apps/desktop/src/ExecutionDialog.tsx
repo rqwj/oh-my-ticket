@@ -1,5 +1,6 @@
 /**
- * U6 (R-B)：执行弹窗（全局 Modal，照 WorkspaceSwitcher overlay 模式）。
+ * U6 (R-B)：执行弹窗（全局 Modal，盖在内容区上的 overlay，样式复用
+ * modal-overlay/modal-panel）。
  * 选择器 = 已启用 harness ∪ 空闲 Agent（渲染但禁用——会话续接 v1 未接入，
  * U11）；默认 = bag v2 defaultHarness（读取时校验 enabled，失效回退首个
  * enabled 并提示）；「详情」展开只读预览（harness_launch_preview：binary/

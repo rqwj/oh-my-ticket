@@ -6,6 +6,7 @@
 import { describe, expect, it, beforeEach } from 'vitest'
 import {
   WORKSPACES_KEY,
+  addCandidates,
   abbreviationOf,
   appendWorkspace,
   hueOf,
@@ -30,10 +31,13 @@ describe('显示名 / 缩写 / 颜色 / 上级目录', () => {
     expect(workspaceNameOf('/Users/x/dev/omt 仓库/.omt', '/Users/x')).toBe('omt 仓库')
   })
 
-  it('abbreviationOf：显示名前两个字符', () => {
+  it('abbreviationOf：显示名前两个字符（按字符切片，不切开 emoji）', () => {
     expect(abbreviationOf('app')).toBe('ap')
     expect(abbreviationOf('桌面终端')).toBe('桌面')
     expect(abbreviationOf('a')).toBe('a')
+    // P3（§64）：emoji 是代理对，按 UTF-16 码元切片会只剩半个字符
+    expect(abbreviationOf('🚀🚀火箭')).toBe('🚀🚀')
+    expect(abbreviationOf('🚀项目')).toBe('🚀项')
   })
 
   it('hueOf/workspaceColor：同路径稳定、不同路径（选取样例）不同色相', () => {
@@ -42,9 +46,12 @@ describe('显示名 / 缩写 / 颜色 / 上级目录', () => {
     expect(workspaceColor('/tmp/one/app/.omt')).not.toBe(workspaceColor('/tmp/two/app/.omt'))
   })
 
-  it('parentDirOf：根路径去最后一段；homeDir 前缀压缩后再取', () => {
+  it('parentDirOf：根路径去最后一段；homeDir 前缀压缩后再取；没有上级（全局 home 的 ~）→ null', () => {
     expect(parentDirOf('/tmp/one/app/.omt')).toBe('/tmp/one')
     expect(parentDirOf('/Users/x/dev/app/.omt', '/Users/x')).toBe('~/dev')
+    // P3（§64）：全局 home 压缩成 ~ 后没有上级目录，返回 null（悬停提示
+    // 不再拼出「~（~）」）
+    expect(parentDirOf('/Users/x/.omt', '/Users/x')).toBeNull()
   })
 })
 
@@ -105,6 +112,47 @@ describe('收录与移除', () => {
   })
 })
 
+describe('添加弹窗候选（F-TERM-5）', () => {
+  const known = (over: Partial<{ path: string; open: boolean; missing: boolean; lastHomeId: string }> = {}) => ({
+    path: '/tmp/ws2/.omt',
+    open: false,
+    missing: false,
+    kind: 'workspace',
+    lastHomeId: 'h_b',
+    ...over,
+  })
+
+  it('候选 = known-homes 条目 + daemon 已开的 home；已在图标栏里的（path 或 homeId）不列', () => {
+    const candidates = addCandidates(
+      // 图标栏已有 ws1（h_a）与 ws3（h_c）
+      [{ path: '/tmp/ws1/.omt', homeId: 'h_a' }, { path: '/tmp/ws3/.omt', homeId: 'h_c' }],
+      [
+        known(), // ws2 未开、不在列表 → 候选
+        known({ path: '/tmp/ws3/.omt' }), // 已在列表（path 命中）→ 不列
+        known({ path: '/tmp/ws5/.omt', lastHomeId: 'h_a' }), // homeId 命中列表项 → 不列
+      ],
+      [
+        { homeId: 'h_a', path: '/tmp/ws1/.omt' }, // 在列表 → 不列
+        { homeId: 'h_d', path: '/tmp/ws4/.omt' }, // daemon 已开但不在列表 → 候选
+      ],
+    )
+    expect(candidates.map(c => c.path)).toEqual(['/tmp/ws4/.omt', '/tmp/ws2/.omt'])
+    expect(candidates[0]).toMatchObject({ homeId: 'h_d', missing: false })
+    expect(candidates[1]).toMatchObject({ homeId: 'h_b', missing: false })
+  })
+
+  it('同一 path 在 daemon 与 known-homes 都出现 → 只列一次；missing 透传；无 lastHomeId 的 known 条目仍可添加', () => {
+    const candidates = addCandidates(
+      [],
+      [known({ missing: true }), known({ path: '/tmp/ws6/.omt', lastHomeId: undefined as unknown as string })],
+      [{ homeId: 'h_x', path: '/tmp/ws2/.omt' }],
+    )
+    expect(candidates.map(c => c.path)).toEqual(['/tmp/ws2/.omt', '/tmp/ws6/.omt'])
+    expect(candidates[0]).toMatchObject({ homeId: 'h_x', missing: false })
+    expect(candidates[1]).toMatchObject({ homeId: null })
+  })
+})
+
 describe('localStorage 存取', () => {
   it('save → read 往返；无存储 → null', () => {
     expect(readStoredWorkspaces()).toBeNull()
@@ -113,11 +161,16 @@ describe('localStorage 存取', () => {
     expect(readStoredWorkspaces()).toEqual(list)
   })
 
-  it('损坏内容（非 JSON / 非数组 / 条目形状不对）→ null（调用方重新迁移）', () => {
+  it('非 JSON / 非数组 → null（调用方重新迁移）', () => {
     window.localStorage.setItem(WORKSPACES_KEY, '{oops')
     expect(readStoredWorkspaces()).toBeNull()
     window.localStorage.setItem(WORKSPACES_KEY, '42')
     expect(readStoredWorkspaces()).toBeNull()
+  })
+
+  // P3（§64）：原标题「形状不对 → null」与行为不符——形状不对的条目被剔除、
+  // 其余保留，只有非 JSON / 非数组才返回 null
+  it('数组里形状不对的条目被剔除，其余条目保留', () => {
     window.localStorage.setItem(WORKSPACES_KEY, JSON.stringify([{ path: '/x/.omt' }, { path: '/y/.omt', homeId: 'h_y', name: 'y' }]))
     expect(readStoredWorkspaces()).toEqual([{ path: '/y/.omt', homeId: 'h_y', name: 'y' }])
   })

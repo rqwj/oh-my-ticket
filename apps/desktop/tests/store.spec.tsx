@@ -136,7 +136,7 @@ describe('declare flow', () => {
 
     let error: string | null = 'unset'
     await act(async () => {
-      error = await result.current.declareHome('/tmp/new-ws/.omt')
+      error = (await result.current.declareHome('/tmp/new-ws/.omt')).error
     })
     expect(error).toBeNull()
     const commands = invokeMock.mock.calls.map(c => c[0])
@@ -157,7 +157,7 @@ describe('declare flow', () => {
 
     let error: string | null = null
     await act(async () => {
-      error = await result.current.declareHome('/tmp/new-ws/.omt')
+      error = (await result.current.declareHome('/tmp/new-ws/.omt')).error
     })
     expect(error).toContain('homeDeclare')
     expect(error).toContain('升级 daemon')

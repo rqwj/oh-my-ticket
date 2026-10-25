@@ -8,10 +8,12 @@
  */
 import { useState } from 'react'
 import { open as openDialog } from '@tauri-apps/plugin-dialog'
+import type { HomeInfo } from './types'
 import type { KnownHome } from './store'
 import { workspaceRootOf } from './homePath'
 import { NOT_A_WORKSPACE_HINT, resolveHomeFromPickedDir } from './workspacePath'
 import {
+  addCandidates,
   abbreviationOf,
   parentDirOf,
   workspaceColor,
@@ -21,6 +23,8 @@ import {
 interface Props {
   workspaces: WorkspaceEntry[]
   knownHomes: KnownHome[]
+  /** daemon 已打开的 home——添加弹窗候选来源之一（F-TERM-5） */
+  homes: HomeInfo[]
   activeHomeId: string | null
   homeDir?: string
   /** 图标错误态（homeId → 原因）：懒声明失败等 */
@@ -40,6 +44,7 @@ interface Props {
 export function WorkspaceRail({
   workspaces,
   knownHomes,
+  homes,
   activeHomeId,
   homeDir,
   errors,
@@ -80,7 +85,10 @@ export function WorkspaceRail({
     }
   }
 
-  const knownClosed = knownHomes.filter(k => !k.open)
+  // F-TERM-5：候选 = known-homes 条目 + daemon 已打开的 home，排除已在
+  // 图标栏里的（path 或 homeId 命中）——已在列表中的不再显示为「已知未开」，
+  // 由 DSH/CLI 打开的 home 也能从这里收进图标栏
+  const candidates = addCandidates(workspaces, knownHomes, homes, homeDir)
 
   return (
     <>
@@ -95,8 +103,11 @@ export function WorkspaceRail({
               missing ? 'missing' : '',
               error ? 'error' : '',
             ].filter(Boolean).join(' ')
+            // P3（§64）：全局 home 的根被压缩成 ~，没有上级目录——悬停提示
+            // 只显示显示名，不出现「~（~）」
+            const parent = parentDirOf(ws.path, homeDir)
             const tooltip = [
-              `${ws.name}（${parentDirOf(ws.path, homeDir)}）`,
+              parent !== null ? `${ws.name}（${parent}）` : ws.name,
               missing ? '目录已不存在' : '',
               error ?? '',
             ].filter(Boolean).join(' — ')
@@ -106,6 +117,8 @@ export function WorkspaceRail({
                 className={cls}
                 style={{ background: workspaceColor(ws.path) }}
                 title={tooltip}
+                aria-label={ws.name}
+                aria-current={ws.homeId === activeHomeId ? 'true' : undefined}
                 onClick={() => onSelect(ws)}
               >
                 <span className="rail-abbr">{abbreviationOf(ws.name)}</span>
@@ -138,20 +151,20 @@ export function WorkspaceRail({
                 <button className="chip" onClick={() => { setAddMessage(null); onAddClose() }}>✕</button>
               </div>
             </header>
-            {knownClosed.length > 0 ? (
+            {candidates.length > 0 ? (
               <div className="known-section">
-                <h4>已知未开（点击即添加）</h4>
-                {knownClosed.map(known => (
+                <h4>可添加的工作区（点击即添加）</h4>
+                {candidates.map(c => (
                   <button
-                    key={known.path}
+                    key={c.path}
                     className="home-row"
-                    disabled={known.missing}
-                    title={known.missing ? '目录已不存在（被移动/删除）' : known.path}
-                    onClick={() => void add(known.path)}
+                    disabled={c.missing}
+                    title={c.missing ? '目录已不存在（被移动/删除）' : c.path}
+                    onClick={() => void add(c.path)}
                   >
-                    <span className="chip">{known.kind}</span>
-                    <span className="mono">{workspaceRootOf(known.path, homeDir, known.name)}</span>
-                    {known.missing && <span className="chip">已缺失</span>}
+                    <span className="chip">{c.kind}</span>
+                    <span className="mono">{workspaceRootOf(c.path, homeDir, c.name)}</span>
+                    {c.missing && <span className="chip">已缺失</span>}
                   </button>
                 ))}
               </div>

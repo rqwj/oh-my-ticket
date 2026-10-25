@@ -26,16 +26,17 @@ export function workspaceNameOf(path: string, homeDir?: string): string {
   return base === '' ? root : base
 }
 
-/** 图标缩写（KTD14）：显示名前两个字符。 */
+/** 图标缩写（KTD14）：显示名前两个字符（按 Unicode 字符而非 UTF-16 码元切片，不切开 emoji）。 */
 export function abbreviationOf(name: string): string {
-  return name.slice(0, 2)
+  return Array.from(name).slice(0, 2).join('')
 }
 
-/** 上级目录（悬停提示用）：根路径去掉最后一段。 */
-export function parentDirOf(path: string, homeDir?: string): string {
+/** 上级目录（悬停提示用）：根路径去掉最后一段；没有上级（根被 homeDir
+ *  压缩成 `~`、或已是顶层路径）→ null，调用方不再拼「name（parent）」。 */
+export function parentDirOf(path: string, homeDir?: string): string | null {
   const root = workspaceRootOf(path, homeDir, path)
   const idx = root.lastIndexOf('/')
-  return idx > 0 ? root.slice(0, idx) : root
+  return idx > 0 ? root.slice(0, idx) : null
 }
 
 /**
@@ -108,8 +109,8 @@ export function removeWorkspace(
 }
 
 /**
- * 读存量列表：无存储（未迁移过）→ null；内容损坏/形状不对 → 也返回 null
- * 让调用方重新迁移（localStorage 自身抛错不在此处理——调用方统一兜底）。
+ * 读存量列表：无存储（未迁移过）→ null；内容损坏（非 JSON / 非数组）→
+ *  也返回 null 让调用方重新迁移；数组里形状不对的条目被剔除、其余保留
  */
 export function readStoredWorkspaces(): WorkspaceEntry[] | null {
   const raw = window.localStorage.getItem(WORKSPACES_KEY)
@@ -136,4 +137,57 @@ export function readStoredWorkspaces(): WorkspaceEntry[] | null {
 /** 落盘（原子整体写）。localStorage 不可用时抛错，由调用方降级。 */
 export function saveStoredWorkspaces(list: WorkspaceEntry[]): void {
   window.localStorage.setItem(WORKSPACES_KEY, JSON.stringify(list))
+}
+
+/** 添加弹窗的候选项（F-TERM-5）。来源：daemon 已打开的 home + known-homes
+ *  条目；已在图标栏里的（path 或 homeId 命中）不列——已在列表中的不应再
+ * 显示为「已知未开」，由 DSH/CLI 打开的 home 也不应凭空消失。 */
+export interface AddCandidate {
+  /** home 目录路径（<root>/.omt）——声明用它 */
+  path: string
+  /** daemon 已开 → 当前 homeId；未开 → known-homes 的 lastHomeId（可空） */
+  homeId: string | null
+  /** 显示名（R7） */
+  name: string
+  kind: string
+  /** known-homes 探测到路径已失效（daemon 已开条目恒 false） */
+  missing: boolean
+}
+
+export function addCandidates(
+  workspaces: ReadonlyArray<{ path: string; homeId: string }>,
+  knownHomes: ReadonlyArray<{ path: string; open: boolean; missing: boolean; kind: string; lastHomeId?: string }>,
+  openHomes: ReadonlyArray<{ homeId: string; path?: string; kind?: string }>,
+  homeDir?: string,
+): AddCandidate[] {
+  const out: AddCandidate[] = []
+  const seen = new Set<string>()
+  const inRail = (path: string, homeId: string | null | undefined) =>
+    workspaces.some(
+      w => w.path === path || (homeId != null && homeId !== '' && w.homeId === homeId),
+    )
+  for (const home of openHomes) {
+    const path = home.path ?? ''
+    if (path === '' || seen.has(path) || inRail(path, home.homeId)) continue
+    seen.add(path)
+    out.push({
+      path,
+      homeId: home.homeId,
+      name: workspaceNameOf(path, homeDir),
+      kind: home.kind ?? 'workspace',
+      missing: false,
+    })
+  }
+  for (const known of knownHomes) {
+    if (seen.has(known.path) || inRail(known.path, known.lastHomeId)) continue
+    seen.add(known.path)
+    out.push({
+      path: known.path,
+      homeId: known.lastHomeId ?? null,
+      name: workspaceNameOf(known.path, homeDir),
+      kind: known.kind,
+      missing: known.missing,
+    })
+  }
+  return out
 }

@@ -585,6 +585,9 @@ export function useTreeStore() {
   const storageBrokenRef = useRef(false)
   // U1：已从存量读取或完成首次迁移（空数组也是有效存量：用户清空过列表）
   const workspacesInitRef = useRef(false)
+  // F-TERM-6：图标点击的选择序号——selectWorkspace 的慢声明完成后若用户
+  // 已改选别的图标，过期结果直接丢弃（先点慢的 B、再点快的 C，最终停在 C）
+  const workspaceSelectSeqRef = useRef(0)
   // Pulls may resolve out of order while the user switches homes (or when a
   // focus/dispatch refresh overlaps another refresh). Only the newest request
   // for the still-active home may update current-home state.
@@ -1126,7 +1129,7 @@ export function useTreeStore() {
     [scheduleAgentsRepull, applyError],
   )
 
-  const refreshHomes = useCallback(async () => {
+  const refreshHomes = useCallback(async (): Promise<boolean> => {
     try {
       // Handshake projection of open homes (pull-based freshness, v1).
       const result = await invoke<{ homes?: HomeInfo[]; homeDir?: string }>('daemon_homes')
@@ -1137,13 +1140,20 @@ export function useTreeStore() {
       // U1b：每个 home 拉到后顺带执行 bag v2 迁移（幂等，旧键清理后为 no-op）
       for (const home of homes) void migrateHarnessBag(home.homeId)
       if (result.homeDir !== undefined) setState(s => ({ ...s, homeDir: result.homeDir }))
+      // F-TERM-2：localStorage 抛错（隐私模式/配额/损坏）不得让应用崩溃——
+      // 记忆恢复降级为「没有记忆值」；读取移出 setState updater（保持纯函数）
+      let remembered: string | null = null
+      try {
+        remembered = window.localStorage.getItem(LAST_HOME_KEY)
+      } catch {
+        /* localStorage 不可用：跳过记忆恢复 */
+      }
       setState(s => {
         // A homes refresh must NEVER unset an existing selection — a
         // transiently incomplete list (in-flight boot, declare still
         // landing) would otherwise wipe the user's active home. Only
         // auto-pick when nothing is selected yet; the boot pick prefers
         // the LAST-USED workspace (localStorage) over the first home.
-        const remembered = window.localStorage.getItem(LAST_HOME_KEY)
         const next = s.activeHome
           ?? (remembered ? homes.find(h => h.homeId === remembered) : undefined)
           ?? homes[0]
@@ -1166,8 +1176,11 @@ export function useTreeStore() {
           error: null,
         }
       })
+      return true
     } catch (error) {
       applyError(error, { loading: false })
+      // F-TERM-3：失败时告知调用方——首次迁移不得在 daemon 不可达时持久化空列表
+      return false
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
@@ -1317,7 +1330,12 @@ export function useTreeStore() {
       // silent 轮询结果被误判为「结构未变」而跳过落账（空列表签名尤其常见）
       agentsSigRef.current = null
       activeHomeRef.current = home
-      window.localStorage.setItem(LAST_HOME_KEY, home.homeId)
+      // F-TERM-2：localStorage 抛错时跳过记忆持久化，不影响切换本身
+      try {
+        window.localStorage.setItem(LAST_HOME_KEY, home.homeId)
+      } catch {
+        /* localStorage 不可用：本次会话不记忆 */
+      }
       // U1b：切 home 装载 per-home 数据时顺带执行 bag v2 迁移（幂等）
       await Promise.all([refreshNodes(home), refreshRuns(home), loadFilters(home), refreshAgents(), refreshBindings(), migrateHarnessBag(home.homeId)])
     },
@@ -1355,27 +1373,29 @@ export function useTreeStore() {
 
   // Declare flow (U5 consumer): register an unregistered home directory,
   // then re-pull the home list. Pre-U5 daemons surface the feature gap
-  // as a readable fallback message.
+  // as a readable fallback message. F-TERM-4：把 home/declare 返回的
+  // homeId 透传给调用方——daemon 回报的 path 可能与声明写法不同（符号
+  // 链接 / 首个声明者的原始路径），按路径字符串找回会误报「没有找到」。
   const declareHome = useCallback(
-    async (path: string) => {
+    async (path: string): Promise<{ homeId: string | null; error: string | null }> => {
       try {
-        await omtCall('home/declare', { path })
+        const result = await omtCall<{ homeId?: string }>('home/declare', { path })
         // requiresRehandshake: a fresh session folds the new home into the
         // credential's scoped grant before we re-list.
         await invoke('daemon_reconnect')
         await refreshHomes()
         await loadKnownHomes()
-        return null
+        return { homeId: result.homeId ?? null, error: null }
       } catch (error) {
         const text = String(error)
         if (text.includes('NOT_FOUND') || text.includes('method')) {
-          return '当前 daemon 版本不支持动态收录 home（缺少 homeDeclare 能力位）— 请升级 daemon 后重试。'
+          return { homeId: null, error: '当前 daemon 版本不支持动态收录 home（缺少 homeDeclare 能力位）— 请升级 daemon 后重试。' }
         }
         // §57 F-SP2-11：home/declare 超时同样结果未知——返回给切换器就地
         // 展示，并落粘性 timeoutNotice
         const presented = presentErrorWithKind(error)
         if (presented.daemonTimeout) setState(s => ({ ...s, timeoutNotice: presented.text }))
-        return presented.text
+        return { homeId: null, error: presented.text }
       }
     },
     [refreshHomes],
@@ -1448,17 +1468,28 @@ export function useTreeStore() {
   /**
    * U1：图标栏点击切换（KTD14 懒声明）。已开（homeId/路径命中 daemon 的
    * home）→ 直接 selectHome；未开且路径已失效（known-homes 探测）→ 图标
-   * 错误态 + 原因，不清空当前选中；否则 declareHome 后按 homeId/路径找回
-   * home 再选中（known-homes 的 lastHomeId 只是历史值，轮换时回写列表）。
-   * 声明失败（配额/路径缺失/home 锁/超时）→ 图标错误态 + 全局提示。
+   * 错误态 + 原因，不清空当前选中；否则 declareHome 后按声明返回的
+   * homeId 找回 home 再选中（known-homes 的 lastHomeId 只是历史值，轮换
+   * 时回写列表）。声明失败（配额/路径缺失/home 锁/超时）→ 图标错误态 +
+   * 全局提示。F-TERM-6：选择序号守卫——慢声明完成后若用户已改选别的
+   * 图标（先点慢的 B 再点快的 C），过期结果直接丢弃，最终停在 C。
    */
   const selectWorkspace = useCallback(
     async (ws: WorkspaceEntry) => {
+      const seq = ++workspaceSelectSeqRef.current
       // daemon 已持有该 home（homeId 命中，或路径命中）→ 直接选中——
       // open 是权威状态，优先于 known-homes 可能过期的 missing 标记
       const open = homesRef.current.find(h => h.homeId === ws.homeId || h.path === ws.path)
       if (open) {
         setWorkspaceError(ws.homeId, null)
+        setWorkspaceError(open.homeId, null)
+        // P3（§64）：homeId 轮换（lastHomeId 只是历史值）——「已打开」分支
+        // 同样回写，否则对齐 effect 会因 homeId 不匹配把图标弹回首项
+        if (open.homeId !== ws.homeId) {
+          updateWorkspaces(list =>
+            list.map(w => (w.homeId === ws.homeId || w.path === ws.path ? { ...w, homeId: open.homeId } : w)),
+          )
+        }
         void selectHome(open)
         return
       }
@@ -1467,18 +1498,23 @@ export function useTreeStore() {
         setWorkspaceError(ws.homeId, '目录已不存在（被移动/删除），无法切换到该工作区。')
         return
       }
-      const error = await declareHome(ws.path)
-      if (error !== null) {
-        setWorkspaceError(ws.homeId, error)
+      const declared = await declareHome(ws.path)
+      if (seq !== workspaceSelectSeqRef.current) return // 过期的慢声明：用户已改选
+      if (declared.error !== null) {
+        setWorkspaceError(ws.homeId, declared.error)
         return
       }
-      const fresh = homesRef.current.find(h => h.homeId === ws.homeId)
+      // F-TERM-4：优先按声明返回的 homeId 找回（路径写法不一致时兜底旧值/路径）
+      const fresh =
+        (declared.homeId !== null ? homesRef.current.find(h => h.homeId === declared.homeId) : undefined)
+        ?? homesRef.current.find(h => h.homeId === ws.homeId)
         ?? homesRef.current.find(h => h.path === ws.path)
       if (!fresh) {
         setWorkspaceError(ws.homeId, '工作区已声明，但 home 列表中没有找到它——请重试。')
         return
       }
       setWorkspaceError(ws.homeId, null)
+      setWorkspaceError(fresh.homeId, null)
       if (fresh.homeId !== ws.homeId) {
         // homeId 轮换（lastHomeId 只是历史值）——回写列表，后续点击直接命中
         updateWorkspaces(list => list.map(w => (w.path === ws.path ? { ...w, homeId: fresh.homeId } : w)))
@@ -1489,15 +1525,18 @@ export function useTreeStore() {
   )
 
   /**
-   * U1：＋添加工作区（R3，目录选择 / 已知未开共用）——声明成功后从刷新的
-   * home 列表取 homeId（声明前不可知，KTD14）收录并切换过去；失败把原因
-   * 返回给调用方在弹窗就地展示，不收录。
+   * U1：＋添加工作区（R3，目录选择 / 已知未开共用）——声明成功后按
+   * home/declare 返回的 homeId（F-TERM-4）从刷新的 home 列表找回并收录
+   * （声明前不可知，KTD14）再切换过去；失败把原因返回给调用方在弹窗就地
+   * 展示，不收录。
    */
   const addWorkspace = useCallback(
     async (homePath: string): Promise<string | null> => {
-      const error = await declareHome(homePath)
-      if (error !== null) return error
-      const home = homesRef.current.find(h => h.path === homePath)
+      const declared = await declareHome(homePath)
+      if (declared.error !== null) return declared.error
+      const home =
+        (declared.homeId !== null ? homesRef.current.find(h => h.homeId === declared.homeId) : undefined)
+        ?? homesRef.current.find(h => h.path === homePath)
       if (!home) return '工作区已声明，但 home 列表中没有找到它——请重试。'
       updateWorkspaces(list => appendWorkspace(list, {
         path: homePath,
@@ -1587,15 +1626,19 @@ export function useTreeStore() {
   }, [])
 
   useEffect(() => {
-    // U1：homes + known-homes 都落定后再初始化工作区列表（迁移需要两者）
+    // U1：homes + known-homes 都落定后再初始化工作区列表（迁移需要两者）；
+    // F-TERM-3：daemon_homes 拉取失败时不迁移、不落盘——否则首启 daemon
+    // 不可达会把「空列表」当作用户清空过的状态持久化，图标栏永久为空
     void (async () => {
-      await refreshHomes()
+      const ok = await refreshHomes()
       await loadKnownHomes()
-      initializeWorkspaces()
+      if (ok) initializeWorkspaces()
     })()
     void loadRecent()
     const onFocus = () => {
-      void refreshHomes().then(initializeWorkspaces) // localStorage 降级时每次重算；正常时 no-op
+      void refreshHomes().then(ok => {
+        if (ok) initializeWorkspaces() // localStorage 降级时每次重算；正常时 no-op
+      })
       void refreshAgents()
       void refreshBindings()
     }
@@ -1619,16 +1662,29 @@ export function useTreeStore() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.activeHome?.homeId])
 
-  // U1：图标栏是切换的唯一入口——daemon 自动选中的 home 不在桌面端列表时
-  // （如记忆的 last-home 已被移出列表）对齐到首项（懒声明由 selectWorkspace
-  // 处理）。列表为空或当前无选中不动：boot 不主动开 home，等用户点击图标。
+  // U1：图标栏是切换的唯一入口——当前选中不在桌面端列表时对齐到首项（懒
+  // 声明由 selectWorkspace 处理）。P3（§64）：boot 的自动选中
+  // （refreshHomes 的 homes[0]/记忆值）不触发对齐——与注释「boot 不主动
+  // 开 home」一致，等用户点击；homeId 轮换（声明侧回写遗漏时）在此兜底
+  // 回写，避免选中被弹回首项。
+  const prevActiveHomeIdRef = useRef<string | undefined>(undefined)
   useEffect(() => {
     const list = state.workspaces
     const active = state.activeHome
     if (list.length === 0 || !active) return
-    if (list.some(w => w.homeId === active.homeId)) return
+    const firstActivation = prevActiveHomeIdRef.current === undefined
+    prevActiveHomeIdRef.current = active.homeId
+    const entry = list.find(w => w.homeId === active.homeId || w.path === active.path)
+    if (entry) {
+      // homeId 轮换兜底回写（daemon 侧重新开过，列表里的历史 id 过期）
+      if (entry.homeId !== active.homeId) {
+        updateWorkspaces(items => items.map(w => (w.path === entry.path ? { ...w, homeId: active.homeId } : w)))
+      }
+      return
+    }
+    if (firstActivation) return
     void selectWorkspace(list[0])
-  }, [state.workspaces, state.activeHome, selectWorkspace])
+  }, [state.workspaces, state.activeHome, selectWorkspace, updateWorkspaces])
 
   // 稳定标识（[] deps，只读 activeHomeRef）：消费方把 fetchRun 放进 effect
   // 依赖时，raw flush 引起的重渲染不得反复 teardown 请求（U7 评审修复）。
