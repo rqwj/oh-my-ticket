@@ -246,7 +246,7 @@
     },
     "LeaseGrant": {
       "type": "object",
-      "description": "Fenced execution lease returned by a successful claim (R10). Reports must echo the token; expiry demotes the claim.",
+      "description": "Fenced execution lease returned by a successful claim (R10). Reports must echo the token; the grant stays valid until the item is reported, retried, removed or interrupted. expiresAt is advisory and not enforced (attempt + token fencing keeps stale executors out).",
       "properties": {
         "token": { "type": "string", "minLength": 16 },
         "attempt": { "type": "integer", "minimum": 1 },
