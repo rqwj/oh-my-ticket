@@ -126,17 +126,24 @@ pub enum ReportVerdict {
 ///   [`ReportVerdict::AdminAuthorized`] so callers can audit it distinctly;
 /// - executor presented no token (empty) → `lease-token-missing` (P3-ACC-2:
 ///   names the missing `leaseToken` parameter instead of a fence mismatch);
-/// - missing/expired grant → `lease-stale`;
+/// - no grant registered for the item → `lease-stale`;
 /// - wrong attempt (stale attempt-one token against attempt-two work) →
 ///   `lease-attempt`;
 /// - wrong token → `lease-token`;
 /// - foreign actor namespace → `actor-mismatch`.
+///
+/// F-SELF-1：wall-clock expiry is NOT a denial rule. A grant stays valid
+/// until the item is reported, retried, removed or interrupted (each of
+/// those drops or supersedes it), and the attempt + token fence is what
+/// keeps a stale executor out. Rejecting on `expires_at` only ever refused
+/// the legitimate holder: nothing renews or reclaims an expired lease, so
+/// any dispatch longer than the TTL finished its work and then could not
+/// record it.
 pub fn authorize_report(
     item_state: RunItemState,
     item_attempts: i64,
     grant: Option<&LeaseGrant>,
     authority: &ReportAuthority,
-    now_ms: i64,
     expected_token: Option<&str>,
 ) -> Result<ReportVerdict> {
     if !is_run_item_in_flight(item_state) {
@@ -171,12 +178,6 @@ pub fn authorize_report(
                     "no live lease holds this item",
                 ));
             };
-            if now_ms >= grant.expires_at {
-                return Err(conflict_rule(
-                    "lease-stale",
-                    "the claiming lease has expired",
-                ));
-            }
             if grant.attempt != item_attempts {
                 return Err(conflict_rule(
                     "lease-attempt",

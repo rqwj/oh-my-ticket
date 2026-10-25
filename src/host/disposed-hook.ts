@@ -11,11 +11,12 @@
  *  2. executor 是主会话：名下有未完项的 running/paused run → 同一降级路径。
  *
  * U7a degradation note: the pre-daemon janitor sweep demoted dead sessions'
- * running items to interrupted IN-PROCESS. This daemon build owns lease
- * expiry (claims carry a bounded lease; the daemon's startup janitor demotes
- * on open) and exposes no mid-flight demotion RPC, so the adapter's sweep is
- * notify-only: outstanding items stay `running` until the daemon-side lease
- * path or a human retry settles them. The liveness probe below still runs —
+ * running items to interrupted IN-PROCESS. This daemon build demotes
+ * in-flight items only in its startup janitor (on open) — lease expiry is
+ * advisory and never demotes (F-SELF-1) — and exposes no mid-flight demotion
+ * RPC, so the adapter's sweep is notify-only: outstanding items stay
+ * `running` until a daemon restart or a human retry settles them. The
+ * liveness probe below still runs —
  * it decides whether the parent handoff or the degraded warning fires.
  *
  * 死会话的 RunningRegistry 标记总是清理（无论是否参与 run）。所有注入失败都
@@ -138,10 +139,10 @@ export function registerOmtDisposedHook(ctx: Context, service: OmtService, runni
     const involved = handedOff || owned.some(({ run, item }) => (run.status === 'running' || run.status === 'paused') && !RUN_ITEM_FINAL_STATES.includes(item.state))
     if (!involved) return
     // Degraded sweep: this daemon build has no mid-flight demotion RPC —
-    // items stay running until the daemon-side lease path settles them.
+    // items stay running until a daemon restart's janitor or a human retry.
     if (!warnedSweepDegraded) {
       warnedSweepDegraded = true
-      warn('janitor sweep unavailable over RPC; outstanding items await daemon lease expiry or manual retry', undefined)
+      warn('janitor sweep unavailable over RPC; outstanding items await a daemon restart or manual retry', undefined)
     }
   }
 
